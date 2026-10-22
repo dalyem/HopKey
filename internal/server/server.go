@@ -367,10 +367,18 @@ func (s *Server) wrap(rt *route) http.Handler {
 			return
 		}
 		var ae *apiError
-		if !errors.As(err, &ae) {
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				s.log.Error("request failed", "route", rt.pattern, "err", err)
-			}
+		switch {
+		case errors.As(err, &ae):
+		case errors.Is(err, context.DeadlineExceeded):
+			// The request ran out of time waiting (for an account lock,
+			// a validation slot or the database): retryable, as when a
+			// queue is full.
+			ae = errBusy
+		case errors.Is(err, context.Canceled):
+			// The client went away; nobody reads a response.
+			return
+		default:
+			s.log.Error("request failed", "route", rt.pattern, "err", err)
 			ae = errInternal
 		}
 		writeError(w, ae)

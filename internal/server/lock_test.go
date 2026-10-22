@@ -354,3 +354,29 @@ func TestAdmittedResponseSentUnderLock(t *testing.T) {
 		t.Errorf("response %q", got)
 	}
 }
+
+// A write that runs out of request time waiting for its account's lock
+// gets a retryable 429 busy, not a 500.
+func TestLockWaitDeadlineIsBusy(t *testing.T) {
+	g := newAdmissionGate()
+	e := newEnv(t,
+		withLimits(func(l *Limits) { l.RequestDeadline = time.Second }),
+		withHooks(func(s *Server) { s.hooks.admitted = g.hook }))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	A := v.dev(0)
+	writer := e.session(v, A)
+	// Released on every exit, so a failure leaves no handler paused.
+	defer g.release()
+
+	read := g.stall(t, e, v, e.session(v, A))
+	ck := v.checkpoint(A)
+	r := within(t, 5*time.Second, "the waiting write", func() resp { return e.post(v, writer, ck) })
+	wantCode(t, r, 429, "busy", "a write whose deadline passed while it waited for the account lock")
+
+	g.release()
+	waitResp(t, read)
+	if n := e.srv.accounts.refsOf(v.accountID()); n != 0 {
+		t.Errorf("%d references to the account lock left", n)
+	}
+}
