@@ -39,6 +39,8 @@ var (
 	ErrBudgetExhausted      = errors.New("crypto: approval budget exhausted (3 attempts per rolling hour)")
 	ErrChallengeOutstanding = errors.New("crypto: this device already has an outstanding approval")
 	ErrEnrollExpired        = errors.New("crypto: the enrollment deadline passed and the attempt failed")
+	ErrSASNotConfirmed      = errors.New("crypto: delivery discarded: the user has not confirmed the SAS on this device")
+	ErrSASRejected          = errors.New("crypto: the user rejected the SAS; this enrollment is over")
 )
 
 // EnrollDeadline bounds an attempt (§7): 10 minutes from COMMITTED on D and
@@ -198,6 +200,8 @@ type DeviceEnrollState string
 const (
 	DeviceCommitted DeviceEnrollState = "committed"
 	DeviceRevealed  DeviceEnrollState = "revealed"
+	DeviceConfirmed DeviceEnrollState = "confirmed" // the user confirmed the SAS on D
+	DeviceRejected  DeviceEnrollState = "rejected"  // the user rejected the SAS on D; terminal, keys wiped
 	DeviceDone      DeviceEnrollState = "done"
 	DeviceFailed    DeviceEnrollState = "failed" // the deadline passed
 )
@@ -221,6 +225,11 @@ type deviceRecord struct {
 // the method returns the message it produces. Messages that fail their
 // checks are discarded with no change of state, so the real message can
 // still arrive before the deadline.
+//
+// Once REVEALED, the user compares the SAS with A's and records the result
+// with ConfirmSAS or RejectSAS. D accepts a delivery only in CONFIRMED.
+// REJECTED is terminal: the enrollment keys are wiped and every later call
+// fails with ErrSASRejected.
 //
 // Messages passed in and returned are copied; the caller may reuse or
 // change its buffers.
@@ -290,7 +299,13 @@ func RestoreDeviceEnrollmentWithClock(p Persister, now Clock, state []byte) (*De
 		return nil, ErrUnsupported
 	}
 	switch rec.State {
-	case DeviceCommitted, DeviceRevealed, DeviceDone, DeviceFailed:
+	case DeviceCommitted, DeviceRevealed, DeviceConfirmed, DeviceDone, DeviceFailed:
+	case DeviceRejected:
+		// The record holds only the terminal state.
+		if !rec.onlyRejected() {
+			return nil, errors.New("crypto: inconsistent enrollment state")
+		}
+		return &DeviceEnrollment{p: p, now: now, rec: rec}, nil
 	default:
 		return nil, fmt.Errorf("crypto: unknown enrollment state %q", rec.State)
 	}
@@ -339,14 +354,27 @@ func (d *DeviceEnrollment) save(rec deviceRecord) error {
 	return nil
 }
 
+// rejectedRecord is the whole persisted record of a REJECTED enrollment.
+func rejectedRecord() deviceRecord { return deviceRecord{V: Version, State: DeviceRejected} }
+
+// onlyRejected reports whether r holds nothing but the REJECTED state.
+func (r *deviceRecord) onlyRejected() bool {
+	return r.State == DeviceRejected && len(r.KEMSK) == 0 && len(r.SigSeed) == 0 && len(r.ND) == 0 &&
+		r.Name == "" && r.Deadline == 0 && r.EnrollID.IsZero() && r.Chal == nil && r.Cert == nil &&
+		len(r.CertSig) == 0 && r.Delivery == nil
+}
+
 // checkDeadline fails an unfinished attempt whose deadline has passed and
-// returns ErrEnrollExpired for a failed one.
+// returns ErrEnrollExpired for a failed one and ErrSASRejected for a
+// rejected one.
 func (d *DeviceEnrollment) checkDeadline() error {
 	switch d.rec.State {
 	case DeviceDone:
 		return nil
 	case DeviceFailed:
 		return ErrEnrollExpired
+	case DeviceRejected:
+		return ErrSASRejected
 	}
 	if !expired(d.now(), d.rec.Deadline) {
 		return nil
@@ -362,12 +390,18 @@ func (d *DeviceEnrollment) checkDeadline() error {
 // State returns D's current state.
 func (d *DeviceEnrollment) State() DeviceEnrollState { return d.rec.State }
 
-// Deadline returns the time at which an unfinished attempt fails.
+// Deadline returns the time at which an unfinished attempt fails. A
+// REJECTED enrollment keeps no deadline and returns the zero Timestamp's
+// time.
 func (d *DeviceEnrollment) Deadline() time.Time { return d.rec.Deadline.Time() }
 
 // Commit returns the commit message. It is the same after a restart, so an
-// uncertain post can be repeated.
+// uncertain post can be repeated. A REJECTED enrollment has no commit and
+// returns the zero value.
 func (d *DeviceEnrollment) Commit() EnrollCommit {
+	if d.rec.State == DeviceRejected {
+		return EnrollCommit{}
+	}
 	return EnrollCommit{V: Version, C: Commitment(&d.open)}
 }
 
@@ -403,7 +437,7 @@ func (d *DeviceEnrollment) HandleChal(in *EnrollChal) (EnrollOpen, error) {
 	}
 	switch d.rec.State {
 	case DeviceCommitted:
-	case DeviceRevealed, DeviceDone:
+	case DeviceRevealed, DeviceConfirmed, DeviceDone:
 		return EnrollOpen{}, ErrChalAfterReveal
 	default:
 		return EnrollOpen{}, ErrEnrollState
@@ -427,13 +461,13 @@ func (d *DeviceEnrollment) HandleChal(in *EnrollChal) (EnrollOpen, error) {
 	return *d.open.clone(), nil
 }
 
-// Open returns the open message once REVEALED, for re-sending after a
-// restart.
+// Open returns the open message once REVEALED (or CONFIRMED), for
+// re-sending after a restart.
 func (d *DeviceEnrollment) Open() (EnrollOpen, error) {
 	if err := d.checkDeadline(); err != nil {
 		return EnrollOpen{}, err
 	}
-	if d.rec.State != DeviceRevealed {
+	if d.rec.State != DeviceRevealed && d.rec.State != DeviceConfirmed {
 		return EnrollOpen{}, ErrEnrollState
 	}
 	return *d.open.clone(), nil
@@ -454,6 +488,63 @@ func (d *DeviceEnrollment) SAS() (string, error) {
 	return SAS(d.transcript())
 }
 
+// ConfirmSAS records that the user saw the same 8 digits on A and D (§7
+// step 4) and persists CONFIRMED. Only then does D accept a delivery. It
+// needs state REVEALED and an SAS that D could show.
+func (d *DeviceEnrollment) ConfirmSAS() error {
+	if err := d.sasDecision(); err != nil {
+		return err
+	}
+	rec := d.rec
+	rec.State = DeviceConfirmed
+	return d.save(rec)
+}
+
+// RejectSAS records that the codes on A and D differ (§7 step 4) and
+// persists REJECTED, which is terminal: the persisted record keeps only the
+// state, the enrollment keys are wiped from memory, and every later call
+// fails with ErrSASRejected. It needs state REVEALED and an SAS that D
+// could show. If persisting fails, nothing changes; D stays REVEALED and
+// still accepts no delivery.
+func (d *DeviceEnrollment) RejectSAS() error {
+	if err := d.sasDecision(); err != nil {
+		return err
+	}
+	old := d.rec
+	if err := d.save(rejectedRecord()); err != nil {
+		return err
+	}
+	clear(old.KEMSK)
+	clear(old.SigSeed)
+	clear(old.ND)
+	d.wipe()
+	return nil
+}
+
+// sasDecision checks that the user can confirm or reject now: REVEALED,
+// before the deadline, with an SAS on screen.
+func (d *DeviceEnrollment) sasDecision() error {
+	if err := d.checkDeadline(); err != nil {
+		return err
+	}
+	if d.rec.State != DeviceRevealed {
+		return ErrEnrollState
+	}
+	_, err := SAS(d.transcript())
+	return err
+}
+
+// wipe clears D's enrollment keys from memory after REJECTED was persisted.
+// The KEM key's internal copy cannot be overwritten from here; dropping the
+// reference leaves it to the garbage collector.
+func (d *DeviceEnrollment) wipe() {
+	clear(d.sig)
+	d.sig = nil
+	d.kem = nil
+	clear(d.open.ND)
+	d.open = EnrollOpen{}
+}
+
 func (d *DeviceEnrollment) verify(e HPKEEnvelope) (*VerifiedDelivery, error) {
 	return verifyDelivery(d.kem, d.open.SigPK, d.rec.Chal, d.open.Name, TranscriptHash(d.transcript()), e)
 }
@@ -464,19 +555,15 @@ func (d *DeviceEnrollment) verify(e HPKEEnvelope) (*VerifiedDelivery, error) {
 // verification changes nothing. Once DONE, handing in the same delivery
 // again returns the same result; any other delivery is rejected.
 //
+// D accepts a delivery only in CONFIRMED (§7 step 6). One that arrives
+// before the user confirmed the SAS on D is discarded unopened with
+// ErrSASNotConfirmed and is not kept; A or the relay must send it again.
+// After RejectSAS every delivery fails with ErrSASRejected. The deadline
+// still applies in CONFIRMED.
+//
 // The caller then runs the anchor algorithm from AnchorSeq/AnchorH and the
 // transitions, and requires the result to contain this device's
 // device_add with the delivered certificate.
-//
-// SPEC GAP (§7): only A records the user's SAS comparison. D's chal is
-// "SAS-authenticated" only if the user saw matching codes, but D is never
-// told the outcome. A relay can send D a chal naming its own acct_sig_fp
-// (the codes then differ and the user rejects on A) and afterwards a
-// delivery sealed under its own account keys, which passes every step 6
-// check. D then finishes enrolled in the relay's account. This code
-// follows the spec as written; a fix needs the spec to add a user
-// confirmation on D (or an equivalent) before a delivery is accepted.
-// TestDeviceAcceptsRelayDeliveryAfterMismatch records the behavior.
 func (d *DeviceEnrollment) HandleDelivery(in HPKEEnvelope) (*VerifiedDelivery, error) {
 	e := in.clone()
 	if d.rec.State == DeviceDone {
@@ -490,8 +577,8 @@ func (d *DeviceEnrollment) HandleDelivery(in HPKEEnvelope) (*VerifiedDelivery, e
 	if err := d.checkDeadline(); err != nil {
 		return nil, err
 	}
-	if d.rec.State != DeviceRevealed {
-		return nil, ErrEnrollState
+	if d.rec.State != DeviceConfirmed {
+		return nil, ErrSASNotConfirmed
 	}
 	v, err := d.verify(e)
 	if err != nil {
@@ -514,6 +601,9 @@ func (d *DeviceEnrollment) HandleDelivery(in HPKEEnvelope) (*VerifiedDelivery, e
 // persisted delivery. It gives the same certificate, account keys and
 // anchor coordinates after a restart as HandleDelivery did.
 func (d *DeviceEnrollment) Delivered() (*VerifiedDelivery, error) {
+	if d.rec.State == DeviceRejected {
+		return nil, ErrSASRejected
+	}
 	if d.rec.State != DeviceDone {
 		return nil, ErrEnrollState
 	}
@@ -524,8 +614,12 @@ func (d *DeviceEnrollment) Delivered() (*VerifiedDelivery, error) {
 	return v, nil
 }
 
-// DeviceKeys returns D's new device keys. The signing key is a copy.
+// DeviceKeys returns D's new device keys. The signing key is a copy. A
+// REJECTED enrollment has no keys and returns nil for both.
 func (d *DeviceEnrollment) DeviceKeys() (hpke.PrivateKey, ed25519.PrivateKey) {
+	if d.rec.State == DeviceRejected {
+		return nil, nil
+	}
 	return d.kem, ed25519.PrivateKey(bytes.Clone(d.sig))
 }
 
