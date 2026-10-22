@@ -432,7 +432,7 @@ func TestLoginMergeCancel(t *testing.T) {
 	if _, err := m.src.s.MergeStart(); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.src.s.MergeCancel(); err != nil {
+	if err := m.src.s.MergeCancel(MergeCancelOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if mergeFileExists(t, m.src.cfg) {
@@ -450,7 +450,7 @@ func TestLoginMergeCancel(t *testing.T) {
 	if _, err := g.signIn(t, g.src.s); !errors.Is(err, errCrash) {
 		t.Fatal(err)
 	}
-	if err := g.src.s.MergeCancel(); !errors.Is(err, ErrMergeState) {
+	if err := g.src.s.MergeCancel(MergeCancelOptions{}); !errors.Is(err, ErrMergeState) {
 		t.Errorf("cancel with a destination record: %v", err)
 	}
 }

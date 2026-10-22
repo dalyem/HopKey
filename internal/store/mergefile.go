@@ -39,7 +39,9 @@ import (
 //     snippet items; no grant, no deploy_op, no checkpoint journal, no
 //     pending kit; a local-only vault, never published), then the file,
 //     durably. The source is frozen: every local append is refused.
-//     MergeCancel deletes the file while no destination record exists.
+//     MergeCancel deletes the file while no destination record exists and
+//     every destination device is resolved (or ForceOrphan keeps the
+//     unresolved ones in the sign-in ledger).
 //   - MergeSignIn: the destination device is named in device.json's next
 //     member, and then its record, with the source's local_key, is made
 //     durable (the keychain entry, or device.next.key); then the
@@ -477,15 +479,52 @@ func (s *Store) MergeStart() (MergeStatus, error) {
 	return m.status(s.rec)
 }
 
+// MergeCancelOptions are MergeCancel's choices.
+type MergeCancelOptions struct {
+	// ForceOrphan cancels even while destination devices are unresolved
+	// (MergeUnresolvedError): the user accepts that a bootstrap may have
+	// committed for them. They are kept in the sign-in ledger (ledger.go),
+	// and the next merge into the same account carries them forward as
+	// stale devices, for hop passwd to revoke. It does not override a
+	// destination device record: that sign-in must finish.
+	ForceOrphan bool
+}
+
+// MergeUnresolvedError is MergeCancel's refusal while destination devices
+// are unresolved: device.json names them (next, or its stale list), and a
+// bootstrap may have committed for any of them, so dropping them could
+// leave a device active in the account that nothing here tracks. Finish
+// the sign-in, or cancel with ForceOrphan.
+type MergeUnresolvedError struct {
+	AccountID model.ID
+	Devices   []model.ID
+}
+
+func (e *MergeUnresolvedError) Error() string {
+	return fmt.Sprintf("store: the merge's destination devices %v in account %v may be enrolled; finish the sign-in, or cancel with --force-orphan to keep them as stale devices of that account", e.Devices, e.AccountID)
+}
+
+// Is makes a MergeUnresolvedError an ErrMergeState.
+func (e *MergeUnresolvedError) Is(target error) bool { return target == ErrMergeState }
+
 // MergeCancel deletes a sealed merge's file and unfreezes the source
 // vault (§4.4, "Recovery"). It is refused once a destination device record
 // exists: the sign-in may have committed, and only MergeSignIn finishes
-// it. A destination device that device.json names but whose record is
-// confirmed gone, or replaced by its tombstone, is no record: cancel then
-// clears it from device.json first. Anything the device key store can't
-// answer conclusively refuses. It needs no key, so it works while the vault
-// is locked.
-func (s *Store) MergeCancel() error {
+// it. Every other destination device device.json names must be resolved
+// first:
+//
+//   - one revoked, by its tombstone or in the sign-in ledger, is resolved:
+//     the ledger keeps the revocation (written first, if only the
+//     tombstone had it) and a missing tombstone is written, or cancel
+//     fails, so no revoked record is left untracked;
+//   - one whose record is confirmed gone, and every stale one, may have
+//     been enrolled: cancel refuses with a *MergeUnresolvedError unless
+//     opts.ForceOrphan, which records them in the ledger as orphaned
+//     before device.json drops them.
+//
+// Anything the device key store can't answer conclusively refuses. It
+// needs no key, so it works while the vault is locked.
+func (s *Store) MergeCancel(opts MergeCancelOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlock, err := s.lockFile()
@@ -520,15 +559,8 @@ func (s *Store) MergeCancel() error {
 		return err
 	}
 	if cfg.Next != nil {
-		state, rec, err := s.nextStore(cfg).probeSlot(cfg.Next.DeviceID)
-		if rec != nil {
-			rec.zero()
-		}
-		if err != nil {
+		if err := s.releaseNext(cfg, opts); err != nil {
 			return err
-		}
-		if state == slotRecord {
-			return fmt.Errorf("%w: a destination device is already enrolled; finish the sign-in", ErrMergeState)
 		}
 		cfg.Next = nil
 		if err := s.writeDeviceConfig(cfg); err != nil {
@@ -539,6 +571,60 @@ func (s *Store) MergeCancel() error {
 	t := &txn{}
 	t.remove(mergeRel)
 	return s.commitTxn(t)
+}
+
+// releaseNext resolves cfg's destination devices for MergeCancel, and
+// records in the sign-in ledger, durably, what device.json is about to
+// drop: the revoked device, and with opts.ForceOrphan the unresolved ones.
+// It changes nothing when it refuses. The caller holds the file lock.
+func (s *Store) releaseNext(cfg deviceConfig, opts MergeCancelOptions) error {
+	next := cfg.Next
+	ns := s.nextStore(cfg)
+	ledger, err := s.l.readLedger()
+	if err != nil {
+		return err
+	}
+	revoked := ledger.isRevoked(next.AccountID, next.DeviceID)
+	if !revoked {
+		state, rec, err := ns.probeSlot(next.DeviceID)
+		if rec != nil {
+			rec.zero()
+		}
+		if err != nil {
+			return err
+		}
+		switch state {
+		case slotRecord:
+			return fmt.Errorf("%w: a destination device is already enrolled; finish the sign-in", ErrMergeState)
+		case slotTombstone:
+			revoked = true
+		}
+	}
+	var unresolved []model.ID
+	if !revoked {
+		unresolved = append(unresolved, next.DeviceID)
+	}
+	unresolved = uniqueIDs(append(unresolved, next.Stale...))
+	if len(unresolved) > 0 && !opts.ForceOrphan {
+		return &MergeUnresolvedError{AccountID: next.AccountID, Devices: unresolved}
+	}
+	var gone []model.ID
+	if revoked {
+		gone = []model.ID{next.DeviceID}
+	}
+	if ledger.add(next.AccountID, gone, unresolved) {
+		if err := s.l.writeLedger(ledger); err != nil {
+			return err
+		}
+	}
+	if revoked {
+		// A record a failed tombstone write left behind must not outlive
+		// device.json's name for it.
+		if err := ns.tombstone(next.DeviceID); err != nil {
+			return fmt.Errorf("%w: the revoked destination device's tombstone could not be written, so the merge was not cancelled: %v", ErrKeyStoreUnavailable, err)
+		}
+	}
+	return nil
 }
 
 // SignInRemote is the destination server as a sign-in reads and writes it,
@@ -634,8 +720,8 @@ func (p *SignInParams) deviceName(s *Store) string {
 }
 
 // serverFor completes f for the verified destination st: a recovery
-// records the creds gen it found, so its checkpoint stays due until a
-// verified checkpoint moves past it.
+// records the creds gen it found, so its checkpoint stays due until this
+// device's own checkpoint moves past it (recoveryCheckpointDone).
 func (p *SignInParams) serverFor(f serverFile, st *vaultlog.State) serverFile {
 	if p.Method == SignInRecovery {
 		f.RecoveryGen = st.Creds.Gen
@@ -644,14 +730,20 @@ func (p *SignInParams) serverFor(f serverFile, st *vaultlog.State) serverFile {
 }
 
 // signInSecrets are the secrets a sign-in holds until it installs them:
-// the account keys, the new device record and the verified destination.
-// Exactly one owner zeroes them: the sign-in (zero, on every path that
-// does not install), or the store, which takes them over (take) under
-// s.mu in the same step that installs them.
+// the account keys, the new device record, the device keys decoded from it
+// and the verified destination. Exactly one owner zeroes them: the sign-in
+// (zero, on every path that does not install), or the store, which takes
+// them over (take) under s.mu in the same step that installs them. The
+// destination's secrets of every state it verified before its current one
+// are dropped as soon as the next one replaces them (supersede).
 type signInSecrets struct {
 	acct *crypto.AccountKeys
 	rec  *deviceRecord
+	dev  *vaultlog.LocalDevice
 	d    *destination
+	// onState, for tests, sees the secrets of every state the destination
+	// verifies, in order.
+	onState func(*vaultlog.Secrets)
 }
 
 // zero drops whatever o still owns.
@@ -668,18 +760,22 @@ func (o *signInSecrets) zero() {
 		o.rec.zero()
 		o.rec = nil
 	}
+	if o.dev != nil {
+		zeroDevice(o.dev)
+		o.dev = nil
+	}
 }
 
-// take hands the record and the destination to the store, which installs
-// them: o no longer zeroes them, nor the account keys if they are the
-// destination's. The caller holds s.mu.
-func (o *signInSecrets) take() (*deviceRecord, *destination) {
-	rec, d := o.rec, o.d
-	o.rec, o.d = nil, nil
+// take hands the record, its device keys and the destination to the
+// store, which installs them: o no longer zeroes them, nor the account
+// keys if they are the destination's. The caller holds s.mu.
+func (o *signInSecrets) take() (*deviceRecord, *vaultlog.LocalDevice, *destination) {
+	rec, dev, d := o.rec, o.dev, o.d
+	o.rec, o.dev, o.d = nil, nil, nil
 	if d != nil && d.sec != nil && d.sec.Account == o.acct {
 		o.acct = nil
 	}
-	return rec, d
+	return rec, dev, d
 }
 
 // zeroSecrets drops verified secrets.
@@ -698,29 +794,57 @@ func zeroSecrets(sec *vaultlog.Secrets) {
 	}
 }
 
+// supersede drops prev, the secrets of a verified state that next, its
+// successor, replaced, except what next still references. A transition
+// copies VK and every item key into next and clones the item map, so those
+// are prev's alone; the account keys are shared until a checkpoint
+// replaces them, and are zeroed only then.
+func supersede(prev, next *vaultlog.Secrets) {
+	if prev == nil || prev == next {
+		return
+	}
+	if next != nil && prev.Account == next.Account {
+		prev.Account = nil
+	}
+	zeroSecrets(prev)
+}
+
+// zeroDevice drops a decoded device's Ed25519 signing key. Its X-Wing key
+// is an opaque value the crypto package holds, which the record's zeroing
+// covers at the source.
+func zeroDevice(d *vaultlog.LocalDevice) {
+	if d != nil {
+		clear(d.Sig)
+	}
+}
+
 // destination is a destination log as a sign-in fetched and verified it.
 // self is the device the sign-in enrolls: every transition is run as that
 // device once it is active, so a checkpoint that keeps it opens its new
 // unlock blob, and one that revokes it is met in the public stage, before
 // anything is decrypted (*vaultlog.RevokedError).
 type destination struct {
-	self  *vaultlog.LocalDevice
-	wires []*vaultlog.Wire // 0..head, each with its objects
-	objs  vaultlog.ObjectMap
-	st    *vaultlog.State
-	sec   *vaultlog.Secrets
+	self    *vaultlog.LocalDevice
+	wires   []*vaultlog.Wire // 0..head, each with its objects
+	objs    vaultlog.ObjectMap
+	st      *vaultlog.State
+	sec     *vaultlog.Secrets
+	onState func(*vaultlog.Secrets)
 }
 
 // fetchDestination reads the whole destination log from genesis and
-// verifies it from the newest anchor (genesis or checkpoint) with acct
-// (§4.4, §5.5), as self. It returns d as soon as it holds secrets, with an
-// error too, so its owner can zero them.
-func fetchDestination(ctx context.Context, r SignInRemote, acct *crypto.AccountKeys, self *vaultlog.LocalDevice) (*destination, error) {
+// verifies it from the newest anchor (genesis or checkpoint) with o's
+// account keys (§4.4, §5.5), as self. The anchor's public stage comes
+// first, and self is checked against it before anything is decrypted: a
+// device the anchor lists as retired was revoked (*vaultlog.RevokedError),
+// and one it lists as active must have self's keys. It returns d as soon
+// as it holds secrets, with an error too, so its owner can zero them.
+func fetchDestination(ctx context.Context, r SignInRemote, o *signInSecrets, self *vaultlog.LocalDevice) (*destination, error) {
 	c0, err := r.EntryAt(ctx, 0)
 	if err != nil {
 		return nil, err
 	}
-	d := &destination{self: self, objs: vaultlog.ObjectMap{}}
+	d := &destination{self: self, objs: vaultlog.ObjectMap{}, onState: o.onState}
 	if err := d.add([]Committed{c0}); err != nil {
 		return nil, err
 	}
@@ -736,11 +860,23 @@ func fetchDestination(ctx context.Context, r SignInRemote, acct *crypto.AccountK
 	if anchor < 0 {
 		return nil, fmt.Errorf("%w: the destination log has no anchor", ErrCorrupt)
 	}
+	acct := o.acct
+	notAnchor := func(err error) error {
+		return fmt.Errorf("store: the destination's newest anchor (seq %d) does not verify with these account keys: %w", anchor, err)
+	}
+	c, err := vaultlog.CheckAnchorPublic(acct.Pin(), d.wires[anchor], d.objs)
+	if err != nil {
+		return nil, notAnchor(err)
+	}
+	if err := d.checkSelf(c.Post); err != nil {
+		return nil, err
+	}
 	st, sec, _, err := vaultlog.Anchor(acct.Pin(), acct, d.wires[anchor], d.objs, nil)
 	if err != nil {
-		return nil, fmt.Errorf("store: the destination's newest anchor (seq %d) does not verify with these account keys: %w", anchor, err)
+		return nil, notAnchor(err)
 	}
 	d.st, d.sec = st, sec
+	d.seen()
 	for _, w := range d.wires[anchor+1:] {
 		if err := d.step(w); err != nil {
 			return d, err
@@ -749,7 +885,32 @@ func fetchDestination(ctx context.Context, r SignInRemote, acct *crypto.AccountK
 	return d, d.departed()
 }
 
-// step verifies w on top of d's verified head, as self once self is active.
+// checkSelf checks self against a verified public state, before anything
+// of it is decrypted: a device the account removed (retired, which is
+// cumulative, includes every revoked device) is a revocation, and a device
+// the state lists as active must be self, with self's keys.
+func (d *destination) checkSelf(st *vaultlog.State) error {
+	if slices.Contains(st.Retired.DeviceIDs, d.self.ID) {
+		return &vaultlog.RevokedError{DeviceID: d.self.ID, Head: st.Head}
+	}
+	if da, ok := st.Devices[d.self.ID]; ok {
+		sigPK := d.self.Sig.Public().(ed25519.PublicKey)
+		if err := crypto.CheckCertKeys(&da.Cert, d.self.KEM.PublicKey().Bytes(), sigPK); err != nil {
+			return fmt.Errorf("%w: the destination lists device %v with other keys than its record's: %v", ErrDeviceKey, d.self.ID, err)
+		}
+	}
+	return nil
+}
+
+// seen reports d's current secrets to the test hook.
+func (d *destination) seen() {
+	if d.onState != nil {
+		d.onState(d.sec)
+	}
+}
+
+// step verifies w on top of d's verified head, as self once self is
+// active, and drops the secrets the new state replaces.
 func (d *destination) step(w *vaultlog.Wire) error {
 	var dev vaultlog.DeviceKey
 	if _, active := d.st.Devices[d.self.ID]; active {
@@ -763,7 +924,10 @@ func (d *destination) step(w *vaultlog.Wire) error {
 		}
 		return fmt.Errorf("store: the destination's entry %d: %w", w.Entry.Seq, err)
 	}
+	prev := d.sec
 	d.st, d.sec = st, sec
+	supersede(prev, sec)
+	d.seen()
 	return nil
 }
 
@@ -876,6 +1040,7 @@ func deviceInfo(rec *deviceRecord, name string) (vaultlog.DeviceInfo, error) {
 	if err != nil {
 		return vaultlog.DeviceInfo{}, err
 	}
+	defer zeroDevice(dev)
 	return vaultlog.DeviceInfo{
 		ID: rec.DeviceID, Name: name, KEMPK: dev.KEM.PublicKey().Bytes(),
 		SigPK: append([]byte(nil), dev.Sig.Public().(ed25519.PublicKey)...),
@@ -919,7 +1084,7 @@ func signInDestination(ctx context.Context, r SignInRemote, o *signInSecrets, se
 	if err := hook("signin:fetch"); err != nil {
 		return err
 	}
-	d, err := fetchDestination(ctx, r, o.acct, self)
+	d, err := fetchDestination(ctx, r, o, self)
 	if d != nil {
 		o.d = d
 	}
@@ -961,8 +1126,9 @@ func (s *Store) nextStore(cfg deviceConfig) *deviceStore {
 // both durable. A failure before step 3 leaves the source as it was,
 // frozen; a crash after it is finished by the next unlock. A revocation of
 // the destination device is terminal for this destination
-// (ErrSignInRevoked): its record becomes a tombstone, and MergeCancel can
-// then unfreeze the source. A recovery sign-in returns CheckpointDue.
+// (ErrSignInRevoked): the sign-in ledger records it and its record becomes
+// a tombstone, and MergeCancel can then unfreeze the source. A recovery
+// sign-in returns CheckpointDue.
 func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams) (MergeStatus, error) {
 	o := &signInSecrets{acct: p.Account}
 	defer o.zero()
@@ -977,12 +1143,13 @@ func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams)
 		return MergeStatus{}, err
 	}
 	o.rec = next
-	if s.testSignIn != nil {
-		s.testSignIn(o)
-	}
 	self, err := next.device()
 	if err != nil {
 		return MergeStatus{}, err
+	}
+	o.dev = self
+	if s.testSignIn != nil {
+		s.testSignIn(o)
 	}
 	info, err := deviceInfo(next, p.deviceName(s))
 	if err != nil {
@@ -992,12 +1159,12 @@ func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams)
 		return signInDestination(ctx, r, o, self, info, s.now, s.hook)
 	})
 	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
-		return MergeStatus{}, s.revokeNext(next.DeviceID, rev)
+		return MergeStatus{}, s.revokeNext(next.AccountID, next.DeviceID, rev)
 	}
 	if err != nil {
 		return MergeStatus{}, err
 	}
-	return s.dropSource(gen, o, self, p.serverFor(sf, o.d.st))
+	return s.dropSource(gen, o, p.serverFor(sf, o.d.st))
 }
 
 // mergeNextDevice checks that a sealed merge is waiting for its sign-in and
@@ -1008,9 +1175,14 @@ func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams)
 // device.json names the destination device before its record is created
 // (the intent), so the device key store never holds a destination record
 // that device.json does not track. An earlier attempt's device is resolved
-// first, from what the store holds for it (deviceStore.probeSlot):
+// first: the sign-in ledger (ledger.go) is read before the device key
+// store, and a device it records as revoked ends the sign-in to this
+// destination (ErrSignInRevoked), whatever the store holds, after its
+// tombstone is tried again. Otherwise it is resolved from what the store
+// holds for it (deviceStore.probeSlot):
 //
-//   - its record: it is used again, made durable again first;
+//   - its record: it is used again, made durable again first, with this
+//     sign-in's Secret Key (refreshSecretKey);
 //   - its tombstone: the device was revoked, and the sign-in to this
 //     destination is over (ErrSignInRevoked); the tombstone is never
 //     overwritten;
@@ -1019,6 +1191,10 @@ func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams)
 //     lost after it was posted), so it is recorded as stale, in the same
 //     write that names the new device, and hop passwd revokes it once the
 //     destination is installed.
+//
+// A new destination device also carries the devices an earlier merge into
+// the same account orphaned (MergeCancel with ForceOrphan) into its stale
+// list.
 func (s *Store) mergeNextDevice(p SignInParams) (*deviceRecord, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1047,10 +1223,19 @@ func (s *Store) mergeNextDevice(p SignInParams) (*deviceRecord, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	var stale []model.ID
+	ledger, err := s.l.readLedger()
+	if err != nil {
+		return nil, 0, err
+	}
+	stale := ledger.orphaned(p.Account.AccountID)
 	if cfg.Next != nil {
 		if cfg.Next.AccountID != p.Account.AccountID {
 			return nil, 0, fmt.Errorf("%w: a sign-in to account %v is already in progress", ErrMergeState, cfg.Next.AccountID)
+		}
+		if ledger.isRevoked(cfg.Next.AccountID, cfg.Next.DeviceID) {
+			revoked := fmt.Errorf("%w (device %v, recorded in %s): this destination can't be signed in to from here again; cancel the merge with hop auth merge --cancel",
+				ErrSignInRevoked, cfg.Next.DeviceID, s.l.ledgerFile())
+			return nil, 0, s.stillRevoked(s.nextStore(cfg), cfg.Next.DeviceID, revoked)
 		}
 		state, rec, err := s.nextStore(cfg).probeSlot(cfg.Next.DeviceID)
 		if err != nil {
@@ -1065,15 +1250,22 @@ func (s *Store) mergeNextDevice(p SignInParams) (*deviceRecord, uint64, error) {
 				rec.zero()
 				return nil, 0, fmt.Errorf("%w: the destination device record does not carry this vault's local key", ErrCorrupt)
 			}
-			// A record found on disk is made durable again before it is used.
+			// A record found on disk is made durable again before it is
+			// used, with this sign-in's Secret Key.
 			if err := s.nextStore(cfg).upgradeRecord(rec); err != nil {
+				rec.zero()
+				return nil, 0, err
+			}
+			if err := s.nextStore(cfg).refreshSecretKey(rec, p.SecretKey); err != nil {
 				rec.zero()
 				return nil, 0, err
 			}
 			return rec, s.gen.Load(), nil
 		}
-		stale = append(slices.Clone(cfg.Next.Stale), cfg.Next.DeviceID)
+		stale = append(stale, cfg.Next.Stale...)
+		stale = append(stale, cfg.Next.DeviceID)
 	}
+	stale = uniqueIDs(stale)
 	if err := s.hook("signin:record"); err != nil {
 		return nil, 0, err
 	}
@@ -1103,32 +1295,77 @@ func (s *Store) mergeNextDevice(p SignInParams) (*deviceRecord, uint64, error) {
 	return rec, s.gen.Load(), nil
 }
 
-// revokeNext makes the revocation of the destination device id terminal
-// for this destination (§5.5): its record is replaced by its tombstone, so
-// every later attempt stops at it (mergeNextDevice) without asking the
-// server, which may withhold the revoking checkpoint then. The source vault
-// is not revoked: it stays frozen until MergeCancel. It needs no unlocked
-// store: a lock meanwhile does not lose the revocation.
-func (s *Store) revokeNext(id model.ID, rev *vaultlog.RevokedError) error {
+// revokeNext makes the revocation of the destination device id of account
+// acct terminal for this destination (§5.5): the sign-in ledger records it
+// durably first, and then its record is replaced by its tombstone, so every
+// later attempt stops at it (mergeNextDevice) without asking the server,
+// which may withhold the revoking checkpoint then. Either one is enough;
+// a tombstone that could not be written is tried again by every later
+// attempt and by MergeCancel. The source vault is not revoked: it stays
+// frozen until MergeCancel. It needs no unlocked store: a lock meanwhile
+// does not lose the revocation.
+func (s *Store) revokeNext(acct, id model.ID, rev *vaultlog.RevokedError) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	revoked := fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrSignInRevoked, id, rev.Head.Seq)
 	unlock, err := s.lockFile()
 	if err != nil {
-		return fmt.Errorf("%w; its tombstone could not be written: %v", revoked, err)
+		return fmt.Errorf("%w; it could not be recorded: %v", revoked, err)
 	}
 	defer unlock()
-	cfg, err := s.readDeviceConfig()
-	if err == nil && (cfg.Next == nil || cfg.Next.DeviceID != id) {
-		err = errors.New("device.json no longer names it")
+	return s.recordRevoked(acct, id, revoked, func() error {
+		cfg, err := s.readDeviceConfig()
+		if err == nil && (cfg.Next == nil || cfg.Next.DeviceID != id) {
+			err = errors.New("device.json no longer names it")
+		}
+		if err != nil {
+			return err
+		}
+		return s.nextStore(cfg).tombstone(id)
+	})
+}
+
+// recordRevoked makes a sign-in's revocation of device id of account acct
+// terminal: the sign-in ledger records it durably, then tombstone replaces
+// its record. It returns revoked, annotated with whichever step failed.
+// The caller holds the file lock.
+func (s *Store) recordRevoked(acct, id model.ID, revoked error, tombstone func() error) error {
+	if err := s.hook("signin:revoked"); err != nil {
+		return errors.Join(revoked, err)
 	}
-	if err == nil {
-		err = s.nextStore(cfg).tombstone(id)
-	}
-	if err != nil {
-		return fmt.Errorf("%w; its tombstone could not be written: %v", revoked, err)
+	merr := s.l.markRevoked(acct, id)
+	terr := tombstone()
+	switch {
+	case merr != nil && terr != nil:
+		return fmt.Errorf("%w; neither the sign-in ledger (%v) nor its tombstone (%v) could be written", revoked, merr, terr)
+	case merr != nil:
+		return fmt.Errorf("%w; the sign-in ledger could not be written (%v), but its tombstone was", revoked, merr)
+	case terr != nil:
+		return fmt.Errorf("%w; the sign-in ledger records it, but its tombstone could not be written yet: %v", revoked, terr)
 	}
 	return revoked
+}
+
+// stillRevoked is the refusal of a sign-in whose device the sign-in ledger
+// records as revoked: it tries the device's tombstone again (in ds), so a
+// record a failed write left is replaced once the store works, and returns
+// revoked. The caller holds the file lock.
+func (s *Store) stillRevoked(ds *deviceStore, id model.ID, revoked error) error {
+	if err := ds.tombstone(id); err != nil {
+		return fmt.Errorf("%w; its tombstone could not be written yet: %v", revoked, err)
+	}
+	return revoked
+}
+
+// uniqueIDs returns ids without duplicates, in their first order.
+func uniqueIDs(ids []model.ID) []model.ID {
+	var out []model.ID
+	for _, id := range ids {
+		if !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // signInCall runs f, the sign-in's requests to the server, without s.mu, in
@@ -1161,7 +1398,7 @@ func (s *Store) signInCall(ctx context.Context, gen uint64, f func(ctx context.C
 // goes and device.json names the destination (promoteNext); then the store
 // takes o's secrets over and is the destination's, unlocked, and the
 // imports are enqueued. Until it takes them, o owns them.
-func (s *Store) dropSource(gen uint64, o *signInSecrets, self *vaultlog.LocalDevice, sf serverFile) (MergeStatus, error) {
+func (s *Store) dropSource(gen uint64, o *signInSecrets, sf serverFile) (MergeStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.gen.Load() != gen || s.state == nil {
@@ -1243,7 +1480,7 @@ func (s *Store) dropSource(gen uint64, o *signInSecrets, self *vaultlog.LocalDev
 		s.lockErr = err
 		return MergeStatus{}, err
 	}
-	rec, d := o.take()
+	rec, self, d := o.take()
 	s.state, s.sec, s.dev, s.rec, s.devCfg, s.server = d.st, d.sec, self, rec, cfg, true
 	s.gen.Add(1)
 	if err := s.finishUnlock(); err != nil {
@@ -1376,6 +1613,13 @@ func (s *Store) promoteNextLocked(cfg deviceConfig) (deviceConfig, error) {
 		StaleDevices: slices.Clone(cfg.Next.Stale)}
 	if err := s.writeDeviceConfig(next); err != nil {
 		return cfg, err
+	}
+	// The devices an earlier, cancelled merge into this account orphaned
+	// are stale devices of it now (mergeNextDevice carried them into
+	// next.stale): the ledger forgets them, at best effort, since keeping
+	// them is harmless.
+	if g, err := s.l.readLedger(); err == nil && g.clearOrphaned(next.AccountID) {
+		s.l.writeLedger(g)
 	}
 	return next, nil
 }

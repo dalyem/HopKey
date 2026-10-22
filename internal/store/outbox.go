@@ -429,8 +429,9 @@ func (s *Store) appendRecord(in merge.Intent) (uint64, error) {
 // server is the server's origin and email the normalized sign-in email,
 // both "" for a vault that EnableServerMode switched without either.
 // recovery_gen is the creds gen a recovery sign-in (§4.5) found, and 0
-// otherwise: until a verified checkpoint moves creds past it, the
-// recovery's checkpoint with new credentials (§10.1) is due. Phase 2's
+// otherwise: while it is set, the recovery's checkpoint with new
+// credentials (§10.1) is due. Only this device's own checkpoint ends it
+// (recoveryCheckpointDone), in the commit that installs it. Phase 2's
 // first format, {"v":1}, reads as v2 with nothing in it. Nothing in it is
 // secret.
 type serverFile struct {
@@ -494,11 +495,12 @@ type ServerInfo struct {
 	Server string `json:"server,omitempty"`
 	Email  string `json:"email,omitempty"`
 	// CheckpointDue means a recovery sign-in (§4.5) is not finished: a
-	// checkpoint with new credentials (§10.1) must commit first. It stays
-	// set, across restarts, until a verified checkpoint moves the
-	// credentials past the generation the recovery found. While the vault
-	// is locked it is reported from the file alone, so it may be stale
-	// in the safe direction.
+	// checkpoint with new credentials (§10.1), authored by this device,
+	// must commit first. It stays set, across restarts, until the commit
+	// that installs such a checkpoint clears it (recoveryCheckpointDone).
+	// A checkpoint another device commits, a password change elsewhere
+	// included, does not: the credentials it sets are not the ones this
+	// recovery chose.
 	CheckpointDue bool `json:"checkpoint_due,omitempty"`
 }
 
@@ -519,11 +521,40 @@ func (s *Store) ServerInfo() (ServerInfo, error) {
 	return s.serverInfoOf(f), nil
 }
 
-// serverInfoOf is f as ServerInfo, checked against verified state when the
-// store is unlocked. The caller holds s.mu.
+// serverInfoOf is f as ServerInfo.
 func (s *Store) serverInfoOf(f *serverFile) ServerInfo {
-	due := f.RecoveryGen != 0 && (s.state == nil || s.state.Creds.Gen <= f.RecoveryGen)
-	return ServerInfo{Server: f.Server, Email: f.Email, CheckpointDue: due}
+	return ServerInfo{Server: f.Server, Email: f.Email, CheckpointDue: f.RecoveryGen != 0}
+}
+
+// recoveryCheckpointDone reports whether w, a checkpoint verified as post
+// (the state it leads to) and committed through the server, ends the
+// obligation of a recovery sign-in that f records (§4.5, §10.1): self, this
+// device, authored it, and it moves the credentials past the generation
+// the recovery found. A checkpoint by any other device does not, nor does
+// any other entry.
+func recoveryCheckpointDone(f *serverFile, w *vaultlog.Wire, post *vaultlog.State, self model.ID) bool {
+	return f != nil && f.RecoveryGen != 0 && w != nil && post != nil &&
+		w.Entry.Kind == vaultlog.KindCheckpoint && w.Entry.Author == self && !self.IsZero() &&
+		post.Head.Seq == w.Entry.Seq && post.Creds.Gen > f.RecoveryGen
+}
+
+// clearRecoveryDue adds to t the vault/server.json that ends a recovery's
+// obligation, when w, verified as post, ends it (recoveryCheckpointDone,
+// with this device as self), and reports whether it did. Slice E's
+// journaled checkpoint calls it with its committed candidate, in the same
+// commit that installs it, so CheckpointDue clears exactly when that
+// checkpoint is durable. The caller holds s.mu and the file lock, and the
+// store is unlocked.
+func (s *Store) clearRecoveryDue(t *txn, w *vaultlog.Wire, post *vaultlog.State) (bool, error) {
+	f, err := s.l.readServerFile()
+	if err != nil {
+		return false, err
+	}
+	if s.dev == nil || !recoveryCheckpointDone(f, w, post, s.dev.ID) {
+		return false, nil
+	}
+	f.RecoveryGen = 0
+	return true, serverModeOps(t, *f)
 }
 
 // EnableServerMode makes the vault server-backed (§11.1) in one durable

@@ -1005,6 +1005,27 @@ func (d *deviceStore) upgradeRecord(rec *deviceRecord) error {
 	return nil
 }
 
+// refreshSecretKey saves rec again, durably, with the Secret Key sk when it
+// holds another one: a sign-in retried after the account's Secret Key
+// changed reuses its earlier attempt's device, whose record must then keep
+// the Secret Key that opens pw_blob now. The device ID, its keys and
+// local_key stay. rec changes only once the store holds the new record.
+// The caller holds the file lock.
+func (d *deviceStore) refreshSecretKey(rec *deviceRecord, sk string) error {
+	if rec.SecretKey == sk {
+		return nil
+	}
+	next := rec.clone()
+	next.SecretKey = sk
+	if err := d.storeDurably(next); err != nil {
+		next.zero()
+		return fmt.Errorf("store: the device record could not be saved with this sign-in's Secret Key: %w", err)
+	}
+	rec.zero()
+	*rec = *next
+	return nil
+}
+
 // reconcileDevice brings device.json up to date with the device key in use
 // and the verified state. The device in use is always one device.json
 // names (load): DeviceID, or the pending replacement. If it is the pending

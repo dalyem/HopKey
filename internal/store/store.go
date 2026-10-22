@@ -372,6 +372,7 @@ func (s *Store) dropLocked(reason error) {
 	if s.rec != nil {
 		s.rec.zero()
 	}
+	zeroDevice(s.dev)
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
 	s.lockErr = reason

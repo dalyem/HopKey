@@ -22,6 +22,13 @@ import (
 // the new account keys, as a login after it opens them from pw_blob.
 func checkpointOn(t *testing.T, s *Store, r *fakeRemote, revoke []model.ID) *crypto.AccountKeys {
 	t.Helper()
+	acct, _ := checkpointKit(t, s, r, revoke)
+	return acct
+}
+
+// checkpointKit is checkpointOn that also returns the new Secret Key.
+func checkpointKit(t *testing.T, s *Store, r *fakeRemote, revoke []model.ID) (*crypto.AccountKeys, string) {
+	t.Helper()
 	pull(t, s, r)
 	sk, err := crypto.NewSecretKey()
 	if err != nil {
@@ -57,7 +64,7 @@ func checkpointOn(t *testing.T, s *Store, r *fakeRemote, revoke []model.ID) *cry
 		t.Fatal(err)
 	}
 	pull(t, s, r)
-	return cloneAccountKeys(t, acct)
+	return cloneAccountKeys(t, acct), sk.String()
 }
 
 // prefix is a server holding only the first n entries of f's log: one
@@ -154,8 +161,9 @@ func activeCount(t *testing.T, srv *fakeServer) int {
 // unreachable Secret Service would, while on.
 type readFailRing struct {
 	*memRing
-	mu    sync.Mutex
-	match string
+	mu      sync.Mutex
+	match   string
+	failSet string
 }
 
 var errKeychainDown = errors.New("keychain: the Secret Service is not answering")
@@ -164,6 +172,24 @@ func (r *readFailRing) set(match string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.match = match
+}
+
+// setFail fails every write of entries whose name holds match, as a
+// keychain that refuses writes would, while on.
+func (r *readFailRing) setFail(match string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failSet = match
+}
+
+func (r *readFailRing) Set(service, user, secret string) error {
+	r.mu.Lock()
+	m := r.failSet
+	r.mu.Unlock()
+	if m != "" && strings.Contains(user, m) {
+		return errKeychainDown
+	}
+	return r.memRing.Set(service, user, secret)
 }
 
 func (r *readFailRing) Get(service, user string) (string, error) {
@@ -242,7 +268,7 @@ func TestMergeNextTombstoneIsTerminal(t *testing.T) {
 				t.Error("a bootstrap was posted")
 			}
 			noUntrackedRecords(t, m.src.cfg, "after the refusal")
-			if err := m.src.s.MergeCancel(); err != nil {
+			if err := m.src.s.MergeCancel(MergeCancelOptions{}); err != nil {
 				t.Fatalf("cancel with a tombstoned destination: %v", err)
 			}
 			if diskDeviceConfig(t, m.src.cfg).Next != nil {
@@ -527,7 +553,7 @@ func TestMergeSignInCheckpointRevokesDevice(t *testing.T) {
 				t.Error("a bootstrap was posted")
 			}
 			m.sourceIntact(t, s)
-			if err := s.MergeCancel(); err != nil {
+			if err := s.MergeCancel(MergeCancelOptions{}); err != nil {
 				t.Fatalf("cancel: %v", err)
 			}
 			m.sourceIntact(t, s)
@@ -703,14 +729,21 @@ func (l *lyingRemote) Since(ctx context.Context, after uint64) ([]Committed, vau
 // capture records a merge sign-in's secrets: the record and account keys
 // when they are made, and the destination once it is verified.
 type capture struct {
-	o    *signInSecrets
-	rec  *deviceRecord
-	acct *crypto.AccountKeys
-	d    *destination
+	o      *signInSecrets
+	rec    *deviceRecord
+	acct   *crypto.AccountKeys
+	dev    *vaultlog.LocalDevice
+	d      *destination
+	states []*vaultlog.Secrets // every state the destination verified
+}
+
+func (c *capture) watch(o *signInSecrets) {
+	c.o, c.rec, c.acct, c.dev = o, o.rec, o.acct, o.dev
+	o.onState = func(sec *vaultlog.Secrets) { c.states = append(c.states, sec) }
 }
 
 func (c *capture) install(s *Store, crash func(string) error) {
-	s.testSignIn = func(o *signInSecrets) { c.o, c.rec, c.acct = o, o.rec, o.acct }
+	s.testSignIn = c.watch
 	s.testHook = func(stage string) error {
 		if c.o != nil && c.o.d != nil {
 			c.d = c.o.d
@@ -736,11 +769,33 @@ func (c *capture) zeroed(t *testing.T, path string) {
 	if !allZero(c.acct.Sig) || c.acct.KEM != nil {
 		t.Errorf("%s: the account keys are not zeroed", path)
 	}
+	if c.dev == nil || !allZero(c.dev.Sig) {
+		t.Errorf("%s: the decoded device signing key is not zeroed", path)
+	}
 	if c.d == nil {
 		t.Fatalf("%s: the sign-in verified no destination", path)
 	}
 	if !allZero(c.d.sec.VK[:]) || len(c.d.sec.Items) != 0 {
 		t.Errorf("%s: the destination's secrets are not zeroed", path)
+	}
+	c.supersededZeroed(t, path, len(c.states))
+}
+
+// supersededZeroed requires the first n states the destination verified
+// to be zeroed: their VK and item keys, and their account keys unless a
+// later state still holds them.
+func (c *capture) supersededZeroed(t *testing.T, path string, n int) {
+	t.Helper()
+	if len(c.states) == 0 {
+		t.Fatalf("%s: the destination verified no state", path)
+	}
+	for i, sec := range c.states[:n] {
+		if !allZero(sec.VK[:]) || len(sec.Items) != 0 {
+			t.Errorf("%s: the secrets of verified state %d of %d are not zeroed", path, i+1, len(c.states))
+		}
+		if sec.Account != nil && (!allZero(sec.Account.Sig) || sec.Account.KEM != nil) {
+			t.Errorf("%s: the account keys of verified state %d of %d are not zeroed", path, i+1, len(c.states))
+		}
 	}
 }
 
@@ -1034,8 +1089,12 @@ func TestSignInNeedsAnEmptyDataDir(t *testing.T) {
 	}
 }
 
-// §4.5: a recovery sign-in leaves its checkpoint due, durably, until a
-// verified checkpoint moves the credentials past the generation it found.
+// §4.5: a recovery sign-in leaves its checkpoint due, durably, until this
+// device's own checkpoint commits with credentials past the generation it
+// found (review round 2, finding 3). Another device's checkpoint, a
+// password change elsewhere, does not clear it, nor does pulling this
+// device's checkpoint: only the commit slice E's journaled checkpoint
+// makes (clearRecoveryDue).
 func TestSignInRecoveryCheckpointDue(t *testing.T) {
 	d := newSignInFix(t)
 	cfg := testConfig(t)
@@ -1060,11 +1119,72 @@ func TestSignInRecoveryCheckpointDue(t *testing.T) {
 	if err := s.Unlock(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	// Another device changes the password: the recovery is not done.
 	checkpointOn(t, d.dst.s, d.r, nil)
 	pull(t, s, d.r)
-	if si, err := s.ServerInfo(); err != nil || si.CheckpointDue {
-		t.Errorf("after a verified checkpoint: %+v %v", si, err)
+	if si, err := s.ServerInfo(); err != nil || !si.CheckpointDue {
+		t.Errorf("after another device's checkpoint: %+v %v", si, err)
 	}
+	other, otherSt := headEntry(t, s)
+	// This device's own checkpoint, pulled: still due until its commit
+	// clears it.
+	checkpointOn(t, s, d.r, nil)
+	if si, err := s.ServerInfo(); err != nil || !si.CheckpointDue {
+		t.Errorf("after pulling this device's checkpoint: %+v %v", si, err)
+	}
+	own, ownSt := headEntry(t, s)
+	f, err := s.l.readServerFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	self := s.dev.ID
+	s.mu.Unlock()
+	if recoveryCheckpointDone(f, other, otherSt, self) {
+		t.Error("another device's checkpoint ends the recovery")
+	}
+	if !recoveryCheckpointDone(f, own, ownSt, self) {
+		t.Error("this device's checkpoint does not end the recovery")
+	}
+	if recoveryCheckpointDone(f, own, ownSt, other.Entry.Author) {
+		t.Error("a checkpoint ends the recovery of a device that did not author it")
+	}
+	// What slice E's journaled checkpoint does in its commit.
+	s.mu.Lock()
+	unlock, err := s.lockFile()
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	tx := &txn{}
+	cleared, err := s.clearRecoveryDue(tx, own, ownSt)
+	if err == nil && cleared {
+		err = s.commitTxn(tx)
+	}
+	unlock()
+	s.mu.Unlock()
+	if err != nil || !cleared {
+		t.Fatalf("clearing the recovery: %v %v", cleared, err)
+	}
+	if si, err := s.ServerInfo(); err != nil || si.CheckpointDue {
+		t.Errorf("after this device's checkpoint committed: %+v %v", si, err)
+	}
+	s = open(t, cfg)
+	if si, err := s.ServerInfo(); err != nil || si.CheckpointDue {
+		t.Errorf("after a restart: %+v %v", si, err)
+	}
+}
+
+// headEntry is s's verified head: its entry and state.
+func headEntry(t *testing.T, s *Store) (*vaultlog.Wire, *vaultlog.State) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w, err := s.l.readEntry(s.state.Head.Seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, s.state
 }
 
 // SignIn stopped at each point leaves no untracked record, and the next

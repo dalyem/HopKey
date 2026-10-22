@@ -16,17 +16,20 @@ import (
 //
 //  1. device.json names the new device as pending (the intent), and then
 //     its record is made durable in the chosen device key store; or the
-//     pending device an earlier attempt left is resolved from what the
-//     store holds for it (deviceStore.probeSlot): its record is used
-//     again, its tombstone ends the sign-in (ErrSignInRevoked), an
-//     inconclusive read changes nothing, and a confirmed absence makes it
-//     stale, since its bootstrap may have committed;
+//     pending device an earlier attempt left is resolved: first from the
+//     sign-in ledger (ledger.go), where a revocation ends the sign-in
+//     (ErrSignInRevoked) whatever the device key store holds, and then
+//     from what the store holds for it (deviceStore.probeSlot): its record
+//     is used again, with this sign-in's Secret Key, its tombstone ends the
+//     sign-in, an inconclusive read changes nothing, and a confirmed
+//     absence makes it stale, since its bootstrap may have committed;
 //  2. signInDestination: the log is read from genesis and verified from
 //     the anchor of the account keys, every head the server reports is
 //     checked against it, the bootstrap is posted unless an earlier
 //     attempt's committed, and the log is caught up as the new device, so
 //     a checkpoint that revokes it is met before anything is decrypted and
-//     made terminal (its record becomes a tombstone);
+//     made terminal (the ledger records it, then its record becomes a
+//     tombstone);
 //  3. one durable commit installs the verified log, account.json and
 //     vault/server.json (the server, the email, and a recovery's due
 //     checkpoint); then device.json names the device as this one
@@ -41,9 +44,9 @@ type SignInResult struct {
 	// followed by a checkpoint with new credentials (§10.1), committed
 	// through the server, before the recovery is reported done (plan R6).
 	// SignIn does not run it: the caller must. The obligation is durable
-	// (ServerInfo.CheckpointDue) and clears itself once a verified
-	// checkpoint moves the credentials past the generation the recovery
-	// found.
+	// (ServerInfo.CheckpointDue), and only the commit of that checkpoint,
+	// authored by this device, clears it (recoveryCheckpointDone): a
+	// checkpoint another device commits does not.
 	CheckpointDue bool
 }
 
@@ -64,7 +67,13 @@ func SignIn(ctx context.Context, cfg Config, r SignInRemote, p SignInParams) (*S
 }
 
 // signIn is SignIn with a test hook.
-func signIn(ctx context.Context, cfg Config, r SignInRemote, p SignInParams, hook func(string) error) (_ *Store, _ SignInResult, err error) {
+func signIn(ctx context.Context, cfg Config, r SignInRemote, p SignInParams, hook func(string) error) (*Store, SignInResult, error) {
+	return signInWith(ctx, cfg, r, p, hook, nil)
+}
+
+// signInWith is signIn with a second test hook, which sees the sign-in's
+// secrets once its device keys are decoded.
+func signInWith(ctx context.Context, cfg Config, r SignInRemote, p SignInParams, hook func(string) error, watch func(*signInSecrets)) (_ *Store, _ SignInResult, err error) {
 	o := &signInSecrets{acct: p.Account}
 	defer o.zero()
 	sf, err := p.check()
@@ -111,6 +120,10 @@ func signIn(ctx context.Context, cfg Config, r SignInRemote, p SignInParams, hoo
 	if err != nil {
 		return nil, SignInResult{}, err
 	}
+	o.dev = self
+	if watch != nil {
+		watch(o)
+	}
 	info, err := deviceInfo(rec, p.deviceName(s))
 	if err != nil {
 		return nil, SignInResult{}, err
@@ -123,7 +136,7 @@ func signIn(ctx context.Context, cfg Config, r SignInRemote, p SignInParams, hoo
 		return nil, SignInResult{}, err
 	}
 	sf = p.serverFor(sf, o.d.st)
-	if err := s.installSignIn(o, self, dcfg, sf); err != nil {
+	if err := s.installSignIn(o, dcfg, sf); err != nil {
 		return nil, SignInResult{}, err
 	}
 	return s, SignInResult{CheckpointDue: s.serverInfoOf(&sf).CheckpointDue}, nil
@@ -173,6 +186,14 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 			return nil, deviceConfig{}, false, fmt.Errorf("store: an earlier sign-in here keeps its device key in the %s store, not %s", dcfg.Store, p.DeviceStore)
 		}
 		if id := dcfg.pendingID(); !id.IsZero() {
+			// The ledger first: a revocation whose tombstone could not be
+			// written leaves the record readable.
+			if revoked, err := s.l.signInRevoked(acctID, id); err != nil {
+				return nil, deviceConfig{}, false, err
+			} else if revoked {
+				return nil, deviceConfig{}, false, s.stillRevoked(s.deviceStore(dcfg), id,
+					fmt.Errorf("%w: %w (device %v, recorded in %s)", ErrDeviceRevoked, ErrSignInRevoked, id, s.l.ledgerFile()))
+			}
 			state, rec, err := s.deviceStore(dcfg).probeSlot(id)
 			if err != nil {
 				return nil, deviceConfig{}, false, fmt.Errorf("store: the device of an earlier sign-in can't be resolved, so nothing was changed: %w", err)
@@ -182,8 +203,12 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 				return nil, deviceConfig{}, false, fmt.Errorf("%w: %w (device %v; its record is a tombstone)", ErrDeviceRevoked, ErrSignInRevoked, id)
 			case slotRecord:
 				// A record found on disk is made durable again before it is
-				// used.
+				// used, with this sign-in's Secret Key.
 				if err := s.deviceStore(dcfg).upgradeRecord(rec); err != nil {
+					rec.zero()
+					return nil, deviceConfig{}, false, err
+				}
+				if err := s.deviceStore(dcfg).refreshSecretKey(rec, p.SecretKey); err != nil {
 					rec.zero()
 					return nil, deviceConfig{}, false, err
 				}
@@ -245,20 +270,18 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 }
 
 // revokePending makes the revocation of id, the pending device of dcfg,
-// terminal for this data directory (§5.5): its record is replaced by its
-// tombstone, which every later attempt stops at (signInDevice), whatever
-// history the server shows then.
+// terminal for this data directory (§5.5): the sign-in ledger records it
+// durably, and then its record is replaced by its tombstone. Every later
+// attempt stops at either (signInDevice), whatever history the server
+// shows then, and tries a tombstone that could not be written again.
 func (s *Store) revokePending(dcfg deviceConfig, id model.ID, rev *vaultlog.RevokedError) error {
 	revoked := fmt.Errorf("%w: %w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, ErrSignInRevoked, id, rev.Head.Seq)
 	unlock, err := s.lockFile()
-	if err == nil {
-		defer unlock()
-		err = s.deviceStore(dcfg).tombstone(id)
-	}
 	if err != nil {
-		return fmt.Errorf("%w; its tombstone could not be written: %v", revoked, err)
+		return fmt.Errorf("%w; it could not be recorded: %v", revoked, err)
 	}
-	return revoked
+	defer unlock()
+	return s.recordRevoked(dcfg.AccountID, id, revoked, func() error { return s.deviceStore(dcfg).tombstone(id) })
 }
 
 // installSignIn installs o's verified destination in one durable commit,
@@ -266,7 +289,7 @@ func (s *Store) revokePending(dcfg deviceConfig, id model.ID, rev *vaultlog.Revo
 // takes o's secrets over, and finishUnlock names the pending device as
 // this one in device.json. A failure leaves the store locked; a crash
 // after the commit is finished by Open.
-func (s *Store) installSignIn(o *signInSecrets, self *vaultlog.LocalDevice, dcfg deviceConfig, sf serverFile) error {
+func (s *Store) installSignIn(o *signInSecrets, dcfg deviceConfig, sf serverFile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlock, err := s.lockFile()
@@ -289,7 +312,7 @@ func (s *Store) installSignIn(o *signInSecrets, self *vaultlog.LocalDevice, dcfg
 	if err := s.commitTxn(t); err != nil {
 		return err
 	}
-	rec, d := o.take()
+	rec, self, d := o.take()
 	s.state, s.sec, s.dev, s.rec, s.devCfg, s.server = d.st, d.sec, self, rec, dcfg, true
 	s.gen.Add(1)
 	if err := s.finishUnlock(); err != nil {

@@ -22,6 +22,9 @@ import (
 //	                         "wires":[wire, ...],
 //	                         "key_store":"keychain"|"file", "records":[{"account_id":id, "device_id":id}, ...]})
 //
+// A pre-release retire.json without key_store and records is unsupported:
+// it does not parse.
+//
 // It is plain JCS: the candidates are public log data, and RETIRED must
 // stay readable after the device record (and local_key with it) is gone. A
 // local attacker who can write it can at worst make this device delete its
