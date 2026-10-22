@@ -59,7 +59,9 @@ func startDaemon(ctx context.Context, e *Env) error {
 			return nil
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return fmt.Errorf("the hop daemon did not come up within %s; see %s%s", wait, oneLine(e.Paths.LogFile()), logTail(e.Paths.LogFile()))
+			// Composed: the log tail's line breaks are layout (logTail
+			// sanitizes each line), so the report keeps them.
+			return &exitError{code: ExitFailure, composed: true, msg: fmt.Sprintf("the hop daemon did not come up within %s; see %s%s", wait, oneLine(e.Paths.LogFile()), logTail(e.Paths.LogFile()))}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

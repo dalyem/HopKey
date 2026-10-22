@@ -95,6 +95,12 @@ func (e *Env) printf(format string, args ...any) { fmt.Fprintf(e.Stdout, format,
 type exitError struct {
 	code int
 	msg  string
+	// composed marks a message whose own line breaks and tabs are deliberate
+	// layout and whose parts were each made display-safe where they were
+	// inserted. Only failMsg and composedErr set it. reportError checks it on
+	// the top-level error only (never through a wrapper), so the text of a
+	// wrapper around a composed error is not covered by it.
+	composed bool
 }
 
 func (e *exitError) Error() string { return e.msg }
@@ -105,9 +111,14 @@ func failf(format string, args ...any) error {
 	return &exitError{code: ExitFailure, msg: safef(format, args...)}
 }
 
-// failMsg fails with a message that was composed from display-safe parts and
-// whose own line breaks are layout, such as describeUnresolved's.
-func failMsg(msg string) error { return &exitError{code: ExitFailure, msg: msg} }
+// failMsg fails with a message that was composed from constant text and
+// display-safe parts and whose own line breaks are layout, such as
+// describeUnresolved's. Every other error is flattened to one line by
+// reportError, so use failMsg only where the layout is deliberate and each
+// inserted value has already gone through oneLine.
+func failMsg(msg string) error {
+	return &exitError{code: ExitFailure, msg: msg, composed: true}
+}
 
 // silent is a failure whose explanation was already printed.
 func silent(code int) error { return &exitError{code: code} }
@@ -168,34 +179,53 @@ func Run(ctx context.Context, args []string, e *Env) int {
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
+	// Only an exitError that is itself the error returned may keep its layout.
+	// One found inside a wrapper supplies the exit status, but the wrapper's
+	// text is not covered by its mark.
+	if top, ok := err.(*exitError); ok {
+		if top.msg != "" {
+			reportError(e, top, args)
+		}
+		return top.code
+	}
 	var ee *exitError
 	if errors.As(err, &ee) {
 		if ee.msg != "" {
-			reportError(e, ee.msg, args)
+			reportError(e, err, args)
 		}
 		return ee.code
 	}
-	reportError(e, err.Error(), args)
+	reportError(e, err, args)
 	return ExitFailure
 }
 
 // reportError prints a failure to stderr, as JSON when the caller asked for it.
-// Errors often quote paths and config text, so what reaches the terminal is
-// made display-safe here, for every command.
-func reportError(e *Env, msg string, args []string) {
+// Errors often quote paths and config text, so the human-readable message is
+// flattened to one line (oneLine) and a quoted value cannot forge a "hop:"
+// line. The exception is an error that is itself a composed exitError (see
+// failMsg): its line breaks and tabs are kept, with the rest of displaySafe
+// applied. JSON carries the full text either way, encoded by encoding/json and
+// escapeJSONControls, for machines.
+func reportError(e *Env, err error, args []string) {
+	msg := err.Error()
 	if wantsJSON(args) {
 		b, _ := json.Marshal(map[string]string{"error": msg})
 		fmt.Fprintln(e.Stderr, string(escapeJSONControls(b)))
 		return
 	}
-	fmt.Fprintf(e.Stderr, "hop: %s\n", displaySafe(msg))
+	if top, ok := err.(*exitError); ok && top.composed {
+		fmt.Fprintf(e.Stderr, "hop: %s\n", displaySafe(msg))
+		return
+	}
+	fmt.Fprintf(e.Stderr, "hop: %s\n", oneLine(msg))
 }
 
 // displaySafe neutralizes what could redraw or reorder the terminal: C0
 // controls other than newline and tab, DEL, C1 (which covers the CSI
-// introducer) and Unicode format characters such as bidi overrides. Callers
-// that quote a single untrusted value use oneLine, which also maps newlines;
-// see display.go.
+// introducer) and Unicode format characters such as bidi overrides. It keeps
+// layout, so reportError uses it only for composed messages. Callers that
+// quote a single untrusted value use oneLine, which also maps newlines; see
+// display.go.
 func displaySafe(s string) string {
 	return strings.Map(func(c rune) rune {
 		if c == '\n' || c == '\t' {
@@ -273,20 +303,40 @@ func dispatch(ctx context.Context, e *Env, args []string) error {
 	return runConnect(ctx, e, args)
 }
 
-// newFlags makes a flag set that reports problems on stderr and does not exit.
+// flagOut collects what the flag package writes while parsing: for a bad
+// flag, a message that quotes the offending text. It is never shown raw;
+// parseFlags reports it through reportError, sanitized.
+type flagOut struct {
+	bytes.Buffer
+	usage string
+}
+
+// newFlags makes a flag set that does not exit and does not write parse
+// diagnostics to stderr itself. -h prints the usage (constant text) and the
+// flag defaults to stderr; a parse error is returned by parseFlags.
 func newFlags(e *Env, name, usage string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	fs.SetOutput(e.Stderr)
+	out := &flagOut{usage: usage}
+	fs.SetOutput(out)
 	fs.Usage = func() {
+		// The flag package calls Usage after a parse error too, having
+		// written the error to out first. That case is reported by
+		// parseFlags; only -h prints the usage here.
+		if out.Len() > 0 {
+			return
+		}
 		fmt.Fprintf(e.Stderr, "usage: %s\n", usage)
+		fs.SetOutput(e.Stderr)
 		fs.PrintDefaults()
+		fs.SetOutput(out)
 	}
 	return fs
 }
 
 // parseFlags parses args allowing flags and positional arguments in any
 // order, which the standard library does not. Arguments after a bare "--" are
-// returned separately and untouched.
+// returned separately and untouched. A parse error quotes the user's own
+// text, so it is made single-line safe; the usage line after it is constant.
 func parseFlags(fs *flag.FlagSet, args []string) (pos, rest []string, err error) {
 	for i, a := range args {
 		if a == "--" {
@@ -299,7 +349,18 @@ func parseFlags(fs *flag.FlagSet, args []string) (pos, rest []string, err error)
 			if errors.Is(err, flag.ErrHelp) {
 				return nil, nil, err
 			}
-			return nil, nil, &exitError{code: ExitFailure} // flag already printed it
+			msg := err.Error()
+			usage := ""
+			if out, ok := fs.Output().(*flagOut); ok {
+				if t := strings.TrimSpace(out.String()); t != "" {
+					msg = t
+				}
+				usage = out.usage
+			}
+			if usage == "" {
+				return nil, nil, failf("%s", msg)
+			}
+			return nil, nil, failMsg(oneLine(msg) + "\nusage: " + usage)
 		}
 		left := fs.Args()
 		if len(left) == 0 {

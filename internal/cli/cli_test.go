@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"os"
@@ -228,13 +229,18 @@ func TestConfigScanFlagsMatchExecInAnyForm(t *testing.T) {
 func TestErrorsAndJSONAreDisplaySafe(t *testing.T) {
 	var out bytes.Buffer
 	e := &Env{Stderr: &out}
-	reportError(e, "open /tmp/x\x1b[2J\u202eevil: no such file\n  next line", nil)
+	reportError(e, failMsg("open /tmp/x\x1b[2J\u202eevil: no such file\n  next line"), nil)
 	got := out.String()
 	if strings.ContainsAny(got, "\x1b\u202e") || !strings.Contains(got, "\n  next line") {
-		t.Errorf("text error not display-safe (or lost its layout): %q", got)
+		t.Errorf("composed error not display-safe (or lost its layout): %q", got)
 	}
 	out.Reset()
-	reportError(e, "bad \u202e name", []string{"--json"})
+	reportError(e, errors.New("open /tmp/x\x1b[2J\u202eevil: no such file\n  next line"), nil)
+	if got := out.String(); strings.ContainsAny(got, "\x1b\u202e") || strings.Count(got, "\n") != 1 {
+		t.Errorf("plain error not flattened to one safe line: %q", got)
+	}
+	out.Reset()
+	reportError(e, errors.New("bad \u202e name"), []string{"--json"})
 	if strings.ContainsRune(out.String(), 0x202e) || !strings.Contains(out.String(), `\u202e`) {
 		t.Errorf("JSON error = %q, want the bidi override escaped", out.String())
 	}
