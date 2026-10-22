@@ -84,7 +84,9 @@ type deviceRecord struct {
 // parseDeviceRecord strictly decodes a device record: unknown, missing,
 // duplicate and wrongly typed members are refused, and so is a record with
 // another version, an empty ID or kem_sk, a signing seed that is not 32
-// bytes, or a secret_key that is not a str≤64.
+// bytes, or a secret_key that is not a str≤64 holding a valid Secret Key
+// (§12). Its errors never quote the record: they could carry a character of
+// the keys.
 func parseDeviceRecord(b []byte) (*deviceRecord, error) {
 	var rec deviceRecord
 	if err := canonjson.Unmarshal(b, &rec); err != nil {
@@ -103,6 +105,11 @@ func parseDeviceRecord(b []byte) (*deviceRecord, error) {
 		err = errors.New("device record: sig_seed is not 32 bytes")
 	default:
 		err = crypto.CheckStr("secret_key", rec.SecretKey, 64)
+	}
+	if err == nil {
+		if _, perr := crypto.ParseSecretKey(rec.SecretKey); perr != nil {
+			err = errors.New("device record: secret_key is not a valid Secret Key")
+		}
 	}
 	if err != nil {
 		rec.zero()
@@ -415,6 +422,31 @@ func (d *deviceStore) sync() error {
 		return err
 	}
 	return syncDir(filepath.Dir(path))
+}
+
+// storeDurably saves rec and checks that the store gives it back: the
+// file store has fsynced device.key and its directory once save returns,
+// and a keychain entry is read back. The caller holds the file lock.
+func (d *deviceStore) storeDurably(rec *deviceRecord) error {
+	if err := d.save(rec); err != nil {
+		return err
+	}
+	got, err := d.load()
+	if err != nil {
+		return err
+	}
+	same := got.equal(rec)
+	got.zero()
+	if !same {
+		return errors.New("the device key store gave back a different device key than was saved")
+	}
+	return nil
+}
+
+// equal reports whether r and o are the same record.
+func (r *deviceRecord) equal(o *deviceRecord) bool {
+	return r.V == o.V && r.AccountID == o.AccountID && r.DeviceID == o.DeviceID &&
+		bytes.Equal(r.KEMSK, o.KEMSK) && bytes.Equal(r.SigSeed, o.SigSeed) && r.SecretKey == o.SecretKey
 }
 
 // clone returns a copy of the record that shares no memory with it.

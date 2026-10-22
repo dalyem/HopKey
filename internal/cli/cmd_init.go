@@ -191,8 +191,11 @@ func writeKitFile(path string, data []byte) error {
 		// The link leaves tmp in place; the deferred Remove takes it.
 		err = kitLink(tmp, path)
 		if err != nil && linkUnsupported(err) {
-			return fmt.Errorf("no kit file was written: the filesystem of %s cannot create a file without the risk of replacing an existing one; "+
-				"choose a --kit-file path on a filesystem that supports it, or leave out --kit-file and copy the kit from the screen", path)
+			// EPERM can also be a real permission problem, so the
+			// error itself is kept in the message.
+			return fmt.Errorf("no kit file was written (%s): the filesystem of %s cannot create a file without the risk of replacing an existing one; "+
+				"choose a --kit-file path on a filesystem that supports it, or leave out --kit-file and copy the kit from the screen",
+				oneLine(err.Error()), oneLine(path))
 		}
 	}
 	if errors.Is(err, os.ErrExist) {

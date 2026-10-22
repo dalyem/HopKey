@@ -233,7 +233,14 @@ func TestKitSecretKeyIsSavedBeforeItIsUsed(t *testing.T) {
 	addHost(t, f.s, "web-1")
 	ctx := context.Background()
 
-	ring.fail = true
+	// The keychain refuses writes once this device's key is saved and the
+	// candidate is journaled.
+	f.s.testHook = func(stage string) error {
+		if stage == "journaled" {
+			ring.fail = true
+		}
+		return nil
+	}
 	kit, err := f.s.ChangePassword(ctx, []byte(testPassword), []byte(newPassword))
 	if err != nil {
 		t.Fatalf("a committed change hides its kit: %v", err)
@@ -864,7 +871,14 @@ func TestAckKitWaitsForADurableSecretKey(t *testing.T) {
 	}
 	t.Cleanup(func() { syncDir = fsyncDir })
 
-	failing = true
+	// The directory fsyncs fail once this device's key is saved and the
+	// candidate is journaled.
+	s.testHook = func(stage string) error {
+		if stage == "journaled" {
+			failing = true
+		}
+		return nil
+	}
 	kit, err := s.ChangePassword(ctx, []byte(testPassword), []byte(newPassword))
 	if err != nil {
 		t.Fatalf("a committed change hides its kit: %v", err)
