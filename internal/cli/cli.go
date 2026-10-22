@@ -59,6 +59,10 @@ type Env struct {
 	ExecSSH func(path string, argv, environ []string) error
 	// Environ is the environment given to ssh. Nil means os.Environ().
 	Environ []string
+	// SSHProbeEnv is added to the otherwise bare environment (HOME, PATH) of
+	// the ssh -G runs of `hop import ssh-config`. Tests use it for the passwd
+	// shim that ssh needs under a uid with no passwd entry.
+	SSHProbeEnv []string
 
 	// DialTimeout bounds TCP and handshake probes. Zero means 5 seconds.
 	DialTimeout time.Duration
@@ -111,7 +115,7 @@ func init() {
 		"edit":    {runEdit, "hop edit <target> [--name N] [--address A]... [other flags as hop add]"},
 		"rm":      {runRm, "hop rm <target> [--yes]"},
 		"key":     {runKey, "hop key add <path> [--name N] | hop key ls | hop key rm <name> [--yes]"},
-		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run]"},
+		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run] [--allow-match-exec] [--json]"},
 		"ts":      {runTS, "hop ts import [name...] [--user U] [--key K] [--tag T] [--no-pin] [--dry-run] | hop ts link <host> <node-id-or-dns-name>"},
 		"setup":   {runSetup, "hop setup [--yes]"},
 		"daemon":  {runDaemon, "hop daemon [stop]"},

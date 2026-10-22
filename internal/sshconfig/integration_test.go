@@ -6,12 +6,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -252,6 +254,9 @@ type env struct {
 	host   sshconfig.Host
 	extra  []sshconfig.Host // more aliases written next to host
 	cwd    string           // working directory for ssh; empty means the test's
+	// sshEnv replaces variables of the environment given to ssh (HOME, and
+	// the passwd shim's NSS_WRAPPER_PASSWD): "NAME=value" entries.
+	sshEnv []string
 }
 
 func newEnv(t *testing.T, rsaKey bool, dirName string) *env {
@@ -374,10 +379,12 @@ func (e *env) sshTo(t *testing.T, sshBin, cfg, to string, args ...string) (stdou
 	// The config names its own agent; make sure a developer's agent cannot
 	// leak in through the environment.
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "SSH_AUTH_SOCK=") {
+		name, _, _ := strings.Cut(kv, "=")
+		if name != "SSH_AUTH_SOCK" && !slices.ContainsFunc(e.sshEnv, func(o string) bool { return strings.HasPrefix(o, name+"=") }) {
 			cmd.Env = append(cmd.Env, kv)
 		}
 	}
+	cmd.Env = append(cmd.Env, e.sshEnv...)
 	var so, se bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &so, &se
 	err = cmd.Run()
@@ -397,7 +404,22 @@ type testServer struct {
 
 	mu       sync.Mutex
 	accepted ssh.PublicKey
+	offered  [][]byte // every public key a client offered, in order
 	cfg      *ssh.ServerConfig
+}
+
+// accept makes the server accept key (and only key) from now on.
+func (ts *testServer) accept(key ssh.PublicKey) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.accepted = key
+}
+
+// offeredKeys returns the keys clients have offered so far.
+func (ts *testServer) offeredKeys() [][]byte {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return slices.Clone(ts.offered)
 }
 
 func newHostSigner(t *testing.T) ssh.Signer {
@@ -419,7 +441,11 @@ func (ts *testServer) useHostKey(signer ssh.Signer) {
 	cfg := &ssh.ServerConfig{ // MaxAuthTries left at its default, 6
 		PublicKeyCallback: func(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
 			ts.authAttempts.Add(1)
-			if c.User() == user && bytes.Equal(k.Marshal(), ts.accepted.Marshal()) {
+			ts.mu.Lock()
+			ts.offered = append(ts.offered, k.Marshal())
+			accepted := ts.accepted
+			ts.mu.Unlock()
+			if c.User() == user && bytes.Equal(k.Marshal(), accepted.Marshal()) {
 				return nil, nil
 			}
 			return nil, errors.New("key not accepted")
@@ -548,4 +574,100 @@ func grepLines(s string, subs ...string) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// useHome makes ssh take dir for its home directory. ssh does not read $HOME:
+// it asks the passwd database, so this needs the passwd shim that
+// scripts/with-passwd.sh sets up under a uid with no passwd entry (Kiln). On a
+// machine with a real passwd entry there is no way to move the home without
+// touching the real one, which a test must not do: the test skips there
+// unless HOPKEY_REQUIRE_SSH is set.
+func (e *env) useHome(t *testing.T, dir string) {
+	t.Helper()
+	orig := os.Getenv("NSS_WRAPPER_PASSWD")
+	if orig == "" {
+		if os.Getenv("HOPKEY_REQUIRE_SSH") != "" {
+			t.Fatal("no passwd shim (NSS_WRAPPER_PASSWD) to move ssh's home directory into the test directory")
+		}
+		t.Skip("cannot give ssh a temporary home without the passwd shim")
+	}
+	b, err := os.ReadFile(orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		f := strings.Split(line, ":")
+		if len(f) >= 6 {
+			f[5] = dir
+		}
+		out = append(out, strings.Join(f, ":"))
+	}
+	passwd := filepath.Join(filepath.Dir(dir), "passwd")
+	if err := os.WriteFile(passwd, []byte(strings.Join(out, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.sshEnv = []string{"HOME=" + dir, "NSS_WRAPPER_PASSWD=" + passwd}
+}
+
+// A Tailscale SSH host must never be offered a key, even when the server asks
+// for public key authentication and would accept a default key sitting in the
+// user's ~/.ssh. The control run drops the two lines that make the block
+// keyless and shows the same server and home would have accepted that key.
+func TestOpenSSHKeylessHostIsNeverOfferedAKey(t *testing.T) {
+	sshBin := requireSSH(t)
+	e := newEnv(t, false, "hop")
+
+	home := filepath.Join(t.TempDir(), "home")
+	if err := os.MkdirAll(filepath.Join(home, ".ssh"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	e.useHome(t, home)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultKey, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".ssh", "id_ed25519"), pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.server.accept(defaultKey)
+
+	e.host.PublicKey, e.host.Keyless = nil, true
+	e.write(t)
+
+	// Control: without the keyless lines, ssh offers the default key and gets in.
+	old := e.writeVariant(t, func(cfg, _ string) string {
+		return dropLines(dropLines(cfg, "PubkeyAuthentication"), "IdentityFile")
+	})
+	stdout, stderr, err := e.ssh(t, sshBin, old, "echo", "ok")
+	if err != nil || strings.TrimSpace(stdout) != "ok" {
+		t.Fatalf("control: the planted default key was not used, so the test proves nothing: %v\n%s", err, stderr)
+	}
+	if got := e.server.offeredKeys(); len(got) != 1 || !bytes.Equal(got[0], defaultKey.Marshal()) {
+		t.Fatalf("control: server saw %d offered keys, want the default key", len(got))
+	}
+
+	before := len(e.server.offeredKeys())
+	attempts := e.server.authAttempts.Load()
+	_, stderr, err = e.ssh(t, sshBin, e.config(), "-v", "echo", "ok")
+	if err == nil {
+		t.Fatal("ssh got in with a key it should not have offered")
+	}
+	if got := e.server.offeredKeys(); len(got) != before {
+		t.Errorf("the server was offered %d keys by the keyless block", len(got)-before)
+	}
+	if got := e.server.authAttempts.Load(); got != attempts {
+		t.Errorf("the server saw %d authentication attempts", got-attempts)
+	}
+	if strings.Contains(stderr, "Offering public key") {
+		t.Errorf("ssh offered a key:\n%s", grepLines(stderr, "Offering public key", "identity file"))
+	}
 }

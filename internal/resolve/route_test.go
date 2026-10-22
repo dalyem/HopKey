@@ -1,12 +1,8 @@
 package resolve
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"strings"
 	"testing"
-
-	"golang.org/x/crypto/ssh"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/tailscale"
@@ -58,6 +54,7 @@ func TestChooseRoute(t *testing.T) {
 		address  string
 		fallback string
 		reason   string // substring
+		blocked  string // substring of Route.Blocked; "" means not blocked
 		wantErr  string
 	}{
 		{name: "auto, online: tailnet, direct as fallback", host: both("auto"), ts: online, chosen: "tailnet", address: "100.64.0.2", fallback: "203.0.113.10", reason: "online"},
@@ -67,7 +64,9 @@ func TestChooseRoute(t *testing.T) {
 		{name: "auto, no status at all: direct", host: both("auto"), ts: nil, chosen: "direct", address: "203.0.113.10"},
 		{name: "direct ignores a running tailnet", host: both("direct"), ts: online, chosen: "direct", address: "203.0.113.10"},
 		{name: "tailnet when online", host: both("tailnet"), ts: online, chosen: "tailnet", address: "100.64.0.2"},
-		{name: "tailnet even when stopped", host: both("tailnet"), ts: stopped, chosen: "tailnet", reason: "tailscale is not running"},
+		{name: "tailnet, tailscale stopped: blocked, never direct", host: both("tailnet"), ts: stopped, chosen: "tailnet", address: "prod.tn.ts.net", blocked: "tailscale is not available here (tailscale is Stopped)"},
+		{name: "tailnet, no status at all: blocked", host: both("tailnet"), ts: nil, chosen: "tailnet", blocked: "does not fall back to a direct address"},
+		{name: "tailnet, peer offline: still the tailnet, no fallback", host: both("tailnet"), ts: offline, chosen: "tailnet", address: "100.64.0.2"},
 		{
 			name: "auto with only a tailnet address uses it", ts: stopped, chosen: "tailnet", address: "100.64.0.7", reason: "no other address",
 			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"100.64.0.7"} }),
@@ -113,6 +112,9 @@ func TestChooseRoute(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if (tt.blocked == "") != (r.Blocked == "") || !strings.Contains(r.Blocked, tt.blocked) {
+				t.Errorf("blocked = %q, want one containing %q", r.Blocked, tt.blocked)
+			}
 			if r.Chosen != tt.chosen || (tt.address != "" && r.Address != tt.address) || r.Fallback != tt.fallback || !strings.Contains(r.Reason, tt.reason) {
 				t.Errorf("got %+v; want chosen=%s address=%s fallback=%s reason~%q", r, tt.chosen, tt.address, tt.fallback, tt.reason)
 			}
@@ -128,20 +130,7 @@ func TestChooseRoute(t *testing.T) {
 }
 
 func TestTailscaleSSHOnlyRoutes(t *testing.T) {
-	line := func() string {
-		pub, _, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		k, err := ssh.NewPublicKey(pub)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k)))
-	}
-	published, other := line(), line()
 	n := node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2")
-	n.SSHHostKeys = []string{published}
 	online := tsStatus(n)
 	stopped := tailscale.Unavailable("tailscale is Stopped")
 
@@ -162,26 +151,28 @@ func TestTailscaleSSHOnlyRoutes(t *testing.T) {
 		ts      *tailscale.Status
 		only    bool
 		address string
+		blocked bool
 		wantErr string
 	}{
 		{name: "keyless", host: mk(nil), ts: online, only: true, address: "100.64.0.2"},
-		{name: "keyless, tailscale not running here", host: mk(nil), ts: stopped, only: true, address: "prod.tn.ts.net"},
+		{name: "keyless, tailscale not running here: blocked", host: mk(nil), ts: stopped, only: true, address: "prod.tn.ts.net", blocked: true},
 		{name: "keyless with route tailnet", host: mk(func(h *model.Host) { h.Route = "tailnet" }), ts: online, only: true, address: "100.64.0.2"},
 		{name: "keyless with route direct is refused", host: mk(func(h *model.Host) { h.Route = "direct" }), ts: online, wantErr: "route direct cannot work"},
-		{name: "keyless but Tailscale SSH unknown", host: mk(func(h *model.Host) { h.Tailscale.SSH = "unknown" }), ts: online, only: false, wantErr: "x"},
-		{name: "keyed, pinned to the keys Tailscale publishes", host: mk(func(h *model.Host) { keyed(h); h.HostKeys = []string{published} }), ts: online, only: true, address: "100.64.0.2"},
-		{name: "keyed, pinned to the published keys, peer offline: still no direct route", host: mk(func(h *model.Host) { keyed(h); h.HostKeys = []string{published} }),
-			ts: tsStatus(func() tailscale.Node { o := n; o.Online = false; return o }()), only: true, address: "100.64.0.2"},
-		{name: "keyed, pinned to some other key", host: mk(func(h *model.Host) { keyed(h); h.HostKeys = []string{published, other} }), ts: online, only: false, address: "100.64.0.2"},
-		{name: "keyed, no pins", host: mk(keyed), ts: online, only: false, address: "100.64.0.2"},
-		{name: "keyed, pinned, but the node is not visible", host: mk(func(h *model.Host) { keyed(h); h.HostKeys = []string{published} }), ts: stopped, only: false, address: "203.0.113.10"},
+		{name: "keyless but Tailscale SSH unknown", host: mk(func(h *model.Host) { h.Tailscale.SSH = "unknown" }), ts: online, address: "100.64.0.2"},
+		// A keyed host is kept to the tailnet by what is stored on it, not by
+		// what Tailscale shows now.
+		{name: "keyed, route auto, tailscale running: the usual auto", host: mk(keyed), ts: online, address: "100.64.0.2"},
+		{name: "keyed, route auto, tailscale stopped: direct", host: mk(keyed), ts: stopped, address: "203.0.113.10"},
+		{name: "keyed, route tailnet", host: mk(func(h *model.Host) { keyed(h); h.Route = "tailnet" }), ts: online, address: "100.64.0.2"},
+		{name: "keyed, route tailnet, tailscale stopped: blocked, not direct", host: mk(func(h *model.Host) { keyed(h); h.Route = "tailnet" }), ts: stopped, address: "prod.tn.ts.net", blocked: true},
+		{name: "keyed, route tailnet, node not visible: blocked, not direct", host: mk(func(h *model.Host) { keyed(h); h.Route = "tailnet" }), ts: nil, address: "prod.tn.ts.net", blocked: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, only := TailscaleSSHOnly(tt.host, tt.ts)
+			_, only := TailscaleSSHOnly(tt.host)
 			r, err := ChooseRoute(tt.host, tt.ts)
 			if tt.wantErr != "" {
-				if tt.wantErr != "x" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("err = %v, want %q", err, tt.wantErr)
 				}
 				return
@@ -195,10 +186,16 @@ func TestTailscaleSSHOnlyRoutes(t *testing.T) {
 			if r.Address != tt.address {
 				t.Errorf("address = %q, want %q", r.Address, tt.address)
 			}
-			if tt.only {
-				if r.Chosen != RouteTailnet || r.Fallback != "" || r.Label() != "tailnet (Tailscale SSH)" {
-					t.Errorf("route = %+v (label %q): the tailnet, no fallback", r, r.Label())
+			if (r.Blocked != "") != tt.blocked {
+				t.Errorf("blocked = %q, want blocked=%v", r.Blocked, tt.blocked)
+			}
+			if tt.only || tt.host.Route == "tailnet" {
+				if r.Chosen != RouteTailnet || r.Fallback != "" {
+					t.Errorf("route = %+v: the tailnet, no fallback", r)
 				}
+			}
+			if tt.only && r.Label() != "tailnet (Tailscale SSH)" {
+				t.Errorf("label = %q", r.Label())
 			}
 		})
 	}

@@ -42,6 +42,9 @@ func connectable(rr *daemon.ResolveResult) (*target, error) {
 	if rr.Route == nil {
 		return nil, failf("%s has no usable route: %s", res.HostName, orUnknown(rr.RouteError))
 	}
+	if rr.Route.Blocked != "" {
+		return nil, failf("%s", rr.Route.Blocked)
+	}
 	if res.User != "" && !sshconfig.ValidUser(res.User) {
 		return nil, failf("user %q is not usable in an ssh config", res.User)
 	}
@@ -453,8 +456,8 @@ func printWhich(e *Env, rr *daemon.ResolveResult, w *WhichResult) {
 	if rr.Route != nil {
 		r := rr.Route
 		e.printf("address:  %s:%d via %s\n", r.Address, r.Port, r.Label())
-		if r.TailscaleSSH && strings.Contains(r.Reason, "may fail") {
-			e.printf("note:     %s\n", r.Reason)
+		if r.Blocked != "" {
+			e.printf("blocked:  %s\n", r.Blocked)
 		}
 		if r.Fallback != "" {
 			e.printf("fallback: %s (direct) if the tailnet address does not answer\n", r.Fallback)
@@ -622,6 +625,9 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		}
 		route = rr.Route
 		addr, port = route.Address, route.Port
+		if route.Blocked != "" {
+			return stepFail, route.Blocked
+		}
 		return stepPass, fmt.Sprintf("%s:%d via %s", addr, port, route.Label())
 	})
 
@@ -747,6 +753,9 @@ func runTrust(ctx context.Context, e *Env, args []string) error {
 	}
 	if rr.Route == nil {
 		return failf("%s has no usable route: %s", rr.Result.HostName, orUnknown(rr.RouteError))
+	}
+	if rr.Route.Blocked != "" {
+		return failf("%s", rr.Route.Blocked)
 	}
 	host := *rr.Host
 	if !host.JumpHostID.IsZero() {

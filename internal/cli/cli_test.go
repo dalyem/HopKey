@@ -44,7 +44,7 @@ func TestSplitDirective(t *testing.T) {
 	}
 }
 
-func TestParseSSHConfig(t *testing.T) {
+func TestConfigScan(t *testing.T) {
 	home := t.TempDir()
 	sshDir := filepath.Join(home, ".ssh")
 	os.MkdirAll(filepath.Join(sshDir, "conf.d"), 0o700)
@@ -57,72 +57,80 @@ func TestParseSSHConfig(t *testing.T) {
 		return p
 	}
 	write("hop/config", "Host from-hop\n  HostName 1.1.1.1\n")
-	write("conf.d/extra.conf", "Host extra\n  HostName 192.0.2.77\n  User x\n")
+	write("conf.d/extra.conf", "Host extra Dup\n  HostName 192.0.2.77\n  User x\n")
+	write("conf.d/second.conf", "Host second\n")
+	write("abs.conf", "Host from-abs\n")
+	write("rel.conf", "Host from-rel\n")
 	main := write("config", `# my config
 Include conf.d/*.conf
 Include ~/.ssh/hop/config
 Include /nonexistent/file
+Include `+filepath.Join(sshDir, "abs.conf")+`
 
 Host *
   ServerAliveInterval 30
+  User   global
 
-Host web web-alias !bad *.wild
+Host web web-alias !bad *.wild prod,comma w?b
   HostName=10.0.0.1
+  Include rel.conf
   User deploy
-  Port 2222
   IdentityFile ~/.ssh/id_web
   IdentityFile "%d/.ssh/id_other"
-  ProxyJump jump@gw:2200
 
 Match host foo
   User nobody
 
-Host db
-  Port nonsense
-  HostName db.example.com
-
-Host *.example.com
-  User wild
+Host dup web
+  Port 22
 `)
-	p := newSSHConfigParser(home, filepath.Join(sshDir, "hop"))
-	if err := p.parseFile(main, 0); err != nil {
+	s := newConfigScan(home, filepath.Join(sshDir, "hop"))
+	if err := s.scan(main); err != nil {
 		t.Fatal(err)
 	}
 	var names []string
-	for _, b := range p.blocks {
-		names = append(names, strings.Join(b.concrete(), ","))
+	for _, a := range s.aliases {
+		names = append(names, a.Name)
 	}
-	if want := []string{"extra", "web,web-alias", "db"}; !slices.Equal(names, want) {
-		t.Fatalf("blocks = %q, want %q (hop's own include must be skipped, wildcards dropped)", names, want)
+	want := []string{"extra", "Dup", "second", "from-abs", "web", "web-alias", "prod,comma", "from-rel"}
+	if !slices.Equal(names, want) {
+		t.Errorf("aliases = %q, want %q (wildcards, negations and hop's own include dropped; duplicates once, whatever their case)", names, want)
 	}
-	web := p.blocks[1]
-	if web.HostName != "10.0.0.1" || web.User != "deploy" || web.Port != 2222 || web.ProxyJump != "jump@gw:2200" ||
-		!slices.Equal(web.IdentityFiles, []string{"~/.ssh/id_web", "%d/.ssh/id_other"}) {
-		t.Errorf("web = %+v", web)
+	if got := s.aliases[4].Source; got != main+":11" {
+		t.Errorf("web's source = %q", got)
 	}
-	if got := p.expand(web.IdentityFiles[0]); got != filepath.Join(home, ".ssh", "id_web") {
-		t.Errorf("expand ~ = %q", got)
+	if len(s.matchExec) != 0 {
+		t.Errorf("matchExec = %q", s.matchExec)
 	}
-	if got := p.expand(web.IdentityFiles[1]); got != filepath.Join(home, ".ssh", "id_other") {
-		t.Errorf("expand %%d = %q", got)
+	if !s.users["deploy"] || !s.users["x"] || !s.users["global"] || !s.users["nobody"] {
+		t.Errorf("users = %v", s.users)
 	}
-	if p.blocks[2].Port != 0 {
-		t.Errorf("a bad Port was kept: %d", p.blocks[2].Port)
+	if !s.identity[filepath.Join(sshDir, "id_web")] || !s.identity[filepath.Join(sshDir, "id_other")] {
+		t.Errorf("identity = %v", s.identity)
 	}
-	if !p.defaults {
-		t.Error("Host * and Match were not noticed")
+	if len(s.warnings) != 0 {
+		t.Errorf("warnings = %q", s.warnings)
 	}
-	if len(p.warnings) == 0 || !strings.Contains(strings.Join(p.warnings, "\n"), "Port") {
-		t.Errorf("warnings = %q", p.warnings)
-	}
-	// Includes nested too deeply stop.
-	loop := write("loop", "Include loop\nHost looped\n")
-	q := newSSHConfigParser(home, "")
-	if err := q.parseFile(loop, 0); err != nil {
+
+	// Match exec, in a file that is only included.
+	write("exec.conf", "Match host a exec \"true\"\n  User q\n")
+	main = write("config", "Include exec.conf\nHost h\nMatch Exec \"x\"\n")
+	s = newConfigScan(home, "")
+	if err := s.scan(main); err != nil {
 		t.Fatal(err)
 	}
-	if len(q.blocks) == 0 || len(q.warnings) == 0 {
-		t.Errorf("a self-including file: %d blocks, warnings %q", len(q.blocks), q.warnings)
+	if want := []string{filepath.Join(sshDir, "exec.conf") + ":1", main + ":3"}; !slices.Equal(s.matchExec, want) {
+		t.Errorf("matchExec = %q, want %q", s.matchExec, want)
+	}
+
+	// Includes nested too deeply stop, as ssh's do.
+	loop := write("loop", "Include loop\nHost looped\n")
+	s = newConfigScan(home, "")
+	if err := s.scan(loop); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.aliases) != 1 || len(s.warnings) == 0 {
+		t.Errorf("a self-including file: aliases %v, warnings %q", s.aliases, s.warnings)
 	}
 }
 
@@ -450,164 +458,5 @@ func TestRunUsageAndVersion(t *testing.T) {
 	se.Reset()
 	if code := Run(ctx, []string{"key", "bogus", "--json"}, e); code != 255 || !strings.HasPrefix(se.String(), `{"error":`) {
 		t.Errorf("json error: %d %q", code, se.String())
-	}
-}
-
-func parseConfigText(t *testing.T, files map[string]string, main string) *sshConfigParser {
-	t.Helper()
-	home := t.TempDir()
-	sshDir := filepath.Join(home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	for name, body := range files {
-		if err := os.WriteFile(filepath.Join(sshDir, name), []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	path := filepath.Join(sshDir, "config")
-	if err := os.WriteFile(path, []byte(main), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	p := newSSHConfigParser(home, "")
-	if err := p.parseFile(path, 0); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-func blockNamed(t *testing.T, p *sshConfigParser, name string) sshBlock {
-	t.Helper()
-	for _, b := range p.blocks {
-		if slices.Contains(b.concrete(), name) {
-			return b
-		}
-	}
-	t.Fatalf("no block for %q in %+v", name, p.blocks)
-	return sshBlock{}
-}
-
-func TestSSHParseFirstValueWins(t *testing.T) {
-	p := parseConfigText(t, nil, `Host a
-  User one
-  User two
-  Port 22
-  Port 2222
-  HostName h1
-  HostName h2
-  ProxyJump j1
-  ProxyJump j2
-  IdentityFile k1
-  IdentityFile k2
-
-Host b
-  User first
-Host b
-  Port 2200
-  User second
-`)
-	a := blockNamed(t, p, "a")
-	if a.User != "one" || a.Port != 22 || a.HostName != "h1" || a.ProxyJump != "j1" || !slices.Equal(a.IdentityFiles, []string{"k1", "k2"}) {
-		t.Errorf("a = %+v: the first value of a single-valued setting wins, IdentityFile accumulates", a)
-	}
-	// The same alias in two blocks is one host, with ssh's merge.
-	n := 0
-	for _, blk := range p.blocks {
-		if slices.Contains(blk.concrete(), "b") {
-			n++
-		}
-	}
-	b := blockNamed(t, p, "b")
-	if n != 1 || b.User != "first" || b.Port != 2200 {
-		t.Errorf("b = %+v (%d blocks), want one host with User first, Port 2200", b, n)
-	}
-}
-
-func TestSSHParseIncludeInsideAHostBlock(t *testing.T) {
-	p := parseConfigText(t, map[string]string{
-		"inc.conf":   "HostName from-include\nUser inc\n",
-		"opens.conf": "User u\nHost c\n  HostName hc\n",
-	}, `Host a
-  Include inc.conf
-  User main
-  Port 2200
-
-Host d
-  Include opens.conf
-  Port 2201
-
-Host b
-  HostName hb
-`)
-	a := blockNamed(t, p, "a")
-	if a.HostName != "from-include" || a.User != "inc" || a.Port != 2200 {
-		t.Errorf("a = %+v: the included lines belong to a, and come first", a)
-	}
-	// A Host line in the included file opens a block that ends with the file;
-	// the lines after the Include are back in d.
-	d, c := blockNamed(t, p, "d"), blockNamed(t, p, "c")
-	if d.User != "u" || d.Port != 2201 || d.HostName != "" {
-		t.Errorf("d = %+v", d)
-	}
-	if c.HostName != "hc" || c.Port != 0 || c.User != "" {
-		t.Errorf("c = %+v: it must not inherit d's lines", c)
-	}
-	if b := blockNamed(t, p, "b"); b.HostName != "hb" || b.User != "" {
-		t.Errorf("b = %+v", b)
-	}
-}
-
-func TestSSHParseUnsupportedSettingsSkipTheHost(t *testing.T) {
-	tests := []struct {
-		name   string
-		config string
-		host   string
-		reason string // a substring of the Unsupported reasons; "" means the host is fine
-	}{
-		{"a Match block before the host supplies Port", "Match host *.corp\n  Port 2222\n\nHost h\n  HostName hh\n", "h", "Match block"},
-		{"a Match block after the host's own value is no matter", "Host h\n  Port 22\n\nMatch all\n  Port 2222\n", "h", ""},
-		{"a Match block that sets nothing hop imports is no matter", "Match all\n  ServerAliveInterval 5\n\nHost h\n  Port 22\n", "h", ""},
-		{"a wildcard Host block before the host supplies User", "Host *.wild\n  User shared\n\nHost x.wild\n  HostName hx\n", "x.wild", "wildcard block"},
-		{"a wildcard block that does not match the host is no matter", "Host *.wild\n  User shared\n\nHost other\n  HostName ho\n", "other", ""},
-		{"a negated pattern keeps the wildcard block off the host", "Host * !neg\n  User shared\n\nHost neg\n  HostName hn\n", "neg", ""},
-		{"a wildcard block after the host's own value is no matter", "Host h\n  User own\n\nHost *\n  User later\n", "h", ""},
-		{"settings before the first Host line apply to every host", "User global\n\nHost h\n  HostName hh\n", "h", "before the first Host line"},
-		{"a wildcard block's IdentityFile is a warning, not a skip", "Host *\n  IdentityFile ~/.ssh/shared\n\nHost h\n  HostName hh\n", "h", ""},
-		{"an unknown token in IdentityFile", "Host h\n  IdentityFile ~/.ssh/%r_key\n", "h", "%r_key"},
-		{"an unknown token in HostName", "Host h\n  HostName %h.%n.example.com\n", "h", "token"},
-		{"%h in HostName is expanded", "Host h\n  HostName %h.example.com\n", "h", ""},
-		{"%d in IdentityFile is expanded", "Host h\n  IdentityFile %d/.ssh/key\n", "h", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := parseConfigText(t, nil, tt.config)
-			b := blockNamed(t, p, tt.host)
-			got := strings.Join(b.Unsupported, "\n")
-			switch {
-			case tt.reason == "" && got != "":
-				t.Errorf("Unsupported = %q, want none", b.Unsupported)
-			case tt.reason != "" && !strings.Contains(got, tt.reason):
-				t.Errorf("Unsupported = %q, want a reason containing %q", b.Unsupported, tt.reason)
-			}
-		})
-	}
-	// A wildcard block's IdentityFile is reported, since hop does not import it.
-	p := parseConfigText(t, nil, "Host *\n  IdentityFile ~/.ssh/shared\n\nHost h\n  HostName hh\n")
-	if !strings.Contains(strings.Join(p.warnings, "\n"), "shared") {
-		t.Errorf("warnings = %q", p.warnings)
-	}
-}
-
-func TestWildMatch(t *testing.T) {
-	for _, tt := range []struct {
-		pat, name string
-		want      bool
-	}{
-		{"*", "anything", true}, {"*.wild", "x.wild", true}, {"*.wild", "wild", false}, {"w?b", "web", true}, {"w?b", "wb", false},
-		{"WEB*", "web-1", true}, {"a*b*c", "aXXbYYc", true}, {"a*b*c", "aXXbYY", false}, {"", "", true}, {"web", "web-1", false},
-	} {
-		if got := wildMatch(tt.pat, tt.name); got != tt.want {
-			t.Errorf("wildMatch(%q, %q) = %v, want %v", tt.pat, tt.name, got, tt.want)
-		}
 	}
 }

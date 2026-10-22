@@ -819,7 +819,7 @@ func TestProxyJump(t *testing.T) {
 	}
 }
 
-func TestKeylessHostHasNoIdentityFile(t *testing.T) {
+func TestKeylessHostOffersNothing(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{Dir: filepath.Join(dir, "hop"), AgentSocket: filepath.Join(dir, "agent.sock")}
 	keyed := Host{Alias: "keyed", HostName: "192.0.2.1", PublicKey: newPub(t)}
@@ -831,8 +831,19 @@ func TestKeylessHostHasNoIdentityFile(t *testing.T) {
 	cfg := string(f.config)
 	_, rest, _ := strings.Cut(cfg, "Host ts\n")
 	block, _, _ := strings.Cut(rest, "\nHost ")
-	if strings.Contains(block, "\n  IdentityFile ") || !strings.Contains(block, "IdentitiesOnly yes\n") {
-		t.Errorf("keyless block:\n%s", block)
+	for _, want := range []string{"\n  PubkeyAuthentication no\n", "\n  IdentityFile none\n", "\n  IdentitiesOnly yes\n"} {
+		if !strings.Contains("\n"+block+"\n", want) {
+			t.Errorf("keyless block lacks %q:\n%s", strings.TrimSpace(want), block)
+		}
+	}
+	if strings.Contains(block, "IdentityAgent") || strings.Contains(block, ".pub") {
+		t.Errorf("keyless block names an agent or a key:\n%s", block)
+	}
+	// The keyed host next to it still uses the agent and its key.
+	_, keyedRest, _ := strings.Cut(cfg, "Host keyed\n")
+	keyedBlock, _, _ := strings.Cut(keyedRest, "\nHost ")
+	if !strings.Contains(keyedBlock, "IdentityAgent") || strings.Contains(keyedBlock, "PubkeyAuthentication") {
+		t.Errorf("keyed block:\n%s", keyedBlock)
 	}
 	if len(f.pubKeys) != 1 {
 		t.Errorf("%d public key files, want only the keyed host's", len(f.pubKeys))

@@ -650,16 +650,16 @@ func TestKeylessTailscaleSSHHostsGetABlockWithNoKey(t *testing.T) {
 	}
 	b := block("tsok")
 	// The tailnet address, not the direct one; no key file; nothing from the agent.
-	for _, want := range []string{"HostName 100.64.0.7\n", "IdentitiesOnly yes\n", "StrictHostKeyChecking yes\n", "HostKeyAlias tsok\n"} {
+	for _, want := range []string{"HostName 100.64.0.7\n", "IdentitiesOnly yes\n", "PubkeyAuthentication no\n", "IdentityFile none\n", "StrictHostKeyChecking yes\n", "HostKeyAlias tsok\n"} {
 		if !strings.Contains(b, want) {
 			t.Errorf("block lacks %q:\n%s", want, b)
 		}
 	}
-	if strings.Contains(b, "IdentityFile") || strings.Contains(b, "203.0.113.50") {
+	if strings.Contains(b, "IdentityAgent") || strings.Contains(b, ".pub") || strings.Contains(b, "203.0.113.50") {
 		t.Errorf("a keyless block must name no key and no direct address:\n%s", b)
 	}
 	// A host with a key still gets its key file.
-	if !strings.Contains(block("keyed"), "IdentityFile ") {
+	if k := block("keyed"); !strings.Contains(k, "IdentityFile ") || !strings.Contains(k, "IdentityAgent") || strings.Contains(k, "PubkeyAuthentication") {
 		t.Errorf("keyed host lost its IdentityFile:\n%s", block("keyed"))
 	}
 	if strings.Contains(cfg, "Host tsunknown") || strings.Contains(cfg, "Host tsdirect") {
@@ -916,25 +916,27 @@ func TestFailedReloadKeepsThePreviousKeyringAndConfig(t *testing.T) {
 	}
 }
 
-// A host pinned to the keys Tailscale publishes for its node must not fall
-// back to the direct address: the direct sshd has other host keys, so the pin
-// could only fail there.
-func TestHostsPinnedFromTailscaleStayOnTheTailnet(t *testing.T) {
-	published, other := genKey(t), genKey(t)
+// A host whose route is tailnet (what hop ts import and hop ts link store for
+// Tailscale SSH hosts and hosts pinned to Tailscale's keys) stays on the
+// tailnet address whether or not the peer is online or even visible. Nothing
+// is inferred from the pins: the same pins under route auto take the ordinary
+// route.
+func TestHostsWithRouteTailnetStayOnTheTailnet(t *testing.T) {
+	published := genKey(t)
 	// An offline peer: a plain "auto" host would go direct.
 	node := tailscale.Node{ID: "nOFF", HostName: "off", DNSName: "off.tn.ts.net", Online: false, IPs: []string{"100.64.0.8"}, SSHHostKeys: []string{published.line()}}
 	st := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net", Self: tailscale.Node{ID: "nSELF", HostName: "me", IPs: []string{"100.64.0.1"}}, Peers: []tailscale.Node{node}}
 	f := newFixture(t, fakeTS{st})
-	mk := func(name string, pin testKey, sshHint string) model.Host {
+	mk := func(name, route string) model.Host {
 		return f.put(f.host(name, func(h *model.Host) {
+			h.Route = route
 			h.Addresses = []string{"203.0.113.50"}
-			h.Tailscale = &model.Tailscale{StableNodeID: "nOFF", DNSName: "off.tn.ts.net", SSH: sshHint}
-			h.HostKeys = []string{pin.line()}
+			h.Tailscale = &model.Tailscale{StableNodeID: "nOFF", DNSName: "off.tn.ts.net", SSH: "yes"}
+			h.HostKeys = []string{published.line()}
 		}))
 	}
-	mk("pinned-ts", published, "yes")
-	mk("pinned-other", other, "yes")
-	mk("pinned-ts-no-hint", published, "unknown")
+	mk("stored-tailnet", "tailnet")
+	mk("auto-same-pins", "auto")
 	if err := f.client().Call(context.Background(), OpReload, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -952,14 +954,11 @@ func TestHostsPinnedFromTailscaleStayOnTheTailnet(t *testing.T) {
 		}
 		return ""
 	}
-	if got := hostName("pinned-ts"); got != "100.64.0.8" {
-		t.Errorf("pinned-ts: HostName %q, want the tailnet address even though the peer is offline", got)
+	if got := hostName("stored-tailnet"); got != "100.64.0.8" {
+		t.Errorf("stored-tailnet: HostName %q, want the tailnet address even though the peer is offline", got)
 	}
-	if got := hostName("pinned-other"); got != "203.0.113.50" {
-		t.Errorf("pinned-other: HostName %q, want the direct address (its pin is not Tailscale's)", got)
-	}
-	if got := hostName("pinned-ts-no-hint"); got != "203.0.113.50" {
-		t.Errorf("pinned-ts-no-hint: HostName %q: without ssh=yes the host takes the ordinary route", got)
+	if got := hostName("auto-same-pins"); got != "203.0.113.50" {
+		t.Errorf("auto-same-pins: HostName %q: route auto with an offline peer takes the direct address", got)
 	}
 	// It still has its key: only the route is forced.
 	if !strings.Contains(cfg, "IdentityFile ") {

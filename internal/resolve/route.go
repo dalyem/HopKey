@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/dalyem/hopkey/internal/model"
-	"github.com/dalyem/hopkey/internal/sshkeys"
 	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
@@ -26,10 +25,13 @@ type Route struct {
 	Port    int    `json:"port"`
 	Reason  string `json:"reason"`
 	// TailscaleSSH is set when the host is reached only through Tailscale SSH:
-	// it has no key of its own to offer, or its pinned host keys are the ones
-	// Tailscale publishes, which the direct sshd does not share. The route is
-	// then the tailnet with no direct fallback.
+	// it has no key of its own to offer. The route is then the tailnet with no
+	// direct fallback.
 	TailscaleSSH bool `json:"tailscale_ssh,omitempty"`
+	// Blocked is why this route cannot be used right now: the host is kept to
+	// the tailnet (route tailnet, or Tailscale SSH) and Tailscale is not
+	// available here. hop will not connect, and will not try a direct address.
+	Blocked string `json:"blocked,omitempty"`
 	// Fallback is the address to try if Chosen was the tailnet under
 	// "auto" and the connection fails. "Online" only means the peer reaches
 	// Tailscale's control plane, not that ssh answers.
@@ -49,37 +51,17 @@ func (r Route) Label() string {
 	return r.Chosen + " (" + r.Reason + ")"
 }
 
-// TailscaleSSHOnly reports whether h can only be reached through Tailscale SSH,
-// and why. That is a host Tailscale marks as running Tailscale SSH that either
-// has no key (Tailscale authenticates the tailnet identity, so no key is
-// offered) or is pinned to the host keys Tailscale publishes for its node
-// (the direct sshd has different ones, so a direct connection could only
-// fail the pin). The second case needs the live node to compare against;
-// without it the host takes the ordinary route.
-func TailscaleSSHOnly(h model.Host, ts *tailscale.Status) (why string, only bool) {
-	if h.Tailscale == nil || h.Tailscale.SSH != "yes" {
-		return "", false
-	}
-	if h.KeyID.IsZero() {
+// TailscaleSSHOnly reports whether h can only be reached through Tailscale
+// SSH, and why: Tailscale marks it as running Tailscale SSH and it has no key
+// of its own, so a direct sshd would have nothing to authenticate with. It
+// looks only at what is stored on the host. A host with a key that should be
+// kept to the tailnet says so with route tailnet, which hop ts import and
+// hop ts link set; nothing here guesses from what Tailscale shows right now.
+func TailscaleSSHOnly(h model.Host) (why string, only bool) {
+	if h.Tailscale != nil && h.Tailscale.SSH == "yes" && h.KeyID.IsZero() {
 		return "the host has no key", true
 	}
-	n, ok := ts.NodeByID(h.Tailscale.StableNodeID)
-	if !ok || len(h.HostKeys) == 0 || len(n.SSHHostKeys) == 0 {
-		return "", false
-	}
-	published := map[string]bool{}
-	for _, line := range n.SSHHostKeys {
-		if k, err := sshkeys.ParsePublic(line); err == nil {
-			published[string(k.Marshal())] = true
-		}
-	}
-	for _, line := range h.HostKeys {
-		k, err := sshkeys.ParsePublic(line)
-		if err != nil || !published[string(k.Marshal())] {
-			return "", false
-		}
-	}
-	return "its pinned host keys are the ones Tailscale publishes", true
+	return "", false
 }
 
 // IsTailnetAddr reports whether addr lives on the tailnet: a Tailscale IP, a
@@ -99,15 +81,16 @@ func IsTailnetAddr(addr, magicDNSSuffix string) bool {
 // ChooseRoute picks the address for h. ts may be nil or unavailable.
 //
 //   - direct: the first stored address that is not on the tailnet.
-//   - tailnet: the host's tailnet address, whether or not Tailscale looks to
-//     be running here.
+//   - tailnet: the host's tailnet address and never a direct one. If Tailscale
+//     is not available here the route is Blocked, so the connection fails with
+//     a message that says why, rather than going around the restriction.
 //   - auto: the tailnet address when local Tailscale is running and the peer
 //     is online, otherwise the direct address, and the tailnet address only
 //     if the host has nothing else.
 //
 // A host reached only through Tailscale SSH (see TailscaleSSHOnly) always gets
-// its tailnet address, with no direct fallback; asking for "direct" is an
-// error.
+// its tailnet address, with no direct fallback, and is Blocked like route
+// tailnet; asking for "direct" is an error.
 func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	setting := h.Route
 	if setting == "" {
@@ -131,7 +114,18 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	tailnet, node, haveNode := tailnetAddress(h, ts)
 
 	r := Route{Setting: setting, Port: port}
-	if why, only := TailscaleSSHOnly(h, ts); only {
+	unavailable := ts == nil || !ts.Available
+	blocked := func() string {
+		if !unavailable {
+			return ""
+		}
+		reason := "no status"
+		if ts != nil && ts.Reason != "" {
+			reason = ts.Reason
+		}
+		return fmt.Sprintf("host %q is kept to the tailnet, but tailscale is not available here (%s), and hop does not fall back to a direct address; start Tailscale, or change the route with: hop edit %s --route auto", h.Name, reason, h.Name)
+	}
+	if why, only := TailscaleSSHOnly(h); only {
 		switch {
 		case setting == RouteDirect:
 			return Route{}, fmt.Errorf("host %q is reached only through Tailscale SSH (%s), so route direct cannot work; set the route to tailnet or auto", h.Name, why)
@@ -140,9 +134,7 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 		}
 		r.Chosen, r.Address, r.TailscaleSSH = RouteTailnet, tailnet, true
 		r.Reason = "Tailscale SSH: " + why
-		if ts == nil || !ts.Available {
-			r.Reason += "; tailscale is not running here, so the connection may fail"
-		}
+		r.Blocked = blocked()
 		return r, nil
 	}
 	useDirect := func(why string) (Route, error) {
@@ -164,11 +156,9 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	case RouteDirect:
 		return useDirect("route is direct")
 	case RouteTailnet:
-		why := "route is tailnet"
-		if ts == nil || !ts.Available {
-			why += "; tailscale is not running here, so the connection may fail"
-		}
-		return useTailnet(why)
+		out, err := useTailnet("route is tailnet")
+		out.Blocked = blocked()
+		return out, err
 	case RouteAuto:
 	default:
 		return Route{}, fmt.Errorf("host %q has unknown route %q", h.Name, setting)

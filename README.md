@@ -10,7 +10,7 @@ hop exec <target> [--timeout D] [--sudo] [--json] -- <cmd...>
 hop check|which|trust <target>    diagnose, explain resolution, pin the server's host key
 hop ls [tag] | info <target> | add | edit | rm
 hop key add <path> | ls | rm
-hop import ssh-config [path] [--with-keys]
+hop import ssh-config [path] [--with-keys] [--allow-match-exec]
 hop ts import | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
 hop setup                         put `Include ~/.ssh/hop/config` above every other directive in ~/.ssh/config
 hop status | daemon [stop]

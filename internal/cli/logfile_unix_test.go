@@ -119,6 +119,24 @@ func TestOpenLog(t *testing.T) {
 			t.Fatal("openLog blocked on a named pipe")
 		}
 	})
+	t.Run("a loose log that grew too big is private when moved aside", func(t *testing.T) {
+		path := log("bigloose.log")
+		if err := os.WriteFile(path, make([]byte, maxLogSize+1), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		os.Chmod(path, 0o644)
+		f, err := openLog(path, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		if p := perm(path + ".1"); p != 0o600 {
+			t.Errorf("previous generation mode = %o, want 600", p)
+		}
+		if p := perm(path); p != 0o600 {
+			t.Errorf("new log mode = %o, want 600", p)
+		}
+	})
 	t.Run("a log that grew too big is moved aside", func(t *testing.T) {
 		path := log("big.log")
 		if err := os.WriteFile(path, make([]byte, maxLogSize+1), 0o600); err != nil {

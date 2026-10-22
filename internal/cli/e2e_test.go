@@ -66,6 +66,20 @@ func requireSSH(t *testing.T) {
 	}
 }
 
+// passwdShimEnv is the part of this process's environment that gives ssh a
+// passwd entry under a uid that has none (see scripts/with-passwd.sh). The
+// ssh -G runs of hop import start from an empty environment, so the tests
+// hand it over explicitly.
+func passwdShimEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "LD_PRELOAD=") || strings.HasPrefix(kv, "NSS_WRAPPER_") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 func newE2E(t *testing.T) *e2e { return newE2EWith(t, noTailscale{}) }
 
 func newE2EWith(t *testing.T, ts daemon.TailscaleSource) *e2e {
@@ -147,6 +161,7 @@ func (e *e2e) hop(t *testing.T, args ...string) (code int, stdout, stderr string
 		Getenv: func(string) string { return "" },
 		Home:   e.home, Paths: e.paths,
 		StdoutTTY: e.tty, StdinTTY: e.tty, SSHBinary: e.sshBin, ReadPassword: e.readPassword,
+		SSHProbeEnv: passwdShimEnv(),
 		StartDaemon: func() error {
 			t.Error("the CLI tried to start a daemon, but one is running")
 			return errors.New("unexpected daemon start")
@@ -1342,17 +1357,27 @@ func setupBeatsStrictNo(t *testing.T, config string) {
 	}
 }
 
-// importConfig writes cfg as the test home's ssh config and imports it.
-func (e *e2e) importConfig(t *testing.T, cfg string) cli.ImportReport {
+// writeSSHFile writes a file under the test home's ~/.ssh and returns its
+// absolute path. Include lines in these configs use absolute paths: ssh
+// expands "~" and relative paths from the passwd entry, not from the test home.
+func (e *e2e) writeSSHFile(t *testing.T, name, body string) string {
 	t.Helper()
 	sshDir := filepath.Join(e.home, ".ssh")
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+	p := filepath.Join(sshDir, name)
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr := e.hop(t, "import", "ssh-config", "--json")
+	return p
+}
+
+// importConfig writes cfg as the test home's ssh config and imports it.
+func (e *e2e) importConfig(t *testing.T, cfg string, args ...string) cli.ImportReport {
+	t.Helper()
+	e.writeSSHFile(t, "config", cfg)
+	code, stdout, stderr := e.hop(t, append([]string{"import", "ssh-config", "--json"}, args...)...)
 	if code != 0 {
 		t.Fatalf("import: %d %s", code, stderr)
 	}
@@ -1361,6 +1386,42 @@ func (e *e2e) importConfig(t *testing.T, cfg string) cli.ImportReport {
 		t.Fatalf("%v\n%s", err, stdout)
 	}
 	return rep
+}
+
+// hostEntries indexes the host lines of a report by name.
+func hostEntries(rep cli.ImportReport) map[string]cli.ImportEntry {
+	out := map[string]cli.ImportEntry{}
+	for _, en := range rep.Entries {
+		if en.Kind == "host" {
+			out[en.Name] = en
+		}
+	}
+	return out
+}
+
+// inVault reports whether hop knows the name.
+func (e *e2e) inVault(t *testing.T, name string) bool {
+	t.Helper()
+	code, _, _ := e.hop(t, "info", name)
+	return code == 0
+}
+
+// sshDefaultUser is the user ssh falls back to, as the real ssh reports it.
+func sshDefaultUser(t *testing.T) string {
+	t.Helper()
+	cmd := exec.Command("ssh", "-G", "-F", os.DevNull, "x")
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, passwdShimEnv()...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("ssh -G: %v", err)
+	}
+	for _, l := range strings.Split(string(out), "\n") {
+		if u, ok := strings.CutPrefix(l, "user "); ok {
+			return strings.TrimSpace(u)
+		}
+	}
+	t.Fatalf("no user in:\n%s", out)
+	return ""
 }
 
 func (e *e2e) view(t *testing.T, name string) cli.HostView {
@@ -1376,74 +1437,269 @@ func (e *e2e) view(t *testing.T, name string) cli.HostView {
 	return v
 }
 
-func TestImportSkipsHostsItCannotReproduce(t *testing.T) {
+// These tests run the real ssh -G over real configs: hop must import what
+// ssh would do, not what a reimplementation of ssh_config thinks it would do.
+
+func TestImportAppliesSettingsFromHostStar(t *testing.T) {
 	e := newE2E(t)
-	rep := e.importConfig(t, `Host early
-  HostName 192.0.2.2
-  Port 2201
+	rep := e.importConfig(t, `Host *
+  User everyone
+  ServerAliveInterval 30
 
-Host *.corp
-  User shared
-
-Host db.corp
-  HostName 192.0.2.3
-
-Host tok
-  HostName 192.0.2.4
-  IdentityFile ~/.ssh/%r_key
-
-Host fine
-  HostName 192.0.2.5
-  User u1
-  User u2
-  Port 2203
-  Port 2204
-
-Host viamatch
+Host a
   HostName 192.0.2.1
 
-Match host viamatch
+Host b
+  HostName 192.0.2.2
   Port 2200
+  User own
 `)
-	status := map[string]cli.ImportEntry{}
-	for _, en := range rep.Entries {
-		status[en.Name] = en
-	}
-	// viamatch has no Port of its own, so the Match block after it may decide
-	// it; early sets its own Port first; db.corp is behind a wildcard block
-	// that sets its User; tok has a token hop cannot expand.
-	for name, want := range map[string]string{"viamatch": "skipped", "early": "imported", "db.corp": "skipped", "tok": "skipped", "fine": "imported"} {
-		if status[name].Status != want {
-			t.Errorf("%s: %+v, want %s", name, status[name], want)
+	for name, en := range hostEntries(rep) {
+		if en.Status != "imported" {
+			t.Errorf("%s: %+v, want imported", name, en)
 		}
 	}
-	warnings := strings.Join(rep.Warnings, "\n")
-	if !strings.Contains(warnings, "db.corp") || !strings.Contains(warnings, "wildcard block") || !strings.Contains(warnings, "Match block") || !strings.Contains(warnings, "%r_key") {
-		t.Errorf("warnings do not explain the skipped hosts:\n%s", warnings)
+	// The first value wins, and Host * comes first.
+	if a := e.view(t, "a"); a.User != "everyone" || a.Port != 22 {
+		t.Errorf("a = user %q port %d", a.User, a.Port)
 	}
-	if code, _, _ := e.hop(t, "info", "db.corp"); code == 0 {
-		t.Error("the skipped host db.corp is in the vault")
+	if b := e.view(t, "b"); b.User != "everyone" || b.Port != 2200 {
+		t.Errorf("b = user %q port %d: Host * sets the user first, the host sets the port", b.User, b.Port)
 	}
-	if f := e.view(t, "fine"); f.User != "u1" || f.Port != 2203 {
-		t.Errorf("fine = user %q port %d: the first value of a repeated setting wins", f.User, f.Port)
-	}
-	if v := e.view(t, "early"); v.Port != 2201 {
-		t.Errorf("early port = %d", v.Port)
+	if w := strings.Join(rep.Warnings, "\n"); strings.Contains(w, "Host *") {
+		t.Errorf("warnings = %q", w)
 	}
 }
 
-func TestImportIncludeInsideAHostBlockApplies(t *testing.T) {
+func TestImportNegation(t *testing.T) {
 	e := newE2E(t)
-	sshDir := filepath.Join(e.home, ".ssh")
-	if err := os.MkdirAll(sshDir, 0o700); err != nil {
-		t.Fatal(err)
+	rep := e.importConfig(t, `Host * !prod
+  User generic
+
+Host prod
+  HostName 192.0.2.3
+
+Host stage
+  HostName 192.0.2.4
+
+Host never !never
+  HostName 192.0.2.5
+`)
+	st := hostEntries(rep)
+	if st["prod"].Status != "imported" || st["stage"].Status != "imported" {
+		t.Errorf("entries = %+v", st)
 	}
-	if err := os.WriteFile(filepath.Join(sshDir, "inc.conf"), []byte("HostName 192.0.2.6\nUser inc\n"), 0o600); err != nil {
-		t.Fatal(err)
+	if v := e.view(t, "prod"); v.User != "" {
+		t.Errorf("prod user = %q: the negated pattern keeps Host * off it", v.User)
 	}
-	e.importConfig(t, "Host nested\n  Include inc.conf\n  Port 2202\n  User outer\n")
+	if v := e.view(t, "stage"); v.User != "generic" {
+		t.Errorf("stage user = %q", v.User)
+	}
+	// "never !never" matches nothing, so ssh gives that name no settings.
+	if st["never"].Status != "skipped" || !strings.Contains(st["never"].Reason, "no Host line applies") || e.inVault(t, "never") {
+		t.Errorf("never = %+v", st["never"])
+	}
+}
+
+func TestImportIncludeInsideAHostBlock(t *testing.T) {
+	e := newE2E(t)
+	inc := e.writeSSHFile(t, "inc.conf", "HostName 192.0.2.6\nUser inc\n")
+	e.importConfig(t, `Host nested
+  Include `+inc+`
+  Port 2202
+  User outer
+
+Host pre
+  User first
+  Include `+inc+`
+`)
 	if v := e.view(t, "nested"); v.User != "inc" || v.Port != 2202 || !slices.Equal(v.Addresses, []string{"192.0.2.6"}) {
 		t.Errorf("nested = %+v: the included lines are in the block and come first", v)
+	}
+	if v := e.view(t, "pre"); v.User != "first" || !slices.Equal(v.Addresses, []string{"192.0.2.6"}) {
+		t.Errorf("pre = %+v: its own User comes before the include", v)
+	}
+}
+
+func TestImportConditionalInclude(t *testing.T) {
+	e := newE2E(t)
+	cond := e.writeSSHFile(t, "cond.conf", "User condu\nPort 2300\n")
+	ghost := e.writeSSHFile(t, "ghost.conf", "Host ghost\n  HostName 192.0.2.99\n")
+	rep := e.importConfig(t, `Match originalhost cond
+  Include `+cond+`
+
+Match originalhost nobody
+  Include `+ghost+`
+
+Host cond
+  HostName 192.0.2.7
+
+Host other
+  HostName 192.0.2.8
+`)
+	if v := e.view(t, "cond"); v.User != "condu" || v.Port != 2300 {
+		t.Errorf("cond = user %q port %d: the include holds for this name", v.User, v.Port)
+	}
+	if v := e.view(t, "other"); v.User != "" || v.Port != 22 {
+		t.Errorf("other = user %q port %d: the include does not hold", v.User, v.Port)
+	}
+	// ghost is named by a file ssh never reads for it.
+	if g := hostEntries(rep)["ghost"]; g.Status != "skipped" || e.inVault(t, "ghost") {
+		t.Errorf("ghost = %+v", g)
+	}
+}
+
+func TestImportSharedAliases(t *testing.T) {
+	e := newE2E(t)
+	e.importConfig(t, `Host b
+  User only-b
+
+Host a b
+  User shared
+  HostName 192.0.2.9
+
+Host c d
+  HostName 192.0.2.20
+`)
+	// a and b answer differently, so they are two hosts.
+	if v := e.view(t, "a"); v.Name != "a" || v.User != "shared" {
+		t.Errorf("a = %+v", v)
+	}
+	if v := e.view(t, "b"); v.Name != "b" || v.User != "only-b" || !slices.Equal(v.Addresses, []string{"192.0.2.9"}) {
+		t.Errorf("b = %+v: the first value, from its own earlier block, wins", v)
+	}
+	// c and d answer alike, so d is c's alias.
+	if v := e.view(t, "d"); v.Name != "c" {
+		t.Errorf("d resolves to %q, want c", v.Name)
+	}
+}
+
+func TestImportSkipsProxyCommand(t *testing.T) {
+	e := newE2E(t)
+	rep := e.importConfig(t, `Host viacmd
+  HostName 192.0.2.10
+  ProxyCommand ssh -W %h:%p gw
+
+Host fine
+  HostName 192.0.2.11
+  ProxyCommand none
+`)
+	st := hostEntries(rep)
+	if st["viacmd"].Status != "skipped" || !strings.Contains(st["viacmd"].Reason, "ProxyCommand") || e.inVault(t, "viacmd") {
+		t.Errorf("viacmd = %+v", st["viacmd"])
+	}
+	if st["fine"].Status != "imported" {
+		t.Errorf("fine = %+v", st["fine"])
+	}
+	if !strings.Contains(strings.Join(rep.Warnings, "\n"), "viacmd") {
+		t.Errorf("warnings = %q", rep.Warnings)
+	}
+}
+
+func TestImportKeepsOnlyIdentityFilesTheConfigNames(t *testing.T) {
+	e := newE2E(t)
+	e.importConfig(t, `Host explicit
+  HostName 192.0.2.12
+  IdentityFile ~/.ssh/id_ed25519
+
+Host plain
+  HostName 192.0.2.13
+
+Host other
+  HostName 192.0.2.14
+  IdentityFile ~/.ssh/id_work
+  IdentityFile %d/.ssh/%n_key
+`)
+	if d := e.view(t, "explicit").Description; !strings.Contains(d, filepath.Join(e.home, ".ssh", "id_ed25519")) {
+		t.Errorf("explicit: %q: a default-named file the config names is kept", d)
+	}
+	if d := e.view(t, "plain").Description; strings.Contains(d, "IdentityFile") {
+		t.Errorf("plain: %q: ssh's default identity files are not the host's", d)
+	}
+	other := e.view(t, "other").Description
+	if !strings.Contains(other, filepath.Join(e.home, ".ssh", "id_work")) || !strings.Contains(other, filepath.Join(e.home, ".ssh", "other_key")) {
+		t.Errorf("other: %q: tokens in IdentityFile are expanded", other)
+	}
+}
+
+// ssh -G prints the local user whether or not the config says so; only a User
+// the config names is the host's.
+func TestImportKeepsOnlyAUserTheConfigNames(t *testing.T) {
+	user := sshDefaultUser(t)
+	e := newE2E(t)
+	e.importConfig(t, "Host plain\n  HostName 192.0.2.13\n")
+	if u := e.view(t, "plain").User; u != "" {
+		t.Errorf("plain user = %q: ssh's own default is not the config's", u)
+	}
+	e = newE2E(t)
+	e.importConfig(t, "Host sameuser\n  HostName 192.0.2.15\n  User "+user+"\n")
+	if u := e.view(t, "sameuser").User; u != user {
+		t.Errorf("sameuser user = %q, want the one the config names, %q", u, user)
+	}
+}
+
+func TestImportRefusesMatchExecUnlessAllowed(t *testing.T) {
+	e := newE2E(t)
+	marker := filepath.Join(e.base, "ran")
+	included := e.writeSSHFile(t, "exec.conf", "Match originalhost h exec \"touch "+marker+"\"\n  User viaexec\n")
+	for name, cfg := range map[string]string{
+		"in the config":    "Match originalhost h exec \"touch " + marker + "\"\n  User viaexec\n\nHost h\n  HostName 192.0.2.30\n",
+		"in an Include":    "Include " + included + "\n\nHost h\n  HostName 192.0.2.30\n",
+		"after other args": "Match host h exec \"touch " + marker + "\"\nHost h\n  HostName 192.0.2.30\n",
+	} {
+		e.writeSSHFile(t, "config", cfg)
+		for _, args := range [][]string{{"import", "ssh-config"}, {"import", "ssh-config", "--dry-run"}} {
+			code, _, stderr := e.hop(t, args...)
+			if code != 255 || !strings.Contains(stderr, "Match exec") || !strings.Contains(stderr, "--allow-match-exec") {
+				t.Errorf("%s %v: code=%d stderr=%q", name, args, code, stderr)
+			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatalf("%s %v: the Match exec command ran", name, args)
+			}
+			if e.inVault(t, "h") {
+				t.Fatalf("%s %v: something was imported", name, args)
+			}
+		}
+	}
+
+	e.writeSSHFile(t, "config", "Match originalhost h exec \"touch "+marker+"\"\n  User viaexec\n\nHost h\n  HostName 192.0.2.30\n")
+	if code, _, stderr := e.hop(t, "import", "ssh-config", "--allow-match-exec"); code != 0 {
+		t.Fatalf("import --allow-match-exec: %d %s", code, stderr)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("--allow-match-exec: the command did not run, so ssh did not evaluate the Match: %v", err)
+	}
+	if v := e.view(t, "h"); v.User != "viaexec" {
+		t.Errorf("h = %+v: the Match exec held", v)
+	}
+}
+
+// ssh -G runs Match exec commands, so they must see only HOME and PATH.
+func TestImportRunsSSHWithABareEnvironment(t *testing.T) {
+	e := newE2E(t)
+	t.Setenv("HOPKEY_PROBE_LEAK", "leaked")
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/leaked-agent")
+	e.importConfig(t, `Match originalhost h exec "test -z ${HOPKEY_PROBE_LEAK} && test -z ${SSH_AUTH_SOCK}"
+  User cleanenv
+
+Host h
+  HostName 192.0.2.31
+`, "--allow-match-exec")
+	if v := e.view(t, "h"); v.User != "cleanenv" {
+		t.Errorf("h user = %q: the caller's environment reached ssh", v.User)
+	}
+}
+
+func TestImportNeedsSSH(t *testing.T) {
+	e := newE2E(t)
+	e.writeSSHFile(t, "config", "Host a\n  HostName 192.0.2.1\n")
+	e.sshBin = filepath.Join(e.base, "no-such-ssh")
+	code, _, stderr := e.hop(t, "import", "ssh-config")
+	if code != 255 || !strings.Contains(stderr, "OpenSSH") || !strings.Contains(stderr, "ssh -G") {
+		t.Errorf("import without ssh: code=%d stderr=%q", code, stderr)
+	}
+	if e.inVault(t, "a") {
+		t.Error("something was imported without ssh")
 	}
 }
 
@@ -1498,28 +1754,61 @@ Host via-twin-address
 Host via-unknown
   HostName 192.0.2.19
   ProxyJump nowhere
+
+Host via-two-hops
+  HostName 192.0.2.21
+  ProxyJump gw,nouser
+
+Host via-none
+  HostName 192.0.2.22
+  ProxyJump none
+
+Host base
+  HostName 192.0.2.40
+  User deploy
+
+Host via-base
+  HostName 192.0.2.41
+  ProxyJump base
+
+Host mid
+  HostName 192.0.2.42
+  ProxyJump nowhere
+
+Host via-mid
+  HostName 192.0.2.43
+  ProxyJump mid
+
+Host loop
+  HostName 192.0.2.44
+  ProxyJump loop
 `)
-	for name, want := range map[string]string{
-		"via-same": "gw", "via-plain": "gw", "via-port-default": "nouser",
-		"via-other-user": "", "via-other-port": "", "via-user-on-nouser": "",
-		"via-twin-name": "", "via-twin-address": "", "via-unknown": "",
-	} {
-		if got := e.view(t, name).JumpHost; got != want {
-			t.Errorf("%s: jump host = %q, want %q", name, got, want)
+	st := hostEntries(rep)
+	imported := map[string]string{"via-same": "gw", "via-plain": "gw", "via-port-default": "nouser", "via-none": "", "via-base": "base", "base": ""}
+	for name, jump := range imported {
+		if st[name].Status != "imported" {
+			t.Errorf("%s: %+v, want imported", name, st[name])
+			continue
+		}
+		if got := e.view(t, name).JumpHost; got != jump {
+			t.Errorf("%s: jump host = %q, want %q", name, got, jump)
 		}
 	}
-	warnings := strings.Join(rep.Warnings, "\n")
-	for _, want := range []string{
-		`via-other-user: ProxyJump "root@gw"`, `via-other-port: ProxyJump "gw:2222"`, `via-user-on-nouser: ProxyJump "bob@nouser"`,
-		"matches several vault hosts (twin-a, twin-b)", "imported without the jump",
-	} {
-		if !strings.Contains(warnings, want) {
-			t.Errorf("warnings lack %q:\n%s", want, warnings)
-		}
+	// A host whose jump cannot be reproduced is left out: imported without
+	// it, it would connect where ssh goes through the jump.
+	reasons := map[string]string{
+		"via-other-user": `ProxyJump "root@gw"`, "via-other-port": `ProxyJump "gw:2222"`, "via-user-on-nouser": `ProxyJump "bob@nouser"`,
+		"via-twin-name": "matches several hosts (twin-a, twin-b)", "via-twin-address": "matches several hosts",
+		"via-unknown": `"nowhere" is not in the vault`, "via-two-hops": "several hops",
+		"mid": `"nowhere" is not in the vault`, "via-mid": `"mid" is not in the vault`, "loop": "the host itself",
 	}
-	// The hosts themselves were imported all the same.
-	for _, name := range []string{"via-other-user", "via-twin-name", "via-twin-address"} {
-		e.view(t, name)
+	for name, why := range reasons {
+		if st[name].Status != "skipped" || !strings.Contains(st[name].Reason, why) {
+			t.Errorf("%s: %+v, want skipped for %q", name, st[name], why)
+		}
+		if e.inVault(t, name) {
+			t.Errorf("%s was imported", name)
+		}
 	}
 }
 
@@ -1569,14 +1858,16 @@ func TestKeylessTailscaleSSHHostOverRealSSH(t *testing.T) {
 	cfg := e.configFile(t)
 	_, rest, _ := strings.Cut(cfg, "Host ts-host\n")
 	block, _, _ := strings.Cut(rest, "\nHost ")
-	if strings.Contains(block, "\n  IdentityFile ") || !strings.Contains(block, "IdentitiesOnly yes") {
+	if strings.Contains(block, "IdentityAgent") || strings.Contains(block, ".pub") || !strings.Contains(block, "IdentityFile none\n") ||
+		!strings.Contains(block, "PubkeyAuthentication no\n") || !strings.Contains(block, "IdentitiesOnly yes") {
 		t.Errorf("block:\n%s", block)
 	}
 	out, err := exec.Command("ssh", "-F", filepath.Join(e.paths.ConfigDir, "config"), "-G", "ts-host").Output()
 	if err != nil {
 		t.Fatalf("ssh -G: %v", err)
 	}
-	if !strings.Contains(string(out), "\nidentitiesonly yes\n") || strings.Contains(string(out), filepath.Join(e.paths.ConfigDir, "keys")) {
+	if !strings.Contains(string(out), "\nidentitiesonly yes\n") || !strings.Contains(string(out), "\npubkeyauthentication false\n") ||
+		strings.Contains(string(out), filepath.Join(e.paths.ConfigDir, "keys")) {
 		t.Errorf("ssh -G offers a hop key:\n%s", out)
 	}
 

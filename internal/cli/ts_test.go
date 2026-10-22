@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -106,6 +108,11 @@ func TestTSImportCreatesAndLinksHosts(t *testing.T) {
 	if len(prod.HostKeys) != 1 || !slices.Contains(prod.Addresses, "203.0.113.10") || !slices.Contains(prod.Addresses, "prod-db.tn.ts.net") {
 		t.Errorf("prod-db after linking: pins=%v addresses=%v (the unparseable key must be dropped; the old address kept)", prod.HostKeys, prod.Addresses)
 	}
+	// prod-db is Tailscale SSH and now pinned to Tailscale's keys: the vault
+	// says it is tailnet-only. build says nothing about SSH, so it stays auto.
+	if prod.Route != "tailnet" || byName["dalys-iphone"].Route != "auto" || byName["build"].Route != "auto" {
+		t.Errorf("routes: prod-db %q, dalys-iphone %q, build %q", prod.Route, byName["dalys-iphone"].Route, byName["build"].Route)
+	}
 	build := byName["build"]
 	if build.User != "ops" || build.Key == nil || build.Key.Name != "deploy-key" || !slices.Equal(build.Tags, []string{"tailnet"}) ||
 		build.Tailscale == nil || build.Tailscale.SSH != "unknown" || len(build.HostKeys) != 0 || build.Addresses[0] != "100.64.0.3" {
@@ -193,6 +200,10 @@ func TestTSLink(t *testing.T) {
 	json.Unmarshal([]byte(stdout), &v)
 	if v.Tailscale == nil || v.Tailscale.StableNodeID != "nPRODDB" || len(v.HostKeys) != 1 {
 		t.Errorf("web-1 = %+v", v)
+	}
+	// The node runs Tailscale SSH, so linking restricts the host to the tailnet.
+	if v.Route != "tailnet" {
+		t.Errorf("web-1 route = %q after linking a Tailscale SSH node", v.Route)
 	}
 	// And now the node resolves to web-1.
 	if code, out, _ := e.hop(t, "which", "100.64.0.2"); code != 0 || !strings.Contains(out, "host:     web-1") {
@@ -318,5 +329,118 @@ func TestTSImportAmbiguousInTheOtherDirection(t *testing.T) {
 	}
 	if e.store.Writes() != before {
 		t.Error("an ambiguous import wrote to the vault")
+	}
+}
+
+// swapTS is a Tailscale source the test can change under a running daemon.
+type swapTS struct {
+	mu sync.Mutex
+	st *tailscale.Status
+}
+
+func (s *swapTS) Status(context.Context) (*tailscale.Status, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.st, nil
+}
+
+func (s *swapTS) set(st *tailscale.Status) {
+	s.mu.Lock()
+	s.st = st
+	s.mu.Unlock()
+	time.Sleep(2200 * time.Millisecond) // the daemon caches the status for 2 seconds
+}
+
+// TestTSImportedHostStaysOnTheTailnetWhileTailscaleIsDown: the restriction is
+// stored on the host by ts import and ts link, so it holds when Tailscale is
+// not running and the node is not visible. The host has a direct address and
+// a key, which hop must not fall back to.
+func TestTSImportedHostStaysOnTheTailnetWhileTailscaleIsDown(t *testing.T) {
+	st, _ := tailnet(t)
+	src := &swapTS{st: st}
+	e := newE2EWith(t, src)
+	// A host with a key and a direct address that is the prod-db node.
+	if _, err := e.store.PutHost(context.Background(), model.Host{
+		Name: "prod-db", Addresses: []string{"127.0.0.1"}, Port: uint32(e.server.port), User: "deploy",
+		KeyID: e.keyID, Route: "auto", AgentAccess: "allow",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := e.hop(t, "ts", "import", "prod-db"); code != 0 {
+		t.Fatalf("ts import: %d %s", code, stderr)
+	}
+	if v := e.view(t, "prod-db"); v.Route != "tailnet" || len(v.HostKeys) == 0 {
+		t.Fatalf("prod-db after import: route %q, pins %v", v.Route, v.HostKeys)
+	}
+
+	src.set(tailscale.Unavailable("tailscale is Stopped"))
+	before := e.server.connections()
+
+	code, stdout, stderr := e.hop(t, "which", "--json", "prod-db")
+	var w cli.WhichResult
+	if err := json.Unmarshal([]byte(stdout), &w); err != nil || code != 0 || w.Route == nil {
+		t.Fatalf("which: %d %v %s %s", code, err, stdout, stderr)
+	}
+	if w.Route.Chosen != "tailnet" || w.Route.Fallback != "" || w.Route.Address == "127.0.0.1" || !strings.Contains(w.Route.Blocked, "tailscale is not available here") {
+		t.Errorf("route = %+v: the tailnet, blocked, no direct address", w.Route)
+	}
+	for _, args := range [][]string{
+		{"exec", "prod-db", "--", "echo", "ok"},
+		{"trust", "prod-db", "--yes"},
+		{"connect", "prod-db"},
+	} {
+		code, _, stderr := e.hop(t, args...)
+		if code != 255 || !strings.Contains(stderr, "tailscale is not available here") || !strings.Contains(stderr, "does not fall back to a direct address") {
+			t.Errorf("hop %v: code=%d stderr=%q, want a clear refusal", args, code, stderr)
+		}
+	}
+	code, stdout, _ = e.hop(t, "check", "prod-db", "--json")
+	var res cli.CheckResult
+	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range res.Steps {
+		if s.Name == "route" && (s.Status != "fail" || !strings.Contains(s.Detail, "tailscale is not available here")) {
+			t.Errorf("route step = %+v", s)
+		}
+	}
+	if code == 0 {
+		t.Error("check passed for a blocked host")
+	}
+	if got := e.server.connections() - before; got != 0 {
+		t.Errorf("hop connected %d times to the direct address of a tailnet-only host", got)
+	}
+
+	// With Tailscale back, the route is the tailnet address again.
+	src.set(st)
+	_, stdout, _ = e.hop(t, "which", "--json", "prod-db")
+	w = cli.WhichResult{}
+	json.Unmarshal([]byte(stdout), &w)
+	if w.Route == nil || w.Route.Blocked != "" || w.Route.Address != "100.64.0.2" {
+		t.Errorf("route with tailscale back = %+v", w.Route)
+	}
+}
+
+func TestTSLinkSetsTailnetOnlyForTailscaleSSHHosts(t *testing.T) {
+	for _, tc := range []struct{ name, route, node, want string }{
+		{"a node with published keys", "auto", "nPRODDB", "tailnet"},
+		{"a node without any", "auto", "nBUILD1", "auto"},
+		{"a route the user chose is not overridden", "direct", "nPRODDB", "direct"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, _ := tailnet(t)
+			e := newE2EWith(t, fixedTS{st})
+			if _, err := e.store.PutHost(context.Background(), model.Host{
+				Name: "h", Addresses: []string{"203.0.113.9"}, Port: 22, Route: tc.route, AgentAccess: "allow",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if code, _, stderr := e.hop(t, "ts", "link", "h", tc.node); code != 0 {
+				t.Fatalf("ts link: %d %s", code, stderr)
+			}
+			if got := e.view(t, "h").Route; got != tc.want {
+				t.Errorf("route = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
