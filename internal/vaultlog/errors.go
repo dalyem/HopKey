@@ -54,6 +54,8 @@ const (
 	RuleCheckpointRetired   Rule = "checkpoint.retired"
 	RuleCheckpointUnlock    Rule = "checkpoint.unlock"        // the new unlock blob does not yield the authenticated account keys
 	RuleUniqueID            Rule = "id.unique"                // an added ID is live or retired already
+	RuleRetireContents      Rule = "retire.contents"          // device_retire is not its normal entry's only op (rev 16)
+	RuleRetireSelf          Rule = "retire.self"              // device_retire names a device other than the author (rev 16)
 	RuleEnrollTranscript    Rule = "normal.enroll-transcript" // a normal entry's device_add has no enroll_transcript (rev 10 item 14)
 	RuleItemVersion         Rule = "item.version"
 	RuleItemType            Rule = "item.type"
