@@ -439,24 +439,40 @@ func (d *deviceStore) load() (*deviceRecord, error) {
 // the tombstone of a device this data directory is (DeviceID or Pending): a
 // revocation whose revoked.json was lost (§5.5, Store.revoke). device.key
 // is this directory's alone, so a tombstone of this account there counts
-// whichever device it names. A record that cannot be read is no
-// tombstone: that is for load to report.
+// whichever device it names. Only a confirmed absence (keyring.ErrNotFound,
+// a missing device.key) or a record that is read and is no tombstone
+// clears a self device. Any other read failure is inconclusive: it fails
+// with ErrKeyStoreUnavailable, which leaves the vault locked and changes
+// nothing, so a tombstone that cannot be read now is never deleted, nor
+// passed over for the other device's key. A tombstone found in one slot
+// wins over a failed read of the other.
 func (d *deviceStore) revokedSelf() error {
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
+		var unread error
 		for _, id := range d.cfg.self() {
 			raw, err := d.ring.Get(keychainService, d.slot(id))
+			if errors.Is(err, keyring.ErrNotFound) {
+				continue
+			}
 			if err != nil {
+				if unread == nil {
+					unread = fmt.Errorf("%w: the keychain entry of device %v could not be read: %v", ErrKeyStoreUnavailable, id, err)
+				}
 				continue
 			}
 			if t, ok := parseTombstone([]byte(raw)); ok && t.AccountID == d.cfg.AccountID && t.DeviceID == id {
 				return t.err()
 			}
 		}
+		return unread
 	case DeviceStoreFile:
 		b, err := os.ReadFile(d.l.deviceKeyFile())
-		if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrKeyStoreUnavailable, err)
 		}
 		if t, ok := parseTombstone(b); ok && t.AccountID == d.cfg.AccountID {
 			return t.err()
@@ -825,17 +841,32 @@ func (d *deviceStore) deleteSlot(id model.ID) error {
 // keychain entry is deleted, and device.key, if it holds id, is replaced
 // with keep (the record in use) or else deleted. A tombstone is never
 // removed: if either self device has one, it fails with ErrDeviceRevoked
-// (revokedSelf) and changes nothing.
+// (revokedSelf) and changes nothing. Nor is anything it could not read:
+// an inconclusive read of a self device, or of id's own record, fails with
+// ErrKeyStoreUnavailable and changes nothing.
 func (d *deviceStore) discard(id model.ID, keep *deviceRecord) error {
 	if err := d.revokedSelf(); err != nil {
 		return err
 	}
 	if d.cfg.Store != DeviceStoreFile {
+		raw, err := d.ring.Get(keychainService, d.slot(id))
+		if errors.Is(err, keyring.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%w: the keychain entry of device %v could not be read: %v", ErrKeyStoreUnavailable, id, err)
+		}
+		if t, ok := parseTombstone([]byte(raw)); ok {
+			return fmt.Errorf("%w: the keychain entry of device %v holds a tombstone (device %v), which is left alone", ErrDeviceKey, id, t.DeviceID)
+		}
 		return d.deleteSlot(id)
 	}
 	cur, ok, err := d.fileDevice()
-	if err != nil || !ok || cur != id {
-		return err
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrKeyStoreUnavailable, err)
+	}
+	if !ok || cur != id {
+		return nil
 	}
 	if keep != nil {
 		return d.storeDurably(keep)

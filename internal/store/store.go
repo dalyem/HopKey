@@ -24,6 +24,13 @@
 //	vault/outbox.json          the outbox counter
 //	vault/revoked.json         present once a checkpoint revoked this device (§5.5)
 //
+// device.json names this device and, while a password unlock is enrolling
+// one, its pending replacement; only those two are ever a source of the
+// device key. A data directory that a phase 1 build left mid-replacement,
+// with the replacement listed as stale and no pending member, is not
+// supported: its key is never loaded, and hop unlock --password enrolls
+// again. Phase 1 was never released, so no such directory needs migrating.
+//
 // One process owns the vault at a time: Open takes vault/owner.lock for the
 // life of the Store, and a second Open fails with ErrVaultBusy. That process
 // is the hop daemon; the CLI goes through it.
@@ -77,6 +84,12 @@ var (
 	// ErrDeviceKey means the device key could not be read. The vault stays
 	// locked; hop unlock --password restores the key.
 	ErrDeviceKey = errors.New("store: the device key is unavailable")
+	// ErrKeyStoreUnavailable means the device key store could not be read
+	// conclusively: a backend or access error, not a missing entry. The
+	// vault stays locked, nothing in the store or in device.json is changed,
+	// and no password unlock replaces the key until the store reads again
+	// (deviceStore.revokedSelf).
+	ErrKeyStoreUnavailable = errors.New("store: the device key store could not be read")
 	// ErrWrongPassword means the master password (with the Secret Key) did
 	// not open the account.
 	ErrWrongPassword = errors.New("store: wrong master password or Secret Key")
@@ -239,7 +252,9 @@ func (s *Store) deviceName() string {
 
 // Open opens the vault in cfg.DataDir and unlocks it with the device key.
 // If the device key cannot be read, the store is returned locked (Info says
-// why) so that hop unlock --password can still reach it. So is the vault of
+// why) so that hop unlock --password can still reach it. So it is when the
+// device key store cannot be read at all (ErrKeyStoreUnavailable), and
+// then the password unlock refuses too. So is the vault of
 // a revoked device, which never unlocks again. A vault that fails
 // verification is an error.
 //
@@ -258,7 +273,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := s.own(); err != nil {
 		return nil, err
 	}
-	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) {
+	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) && !errors.Is(err, ErrKeyStoreUnavailable) {
 		s.Close()
 		return nil, err
 	}
@@ -485,13 +500,18 @@ func (l layout) revokedFile() string { return filepath.Join(l.vault(), "revoked.
 // pending replacement of a password unlock (deviceConfig.self). Either
 // one's revocation is terminal for the directory.
 //
-// Either the marker or the tombstone keeps the revocation terminal under a
-// server that withholds the revoking checkpoint: Open, Unlock and both
-// password unlocks refuse when they find either, the tombstone of the
-// pending replacement included (checkRevoked, load). If both fail, the device
-// record is deleted as a last resort, and the error says so: a password
-// unlock against a server that withholds the checkpoint could then enroll
-// this machine again (the total-failure limitation).
+// The marker and a tombstone in every self record (DeviceID's and the
+// pending replacement's keychain entries, or device.key) are each
+// attempted, independently, and each failure is reported. Any one of them
+// keeps the revocation terminal under a server that withholds the revoking
+// checkpoint: Open, Unlock and both password unlocks refuse when they find
+// it (checkRevoked, load). Only if none was written is every self record
+// deleted, each independently, as a last resort, and the error says so: a
+// password unlock against a server that withholds the checkpoint could
+// then enroll this machine again (the total-failure limitation). A self
+// record whose deletion failed is still readable, and its key unlocks the
+// vault again after a restart unless the server shows the revocation; the
+// error names it.
 func (s *Store) revoke(rev *vaultlog.RevokedError) error {
 	s.setRevoked(fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, rev.DeviceID, rev.Head.Seq))
 	var failed []string
@@ -502,18 +522,18 @@ func (s *Store) revoke(rev *vaultlog.RevokedError) error {
 	if err == nil {
 		err = writeFileAtomic(s.l.revokedFile(), b)
 	}
-	markerOK := err == nil
-	if !markerOK {
+	written := err == nil
+	if !written {
 		failed = append(failed, fmt.Sprintf("recording it on disk failed: %v", err))
 	}
-	if err := s.tombstoneRecord(rev.DeviceID); err != nil {
-		failed = append(failed, fmt.Sprintf("replacing the device key with a tombstone failed: %v", err))
-		if !markerOK {
-			if err := s.destroyDeviceRecord(rev.DeviceID); err != nil {
-				failed = append(failed, fmt.Sprintf("deleting the device key failed: %v", err))
-			} else {
-				failed = append(failed, "the device key was deleted instead, so a server that withholds the revocation could enroll this machine again")
-			}
+	tombs, errs := s.tombstoneRecord(rev.DeviceID)
+	failed = append(failed, errs...)
+	if !written && tombs == 0 {
+		if errs := s.destroyDeviceRecord(rev.DeviceID); len(errs) > 0 {
+			failed = append(failed, errs...)
+			failed = append(failed, "a device key that could not be deleted is still readable on this machine")
+		} else {
+			failed = append(failed, "the device key was deleted instead, so a server that withholds the revocation could enroll this machine again")
 		}
 	}
 	s.dropLocked(s.revoked)
@@ -523,44 +543,68 @@ func (s *Store) revoke(rev *vaultlog.RevokedError) error {
 	return s.revoked
 }
 
-// tombstoneRecord overwrites device id's record with its tombstone
-// (deviceStore.tombstone). The revocation is the whole data directory's,
-// so the keychain entry of the other device it is (DeviceID or the pending
-// replacement) gets its own tombstone too, best effort: id's already keeps
-// the revocation terminal. The caller holds s.mu.
-func (s *Store) tombstoneRecord(id model.ID) error {
-	cfg, err := s.readDeviceConfig()
-	if err != nil {
-		return err
+// selfRecords is the device records a revocation of id reaches: in the
+// keychain, id's entry and the entry of every device this data directory
+// is (deviceConfig.self), DeviceID's and the pending replacement's;
+// device.key is one record, whichever self device it holds (ownsFile).
+func selfRecords(cfg deviceConfig, id model.ID) []model.ID {
+	if cfg.Store != DeviceStoreKeychain {
+		return []model.ID{id}
 	}
-	if err := s.hook("revoke:tombstone"); err != nil {
-		return err
-	}
-	ds := s.deviceStore(cfg)
-	if err := ds.tombstone(id); err != nil {
-		return err
-	}
-	if cfg.Store == DeviceStoreKeychain {
-		for _, other := range cfg.self() {
-			if other != id {
-				ds.tombstone(other)
-			}
+	ids := []model.ID{id}
+	for _, other := range cfg.self() {
+		if !slices.Contains(ids, other) {
+			ids = append(ids, other)
 		}
 	}
-	return nil
+	return ids
 }
 
-// destroyDeviceRecord deletes device id's record (deviceStore.destroy).
-// The caller holds s.mu.
-func (s *Store) destroyDeviceRecord(id model.ID) error {
+// tombstoneRecord overwrites every self record a revocation of id reaches
+// with its tombstone (selfRecords, deviceStore.tombstone), each
+// independently: one that fails does not stop the others. It returns how
+// many were written and a description of each failure. The caller holds
+// s.mu.
+func (s *Store) tombstoneRecord(id model.ID) (int, []string) {
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
-		return err
+		return 0, []string{fmt.Sprintf("replacing the device key with a tombstone failed: %v", err)}
+	}
+	if err := s.hook("revoke:tombstone"); err != nil {
+		return 0, []string{fmt.Sprintf("replacing the device key with a tombstone failed: %v", err)}
+	}
+	ds := s.deviceStore(cfg)
+	var n int
+	var failed []string
+	for _, rid := range selfRecords(cfg, id) {
+		if err := ds.tombstone(rid); err != nil {
+			failed = append(failed, fmt.Sprintf("replacing the device key of %v with a tombstone failed: %v", rid, err))
+			continue
+		}
+		n++
+	}
+	return n, failed
+}
+
+// destroyDeviceRecord deletes every self record a revocation of id
+// reaches (selfRecords, deviceStore.destroy), each independently, and
+// returns a description of each failure. The caller holds s.mu.
+func (s *Store) destroyDeviceRecord(id model.ID) []string {
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return []string{fmt.Sprintf("deleting the device key failed: %v", err)}
 	}
 	if err := s.hook("revoke:destroy"); err != nil {
-		return err
+		return []string{fmt.Sprintf("deleting the device key failed: %v", err)}
 	}
-	return s.deviceStore(cfg).destroy(id)
+	ds := s.deviceStore(cfg)
+	var failed []string
+	for _, rid := range selfRecords(cfg, id) {
+		if err := ds.destroy(rid); err != nil {
+			failed = append(failed, fmt.Sprintf("deleting the device key of %v failed: %v", rid, err))
+		}
+	}
+	return failed
 }
 
 // retryTombstone writes the tombstone of the device revoked.json names,
@@ -578,8 +622,10 @@ func (s *Store) retryTombstone() {
 // checkRevoked fails with ErrDeviceRevoked once this device is revoked: a
 // file at vault/revoked.json (any file counts: only hop writes it), or the
 // tombstone of a device this data directory is, DeviceID or the pending
-// replacement, in the device key store (deviceStore.revokedSelf). The
-// caller holds s.mu.
+// replacement, in the device key store (deviceStore.revokedSelf). A device
+// key store it cannot read conclusively fails with ErrKeyStoreUnavailable,
+// which is not a revocation: nothing is recorded, and the next check reads
+// again. The caller holds s.mu.
 func (s *Store) checkRevoked() error {
 	if s.revoked != nil {
 		return s.revoked
@@ -587,10 +633,11 @@ func (s *Store) checkRevoked() error {
 	b, err := os.ReadFile(s.l.revokedFile())
 	if errors.Is(err, os.ErrNotExist) {
 		if cfg, err := s.readDeviceConfig(); err == nil {
-			if err := s.deviceStore(cfg).revokedSelf(); err != nil {
+			err := s.deviceStore(cfg).revokedSelf()
+			if errors.Is(err, ErrDeviceRevoked) {
 				s.setRevoked(err)
-				return err
 			}
+			return err
 		}
 		return nil
 	}
@@ -829,7 +876,7 @@ func (s *Store) Head() (Head, error) {
 func (s *Store) Info() Info {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info := Info{Locked: s.state == nil, KitPending: s.kit != nil, Revoked: s.checkRevoked() != nil}
+	info := Info{Locked: s.state == nil, KitPending: s.kit != nil, Revoked: errors.Is(s.checkRevoked(), ErrDeviceRevoked)}
 	if cfg, err := s.readDeviceConfig(); err == nil {
 		info.DeviceStore = s.deviceStore(cfg).Describe()
 		info.AccountID = cfg.AccountID.String()

@@ -116,6 +116,9 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	} else if errors.Is(err, ErrDeviceRevoked) {
 		s.setRevoked(err)
 		return err
+	} else if errors.Is(err, ErrKeyStoreUnavailable) {
+		// A self record that cannot be read may be a tombstone.
+		return err
 	}
 	defer func() {
 		if old != nil {
