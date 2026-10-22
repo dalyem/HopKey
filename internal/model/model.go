@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ID is a 16-byte random identifier, written as 32 lowercase hex characters.
@@ -134,6 +135,58 @@ type Snippet struct {
 	Command     string   `json:"command"`
 	Params      []string `json:"params"`
 	Description string   `json:"description"`
+}
+
+// Grant is the management record for a token grant (spec §6.5, type
+// "grant"). It never holds the token seed or the token's KEM private key.
+// TokenKEMPK is a b64 member: encode grants with internal/canonjson, which
+// writes []byte as base64url without padding (spec §3).
+type Grant struct {
+	Header
+	GrantID        ID        `json:"grant_id"`
+	Name           string    `json:"name"`
+	ExpiresAt      Timestamp `json:"expires_at"`
+	TokenKEMPK     []byte    `json:"token_kem_pk"`
+	Items          []ID      `json:"items"` // sorted, unique
+	HostKeyMap     map[ID]ID `json:"host_key_map"`
+	KeyPolicy      string    `json:"key_policy"` // "dedicated" | "shared"
+	DedicatedKeyID ID        `json:"dedicated_key_id"`
+	ReissuedFrom   ID        `json:"reissued_from"`
+}
+
+// TimestampLayout is the spec §3 ts format.
+const TimestampLayout = "2006-01-02T15:04:05Z"
+
+// Timestamp is a ts value (spec §3): a UTC instant with one-second
+// precision, stored as Unix seconds and written YYYY-MM-DDTHH:MM:SSZ.
+type Timestamp int64
+
+// TimestampOf truncates t to whole seconds.
+func TimestampOf(t time.Time) Timestamp { return Timestamp(t.Unix()) }
+
+// Time returns ts as a UTC time.Time.
+func (ts Timestamp) Time() time.Time { return time.Unix(int64(ts), 0).UTC() }
+
+func (ts Timestamp) String() string { return ts.Time().Format(TimestampLayout) }
+
+// MarshalText fails for instants outside years 0000 to 9999, which the
+// four-digit year cannot express.
+func (ts Timestamp) MarshalText() ([]byte, error) {
+	s := ts.String()
+	if len(s) != len(TimestampLayout) {
+		return nil, fmt.Errorf("model: timestamp %d outside years 0000-9999", int64(ts))
+	}
+	return []byte(s), nil
+}
+
+// UnmarshalText accepts exactly YYYY-MM-DDTHH:MM:SSZ with in-range fields.
+func (ts *Timestamp) UnmarshalText(b []byte) error {
+	t, err := time.Parse(TimestampLayout, string(b))
+	if err != nil || len(b) != len(TimestampLayout) || t.Format(TimestampLayout) != string(b) {
+		return fmt.Errorf("model: %q is not a YYYY-MM-DDTHH:MM:SSZ timestamp", b)
+	}
+	*ts = TimestampOf(t)
+	return nil
 }
 
 // Snapshot is every live, decrypted item in a vault at one log head.
