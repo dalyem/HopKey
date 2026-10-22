@@ -286,3 +286,23 @@ func TestSafefCoversStringersAndNamedStrings(t *testing.T) {
 		t.Errorf("safef(nil, ints) = %q", got)
 	}
 }
+
+type nilTolerant struct{}
+
+func (*nilTolerant) String() string { return "\nhop: forged\x1b[2J" }
+
+type nilPanicky struct{ msg string }
+
+func (e *nilPanicky) Error() string { return e.msg }
+
+// Typed nil pointers never reach their methods: one would smuggle raw text
+// past sanitizing, the other would panic.
+func TestSafefTypedNil(t *testing.T) {
+	var s *nilTolerant
+	var e *nilPanicky
+	var err error = e
+	got := safef("a=%v b=%v c=%s", s, err, e)
+	if got != "a=<nil> b=<nil> c=<nil>" {
+		t.Errorf("safef with typed nils = %q", got)
+	}
+}

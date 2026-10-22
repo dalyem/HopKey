@@ -100,17 +100,20 @@ func cleanArg(a any) any {
 		return a
 	case string:
 		return oneLine(v)
-	case error:
-		return oneLine(v.Error())
 	case []string:
 		return oneLines(v)
 	}
 	rv := reflect.ValueOf(a)
-	switch a.(type) {
+	// A typed nil pointer is printed as a constant rather than through its
+	// methods: an Error or String method may dereference the receiver and
+	// panic, or tolerate nil and return text that would skip sanitizing.
+	if rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return "<nil>"
+	}
+	switch v := a.(type) {
+	case error:
+		return oneLine(v.Error())
 	case fmt.Stringer, fmt.Formatter:
-		if rv.Kind() == reflect.Pointer && rv.IsNil() {
-			return a
-		}
 		return oneLine(fmt.Sprintf("%v", a))
 	}
 	switch rv.Kind() {
