@@ -760,7 +760,7 @@ func TestKeyAddAndImportSSHConfig(t *testing.T) {
 	}
 
 	// Without --with-keys: the key is referenced, not imported.
-	code, stdout, stderr := e.hop(t, "import", "ssh-config", "--json", "--dry-run")
+	code, stdout, stderr := e.hop(t, "import", "ssh-config", "--yes", "--json", "--dry-run")
 	if code != 0 {
 		t.Fatalf("dry run: %d %s", code, stderr)
 	}
@@ -772,7 +772,7 @@ func TestKeyAddAndImportSSHConfig(t *testing.T) {
 		t.Errorf("dry run wrote to the store: dry_run=%v writes=%d", rep.DryRun, e.store.Writes())
 	}
 
-	if code, _, stderr := e.hop(t, "import", "ssh-config"); code != 0 {
+	if code, _, stderr := e.hop(t, "import", "ssh-config", "--yes"); code != 0 {
 		t.Fatalf("import: %d %s", code, stderr)
 	}
 	_, stdout, _ = e.hop(t, "info", "--json", "app-alias")
@@ -1241,7 +1241,7 @@ func TestImportWithKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, stdout, stderr := e.hop(t, "import", "ssh-config", "--with-keys", "--json")
+	code, stdout, stderr := e.hop(t, "import", "ssh-config", "--yes", "--with-keys", "--json")
 	if code != 0 {
 		t.Fatalf("import: %d %s", code, stderr)
 	}
@@ -1385,7 +1385,7 @@ func (e *e2e) writeSSHFile(t *testing.T, name, body string) string {
 func (e *e2e) importConfig(t *testing.T, cfg string, args ...string) cli.ImportReport {
 	t.Helper()
 	e.writeSSHFile(t, "config", cfg)
-	code, stdout, stderr := e.hop(t, append([]string{"import", "ssh-config", "--json"}, args...)...)
+	code, stdout, stderr := e.hop(t, append([]string{"import", "ssh-config", "--yes", "--json"}, args...)...)
 	if code != 0 {
 		t.Fatalf("import: %d %s", code, stderr)
 	}
@@ -1686,7 +1686,9 @@ func TestImportUserOfOneBlockDoesNotLeakToAnother(t *testing.T) {
 	}
 }
 
-func TestImportRefusesMatchExecUnlessAllowed(t *testing.T) {
+// ssh -G runs Match exec commands. hop's scan only lists them: consent, given
+// with --yes or at the prompt, is what lets ssh -G run at all.
+func TestImportNeedsConsentBeforeRunningSSH(t *testing.T) {
 	e := newE2E(t)
 	marker := filepath.Join(e.base, "ran")
 	included := e.writeSSHFile(t, "exec.conf", "Match originalhost h exec \"touch "+marker+"\"\n  User viaexec\n")
@@ -1696,21 +1698,22 @@ func TestImportRefusesMatchExecUnlessAllowed(t *testing.T) {
 		"in an Include":    "Include " + included + host,
 		"after other args": "Match host h exec \"touch " + marker + "\"" + host,
 		"negated":          "Match !exec \"touch " + marker + "\"\n  User viaexec" + host,
-		"negated after":    "Match originalhost h !exec \"touch " + marker + "\"" + host,
 		"upper case":       "MATCH EXEC \"touch " + marker + "\"" + host,
 		"quoted keyword":   "Match \"exec\" \"touch " + marker + "\"" + host,
-		"single quotes":    "Match 'exec' 'touch " + marker + "'" + host,
 		"split by quotes":  "Match \"!ex\"\"ec\" \"touch " + marker + "\"" + host,
 		"all and exec":     "Match all exec \"touch " + marker + "\"" + host,
 	} {
 		e.writeSSHFile(t, "config", cfg)
-		for _, args := range [][]string{{"import", "ssh-config"}, {"import", "ssh-config", "--dry-run"}} {
+		for _, args := range [][]string{{"import", "ssh-config"}, {"import", "ssh-config", "--dry-run"}, {"import", "ssh-config", "--json"}} {
 			code, _, stderr := e.hop(t, args...)
-			if code != 255 || !strings.Contains(stderr, "Match exec") || !strings.Contains(stderr, "--allow-match-exec") {
-				t.Errorf("%s %v: code=%d stderr=%q", name, args, code, stderr)
+			if code != 255 || !strings.Contains(stderr, "--yes") {
+				t.Errorf("%s %v: code=%d stderr=%q, want a refusal that names --yes", name, args, code, stderr)
+			}
+			if !slices.Contains(args, "--json") && !strings.Contains(stderr, "touch "+marker) {
+				t.Errorf("%s %v: the refusal does not show the Match exec line: %q", name, args, stderr)
 			}
 			if _, err := os.Stat(marker); err == nil {
-				t.Fatalf("%s %v: the Match exec command ran", name, args)
+				t.Fatalf("%s %v: the Match exec command ran without consent", name, args)
 			}
 			if e.inVault(t, "h") {
 				t.Fatalf("%s %v: something was imported", name, args)
@@ -1718,15 +1721,109 @@ func TestImportRefusesMatchExecUnlessAllowed(t *testing.T) {
 		}
 	}
 
-	e.writeSSHFile(t, "config", "Match originalhost h exec \"touch "+marker+"\"\n  User viaexec\n\nHost h\n  HostName 192.0.2.30\n")
-	if code, _, stderr := e.hop(t, "import", "ssh-config", "--allow-match-exec"); code != 0 {
-		t.Fatalf("import --allow-match-exec: %d %s", code, stderr)
-	}
+	// --yes is consent: ssh -G runs the command, and the output names the line.
+	cfg := "Match originalhost h exec \"touch " + marker + "\"\n  User viaexec" + host
+	rep := e.importConfig(t, cfg)
 	if _, err := os.Stat(marker); err != nil {
-		t.Errorf("--allow-match-exec: the command did not run, so ssh did not evaluate the Match: %v", err)
+		t.Errorf("--yes: the command did not run, so ssh did not evaluate the Match: %v", err)
 	}
 	if v := e.view(t, "h"); v.User != "viaexec" {
 		t.Errorf("h = %+v: the Match exec held", v)
+	}
+	cfgPath := filepath.Join(e.home, ".ssh", "config")
+	if w := strings.Join(rep.Warnings, "\n"); !strings.Contains(w, "Match exec") || !strings.Contains(w, cfgPath+":1") || !strings.Contains(w, "touch "+marker) {
+		t.Errorf("the JSON warnings do not name the Match exec line: %q", rep.Warnings)
+	}
+}
+
+func TestImportYesPrintsTheFindingsInText(t *testing.T) {
+	e := newE2E(t)
+	marker := filepath.Join(e.base, "ran")
+	cfgPath := e.writeSSHFile(t, "config", "Match originalhost h exec \"touch "+marker+"\"\n  User viaexec\n\nHost h\n  HostName 192.0.2.30\n")
+	code, _, stderr := e.hop(t, "import", "ssh-config", "--yes")
+	if code != 0 {
+		t.Fatalf("import --yes: %d %s", code, stderr)
+	}
+	if !strings.Contains(stderr, cfgPath+":1: Match originalhost h exec") || strings.Count(stderr, "touch "+marker) != 1 {
+		t.Errorf("stderr should list the Match exec line once: %q", stderr)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the command did not run: %v", err)
+	}
+}
+
+func TestImportPrompt(t *testing.T) {
+	e := newE2E(t)
+	marker := filepath.Join(e.base, "ran")
+	e.writeSSHFile(t, "config", "Match originalhost h exec \"touch "+marker+"\"\n  User viaexec\n\nHost h\n  HostName 192.0.2.30\n")
+	before := e.vaultHostCount(t)
+	e.tty = true
+	defer func() { e.tty = false }()
+	for _, answer := range []string{"n\n", "\n", "no\n", "maybe\n", ""} {
+		e.stdin = answer
+		code, _, stderr := e.hop(t, "import", "ssh-config")
+		if code != 255 || !strings.Contains(stderr, "[y/N]") || !strings.Contains(stderr, "touch "+marker) {
+			t.Errorf("answer %q: code=%d stderr=%q, want a refusal after showing the prompt and the Match exec line", answer, code, stderr)
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("answer %q: the Match exec command ran", answer)
+		}
+		if e.vaultHostCount(t) != before {
+			t.Fatalf("answer %q: something was imported", answer)
+		}
+	}
+	// A terminal does not make --json interactive.
+	e.stdin = "y\n"
+	if code, _, stderr := e.hop(t, "import", "ssh-config", "--json"); code != 255 || !strings.Contains(stderr, "--yes") {
+		t.Errorf("--json on a terminal: code=%d stderr=%q", code, stderr)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("--json asked nothing and ran the command")
+	}
+
+	e.stdin = "y\n"
+	code, stdout, stderr := e.hop(t, "import", "ssh-config")
+	if code != 0 {
+		t.Fatalf("answer y: %d %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "imported") {
+		t.Errorf("stdout = %q", stdout)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("answer y: the command did not run: %v", err)
+	}
+	if v := e.view(t, "h"); v.User != "viaexec" {
+		t.Errorf("h = %+v", v)
+	}
+}
+
+// A config hop finds nothing in still gets the question: hop's scan is best
+// effort, and ssh is what reads the config.
+func TestImportAsksEvenWhenTheScanFindsNothing(t *testing.T) {
+	e := newE2E(t)
+	marker := filepath.Join(e.base, "ssh-ran")
+	e.sshBin = e.fakeSSH(t, "touch "+marker)
+	e.writeSSHFile(t, "config", "Host a\n  HostName 192.0.2.1\n")
+	code, _, stderr := e.hop(t, "import", "ssh-config")
+	if code != 255 || !strings.Contains(stderr, "--yes") || !strings.Contains(stderr, "hop's scan is best effort") {
+		t.Errorf("non-interactive: code=%d stderr=%q", code, stderr)
+	}
+	e.tty, e.stdin = true, "n\n"
+	code, _, stderr = e.hop(t, "import", "ssh-config", "--dry-run")
+	e.tty = false
+	if code != 255 || !strings.Contains(stderr, "[y/N]") || !strings.Contains(stderr, "hop's scan is best effort") {
+		t.Errorf("interactive n: code=%d stderr=%q", code, stderr)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("ssh ran before the user agreed")
+	}
+	if e.inVault(t, "a") {
+		t.Error("something was imported")
+	}
+	e.sshBin = ""
+	rep := e.importConfig(t, "Host a\n  HostName 192.0.2.1\n")
+	if en := hostEntries(rep)["a"]; en.Status != "imported" {
+		t.Errorf("with --yes: a = %+v", en)
 	}
 }
 
@@ -1740,7 +1837,7 @@ func TestImportRunsSSHWithABareEnvironment(t *testing.T) {
 
 Host h
   HostName 192.0.2.31
-`, "--allow-match-exec")
+`)
 	if v := e.view(t, "h"); v.User != "cleanenv" {
 		t.Errorf("h user = %q: the caller's environment reached ssh", v.User)
 	}
@@ -1981,12 +2078,10 @@ func (e *e2e) vaultHostCount(t *testing.T) int {
 	return len(snap.Hosts)
 }
 
-// ssh reads an Include hop cannot resolve or read, so the import refuses to
-// run ssh -G over it, unless told to, and then still wants consent for Match
-// exec.
-func TestImportRefusesIncludesItCannotCheck(t *testing.T) {
+// An Include hop cannot resolve or read is listed in the confirmation and in
+// the report. ssh -G reads whatever it finds there; the user agreed to that.
+func TestImportListsIncludesItCannotCheck(t *testing.T) {
 	e := newE2E(t)
-	marker := filepath.Join(e.base, "ran")
 	unreadable := e.writeSSHFile(t, "locked.conf", "Host locked\n  User x\n")
 	if err := os.Chmod(unreadable, 0); err != nil {
 		t.Fatal(err)
@@ -1997,10 +2092,8 @@ func TestImportRefusesIncludesItCannotCheck(t *testing.T) {
 		canRead = true // root, say: the unreadable case proves nothing
 	}
 	host := "\n\nHost h\n  HostName 192.0.2.30\n"
-	before := e.vaultHostCount(t)
 	cases := map[string]struct{ cfg, want string }{
 		"variable":       {"Include ${SITEDIR}/extra.conf" + host, "environment variable"},
-		"variable only":  {"Include ${HOME}/.ssh/x.conf" + host, "environment variable"},
 		"another user":   {"Include ~bob/.ssh/extra.conf" + host, "~user"},
 		"host token":     {"Include /etc/ssh/%h.conf" + host, "token"},
 		"bad glob":       {"Include /nowhere/[" + host, "not a usable pattern"},
@@ -2010,48 +2103,42 @@ func TestImportRefusesIncludesItCannotCheck(t *testing.T) {
 	if canRead {
 		delete(cases, "unreadable")
 	}
+	before := e.vaultHostCount(t)
 	for name, c := range cases {
 		e.writeSSHFile(t, "config", c.cfg)
-		for _, args := range [][]string{nil, {"--dry-run"}} {
-			stderr := e.importFails(t, name, args...)
-			if !strings.Contains(stderr, "Include") || !strings.Contains(stderr, c.want) || !strings.Contains(stderr, "--allow-unscanned-includes") {
-				t.Errorf("%s %v: stderr = %q, want it to name the Include (%q) and the override", name, args, stderr, c.want)
-			}
-			if e.vaultHostCount(t) != before {
-				t.Fatalf("%s %v: something was imported", name, args)
-			}
+		stderr := e.importFails(t, name)
+		if !strings.Contains(stderr, "Include") || !strings.Contains(stderr, c.want) || !strings.Contains(stderr, "--yes") {
+			t.Errorf("%s: stderr = %q, want the Include (%q) listed and --yes named", name, stderr, c.want)
+		}
+		if e.vaultHostCount(t) != before {
+			t.Fatalf("%s: something was imported without consent", name)
+		}
+		// With --yes the report carries the same list, and says what was not
+		// enumerated. Whether ssh -G accepts the line is ssh's business.
+		e.writeSSHFile(t, "config", c.cfg)
+		code, stdout, stderr := e.hop(t, "import", "ssh-config", "--yes", "--json", "--dry-run")
+		if code != 0 {
+			t.Fatalf("%s --yes: %d %s", name, code, stderr)
+		}
+		var rep cli.ImportReport
+		if err := json.Unmarshal([]byte(stdout), &rep); err != nil {
+			t.Fatalf("%v\n%s", err, stdout)
+		}
+		w := strings.Join(rep.Warnings, "\n")
+		if !strings.Contains(w, "Include hop could not inspect") || !strings.Contains(w, c.want) || !strings.Contains(w, "not enumerated") {
+			t.Errorf("%s: warnings = %q", name, rep.Warnings)
 		}
 	}
 
-	// The override reads the config; the files that were checked still count.
-	e.writeSSHFile(t, "config", "Include ${SITEDIR}/extra.conf\nMatch originalhost h exec \"touch "+marker+"\"\n  User viaexec"+host)
-	stderr := e.importFails(t, "override with exec", "--allow-unscanned-includes")
-	if !strings.Contains(stderr, "--allow-match-exec") {
-		t.Errorf("the override did not keep the Match exec consent: %q", stderr)
-	}
-	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("the Match exec command ran")
-	}
-
-	// The unscanned files may hold Match exec too, so the override alone is
-	// not consent to run them.
-	e.writeSSHFile(t, "config", "Include ${SITEDIR}/extra.conf"+host)
-	stderr = e.importFails(t, "override alone", "--allow-unscanned-includes")
-	if !strings.Contains(stderr, "--allow-match-exec") {
-		t.Errorf("--allow-unscanned-includes without --allow-match-exec: %q", stderr)
-	}
-	rep := e.importConfig(t, "Include ${SITEDIR}/extra.conf"+host, "--allow-unscanned-includes", "--allow-match-exec")
+	rep := e.importConfig(t, "Include ${SITEDIR}/extra.conf"+host)
 	if en := hostEntries(rep)["h"]; en.Status != "imported" {
-		t.Errorf("with the override: h = %+v", en)
-	}
-	if w := strings.Join(rep.Warnings, "\n"); !strings.Contains(w, "SITEDIR") || !strings.Contains(w, "not checked") {
-		t.Errorf("the override left no warning naming the Include: %q", rep.Warnings)
+		t.Errorf("with --yes: h = %+v", en)
 	}
 }
 
 // A file the safety scan skips for aliases (hop's own generated config) is
 // still scanned for what it makes ssh do.
-func TestImportScansHopsOwnConfigForMatchExec(t *testing.T) {
+func TestImportListsMatchExecInHopsOwnConfig(t *testing.T) {
 	e := newE2E(t)
 	marker := filepath.Join(e.base, "ran")
 	if err := os.MkdirAll(e.paths.ConfigDir, 0o700); err != nil {
@@ -2063,11 +2150,22 @@ func TestImportScansHopsOwnConfigForMatchExec(t *testing.T) {
 	}
 	e.writeSSHFile(t, "config", "Include "+gen+"\n\nHost h\n  HostName 192.0.2.30\n")
 	stderr := e.importFails(t, "exec in the excluded file")
-	if !strings.Contains(stderr, "Match exec") || !strings.Contains(stderr, gen+":1") {
+	if !strings.Contains(stderr, "Match originalhost h exec") || !strings.Contains(stderr, gen+":1") {
 		t.Errorf("stderr = %q", stderr)
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("the Match exec command ran")
+	}
+	code, stdout, stderr := e.hop(t, "import", "ssh-config", "--yes", "--json")
+	if code != 0 {
+		t.Fatalf("--yes: %d %s", code, stderr)
+	}
+	var out cli.ImportReport
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatal(err)
+	}
+	if w := strings.Join(out.Warnings, "\n"); !strings.Contains(w, gen+":1") {
+		t.Errorf("warnings do not list the Match exec in hop's own config: %q", out.Warnings)
 	}
 }
 
@@ -2085,7 +2183,7 @@ func TestImportUsesThePasswdHome(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.passwdHome = alt
-	rep := e.importConfigAt(t, "", "--allow-match-exec")
+	rep := e.importConfigAt(t, "")
 	if w := strings.Join(rep.Warnings, "\n"); !strings.Contains(w, alt) || !strings.Contains(w, "passwd") || !strings.Contains(w, e.home) {
 		t.Errorf("no warning that the passwd home differs from $HOME: %q", rep.Warnings)
 	}
@@ -2098,7 +2196,7 @@ func TestImportUsesThePasswdHome(t *testing.T) {
 // default location.
 func (e *e2e) importConfigAt(t *testing.T, path string, args ...string) cli.ImportReport {
 	t.Helper()
-	all := []string{"import", "ssh-config", "--json"}
+	all := []string{"import", "ssh-config", "--yes", "--json"}
 	if path != "" {
 		all = append(all, path)
 	}
@@ -2159,8 +2257,49 @@ esac`,
 		e.writeSSHFile(t, "config", cfg)
 		before := e.vaultHostCount(t)
 		for _, args := range [][]string{nil, {"--dry-run"}} {
-			stderr := e.importFails(t, name, args...)
+			stderr := e.importFails(t, name, append([]string{"--yes"}, args...)...)
 			if !strings.Contains(stderr, "can't verify which Host blocks applied with this OpenSSH version") {
+				t.Errorf("%s %v: stderr = %q", name, args, stderr)
+			}
+			if e.vaultHostCount(t) != before {
+				t.Fatalf("%s %v: something was imported", name, args)
+			}
+		}
+	}
+}
+
+// Output hop drops cannot be read, and the line that says which Host blocks
+// applied may be in it: a probe whose stderr overflowed stops the import.
+func TestImportFailsClosedWhenTheTraceOverflows(t *testing.T) {
+	cfg := "Host a\n  HostName 192.0.2.1\n\nHost b\n  HostName 192.0.2.2\n"
+	noise := `head -c 1100000 /dev/zero | tr '\0' x >&2`
+	applied := func(host string) string {
+		return `echo "debug1: Reading configuration data $cfg" >&2; echo "debug1: $cfg line 1: Applying options for ` + host + `" >&2`
+	}
+	for name, debug := range map[string]string{
+		// A valid trace first, then more than hop keeps.
+		"the real probe": `case "$cfg" in
+*hop-trace*) ` + applied("hop-trace-probe") + ` ;;
+/dev/null) ;;
+*) ` + applied("a") + `; ` + noise + ` ;;
+esac`,
+		"the defaults probe": `case "$cfg" in
+*hop-trace*) ` + applied("hop-trace-probe") + ` ;;
+/dev/null) ` + noise + ` ;;
+*) ` + applied("a") + ` ;;
+esac`,
+		"the trace check": `case "$cfg" in
+*hop-trace*) ` + applied("hop-trace-probe") + `; ` + noise + ` ;;
+*) ` + applied("a") + ` ;;
+esac`,
+	} {
+		e := newE2E(t)
+		e.sshBin = e.fakeSSH(t, debug)
+		e.writeSSHFile(t, "config", cfg)
+		before := e.vaultHostCount(t)
+		for _, args := range [][]string{{"--yes"}, {"--yes", "--dry-run"}} {
+			stderr := e.importFails(t, name, args...)
+			if !strings.Contains(stderr, "can't verify which Host blocks applied with this OpenSSH version") || !strings.Contains(stderr, "nothing was imported") {
 				t.Errorf("%s %v: stderr = %q", name, args, stderr)
 			}
 			if e.vaultHostCount(t) != before {

@@ -125,7 +125,7 @@ Host dup web
 	if err := s.scan(main); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{filepath.Join(sshDir, "exec.conf") + ":1", main + ":3"}; !slices.Equal(s.matchExec, want) {
+	if want := []string{filepath.Join(sshDir, "exec.conf") + ":1", main + ":3"}; !slices.Equal(execSources(s), want) {
 		t.Errorf("matchExec = %q, want %q", s.matchExec, want)
 	}
 
@@ -138,6 +138,32 @@ Host dup web
 	if len(s.aliases) != 1 || len(s.unscanned) == 0 || !strings.Contains(s.unscanned[0], "nested too deeply") {
 		t.Errorf("a self-including file: aliases %v, unscanned %q", s.aliases, s.unscanned)
 	}
+}
+
+func TestLimitedBufferRecordsOverflow(t *testing.T) {
+	var b bytes.Buffer
+	l := &limitedBuffer{buf: &b, max: 4}
+	l.Write([]byte("abcd"))
+	if l.overflow || b.String() != "abcd" {
+		t.Errorf("exactly max: overflow=%v kept=%q", l.overflow, b.String())
+	}
+	if n, err := l.Write([]byte("ef")); n != 2 || err != nil || !l.overflow || b.String() != "abcd" {
+		t.Errorf("past max: n=%d err=%v overflow=%v kept=%q", n, err, l.overflow, b.String())
+	}
+	b.Reset()
+	l = &limitedBuffer{buf: &b, max: 4}
+	l.Write([]byte("abcdef"))
+	if !l.overflow || b.String() != "abcd" {
+		t.Errorf("one write across max: overflow=%v kept=%q", l.overflow, b.String())
+	}
+}
+
+func execSources(s *configScan) []string {
+	var out []string
+	for _, m := range s.matchExec {
+		out = append(out, m.source)
+	}
+	return out
 }
 
 func TestMatchRunsCommand(t *testing.T) {
@@ -188,8 +214,33 @@ func TestConfigScanFlagsMatchExecInAnyForm(t *testing.T) {
 	if err := s.scan(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{cfg + ":1", cfg + ":2"}; !slices.Equal(s.matchExec, want) {
+	if want := []string{cfg + ":1", cfg + ":2"}; !slices.Equal(execSources(s), want) {
 		t.Errorf("matchExec = %q, want %q", s.matchExec, want)
+	}
+	if got := s.matchExec[0].text; got != `Match !exec "x"` {
+		t.Errorf("the line text = %q", got)
+	}
+}
+
+func TestConsentNoticeAndPrintable(t *testing.T) {
+	s := &configScan{}
+	notice := consentNotice("/c", s)
+	if !strings.Contains(notice, "no `Match exec` lines") || !strings.Contains(notice, "hop's scan is best effort") {
+		t.Errorf("empty notice = %q", notice)
+	}
+	s.matchExec = []execLine{{"/c:3", "Match exec \"touch x\"\x1b[2J"}}
+	s.unscanned = []string{"/c:1: Include \"${X}\" uses an environment variable"}
+	notice = consentNotice("/c", s)
+	for _, want := range []string{"ssh -G", "DNS", "/c:3: Match exec \"touch x\"?[2J", "/c:1: Include", "not imported"} {
+		if !strings.Contains(notice, want) {
+			t.Errorf("notice lacks %q:\n%s", want, notice)
+		}
+	}
+	if strings.ContainsRune(notice, 0x1b) {
+		t.Errorf("a control character reached the terminal: %q", notice)
+	}
+	if got := printable(strings.Repeat("x", 500)); len(got) != maxShown+3 {
+		t.Errorf("a long line is cut to %d bytes, got %d", maxShown+3, len(got))
 	}
 }
 
