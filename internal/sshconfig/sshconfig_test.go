@@ -525,6 +525,36 @@ func TestReferencedFileGraceRestartsWhenDropped(t *testing.T) {
 	}
 }
 
+// The previous generation's times must be refreshed before the new config is
+// published; otherwise a crash between publishing and refreshing lets the next
+// Write prune files a reader of the previous config still needs.
+func TestPreviousGenerationIsRefreshedBeforePublish(t *testing.T) {
+	opts, clk := testOptsClock(t)
+	hostA := Host{Alias: "a", HostName: "h", PublicKey: newPub(t)}
+	hostB := Host{Alias: "b", HostName: "h", PublicKey: newPub(t)}
+	aKey := filepath.Join(opts.Dir, "keys", contentID(ssh.MarshalAuthorizedKey(hostA.PublicKey))+".pub")
+
+	mustWrite(t, opts, hostA)
+	clk.advance(10 * graceForTests) // config A has been current for a long time
+	want := clk.now()
+
+	var seen time.Time
+	testHookBeforeConfig = func() error {
+		fi, err := os.Stat(aKey)
+		if err != nil {
+			return err
+		}
+		seen = fi.ModTime()
+		return nil
+	}
+	t.Cleanup(func() { testHookBeforeConfig = nil })
+
+	mustWrite(t, opts, hostB)
+	if d := seen.Sub(want); d < -time.Second || d > time.Second {
+		t.Errorf("previous generation's mtime at publish = %v, want %v (refreshed before publishing)", seen, want)
+	}
+}
+
 func TestPruneSweepsOnlyOldTempFiles(t *testing.T) {
 	opts, clk := testOptsClock(t)
 	host := Host{Alias: "a", HostName: "h", PublicKey: newPub(t)}

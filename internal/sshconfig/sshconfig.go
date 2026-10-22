@@ -158,6 +158,16 @@ func Write(opts Options, hosts []Host) error {
 		return err
 	}
 
+	// Refresh the times of everything the new and previous configs name
+	// before the new config is published. If this ran afterwards, a crash in
+	// between would leave the previous generation with old times, and the
+	// next Write would prune it at once under a reader that had just read it.
+	keep := referencedFiles(f.config, prevConfig)
+	now := opts.clock()
+	if err := touch(dir, keysDir, keep, now); err != nil {
+		return fmt.Errorf("sshconfig: refreshing file times: %w", err)
+	}
+
 	if testHookBeforeConfig != nil {
 		if err := testHookBeforeConfig(); err != nil {
 			return err
@@ -170,11 +180,6 @@ func Write(opts Options, hosts []Host) error {
 		return err
 	}
 
-	keep := referencedFiles(f.config, prevConfig)
-	now := opts.clock()
-	if err := touch(dir, keysDir, keep, now); err != nil {
-		return fmt.Errorf("sshconfig: new config is in place, but refreshing file times failed: %w", err)
-	}
 	if err := prune(dir, keysDir, keep, now, opts.grace()); err != nil {
 		return fmt.Errorf("sshconfig: new config is in place, but removing old files failed: %w", err)
 	}
@@ -366,11 +371,37 @@ func touch(dir, keysDir string, keep map[string]bool, now time.Time) error {
 		if strings.HasSuffix(name, ".pub") {
 			d = keysDir
 		}
-		if err := os.Chtimes(filepath.Join(d, name), now, now); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := touchFile(filepath.Join(d, name), now); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// touchFile sets the times of a regular file and syncs it, so the new times
+// survive a crash before the config that depends on them is published. It
+// skips anything that is not a regular file rather than follow a symlink out
+// of the directory.
+func touchFile(path string, now time.Time) error {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil
+	}
+	if err := os.Chtimes(path, now, now); err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // isTemp reports whether name is a leftover of writeFileAtomic.
