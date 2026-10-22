@@ -33,7 +33,7 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	d, err := daemon.Start(daemon.Options{
 		Paths: e.Paths, Store: store, Version: version.Version,
 		Logf: func(format string, args ...any) {
-			fmt.Fprintf(e.Stderr, "%s %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
+			fmt.Fprintf(e.Stderr, "%s %s\n", time.Now().Format(time.RFC3339), safef(format, args...))
 		},
 	})
 	if errors.Is(err, daemon.ErrAlreadyRunning) {
@@ -60,7 +60,7 @@ func dialExisting(ctx context.Context, e *Env) (*daemon.Client, error) {
 		if socketAbsent(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("cannot reach the hop daemon at %s: %w", e.Paths.ControlSocket(), err)
+		return nil, fmt.Errorf("cannot reach the hop daemon at %s: %w", oneLine(e.Paths.ControlSocket()), cleanErr(err))
 	}
 	return c, nil
 }
@@ -124,22 +124,22 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 			daemon.StatusResult
 		}{true, st})
 	}
-	e.printf("hop daemon %s, pid %d, up since %s\n", st.Version, st.PID, st.StartedAt.Format(time.RFC3339))
+	e.printf("hop daemon %s, pid %d, up since %s\n", oneLine(st.Version), st.PID, st.StartedAt.Format(time.RFC3339))
 	e.printf("hosts:        %d (%d usable with ssh)\n", st.Hosts, st.SSHHosts)
 	e.printf("keys:         %d in the vault, %d in the agent\n", st.Keys, st.KeysInAgent)
-	e.printf("agent socket: %s\n", st.AgentSocket)
-	e.printf("ssh config:   %s\n", st.ConfigDir)
+	e.printf("agent socket: %s\n", oneLine(st.AgentSocket))
+	e.printf("ssh config:   %s\n", oneLine(st.ConfigDir))
 	printVaultStatus(e, st.Vault)
 	if st.Tailscale.Available {
 		e.printf("tailscale:    available\n")
 	} else {
-		e.printf("tailscale:    %s\n", st.Tailscale.Reason)
+		e.printf("tailscale:    %s\n", oneLine(st.Tailscale.Reason))
 	}
 	for _, w := range st.Warnings {
-		e.printf("warning:      %s\n", w)
+		e.printf("warning:      %s\n", oneLine(w))
 	}
 	if st.LastError != "" {
-		e.printf("last error:   %s\n", st.LastError)
+		e.printf("last error:   %s\n", oneLine(st.LastError))
 	}
 	return nil
 }

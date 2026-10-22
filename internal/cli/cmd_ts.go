@@ -139,7 +139,7 @@ func (p *tsPairs) reason(hosts []model.Host, n tailscale.Node) string {
 	}
 	slices.Sort(names)
 	names = slices.Compact(names)
-	return fmt.Sprintf("could be more than one host or node (%s); nothing was linked or pinned. Pick one: hop ts link <host> %s", strings.Join(names, ", "), n.ID)
+	return safef("could be more than one host or node (%s); nothing was linked or pinned. Pick one: hop ts link <host> %s", joinOne(names, ", "), n.ID)
 }
 
 // findNode finds the node a user means for hop ts link: by stable node ID,
@@ -272,7 +272,7 @@ func runTSImport(ctx context.Context, e *Env, args []string) error {
 			tsLink(&h, n, !*noPin)
 			saved, err := save(h)
 			if err != nil {
-				entry.Status, entry.Reason = "skipped", err.Error()
+				entry.Status, entry.Reason = "skipped", oneLine(err.Error())
 				break
 			}
 			hosts[matches[0]] = saved
@@ -289,7 +289,7 @@ func runTSImport(ctx context.Context, e *Env, args []string) error {
 			tsLink(&h, n, !*noPin)
 			saved, err := save(h)
 			if err != nil {
-				entry.Status, entry.Reason = "skipped", err.Error()
+				entry.Status, entry.Reason = "skipped", oneLine(err.Error())
 				break
 			}
 			hosts = append(hosts, saved)
@@ -311,12 +311,13 @@ func printTSReport(e *Env, asJSON bool, report []TSEntry) error {
 		fmt.Fprintln(e.Stderr, "no tailscale nodes")
 	}
 	for _, r := range report {
-		line := fmt.Sprintf("%-14s %s", r.Status, r.Node)
+		// Node and host names are raw in the JSON report; here they are text.
+		line := fmt.Sprintf("%-14s %s", r.Status, oneLine(r.Node))
 		if r.Host != "" && r.Host != r.Node {
-			line += " -> " + r.Host
+			line += " -> " + oneLine(r.Host)
 		}
 		if r.Reason != "" {
-			line += ": " + r.Reason
+			line += ": " + oneLine(r.Reason)
 		}
 		e.printf("%s\n", line)
 	}
@@ -345,7 +346,7 @@ func runTSLink(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
-		return failf("%s", describeUnresolved(rr.Result))
+		return failMsg(describeUnresolved(rr.Result))
 	}
 	nodes := findNode(st, pos[1])
 	switch {
@@ -354,7 +355,7 @@ func runTSLink(ctx context.Context, e *Env, args []string) error {
 	case len(nodes) > 1:
 		var ids []string
 		for _, n := range nodes {
-			ids = append(ids, fmt.Sprintf("%s (%s)", n.DNSName, n.ID))
+			ids = append(ids, safef("%s (%s)", n.DNSName, n.ID))
 		}
 		return failf("%q matches several tailscale nodes: %s; use the node ID, the full DNS name or the IP", pos[1], strings.Join(ids, ", "))
 	}

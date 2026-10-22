@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
@@ -68,7 +67,7 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	}
 	var warnings []string
 	if home != e.Home {
-		warnings = append(warnings, fmt.Sprintf("your home directory is %s in the passwd database but %s in $HOME; OpenSSH expands ~ from the passwd entry, so hop reads %s", home, e.Home, home))
+		warnings = append(warnings, safef("your home directory is %s in the passwd database but %s in $HOME; OpenSSH expands ~ from the passwd entry, so hop reads %s", home, e.Home, home))
 	}
 	path := filepath.Join(home, ".ssh", "config")
 	if len(pos) == 1 {
@@ -128,16 +127,18 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	}
 	for _, en := range imp.report.Entries {
 		// Names and reasons quote config values (paths, IdentityFile,
-		// HostKeyAlias, ssh's own errors), so they are made display-safe.
+		// HostKeyAlias, ssh's own errors). Reasons and warnings are made
+		// single-line where they are composed; the name is raw in the JSON
+		// report, so it is made safe here.
 		line := fmt.Sprintf("%-12s %s %s", en.Status, en.Kind, printable(en.Name))
 		if en.Reason != "" {
-			line += ": " + displaySafe(en.Reason)
+			line += ": " + oneLine(en.Reason)
 		}
 		e.printf("%s\n", line)
 	}
 	// The scan's findings were printed with the notice.
 	for _, w := range slices.Concat(warnings, imp.warnings) {
-		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", displaySafe(w))
+		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", oneLine(w))
 	}
 	if !*dryRun && slices.ContainsFunc(imp.report.Entries, func(en ImportEntry) bool { return en.Kind == "host" && en.Status == "imported" }) {
 		fmt.Fprintf(e.Stderr, "hop: imported hosts have no pinned host keys yet; pin each with: hop trust <host>\n")
@@ -179,7 +180,7 @@ func consentNotice(path string, s *configScan) string {
 func scanWarnings(s *configScan) []string {
 	var out []string
 	for _, m := range s.matchExec {
-		out = append(out, fmt.Sprintf("Match exec, run by ssh -G: %s: %s", printable(m.source), printable(m.text)))
+		out = append(out, safef("Match exec, run by ssh -G: %s: %s", printable(m.source), printable(m.text)))
 	}
 	for _, u := range s.unscanned {
 		out = append(out, "Include hop could not inspect: "+printable(u))
@@ -188,32 +189,6 @@ func scanWarnings(s *configScan) []string {
 		out = append(out, "Host names in the files those Includes name were not enumerated, so they are not imported (import them with their own path, or hop add)")
 	}
 	return out
-}
-
-// maxShown caps one line of config text echoed back to the user.
-const maxShown = 200
-
-// printable makes text from a config file safe to show: control characters,
-// which could rewrite what the terminal displays, become '?', and a long line
-// is cut.
-func printable(s string) string {
-	r := []rune(s)
-	cut := len(r) > maxShown
-	if cut {
-		r = r[:maxShown]
-	}
-	for i, c := range r {
-		// C0, DEL, C1 (which covers the ANSI CSI introducer), and Unicode
-		// format characters such as bidi overrides, which reorder what the
-		// prompt shows.
-		if c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0) || unicode.Is(unicode.Cf, c) {
-			r[i] = '?'
-		}
-	}
-	if cut {
-		return string(r) + "..."
-	}
-	return string(r)
 }
 
 // candidate is a host the import is working out: one Host line's worth of
@@ -251,7 +226,7 @@ func (im *importer) add(kind, name, status, reason string) int {
 }
 
 func (im *importer) warnf(format string, args ...any) {
-	im.warnings = append(im.warnings, fmt.Sprintf(format, args...))
+	im.warnings = append(im.warnings, safef(format, args...))
 }
 
 func (im *importer) imported() string {
@@ -287,12 +262,12 @@ func (im *importer) run() error {
 	bySource := map[string][]*candidate{}
 	for _, a := range im.scan.aliases {
 		if owner, ok := im.taken(a.Name); ok {
-			im.add("host", a.Name, "exists", fmt.Sprintf("already in the vault as %q", owner))
+			im.add("host", a.Name, "exists", safef("already in the vault as %q", owner))
 			continue
 		}
 		if !sshconfig.ValidAlias(a.Name) {
 			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source,
-				fmt.Sprintf("%q is not usable as a host name (letters, digits, '.', '_' and '-')", a.Name))
+				safef("%q is not usable as a host name (letters, digits, '.', '_' and '-')", a.Name))
 			continue
 		}
 		set, err := im.prober.run(im.ctx, im.config, a.Name, true)
@@ -300,7 +275,7 @@ func (im *importer) run() error {
 			if isTraceError(err) {
 				return err
 			}
-			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, err.Error())
+			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, oneLine(err.Error()))
 			continue
 		}
 		if why := set.traceProblem(); why != "" {
@@ -313,7 +288,7 @@ func (im *importer) run() error {
 			if isTraceError(err) {
 				return err
 			}
-			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, err.Error())
+			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, oneLine(err.Error()))
 			continue
 		}
 		c, why := im.candidateFor(a, set, def)
@@ -350,20 +325,20 @@ func (im *importer) candidateFor(a configAlias, set sshSettings, def sshSettings
 		return nil, "no Host line applies to this name under ssh's rules (it is negated, or its file is only included where a Match does not hold)"
 	}
 	if pc := set.ProxyCommand; pc != "" && !strings.EqualFold(pc, "none") {
-		return nil, fmt.Sprintf("ProxyCommand %q cannot be reproduced; importing it as a direct connection would change where ssh connects", pc)
+		return nil, safef("ProxyCommand %q cannot be reproduced; importing it as a direct connection would change where ssh connects", pc)
 	}
 	addr := set.HostName
 	if addr == "" {
 		addr = a.Name
 	}
 	if !sshconfig.ValidHostName(addr) {
-		return nil, fmt.Sprintf("HostName %q is not usable", addr)
+		return nil, safef("HostName %q is not usable", addr)
 	}
 	port := uint32(22)
 	if set.Port != "" {
 		n, err := strconv.Atoi(set.Port)
 		if err != nil || n <= 0 || n >= 65536 {
-			return nil, fmt.Sprintf("Port %q is not usable", set.Port)
+			return nil, safef("Port %q is not usable", set.Port)
 		}
 		port = uint32(n)
 	}
@@ -372,7 +347,7 @@ func (im *importer) candidateFor(a configAlias, set sshSettings, def sshSettings
 		user = "" // ssh's own default, not something the config says
 	}
 	if user != "" && !sshconfig.ValidUser(user) {
-		return nil, fmt.Sprintf("User %q is not usable", user)
+		return nil, safef("User %q is not usable", user)
 	}
 	c := &candidate{source: a.Source, jump: set.ProxyJump}
 	if strings.EqualFold(c.jump, "none") {
@@ -465,7 +440,7 @@ func (im *importer) save(cands []*candidate) {
 			}
 			if target == nil {
 				c.skipped = true
-				im.skip(c.entry, c.host.Name, c.source, fmt.Sprintf("its jump host %q was not saved, and without it %s would connect directly where ssh goes through the jump", c.jump, c.host.Name))
+				im.skip(c.entry, c.host.Name, c.source, safef("its jump host %q was not saved, and without it %s would connect directly where ssh goes through the jump", c.jump, c.host.Name))
 				return
 			}
 			c.host.JumpHostID = target.ItemID
@@ -479,7 +454,7 @@ func (im *importer) save(cands []*candidate) {
 		}
 		var saved model.Host
 		if err := call(im.ctx, im.e, daemon.OpPutHost, daemon.PutHostParams{Host: c.host}, &saved); err != nil {
-			im.report.Entries[c.entry].Status, im.report.Entries[c.entry].Reason = "failed", err.Error()
+			im.report.Entries[c.entry].Status, im.report.Entries[c.entry].Reason = "failed", oneLine(err.Error())
 			c.skipped = true
 			return
 		}
@@ -531,7 +506,7 @@ func (im *importer) importKey(path string) (model.ID, string, error) {
 	}
 	pem, key, err := readPrivateKey(im.e, path)
 	if err != nil {
-		return model.ID{}, "", errors.New(strings.TrimPrefix(err.Error(), path+": "))
+		return model.ID{}, "", errors.New(strings.TrimPrefix(err.Error(), oneLine(path)+": "))
 	}
 	fp := sshkeys.Fingerprint(key.Public)
 	for _, k := range im.l.Keys {
@@ -542,16 +517,16 @@ func (im *importer) importKey(path string) (model.ID, string, error) {
 	}
 	name := uniqueKeyName(im.l, filepath.Base(path))
 	if im.dryRun {
-		im.add("key", name, im.imported(), path)
+		im.add("key", name, im.imported(), oneLine(path))
 		im.l.Keys = append(im.l.Keys, daemon.KeyInfo{Name: name, Fingerprint: fp})
 		return model.ID{}, "", nil
 	}
 	var info daemon.KeyInfo
 	if err := call(im.ctx, im.e, daemon.OpPutKey, daemon.PutKeyParams{Name: name, PrivateKey: pem}, &info); err != nil {
-		im.add("key", name, "failed", err.Error())
+		im.add("key", name, "failed", oneLine(err.Error()))
 		return model.ID{}, "", err
 	}
-	im.add("key", name, "imported", path)
+	im.add("key", name, "imported", oneLine(path))
 	im.l.Keys = append(im.l.Keys, info)
 	id, err := model.ParseID(info.ID)
 	return id, "", err
@@ -664,7 +639,7 @@ func (im *importer) planJumps(cands []*candidate) {
 		for _, c := range cands {
 			if !c.skipped && c.jump != "" && jumpsToItself(c, len(cands)) {
 				c.skipped, changed = true, true
-				im.skip(c.entry, c.host.Name, c.source, fmt.Sprintf("ProxyJump %q leads back to the host through other imported hosts; hop cannot import a loop of jumps", c.jump))
+				im.skip(c.entry, c.host.Name, c.source, safef("ProxyJump %q leads back to the host through other imported hosts; hop cannot import a loop of jumps", c.jump))
 			}
 		}
 	}
@@ -688,20 +663,20 @@ func jumpsToItself(c *candidate, limit int) bool {
 func (im *importer) jumpProblem(c *candidate, cands []*candidate) string {
 	name := c.host.Name
 	if strings.Contains(c.jump, ",") {
-		return fmt.Sprintf("ProxyJump %q has several hops; only a single-hop jump can be imported", c.jump)
+		return safef("ProxyJump %q has several hops; only a single-hop jump can be imported", c.jump)
 	}
 	jump := parseJump(c.jump)
 	hit, ambiguous := im.jumpTarget(jump.host, cands)
 	switch {
 	case len(ambiguous) > 0:
-		return fmt.Sprintf("ProxyJump host %q matches several hosts (%s); pick one after importing with hop edit %s --jump <host>", jump.host, strings.Join(ambiguous, ", "), name)
+		return safef("ProxyJump host %q matches several hosts (%s); pick one after importing with hop edit %s --jump <host>", jump.host, strings.Join(ambiguous, ", "), name)
 	case hit == nil:
-		return fmt.Sprintf("ProxyJump host %q is not in the vault; add it, import again, or use hop edit %s --jump <host>", jump.host, name)
+		return safef("ProxyJump host %q is not in the vault; add it, import again, or use hop edit %s --jump <host>", jump.host, name)
 	case hit.cand == c:
-		return fmt.Sprintf("ProxyJump %q is the host itself", c.jump)
+		return safef("ProxyJump %q is the host itself", c.jump)
 	}
 	if why := jumpOverride(jump, hit.host); why != "" {
-		return fmt.Sprintf("ProxyJump %q %s; hop cannot import that (hop edit %s --jump %s uses the vault host as it is)", c.jump, why, name, hit.host.Name)
+		return safef("ProxyJump %q %s; hop cannot import that (hop edit %s --jump %s uses the vault host as it is)", c.jump, why, name, hit.host.Name)
 	}
 	if hit.cand != nil {
 		c.jumpTo, c.jumpToCnd = nil, hit.cand
@@ -719,9 +694,9 @@ func jumpOverride(j jumpSpec, h model.Host) string {
 	var diffs []string
 	if j.user != "" && j.user != h.User {
 		if h.User == "" {
-			diffs = append(diffs, fmt.Sprintf("logs in as %q but the vault host %s has no user", j.user, h.Name))
+			diffs = append(diffs, safef("logs in as %q but the vault host %s has no user", j.user, h.Name))
 		} else {
-			diffs = append(diffs, fmt.Sprintf("logs in as %q but the vault host %s uses %q", j.user, h.Name, h.User))
+			diffs = append(diffs, safef("logs in as %q but the vault host %s uses %q", j.user, h.Name, h.User))
 		}
 	}
 	if j.port != "" {
@@ -730,7 +705,7 @@ func jumpOverride(j jumpSpec, h model.Host) string {
 			port = 22
 		}
 		if n, err := strconv.Atoi(j.port); err != nil || uint32(n) != port {
-			diffs = append(diffs, fmt.Sprintf("uses port %s but the vault host %s uses %d", j.port, h.Name, port))
+			diffs = append(diffs, safef("uses port %s but the vault host %s uses %d", j.port, h.Name, port))
 		}
 	}
 	return strings.Join(diffs, " and ")

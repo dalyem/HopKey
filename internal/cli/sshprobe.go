@@ -132,7 +132,7 @@ func (p *sshProber) run(ctx context.Context, config, name string, trace bool) (s
 		if ctx.Err() != nil {
 			return sshSettings{}, fmt.Errorf("ssh -G timed out after %v", sshProbeTimeout)
 		}
-		return sshSettings{}, fmt.Errorf("ssh -G failed: %s", sshError(stderr.String(), err))
+		return sshSettings{}, fmt.Errorf("ssh -G failed: %s", oneLine(sshError(stderr.String(), err)))
 	}
 	return parseSSHG(stdout.String(), stderr.String()), nil
 }

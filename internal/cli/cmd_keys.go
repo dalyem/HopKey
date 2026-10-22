@@ -57,7 +57,7 @@ func readPrivateKey(e *Env, path string) (pem string, key *sshkeys.Private, err 
 		if e.ReadPassword == nil || !e.StdinTTY {
 			return "", nil, failf("%s is passphrase-protected; run this on a terminal so hop can ask for the passphrase", path)
 		}
-		pass, perr := e.ReadPassword(fmt.Sprintf("Passphrase for %s: ", path))
+		pass, perr := e.ReadPassword(safef("Passphrase for %s: ", path))
 		if perr != nil {
 			return "", nil, failf("reading the passphrase: %v", perr)
 		}
@@ -101,7 +101,7 @@ func runKeyAdd(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		return printJSON(e, info)
 	}
-	e.printf("added key %s (%s %s)\n", info.Name, info.KeyType, info.Fingerprint)
+	e.printf("added key %s (%s %s)\n", oneLine(info.Name), oneLine(info.KeyType), oneLine(info.Fingerprint))
 	return nil
 }
 
@@ -143,7 +143,8 @@ func runKeyLs(ctx context.Context, e *Env, args []string) error {
 	tw := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAME\tTYPE\tFINGERPRINT\tHOSTS")
 	for _, v := range views {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", v.Name, v.KeyType, v.Fingerprint, dash(strings.Join(v.Hosts, ",")))
+		// Vault text: no tabs or newlines may break the table.
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", oneLine(v.Name), oneLine(v.KeyType), oneLine(v.Fingerprint), dash(joinOne(v.Hosts, ",")))
 	}
 	return tw.Flush()
 }
@@ -175,9 +176,9 @@ func runKeyRm(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 	if len(using) > 0 {
-		return failf("key %s is used by %s; point those hosts at another key first (hop edit <host> --key <name>)", pos[0], strings.Join(using, ", "))
+		return failf("key %s is used by %s; point those hosts at another key first (hop edit <host> --key <name>)", pos[0], joinOne(using, ", "))
 	}
-	ok, err := confirm(e, *yes, fmt.Sprintf("Remove key %s? This deletes the private key from the vault.", pos[0]))
+	ok, err := confirm(e, *yes, safef("Remove key %s? This deletes the private key from the vault.", pos[0]))
 	if err != nil {
 		return err
 	}

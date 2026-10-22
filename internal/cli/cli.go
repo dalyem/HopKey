@@ -19,7 +19,6 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf16"
 
 	"github.com/dalyem/hopkey/internal/daemon"
@@ -100,9 +99,15 @@ type exitError struct {
 
 func (e *exitError) Error() string { return e.msg }
 
+// failf fails with a message built by safef: untrusted string and error
+// arguments are made single-line safe where they are inserted.
 func failf(format string, args ...any) error {
-	return &exitError{code: ExitFailure, msg: fmt.Sprintf(format, args...)}
+	return &exitError{code: ExitFailure, msg: safef(format, args...)}
 }
+
+// failMsg fails with a message that was composed from display-safe parts and
+// whose own line breaks are layout, such as describeUnresolved's.
+func failMsg(msg string) error { return &exitError{code: ExitFailure, msg: msg} }
 
 // silent is a failure whose explanation was already printed.
 func silent(code int) error { return &exitError{code: code} }
@@ -180,7 +185,7 @@ func Run(ctx context.Context, args []string, e *Env) int {
 func reportError(e *Env, msg string, args []string) {
 	if wantsJSON(args) {
 		b, _ := json.Marshal(map[string]string{"error": msg})
-		fmt.Fprintln(e.Stderr, string(escapeFormatChars(b)))
+		fmt.Fprintln(e.Stderr, string(escapeJSONControls(b)))
 		return
 	}
 	fmt.Fprintf(e.Stderr, "hop: %s\n", displaySafe(msg))
@@ -189,30 +194,32 @@ func reportError(e *Env, msg string, args []string) {
 // displaySafe neutralizes what could redraw or reorder the terminal: C0
 // controls other than newline and tab, DEL, C1 (which covers the CSI
 // introducer) and Unicode format characters such as bidi overrides. Callers
-// that quote a single untrusted value use printable, which also maps newlines.
+// that quote a single untrusted value use oneLine, which also maps newlines;
+// see display.go.
 func displaySafe(s string) string {
 	return strings.Map(func(c rune) rune {
 		if c == '\n' || c == '\t' {
 			return c
 		}
-		if c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0) || unicode.Is(unicode.Cf, c) {
+		if unsafeRune(c) {
 			return '?'
 		}
 		return c
 	}, s)
 }
 
-// escapeFormatChars rewrites Unicode format characters in encoded JSON as
-// \uXXXX escapes. encoding/json already escapes ASCII controls; this keeps
-// values intact for machines while bidi overrides stay inert on a terminal.
-// Format characters are never JSON syntax, so they only occur inside strings.
-func escapeFormatChars(b []byte) []byte {
-	if !bytes.ContainsFunc(b, func(c rune) bool { return unicode.Is(unicode.Cf, c) }) {
+// escapeJSONControls rewrites Unicode format characters in encoded JSON as
+// \uXXXX escapes, and so are DEL and C1 (U+0080 to U+009F). encoding/json
+// already escapes C0 controls; this keeps values intact for machines while
+// bidi overrides and the CSI introducer stay inert on a terminal. None of
+// these is JSON syntax, so they only occur inside strings.
+func escapeJSONControls(b []byte) []byte {
+	if !bytes.ContainsFunc(b, jsonUnsafeRune) {
 		return b
 	}
 	var out bytes.Buffer
 	for _, c := range string(b) {
-		if unicode.Is(unicode.Cf, c) {
+		if jsonUnsafeRune(c) {
 			if c > 0xffff {
 				hi, lo := utf16.EncodeRune(c)
 				fmt.Fprintf(&out, "\\u%04x\\u%04x", hi, lo)
@@ -225,6 +232,10 @@ func escapeFormatChars(b []byte) []byte {
 	}
 	return out.Bytes()
 }
+
+// jsonUnsafeRune is unsafeRune without the C0 range, which encoding/json
+// escapes itself.
+func jsonUnsafeRune(c rune) bool { return c >= ' ' && unsafeRune(c) }
 
 func wantsJSON(args []string) bool {
 	for _, a := range args {
@@ -330,7 +341,7 @@ func printJSON(e *Env, v any) error {
 	if err := enc.Encode(v); err != nil {
 		return err
 	}
-	_, err := e.Stdout.Write(escapeFormatChars(buf.Bytes()))
+	_, err := e.Stdout.Write(escapeJSONControls(buf.Bytes()))
 	return err
 }
 

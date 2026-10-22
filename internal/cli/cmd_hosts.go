@@ -145,19 +145,21 @@ func runLs(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintln(e.Stderr, "no hosts")
 		return nil
 	}
+	// Every field is vault text: oneLine takes out the tabs and newlines that
+	// would break the table, and the escapes that would redraw it.
 	tw := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "NAME\tADDRESS\tUSER\tKEY\tTAGS\tTAILSCALE\tPINS\tSSH")
 	for _, v := range views {
 		addr := ""
 		if len(v.Addresses) > 0 {
-			addr = v.Addresses[0]
+			addr = oneLine(v.Addresses[0])
 			if len(v.Addresses) > 1 {
 				addr += fmt.Sprintf(" +%d", len(v.Addresses)-1)
 			}
 		}
 		key := "-"
 		if v.Key != nil {
-			key = v.Key.Name
+			key = oneLine(v.Key.Name)
 		}
 		ts := "-"
 		if v.Tailscale != nil {
@@ -174,7 +176,7 @@ func runLs(ctx context.Context, e *Env, args []string) error {
 		if v.SSHProblem != "" {
 			sshState = "blocked"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", v.Name, addr, dash(v.User), key, dash(strings.Join(v.Tags, ",")), ts, len(v.HostKeys), sshState)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", oneLine(v.Name), addr, dash(oneLine(v.User)), key, dash(joinOne(v.Tags, ",")), ts, len(v.HostKeys), sshState)
 	}
 	return tw.Flush()
 }
@@ -202,7 +204,7 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
-		return failf("%s", describeUnresolved(rr.Result))
+		return failMsg(describeUnresolved(rr.Result))
 	}
 	l, err := listAll(ctx, e)
 	if err != nil {
@@ -213,48 +215,50 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		return printJSON(e, v)
 	}
-	e.printf("name:         %s\n", v.Name)
-	e.printf("id:           %s\n", v.ID)
+	// Every value below is vault text (or comes from the daemon's view of
+	// it), so each goes through oneLine as it is inserted.
+	e.printf("name:         %s\n", oneLine(v.Name))
+	e.printf("id:           %s\n", oneLine(v.ID))
 	if len(v.Aliases) > 0 {
-		e.printf("aliases:      %s\n", strings.Join(v.Aliases, ", "))
+		e.printf("aliases:      %s\n", joinOne(v.Aliases, ", "))
 	}
-	e.printf("addresses:    %s\n", strings.Join(v.Addresses, ", "))
+	e.printf("addresses:    %s\n", joinOne(v.Addresses, ", "))
 	e.printf("port:         %d\n", v.Port)
-	e.printf("user:         %s\n", dash(v.User))
+	e.printf("user:         %s\n", dash(oneLine(v.User)))
 	if v.Key != nil {
-		e.printf("key:          %s (%s)\n", v.Key.Name, v.Key.Fingerprint)
+		e.printf("key:          %s (%s)\n", oneLine(v.Key.Name), oneLine(v.Key.Fingerprint))
 	} else {
 		e.printf("key:          none\n")
 	}
 	if v.JumpHost != "" {
-		e.printf("jump host:    %s\n", v.JumpHost)
+		e.printf("jump host:    %s\n", oneLine(v.JumpHost))
 	}
-	e.printf("tags:         %s\n", dash(strings.Join(v.Tags, ", ")))
+	e.printf("tags:         %s\n", dash(joinOne(v.Tags, ", ")))
 	if v.Description != "" {
-		e.printf("description:  %s\n", v.Description)
+		e.printf("description:  %s\n", oneLine(v.Description))
 	}
-	e.printf("route:        %s\n", v.Route)
+	e.printf("route:        %s\n", oneLine(string(v.Route)))
 	if v.ChosenRoute != nil {
-		e.printf("would use:    %s:%d via %s\n", v.ChosenRoute.Address, v.ChosenRoute.Port, v.ChosenRoute.Label())
+		e.printf("would use:    %s:%d via %s\n", oneLine(v.ChosenRoute.Address), v.ChosenRoute.Port, oneLine(v.ChosenRoute.Label()))
 	}
-	e.printf("agent access: %s\n", v.AgentAccess)
+	e.printf("agent access: %s\n", oneLine(string(v.AgentAccess)))
 	if t := v.Tailscale; t != nil {
 		state := "unknown"
 		if t.Online != nil {
 			state = map[bool]string{true: "online", false: "offline"}[*t.Online]
 		}
-		e.printf("tailscale:    %s, %s, node %s, ssh %s\n", t.DNSName, state, t.StableNodeID, t.SSH)
+		e.printf("tailscale:    %s, %s, node %s, ssh %s\n", oneLine(t.DNSName), state, oneLine(t.StableNodeID), oneLine(t.SSH))
 	}
 	if len(v.HostKeys) == 0 {
-		e.printf("host keys:    none pinned (ssh will refuse this host until you run hop trust %s)\n", v.Name)
+		e.printf("host keys:    none pinned (ssh will refuse this host until you run hop trust %s)\n", oneLine(v.Name))
 	}
 	for _, p := range v.HostKeys {
-		e.printf("host key:     %s %s\n", p.Type, p.Fingerprint)
+		e.printf("host key:     %s %s\n", oneLine(p.Type), oneLine(p.Fingerprint))
 	}
 	if v.SSHAlias != "" {
-		e.printf("ssh:          ssh %s\n", v.SSHAlias)
+		e.printf("ssh:          ssh %s\n", oneLine(v.SSHAlias))
 	} else {
-		e.printf("ssh:          not available: %s\n", orUnknown(v.SSHProblem))
+		e.printf("ssh:          not available: %s\n", oneLine(orUnknown(v.SSHProblem)))
 	}
 	return nil
 }
@@ -360,7 +364,7 @@ func (hf *hostFlags) apply(ctx context.Context, e *Env, h *model.Host, l *daemon
 				return err
 			}
 			if rr.Result.Status != resolve.StatusMatched {
-				return failf("--jump: %s", describeUnresolved(rr.Result))
+				return failMsg("--jump: " + describeUnresolved(rr.Result))
 			}
 			id, err := model.ParseID(rr.Result.HostID)
 			if err != nil {
@@ -386,7 +390,7 @@ func findKey(l *daemon.ListResult, ref string) (model.ID, error) {
 	if len(names) == 0 {
 		return model.ID{}, failf("no key named %q; the vault has no keys yet (hop key add <path>)", ref)
 	}
-	return model.ID{}, failf("no key named %q; keys: %s", ref, strings.Join(names, ", "))
+	return model.ID{}, failf("no key named %q; keys: %s", ref, joinOne(names, ", "))
 }
 
 func runAdd(ctx context.Context, e *Env, args []string) error {
@@ -428,11 +432,11 @@ func reportHost(ctx context.Context, e *Env, asJSON bool, h model.Host, verb str
 	if asJSON {
 		return printJSON(e, v)
 	}
-	e.printf("%s %s\n", verb, v.Name)
+	e.printf("%s %s\n", verb, oneLine(v.Name))
 	if v.SSHProblem != "" {
-		fmt.Fprintf(e.Stderr, "hop: note: %s is not usable with ssh yet: %s\n", v.Name, v.SSHProblem)
+		fmt.Fprintf(e.Stderr, "hop: note: %s is not usable with ssh yet: %s\n", oneLine(v.Name), oneLine(v.SSHProblem))
 	} else if len(v.HostKeys) == 0 {
-		fmt.Fprintf(e.Stderr, "hop: note: no host key is pinned for %s; pin it with: hop trust %s\n", v.Name, v.Name)
+		fmt.Fprintf(e.Stderr, "hop: note: no host key is pinned for %s; pin it with: hop trust %s\n", oneLine(v.Name), oneLine(v.Name))
 	}
 	return nil
 }
@@ -454,7 +458,7 @@ func runEdit(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
-		return failf("%s", describeUnresolved(rr.Result))
+		return failMsg(describeUnresolved(rr.Result))
 	}
 	l, err := listAll(ctx, e)
 	if err != nil {
@@ -488,10 +492,10 @@ func runRm(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
-		return failf("%s", describeUnresolved(rr.Result))
+		return failMsg(describeUnresolved(rr.Result))
 	}
 	h := rr.Host
-	ok, err := confirm(e, *yes, fmt.Sprintf("Remove host %s (%s)?", h.Name, strings.Join(h.Addresses, ", ")))
+	ok, err := confirm(e, *yes, safef("Remove host %s (%s)?", h.Name, joinOne(h.Addresses, ", ")))
 	if err != nil {
 		return err
 	}
@@ -504,6 +508,6 @@ func runRm(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		return printJSON(e, map[string]any{"removed": h.Name, "id": h.ItemID.String()})
 	}
-	e.printf("removed %s\n", h.Name)
+	e.printf("removed %s\n", oneLine(h.Name))
 	return nil
 }

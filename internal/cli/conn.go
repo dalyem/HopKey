@@ -26,7 +26,7 @@ func connect(ctx context.Context, e *Env) (*daemon.Client, error) {
 	// Only a missing or dead socket means "start it". Anything else (a
 	// permission error, say) is reported as it is.
 	if !socketAbsent(err) {
-		return nil, fmt.Errorf("cannot reach the hop daemon at %s: %w", path, err)
+		return nil, fmt.Errorf("cannot reach the hop daemon at %s: %w", oneLine(path), cleanErr(err))
 	}
 	if err := startDaemon(ctx, e); err != nil {
 		return nil, err
@@ -49,7 +49,7 @@ func startDaemon(ctx context.Context, e *Env) error {
 		launch = func() error { return launchDaemon(e) }
 	}
 	if err := launch(); err != nil {
-		return fmt.Errorf("starting the hop daemon: %w", err)
+		return fmt.Errorf("starting the hop daemon: %w", cleanErr(err))
 	}
 	deadline := time.Now().Add(wait)
 	for {
@@ -59,7 +59,7 @@ func startDaemon(ctx context.Context, e *Env) error {
 			return nil
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return fmt.Errorf("the hop daemon did not come up within %s; see %s%s", wait, e.Paths.LogFile(), logTail(e.Paths.LogFile()))
+			return fmt.Errorf("the hop daemon did not come up within %s; see %s%s", wait, oneLine(e.Paths.LogFile()), logTail(e.Paths.LogFile()))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -108,7 +108,8 @@ func logTail(path string) string {
 	if len(lines) > 5 {
 		lines = lines[len(lines)-5:]
 	}
-	return ":\n  " + strings.Join(lines, "\n  ")
+	// The lines are the log's; the line breaks between them are ours.
+	return ":\n  " + joinOne(lines, "\n  ")
 }
 
 func (e *Env) environ() []string {
@@ -147,7 +148,8 @@ func call(ctx context.Context, e *Env, op string, params, result any) error {
 		return err
 	}
 	defer c.Close()
-	return c.Call(ctx, op, params, result)
+	// What the daemon says can quote vault values.
+	return cleanErr(c.Call(ctx, op, params, result))
 }
 
 // resolveTarget asks the daemon to resolve target. With interactive, an
@@ -178,6 +180,8 @@ func resolveTarget(ctx context.Context, e *Env, target string, interactive bool)
 
 // pick shows the candidates and returns the name the user chose.
 func pick(e *Env, res *resolve.Result) (string, error) {
+	// %q escapes what is unsafe; the candidate fields come from the vault and
+	// the tailnet, so they go through oneLine.
 	fmt.Fprintf(e.Stderr, "%q matches more than one host:\n", res.Target)
 	var named []resolve.Candidate
 	for _, c := range res.Candidates {
@@ -185,7 +189,7 @@ func pick(e *Env, res *resolve.Result) (string, error) {
 			continue // a tailnet node with no vault host cannot be connected to by name
 		}
 		named = append(named, c)
-		fmt.Fprintf(e.Stderr, "  %d) %s  %s  (%s)\n", len(named), c.Name, strings.Join(c.Addresses, ","), c.Detail)
+		fmt.Fprintf(e.Stderr, "  %d) %s  %s  (%s)\n", len(named), oneLine(c.Name), joinOne(c.Addresses, ","), oneLine(c.Detail))
 	}
 	if len(named) == 0 {
 		return "", failf("no vault host to pick; link the tailnet node with hop ts link <host> <node-id>")
@@ -203,26 +207,28 @@ func pick(e *Env, res *resolve.Result) (string, error) {
 }
 
 // describeUnresolved turns a Result that did not match into the error text
-// the user sees, with candidates listed.
+// the user sees, with candidates listed. The line breaks are its layout, so
+// every value in it is made single-line safe here; callers pass the result to
+// failMsg, not failf.
 func describeUnresolved(res *resolve.Result) string {
 	var sb strings.Builder
 	switch res.Status {
 	case resolve.StatusAmbiguous:
-		fmt.Fprintf(&sb, "%q is ambiguous (%s)", res.Target, res.Matched)
+		fmt.Fprintf(&sb, "%q is ambiguous (%s)", res.Target, oneLine(res.Matched))
 	case resolve.StatusPlainSSH:
 		fmt.Fprintf(&sb, "%q is not in the vault", res.Target)
 	default:
 		fmt.Fprintf(&sb, "no host matches %q", res.Target)
 	}
 	for _, c := range res.Candidates {
-		id := c.Name
+		id := oneLine(c.Name)
 		if len(c.Addresses) > 0 {
-			id += " (" + strings.Join(c.Addresses, ", ") + ")"
+			id += " (" + joinOne(c.Addresses, ", ") + ")"
 		}
-		fmt.Fprintf(&sb, "\n  candidate: %s - %s", id, c.Detail)
+		fmt.Fprintf(&sb, "\n  candidate: %s - %s", id, oneLine(c.Detail))
 	}
 	for _, n := range res.Notes {
-		fmt.Fprintf(&sb, "\n  note: %s", n)
+		fmt.Fprintf(&sb, "\n  note: %s", oneLine(n))
 	}
 	return sb.String()
 }

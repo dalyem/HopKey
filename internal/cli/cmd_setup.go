@@ -145,11 +145,11 @@ func runSetup(ctx context.Context, e *Env, args []string) error {
 		if *asJSON {
 			return printJSON(e, result)
 		}
-		e.printf("%s already includes %s\n", cfgPath, filepath.Join(e.Paths.ConfigDir, "config"))
+		e.printf("%s already includes %s\n", oneLine(cfgPath), oneLine(filepath.Join(e.Paths.ConfigDir, "config")))
 		return nil
 	}
 
-	fmt.Fprintf(e.Stderr, "hop will add %q at the top of %s", include, cfgPath)
+	fmt.Fprintf(e.Stderr, "hop will add %q at the top of %s", include, oneLine(cfgPath))
 	if len(old) > 0 {
 		fmt.Fprintf(e.Stderr, " (a backup is saved first)")
 	}
@@ -194,10 +194,10 @@ func runSetup(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		return printJSON(e, result)
 	}
-	e.printf("updated %s\n", cfgPath)
+	e.printf("updated %s\n", oneLine(cfgPath))
 	if b, ok := result["backup"]; ok {
-		e.printf("backup: %s\n", b)
+		e.printf("backup: %s\n", oneLine(fmt.Sprint(b)))
 	}
-	e.printf("The hop daemon writes %s the first time you run a hop command.\n", filepath.Join(e.Paths.ConfigDir, "config"))
+	e.printf("The hop daemon writes %s the first time you run a hop command.\n", oneLine(filepath.Join(e.Paths.ConfigDir, "config")))
 	return nil
 }

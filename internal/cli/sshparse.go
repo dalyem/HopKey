@@ -94,7 +94,7 @@ func (s *configScan) declares(file string, line int, alias string) bool {
 func (s *configScan) file(path string, depth int, aliases bool) error {
 	rc, err := s.readFile(path)
 	if err != nil {
-		return err
+		return cleanErr(err) // the message quotes the path
 	}
 	defer rc.Close()
 	sc := bufio.NewScanner(rc)
@@ -129,14 +129,14 @@ func (s *configScan) file(path string, depth int, aliases bool) error {
 			}
 		}
 	}
-	return sc.Err()
+	return cleanErr(sc.Err())
 }
 
 // include scans the files one Include argument names. Anything it cannot
 // resolve or read goes to s.unscanned: ssh -G may still read it.
 func (s *configScan) include(source, raw string, depth int, aliases bool) {
 	fail := func(why string) {
-		s.unscanned = append(s.unscanned, fmt.Sprintf("%s: Include %q %s", source, raw, why))
+		s.unscanned = append(s.unscanned, safef("%s: Include %q %s", source, raw, why))
 	}
 	if depth >= maxIncludeDepth {
 		fail("is nested too deeply")
@@ -149,7 +149,7 @@ func (s *configScan) include(source, raw string, depth int, aliases bool) {
 	}
 	matches, err := s.globFiles(pattern)
 	if err != nil {
-		fail(fmt.Sprintf("is not a usable pattern (%v)", err))
+		fail(safef("is not a usable pattern (%v)", err))
 		return
 	}
 	for _, m := range matches {
@@ -160,7 +160,7 @@ func (s *configScan) include(source, raw string, depth int, aliases bool) {
 		err := s.file(m, depth+1, sub)
 		// ssh skips a file that is gone and reads nothing from a directory.
 		if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.EISDIR) {
-			fail(fmt.Sprintf("names %s, which cannot be read (%v)", m, err))
+			fail(safef("names %s, which cannot be read (%v)", m, err))
 		}
 	}
 }
