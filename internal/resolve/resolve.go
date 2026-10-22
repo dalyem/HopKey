@@ -236,14 +236,15 @@ func (r *Result) byTailscale(nodes []tailscale.Node, hosts []model.Host) bool {
 		n := p.node
 		r.Tailscale = &n
 		return true
-	case len(linked) == 0:
-		for _, n := range unlinked {
-			r.Notes = append(r.Notes, fmt.Sprintf("tailscale node %q (%s) is not linked to a vault host; hop ts import or hop ts link links it", n.HostName, n.ID))
-		}
+	case len(nodes) == 1 && len(linked) == 0:
+		// One node and no vault host for it: a note, and the search goes on.
+		n := unlinked[0]
+		r.Notes = append(r.Notes, fmt.Sprintf("tailscale node %q (%s) is not linked to a vault host; hop ts import or hop ts link links it", n.HostName, n.ID))
 		return false
 	}
 
-	// Several nodes share the name, or several hosts claim one node.
+	// Several nodes share the name (linked or not), or several hosts claim one
+	// node. Falling through to DNS or fuzzy matching would pick among them.
 	r.Rule, r.Status = RuleTailscale, StatusAmbiguous
 	r.Matched = fmt.Sprintf("%d tailscale nodes or hosts match", len(nodes))
 	for _, p := range linked {

@@ -34,13 +34,17 @@ import (
 
 // Host is one vault host as ssh needs to see it.
 type Host struct {
-	Alias     string          // what the user types: ssh <alias>
-	HostName  string          // address to connect to
-	Port      int             // 0 means 22
-	User      string          // empty leaves ssh's own default
-	ProxyJump string          // alias of another Host in the same Write; empty means a direct connection
-	PublicKey ssh.PublicKey   // selects the agent key; the private half never leaves the agent
-	HostKeys  []ssh.PublicKey // pinned server keys; none means ssh refuses the host
+	Alias     string        // what the user types: ssh <alias>
+	HostName  string        // address to connect to
+	Port      int           // 0 means 22
+	User      string        // empty leaves ssh's own default
+	ProxyJump string        // alias of another Host in the same Write; empty means a direct connection
+	PublicKey ssh.PublicKey // selects the agent key; the private half never leaves the agent
+	// Keyless is for a host reached through Tailscale SSH, which authenticates
+	// the tailnet identity and needs no key. Its block has no IdentityFile and
+	// sets IdentitiesOnly, so the agent offers it nothing. PublicKey must be nil.
+	Keyless  bool
+	HostKeys []ssh.PublicKey // pinned server keys; none means ssh refuses the host
 }
 
 // Options says where the files go and which agent socket they point at.
@@ -283,12 +287,14 @@ func render(opts Options, hosts []Host) (*files, error) {
 		if port == 0 {
 			port = 22
 		}
-		pub := ssh.MarshalAuthorizedKey(h.PublicKey)
-		pubName := contentID(pub) + ".pub"
-		pubKeys[pubName] = pub
-		pubPath, err := quotePath(filepath.Join(opts.Dir, "keys", pubName))
-		if err != nil {
-			return nil, err
+		var pubPath string
+		if !h.Keyless {
+			pub := ssh.MarshalAuthorizedKey(h.PublicKey)
+			pubName := contentID(pub) + ".pub"
+			pubKeys[pubName] = pub
+			if pubPath, err = quotePath(filepath.Join(opts.Dir, "keys", pubName)); err != nil {
+				return nil, err
+			}
 		}
 
 		fmt.Fprintf(&config, "\nHost %s\n", h.Alias)
@@ -301,7 +307,9 @@ func render(opts Options, hosts []Host) (*files, error) {
 			fmt.Fprintf(&config, "  ProxyJump %s\n", h.ProxyJump)
 		}
 		fmt.Fprintf(&config, "  IdentityAgent %s\n", agentSock)
-		fmt.Fprintf(&config, "  IdentityFile %s\n", pubPath)
+		if !h.Keyless {
+			fmt.Fprintf(&config, "  IdentityFile %s\n", pubPath)
+		}
 		config.WriteString("  IdentitiesOnly yes\n")
 		config.WriteString("  ForwardAgent no\n")
 		// Pins are looked up under the alias, never the address, so they
@@ -339,8 +347,10 @@ func (h Host) validate() error {
 		return fmt.Errorf("sshconfig: host %q: invalid user %q", h.Alias, h.User)
 	case h.ProxyJump != "" && !aliasRe.MatchString(h.ProxyJump):
 		return fmt.Errorf("sshconfig: host %q: invalid ProxyJump %q", h.Alias, h.ProxyJump)
-	case h.PublicKey == nil:
+	case h.PublicKey == nil && !h.Keyless:
 		return fmt.Errorf("sshconfig: host %q: no public key", h.Alias)
+	case h.PublicKey != nil && h.Keyless:
+		return fmt.Errorf("sshconfig: host %q: a keyless host has a public key", h.Alias)
 	}
 	return nil
 }

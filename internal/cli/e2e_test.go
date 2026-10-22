@@ -583,6 +583,40 @@ func TestConnectExecsSSHWithTheGeneratedConfig(t *testing.T) {
 	}
 }
 
+func TestPickerKeepsTheUserOverride(t *testing.T) {
+	e := newE2E(t)
+	var gotArgv []string
+	run := func(stdin string, args ...string) (int, string) {
+		var so, se bytes.Buffer
+		env := &cli.Env{
+			Stdin: strings.NewReader(stdin), Stdout: &so, Stderr: &se,
+			Getenv: func(string) string { return "" }, Home: e.home, Paths: e.paths,
+			StdoutTTY: true, StdinTTY: true,
+			Environ: []string{"PATH=" + os.Getenv("PATH")},
+			ExecSSH: func(path string, argv, environ []string) error { gotArgv = argv; return nil },
+		}
+		code := cli.Run(context.Background(), args, env)
+		return code, se.String()
+	}
+	// "web" is a prefix of web-1 and web-2, so the terminal asks which.
+	if code, stderr := run("2\n", "root@web"); code != 0 {
+		t.Fatalf("hop root@web: exit %d, stderr %q", code, stderr)
+	}
+	cfg := filepath.Join(e.paths.ConfigDir, "config")
+	want := []string{"ssh", "-F", cfg, "-o", "HostName=127.0.0.1", "-o", "User=root", "--", "web-2"}
+	if !slices.Equal(gotArgv, want) {
+		t.Errorf("argv = %q\nwant   %q (the user typed before the picker must survive it)", gotArgv, want)
+	}
+	// No user typed, none added.
+	if code, stderr := run("1\n", "web"); code != 0 {
+		t.Fatalf("hop web: exit %d, stderr %q", code, stderr)
+	}
+	want = []string{"ssh", "-F", cfg, "-o", "HostName=127.0.0.1", "--", "web-1"}
+	if !slices.Equal(gotArgv, want) {
+		t.Errorf("argv = %q\nwant   %q", gotArgv, want)
+	}
+}
+
 func TestStatusLsAndInfoShowNoSecrets(t *testing.T) {
 	e := newE2E(t)
 
@@ -837,6 +871,14 @@ func (s *sshServer) setHostKey(signer ssh.Signer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cfg, s.hostKey = cfg, signer.PublicKey()
+}
+
+// allowNone makes the server accept a client that presents no credentials,
+// as Tailscale SSH does for an identity it has already checked.
+func (s *sshServer) allowNone() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.NoClientAuth = true
 }
 
 func (s *sshServer) useNewHostKey(t *testing.T) { s.setHostKey(newSigner(t)) }
@@ -1218,5 +1260,354 @@ func TestImportWithKeys(t *testing.T) {
 		if key == "" && !strings.Contains(v.Description, "could not be imported") {
 			t.Errorf("host %s: the description does not record the unimported IdentityFile: %q", name, v.Description)
 		}
+	}
+}
+
+// TestSetupBeatsAnEarlierStrictHostKeyCheckingNo runs the real ssh: a user
+// config that starts with "StrictHostKeyChecking no" must not be able to
+// switch off the pinning of a hop alias, so setup puts its Include above it.
+func TestSetupBeatsAnEarlierStrictHostKeyCheckingNo(t *testing.T) {
+	requireSSH(t)
+	for _, tc := range []struct{ name, config string }{
+		{"no include yet", "StrictHostKeyChecking no\n\nHost *\n  User someone\n"},
+		// Where an earlier setup, or the user, put it: after the directive,
+		// so ssh has already taken "no".
+		{"include already below the directive", "StrictHostKeyChecking no\nInclude @INCLUDE@\n\nHost *\n  User someone\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) { setupBeatsStrictNo(t, tc.config) })
+	}
+}
+
+func setupBeatsStrictNo(t *testing.T, config string) {
+	t.Helper()
+	base, err := os.MkdirTemp("", "hk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	home := filepath.Join(base, "home")
+	// Not the default ~/.ssh/hop: ssh expands "~" from the passwd entry, not
+	// from this test's home, so the include has to be an absolute path.
+	cfgDir := filepath.Join(base, "hopcfg")
+	for _, d := range []string{filepath.Join(home, ".ssh"), cfgDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	generated := "Host pinned\n  HostName 192.0.2.1\n  StrictHostKeyChecking yes\n  UpdateHostKeys no\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "config"), []byte(generated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	userCfg := filepath.Join(home, ".ssh", "config")
+	config = strings.ReplaceAll(config, "@INCLUDE@", filepath.Join(cfgDir, "config"))
+	if err := os.WriteFile(userCfg, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	effective := func() string {
+		out, err := exec.Command("ssh", "-F", userCfg, "-G", "pinned").Output()
+		if err != nil {
+			t.Fatalf("ssh -G: %v", err)
+		}
+		for _, l := range strings.Split(string(out), "\n") {
+			if v, ok := strings.CutPrefix(l, "stricthostkeychecking "); ok {
+				return v
+			}
+		}
+		t.Fatalf("no stricthostkeychecking in:\n%s", out)
+		return ""
+	}
+	if got := effective(); got != "false" {
+		t.Fatalf("before setup the user's config should win (false), got %q: the test would prove nothing", got)
+	}
+
+	var so, se bytes.Buffer
+	env := &cli.Env{
+		Stdin: strings.NewReader(""), Stdout: &so, Stderr: &se, Home: home,
+		Getenv: func(string) string { return "" },
+		Paths:  daemon.Paths{ConfigDir: cfgDir},
+	}
+	if code := cli.Run(context.Background(), []string{"setup", "--yes"}, env); code != 0 {
+		t.Fatalf("setup: exit %d, %s", code, se.String())
+	}
+	if got := effective(); got != "true" {
+		b, _ := os.ReadFile(userCfg)
+		t.Errorf("effective stricthostkeychecking for the hop alias = %q after setup, want true\n%s", got, b)
+	}
+	// And the user's own settings are all still there.
+	b, _ := os.ReadFile(userCfg)
+	if !strings.Contains(string(b), "StrictHostKeyChecking no\n") || !strings.Contains(string(b), "Host *\n  User someone\n") ||
+		strings.Count(string(b), "hopcfg") != 1 {
+		t.Errorf("the user's config was damaged:\n%s", b)
+	}
+}
+
+// importConfig writes cfg as the test home's ssh config and imports it.
+func (e *e2e) importConfig(t *testing.T, cfg string) cli.ImportReport {
+	t.Helper()
+	sshDir := filepath.Join(e.home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := e.hop(t, "import", "ssh-config", "--json")
+	if code != 0 {
+		t.Fatalf("import: %d %s", code, stderr)
+	}
+	var rep cli.ImportReport
+	if err := json.Unmarshal([]byte(stdout), &rep); err != nil {
+		t.Fatalf("%v\n%s", err, stdout)
+	}
+	return rep
+}
+
+func (e *e2e) view(t *testing.T, name string) cli.HostView {
+	t.Helper()
+	code, stdout, stderr := e.hop(t, "info", "--json", name)
+	if code != 0 {
+		t.Fatalf("info %s: %d %s", name, code, stderr)
+	}
+	var v cli.HostView
+	if err := json.Unmarshal([]byte(stdout), &v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func TestImportSkipsHostsItCannotReproduce(t *testing.T) {
+	e := newE2E(t)
+	rep := e.importConfig(t, `Host early
+  HostName 192.0.2.2
+  Port 2201
+
+Host *.corp
+  User shared
+
+Host db.corp
+  HostName 192.0.2.3
+
+Host tok
+  HostName 192.0.2.4
+  IdentityFile ~/.ssh/%r_key
+
+Host fine
+  HostName 192.0.2.5
+  User u1
+  User u2
+  Port 2203
+  Port 2204
+
+Host viamatch
+  HostName 192.0.2.1
+
+Match host viamatch
+  Port 2200
+`)
+	status := map[string]cli.ImportEntry{}
+	for _, en := range rep.Entries {
+		status[en.Name] = en
+	}
+	// viamatch has no Port of its own, so the Match block after it may decide
+	// it; early sets its own Port first; db.corp is behind a wildcard block
+	// that sets its User; tok has a token hop cannot expand.
+	for name, want := range map[string]string{"viamatch": "skipped", "early": "imported", "db.corp": "skipped", "tok": "skipped", "fine": "imported"} {
+		if status[name].Status != want {
+			t.Errorf("%s: %+v, want %s", name, status[name], want)
+		}
+	}
+	warnings := strings.Join(rep.Warnings, "\n")
+	if !strings.Contains(warnings, "db.corp") || !strings.Contains(warnings, "wildcard block") || !strings.Contains(warnings, "Match block") || !strings.Contains(warnings, "%r_key") {
+		t.Errorf("warnings do not explain the skipped hosts:\n%s", warnings)
+	}
+	if code, _, _ := e.hop(t, "info", "db.corp"); code == 0 {
+		t.Error("the skipped host db.corp is in the vault")
+	}
+	if f := e.view(t, "fine"); f.User != "u1" || f.Port != 2203 {
+		t.Errorf("fine = user %q port %d: the first value of a repeated setting wins", f.User, f.Port)
+	}
+	if v := e.view(t, "early"); v.Port != 2201 {
+		t.Errorf("early port = %d", v.Port)
+	}
+}
+
+func TestImportIncludeInsideAHostBlockApplies(t *testing.T) {
+	e := newE2E(t)
+	sshDir := filepath.Join(e.home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sshDir, "inc.conf"), []byte("HostName 192.0.2.6\nUser inc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.importConfig(t, "Host nested\n  Include inc.conf\n  Port 2202\n  User outer\n")
+	if v := e.view(t, "nested"); v.User != "inc" || v.Port != 2202 || !slices.Equal(v.Addresses, []string{"192.0.2.6"}) {
+		t.Errorf("nested = %+v: the included lines are in the block and come first", v)
+	}
+}
+
+func TestImportProxyJump(t *testing.T) {
+	e := newE2E(t)
+	ctx := context.Background()
+	put := func(h model.Host) {
+		t.Helper()
+		h.Port, h.Route, h.AgentAccess = cmpOr(h.Port, 22), "auto", "allow"
+		if _, err := e.store.PutHost(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(model.Host{Name: "gw", Addresses: []string{"198.51.100.1"}, User: "deploy", Port: 2200})
+	put(model.Host{Name: "nouser", Addresses: []string{"198.51.100.2"}})
+	// Two hosts that both answer to "twin" and to 198.51.100.9.
+	put(model.Host{Name: "twin-a", Aliases: []string{"twin"}, Addresses: []string{"198.51.100.9"}})
+	put(model.Host{Name: "twin-b", Aliases: []string{"twin"}, Addresses: []string{"198.51.100.9"}})
+
+	rep := e.importConfig(t, `Host via-same
+  HostName 192.0.2.11
+  ProxyJump deploy@gw:2200
+
+Host via-plain
+  HostName 192.0.2.12
+  ProxyJump gw
+
+Host via-other-user
+  HostName 192.0.2.13
+  ProxyJump root@gw
+
+Host via-other-port
+  HostName 192.0.2.14
+  ProxyJump gw:2222
+
+Host via-user-on-nouser
+  HostName 192.0.2.15
+  ProxyJump bob@nouser
+
+Host via-port-default
+  HostName 192.0.2.16
+  ProxyJump nouser:22
+
+Host via-twin-name
+  HostName 192.0.2.17
+  ProxyJump twin
+
+Host via-twin-address
+  HostName 192.0.2.18
+  ProxyJump 198.51.100.9
+
+Host via-unknown
+  HostName 192.0.2.19
+  ProxyJump nowhere
+`)
+	for name, want := range map[string]string{
+		"via-same": "gw", "via-plain": "gw", "via-port-default": "nouser",
+		"via-other-user": "", "via-other-port": "", "via-user-on-nouser": "",
+		"via-twin-name": "", "via-twin-address": "", "via-unknown": "",
+	} {
+		if got := e.view(t, name).JumpHost; got != want {
+			t.Errorf("%s: jump host = %q, want %q", name, got, want)
+		}
+	}
+	warnings := strings.Join(rep.Warnings, "\n")
+	for _, want := range []string{
+		`via-other-user: ProxyJump "root@gw"`, `via-other-port: ProxyJump "gw:2222"`, `via-user-on-nouser: ProxyJump "bob@nouser"`,
+		"matches several vault hosts (twin-a, twin-b)", "imported without the jump",
+	} {
+		if !strings.Contains(warnings, want) {
+			t.Errorf("warnings lack %q:\n%s", want, warnings)
+		}
+	}
+	// The hosts themselves were imported all the same.
+	for _, name := range []string{"via-other-user", "via-twin-name", "via-twin-address"} {
+		e.view(t, name)
+	}
+}
+
+func cmpOr(v, def uint32) uint32 {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
+// TestKeylessTailscaleSSHHostOverRealSSH: a host with Tailscale SSH and no key
+// is reached over the tailnet only, offers no key, and hop check does not
+// probe it directly.
+func TestKeylessTailscaleSSHHostOverRealSSH(t *testing.T) {
+	// The tailnet address of the node is the loopback address of the test
+	// server, so the real ssh gets somewhere.
+	st := &tailscale.Status{
+		Available: true, MagicDNSSuffix: "tn.ts.net",
+		Self: tailscale.Node{ID: "nSELF", HostName: "laptop", DNSName: "laptop.tn.ts.net", Online: true, IPs: []string{"100.64.0.1"}, Self: true},
+	}
+	e := newE2EWith(t, fixedTS{st})
+	e.server.allowNone()
+	pin := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(e.server.hostKey)))
+	st.Peers = []tailscale.Node{{ID: "nTS", HostName: "tshost", DNSName: "tshost.tn.ts.net", Online: true, IPs: []string{"127.0.0.1"}, SSHHostKeys: []string{pin}}}
+	if _, err := e.store.PutHost(context.Background(), model.Host{
+		Name: "ts-host", Addresses: []string{"203.0.113.77"}, Port: uint32(e.server.port), User: "deploy",
+		Route: "auto", AgentAccess: "allow", HostKeys: []string{pin},
+		Tailscale: &model.Tailscale{StableNodeID: "nTS", DNSName: "tshost.tn.ts.net", SSH: "yes"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := e.hop(t, "which", "ts-host")
+	if code != 0 || !strings.Contains(stdout, "127.0.0.1:"+strconv.Itoa(e.server.port)+" via tailnet (Tailscale SSH)") || strings.Contains(stdout, "fallback") {
+		t.Errorf("which: code=%d\n%s%s", code, stdout, stderr)
+	}
+	code, stdout, _ = e.hop(t, "info", "ts-host")
+	if code != 0 || !strings.Contains(stdout, "via tailnet (Tailscale SSH)") || !strings.Contains(stdout, "key:          none") {
+		t.Errorf("info: code=%d\n%s", code, stdout)
+	}
+	v := e.view(t, "ts-host")
+	if v.ChosenRoute == nil || !v.ChosenRoute.TailscaleSSH || v.ChosenRoute.Chosen != "tailnet" || v.ChosenRoute.Fallback != "" || v.SSHAlias != "ts-host" {
+		t.Errorf("view = %+v / %+v", v, v.ChosenRoute)
+	}
+
+	// The generated block names no key file, and real ssh agrees.
+	cfg := e.configFile(t)
+	_, rest, _ := strings.Cut(cfg, "Host ts-host\n")
+	block, _, _ := strings.Cut(rest, "\nHost ")
+	if strings.Contains(block, "\n  IdentityFile ") || !strings.Contains(block, "IdentitiesOnly yes") {
+		t.Errorf("block:\n%s", block)
+	}
+	out, err := exec.Command("ssh", "-F", filepath.Join(e.paths.ConfigDir, "config"), "-G", "ts-host").Output()
+	if err != nil {
+		t.Fatalf("ssh -G: %v", err)
+	}
+	if !strings.Contains(string(out), "\nidentitiesonly yes\n") || strings.Contains(string(out), filepath.Join(e.paths.ConfigDir, "keys")) {
+		t.Errorf("ssh -G offers a hop key:\n%s", out)
+	}
+
+	// check: no probe from hop itself, and ssh gets in with no credentials.
+	before := e.server.connections()
+	code, stdout, stderr = e.hop(t, "check", "ts-host", "--json")
+	if code != 0 {
+		t.Fatalf("check: %d\n%s%s", code, stdout, stderr)
+	}
+	var res cli.CheckResult
+	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+		t.Fatal(err)
+	}
+	steps := map[string]cli.Step{}
+	for _, s := range res.Steps {
+		steps[s.Name] = s
+	}
+	for name, want := range map[string]string{"route": "pass", "tcp_reachable": "skipped", "host_key_pinned": "pass", "host_key_matches": "skipped", "auth_ok": "pass"} {
+		if steps[name].Status != want {
+			t.Errorf("step %s = %+v, want %s", name, steps[name], want)
+		}
+	}
+	if !strings.Contains(steps["route"].Detail, "via tailnet (Tailscale SSH)") || !strings.Contains(steps["tcp_reachable"].Detail, "Tailscale SSH") {
+		t.Errorf("details: route %q, tcp %q", steps["route"].Detail, steps["tcp_reachable"].Detail)
+	}
+	if got := e.server.connections() - before; got != 1 {
+		t.Errorf("check made %d connections, want only ssh's own", got)
+	}
+
+	// And exec works the same way: no key, no direct address.
+	if code, stdout, stderr := e.hop(t, "exec", "ts-host", "--", "echo", "ok"); code != 0 || stdout != "ok\n" {
+		t.Errorf("exec: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }

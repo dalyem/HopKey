@@ -227,3 +227,96 @@ func TestTSCommandsWithoutTailscale(t *testing.T) {
 		}
 	}
 }
+
+// twinTailnet is a tailnet with two peers called "build", both publishing SSH
+// host keys, in the order given.
+func twinTailnet(t *testing.T, reversed bool) *tailscale.Status {
+	t.Helper()
+	pub := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(newSigner(t).PublicKey())))
+	a := tailscale.Node{ID: "nBUILDA", HostName: "build", DNSName: "build.tn.ts.net", Online: true, IPs: []string{"100.64.0.10"}, SSHHostKeys: []string{pub}}
+	b := tailscale.Node{ID: "nBUILDB", HostName: "build", DNSName: "build-1.tn.ts.net", Online: true, IPs: []string{"100.64.0.11"}, SSHHostKeys: []string{pub}}
+	peers := []tailscale.Node{a, b}
+	if reversed {
+		peers = []tailscale.Node{b, a}
+	}
+	return &tailscale.Status{
+		Available: true, MagicDNSSuffix: "tn.ts.net",
+		Self:  tailscale.Node{ID: "nSELF", HostName: "laptop", DNSName: "laptop.tn.ts.net", Online: true, IPs: []string{"100.64.0.1"}, Self: true},
+		Peers: peers,
+	}
+}
+
+func TestTSImportNeverLinksAnAmbiguousHost(t *testing.T) {
+	for _, reversed := range []bool{false, true} {
+		name := "peers in order"
+		if reversed {
+			name = "peers reversed"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newE2EWith(t, fixedTS{twinTailnet(t, reversed)})
+			// An existing, unlinked, unpinned host that could be either peer.
+			if _, err := e.store.PutHost(context.Background(), model.Host{
+				Name: "build", Addresses: []string{"203.0.113.50"}, Port: 22, Route: "auto", AgentAccess: "allow",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			before := e.store.Writes()
+			code, stdout, stderr := e.hop(t, "ts", "import", "--json")
+			if code != 0 {
+				t.Fatalf("import: %d %s", code, stderr)
+			}
+			got := decodeTS(t, stdout)
+			for _, id := range []string{"nBUILDA", "nBUILDB"} {
+				if got[id].Status != "ambiguous" || !strings.Contains(got[id].Reason, "hop ts link <host> "+id) {
+					t.Errorf("%s: %+v, want ambiguous with a pointer to hop ts link", id, got[id])
+				}
+			}
+			if e.store.Writes() != before {
+				t.Errorf("an ambiguous import wrote %d times; nothing may be linked, pinned or created", e.store.Writes()-before)
+			}
+			snap, err := e.store.Snapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, h := range snap.Hosts {
+				if h.Name == "build" && (h.Tailscale != nil || len(h.HostKeys) != 0) {
+					t.Errorf("host build was linked or pinned: tailscale=%+v pins=%v", h.Tailscale, h.HostKeys)
+				}
+			}
+
+			// Picking a node by its ID is the way out, and then it pins.
+			if code, _, stderr := e.hop(t, "ts", "link", "build", "nBUILDB"); code != 0 {
+				t.Fatalf("ts link by node ID: %d %s", code, stderr)
+			}
+			_, stdout, _ = e.hop(t, "info", "--json", "build")
+			var v cli.HostView
+			json.Unmarshal([]byte(stdout), &v)
+			if v.Tailscale == nil || v.Tailscale.StableNodeID != "nBUILDB" || len(v.HostKeys) != 1 {
+				t.Errorf("after ts link: %+v", v)
+			}
+		})
+	}
+}
+
+func TestTSImportAmbiguousInTheOtherDirection(t *testing.T) {
+	// One node, two hosts that both look like it: neither gets linked.
+	st, _ := tailnet(t)
+	e := newE2EWith(t, fixedTS{st})
+	ctx := context.Background()
+	for _, h := range []model.Host{
+		{Name: "prod-db", Addresses: []string{"203.0.113.10"}, Port: 22, Route: "auto", AgentAccess: "allow"},
+		{Name: "pdb", Aliases: []string{"prod-db.tn.ts.net"}, Addresses: []string{"100.64.0.2"}, Port: 22, Route: "auto", AgentAccess: "allow"},
+	} {
+		if _, err := e.store.PutHost(ctx, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := e.store.Writes()
+	_, stdout, _ := e.hop(t, "ts", "import", "--json", "prod-db")
+	if got := decodeTS(t, stdout); got["nPRODDB"].Status != "ambiguous" {
+		t.Errorf("report = %+v", got)
+	}
+	if e.store.Writes() != before {
+		t.Error("an ambiguous import wrote to the vault")
+	}
+}

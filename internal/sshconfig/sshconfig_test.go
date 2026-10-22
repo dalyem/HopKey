@@ -818,3 +818,30 @@ func TestProxyJump(t *testing.T) {
 		t.Error("ValidAlias disagrees with the alias rule")
 	}
 }
+
+func TestKeylessHostHasNoIdentityFile(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{Dir: filepath.Join(dir, "hop"), AgentSocket: filepath.Join(dir, "agent.sock")}
+	keyed := Host{Alias: "keyed", HostName: "192.0.2.1", PublicKey: newPub(t)}
+	keyless := Host{Alias: "ts", HostName: "100.64.0.7", Keyless: true}
+	f, err := render(opts, []Host{keyed, keyless})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := string(f.config)
+	_, rest, _ := strings.Cut(cfg, "Host ts\n")
+	block, _, _ := strings.Cut(rest, "\nHost ")
+	if strings.Contains(block, "\n  IdentityFile ") || !strings.Contains(block, "IdentitiesOnly yes\n") {
+		t.Errorf("keyless block:\n%s", block)
+	}
+	if len(f.pubKeys) != 1 {
+		t.Errorf("%d public key files, want only the keyed host's", len(f.pubKeys))
+	}
+	// Neither a keyless host with a key, nor a keyed host without, is allowed.
+	if _, err := render(opts, []Host{{Alias: "x", HostName: "h", Keyless: true, PublicKey: newPub(t)}}); err == nil {
+		t.Error("keyless with a public key was accepted")
+	}
+	if _, err := render(opts, []Host{{Alias: "x", HostName: "h"}}); err == nil {
+		t.Error("a host with neither key nor Keyless was accepted")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"strings"
@@ -18,10 +19,15 @@ import (
 	"github.com/dalyem/hopkey/internal/sshkeys"
 )
 
-const (
-	maxRequest     = 4 << 20 // bytes in one request line
-	requestTimeout = 30 * time.Second
-	idleTimeout    = 2 * time.Minute
+const maxRequest = 4 << 20 // bytes in one request line
+
+// Deadlines for one connection. The whole of a request line has to arrive
+// within idleTimeout of the previous response, so a client that stops sending,
+// or drips bytes, is cut off without holding up the others. They are
+// variables so tests can shorten them.
+var (
+	requestTimeout = 30 * time.Second // handling a request, and writing its response
+	idleTimeout    = 2 * time.Minute  // waiting for a whole request
 )
 
 func (d *Daemon) serveControl() {
@@ -57,7 +63,16 @@ func (d *Daemon) serveConn(c net.Conn) {
 	enc := json.NewEncoder(c)
 	for {
 		c.SetReadDeadline(time.Now().Add(idleTimeout))
-		if !sc.Scan() {
+		ok := sc.Scan()
+		// A read error ends the connection even when Scan hands back the
+		// half-line it had: a request cut off by the deadline is not a request.
+		if err := sc.Err(); err != nil {
+			if errors.Is(err, bufio.ErrTooLong) {
+				rejectOversize(c, enc)
+			}
+			return
+		}
+		if !ok {
 			return
 		}
 		var req Request
@@ -77,6 +92,19 @@ func (d *Daemon) serveConn(c net.Conn) {
 			return
 		}
 	}
+}
+
+// rejectOversize answers a request line longer than maxRequest and then reads
+// (and drops) what the client is still sending, for a short while and up to a
+// bound, so that closing the socket does not reset the connection before the
+// client has read the refusal.
+func rejectOversize(c net.Conn, enc *json.Encoder) {
+	c.SetWriteDeadline(time.Now().Add(requestTimeout))
+	if err := enc.Encode(errorResponse(invalidf("request is larger than %d bytes", maxRequest))); err != nil {
+		return
+	}
+	c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	io.Copy(io.Discard, io.LimitReader(c, 64<<20))
 }
 
 func errorResponse(err error) Response {

@@ -65,6 +65,10 @@ func startDaemon(ctx context.Context, e *Env) error {
 	}
 }
 
+// maxLogSize is how big the daemon log may get before the next start moves it
+// aside, keeping one previous generation.
+const maxLogSize = 1 << 20
+
 // launchDaemon runs `hop daemon` detached, with its output going to the log.
 func launchDaemon(e *Env) error {
 	if e.Executable == "" {
@@ -73,12 +77,7 @@ func launchDaemon(e *Env) error {
 	if _, err := safepath.EnsurePrivateDir(e.Paths.StateDir); err != nil {
 		return err
 	}
-	logPath := e.Paths.LogFile()
-	// Keep the log from growing without bound: one previous generation.
-	if fi, err := os.Stat(logPath); err == nil && fi.Size() > 1<<20 {
-		os.Rename(logPath, logPath+".1")
-	}
-	logf, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	logf, err := openLog(e.Paths.LogFile(), os.Getuid())
 	if err != nil {
 		return err
 	}
@@ -164,7 +163,11 @@ func resolveTarget(ctx context.Context, e *Env, target string, interactive bool)
 		if err != nil {
 			return nil, err
 		}
+		// Pick by the chosen host's name, and keep the user typed in user@target.
 		params.Target = picked
+		if u := rr.Result.User; u != "" {
+			params.Target = u + "@" + picked
+		}
 		rr = daemon.ResolveResult{}
 		if err := call(ctx, e, daemon.OpResolve, params, &rr); err != nil {
 			return nil, err
@@ -185,7 +188,7 @@ func pick(e *Env, res *resolve.Result) (string, error) {
 		fmt.Fprintf(e.Stderr, "  %d) %s  %s  (%s)\n", len(named), c.Name, strings.Join(c.Addresses, ","), c.Detail)
 	}
 	if len(named) == 0 {
-		return "", failf("no vault host to pick; link the tailnet node with hop ts import")
+		return "", failf("no vault host to pick; link the tailnet node with hop ts link <host> <node-id>")
 	}
 	fmt.Fprintf(e.Stderr, "pick 1-%d: ", len(named))
 	line, err := readLine(e.Stdin)

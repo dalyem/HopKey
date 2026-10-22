@@ -129,6 +129,7 @@ type plan struct {
 	hostName string
 	port     int
 	pub      ssh.PublicKey
+	keyless  bool // Tailscale SSH: the block offers no key
 	pins     []ssh.PublicKey
 	aliases  []string // the Host blocks it gets; the first is the primary
 	problem  string   // why the host gets none
@@ -189,7 +190,7 @@ func (d *Daemon) apply(ctx context.Context, snap model.Snapshot) (*state, error)
 		for _, alias := range p.aliases {
 			hosts = append(hosts, sshconfig.Host{
 				Alias: alias, HostName: p.hostName, Port: p.port, User: p.host.User,
-				ProxyJump: jump, PublicKey: p.pub, HostKeys: p.pins,
+				ProxyJump: jump, PublicKey: p.pub, Keyless: p.keyless, HostKeys: p.pins,
 			})
 		}
 	}
@@ -281,19 +282,25 @@ func (d *Daemon) plan(snap model.Snapshot, ts *tailscale.Status, pubs map[model.
 // checkHost fills in p's connection details and returns the reason the host
 // cannot go in the ssh config, or "".
 func (d *Daemon) checkHost(h model.Host, ts *tailscale.Status, pubs map[model.ID]ssh.PublicKey, keyProblem map[model.ID]string, p *plan, warn func(string, ...any)) string {
-	switch {
-	case !h.CredentialID.IsZero() && h.KeyID.IsZero():
-		return "password hosts are not supported yet; assign a key"
-	case h.KeyID.IsZero():
-		return "no key assigned; set one with hop edit " + h.Name + " --key <name>"
-	case keyProblem[h.KeyID] != "":
-		return keyProblem[h.KeyID]
+	// A Tailscale SSH host needs no key: Tailscale authenticates the tailnet
+	// identity, so its block offers none and the route is forced to the tailnet.
+	if _, only := resolve.TailscaleSSHOnly(h, ts); only && h.KeyID.IsZero() {
+		p.keyless = true
+	} else {
+		switch {
+		case !h.CredentialID.IsZero() && h.KeyID.IsZero():
+			return "password hosts are not supported yet; assign a key"
+		case h.KeyID.IsZero():
+			return "no key assigned; set one with hop edit " + h.Name + " --key <name>"
+		case keyProblem[h.KeyID] != "":
+			return keyProblem[h.KeyID]
+		}
+		pub, ok := pubs[h.KeyID]
+		if !ok {
+			return "its key is missing from the vault"
+		}
+		p.pub = pub
 	}
-	pub, ok := pubs[h.KeyID]
-	if !ok {
-		return "its key is missing from the vault"
-	}
-	p.pub = pub
 
 	route, err := resolve.ChooseRoute(h, ts)
 	if err != nil {

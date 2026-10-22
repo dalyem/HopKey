@@ -22,42 +22,42 @@ func includeLine(e *Env) string {
 }
 
 // ensureInclude returns content with the include line at the top. changed is
-// false when it is already there, before the first Host or Match line (an
-// Include after one would only apply inside that block). A copy further down
-// is removed.
+// false when HopKey's path is already the first argument of the first
+// directive in the file: ssh keeps the first value it sees for most options,
+// so anything read before HopKey's file (another directive, a Host or Match
+// line that would scope an Include, another path on the same Include line)
+// can override what the generated Host blocks say. Otherwise HopKey's path is
+// taken out of wherever it appears, leaving the other arguments of that line
+// where they were, and the include goes to the very top.
 func ensureInclude(content, include string, same func(arg string) bool) (out string, changed bool) {
 	lines := strings.Split(content, "\n")
-	firstBlock := len(lines)
-	for i, l := range lines {
-		if k, _ := splitDirective(l); k == "host" || k == "match" {
-			firstBlock = i
-			break
+	isOurs := func(sp argSpan) bool { return same(sp.val) }
+	for _, l := range lines {
+		spans := directiveSpans(l)
+		if len(spans) == 0 {
+			continue // blank or comment
 		}
-	}
-	isOurs := func(l string) bool {
-		k, args := splitDirective(l)
-		if k != "include" {
-			return false
+		// The first directive decides.
+		if strings.EqualFold(spans[0].val, "include") && len(spans) > 1 && isOurs(spans[1]) {
+			return content, false
 		}
-		for _, a := range args {
-			if same(a) {
-				return true
-			}
-		}
-		return false
+		break
 	}
-	present := false
-	for i := 0; i < firstBlock; i++ {
-		if isOurs(lines[i]) {
-			present = true
-		}
-	}
-	if present {
-		return content, false
-	}
+
 	var kept []string
 	for _, l := range lines {
-		if !isOurs(l) {
+		spans := directiveSpans(l)
+		if len(spans) < 2 || !strings.EqualFold(spans[0].val, "include") {
+			kept = append(kept, l)
+			continue
+		}
+		rest, removed, empty := withoutArgs(l, spans, isOurs)
+		switch {
+		case empty:
+			// The line held nothing but HopKey's path.
+		case removed:
+			kept = append(kept, rest)
+		default:
 			kept = append(kept, l)
 		}
 	}
@@ -67,6 +67,38 @@ func ensureInclude(content, include string, same func(arg string) bool) (out str
 		head += "\n"
 	}
 	return head + strings.TrimLeft(rest, "\n"), true
+}
+
+// withoutArgs removes the arguments of line (spans, from directiveSpans)
+// that match drop, and the blanks that separated them, leaving every other
+// word as it was written. empty reports that no argument was left.
+func withoutArgs(line string, spans []argSpan, drop func(argSpan) bool) (out string, removed, empty bool) {
+	var sb strings.Builder
+	last, left := 0, 0
+	for i, sp := range spans {
+		if i == 0 {
+			continue
+		}
+		if !drop(sp) {
+			left++
+			continue
+		}
+		removed = true
+		sb.WriteString(line[last:sp.start])
+		last = sp.end
+		// Swallow the blanks after the word so the next one keeps its place.
+		for last < len(line) && (line[last] == ' ' || line[last] == '\t') {
+			last++
+		}
+	}
+	if !removed {
+		return line, false, false
+	}
+	if left == 0 {
+		return "", true, true
+	}
+	sb.WriteString(line[last:])
+	return strings.TrimRight(sb.String(), " \t"), true, false
 }
 
 func runSetup(ctx context.Context, e *Env, args []string) error {
