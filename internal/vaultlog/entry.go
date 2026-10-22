@@ -14,9 +14,11 @@
 //     server runs (§5.3 "Who validates what").
 //   - Transition: public stage, revoked-here exit, plaintext stage (§5.5).
 //   - Anchor: the fresh-client anchor algorithm (§5.5).
-//   - BuildGenesis, BuildBootstrap, BuildNormal, BuildCheckpoint: the
-//     entries a client authors; every result has passed Transition or
-//     Anchor before it is returned.
+//   - ApplyPublic: the public stage for a server, returning the PublicState
+//     the public ops determine (rev 16). Clients never use it.
+//   - BuildGenesis, BuildBootstrap, BuildNormal, BuildRetire,
+//     BuildCheckpoint: the entries a client authors; every result has
+//     passed Transition or Anchor before it is returned.
 package vaultlog
 
 import (

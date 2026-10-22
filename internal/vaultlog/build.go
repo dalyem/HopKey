@@ -292,6 +292,36 @@ func BuildBootstrap(pre *State, sec *Secrets, d DeviceInfo, t model.Timestamp) (
 	return &b.w, s, next, nil
 }
 
+// BuildRetire builds the device_retire entry by which dev removes itself
+// (rev 16, §5.3): a normal entry, signed by dev, whose only op names dev.
+// Nothing is rotated. It verifies the result as a transition of pre by dev;
+// the returned State no longer lists dev as active.
+func BuildRetire(pre *State, sec *Secrets, dev DeviceKey, t model.Timestamp) (*Wire, *State, *Secrets, error) {
+	w, err := buildRetireWire(pre, sec, dev, t)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	s, next, err := Transition(pre, sec, dev, w, nil)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("vaultlog: built retirement fails verification: %w", err)
+	}
+	return w, s, next, nil
+}
+
+// buildRetireWire builds and signs a device_retire entry without verifying
+// it.
+func buildRetireWire(pre *State, sec *Secrets, dev DeviceKey, t model.Timestamp) (*Wire, error) {
+	if err := checkSecrets(pre, sec); err != nil {
+		return nil, err
+	}
+	b := newBuilder(nextEntry(pre, KindNormal, dev.DeviceID(), t))
+	b.op(&DeviceRetireOp{Op: OpDeviceRetire, DeviceID: dev.DeviceID()})
+	if err := b.signDevice(dev); err != nil {
+		return nil, err
+	}
+	return &b.w, nil
+}
+
 // NewGrant is a grant to create (§8.1): the plaintext grant record (with
 // its item_id, grant_id, token_kem_pk and expires_at set) and SHA-256(tAuth).
 type NewGrant struct {

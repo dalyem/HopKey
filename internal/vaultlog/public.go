@@ -30,6 +30,7 @@ type Candidate struct {
 
 	deviceAdds     map[model.ID]*DeviceAddOp // by device_id
 	revokedDevices idSet
+	retiredDevices idSet // device_retire (rev 16)
 	puts           map[model.ID]*ItemPutOp
 	deletes        map[model.ID]*ItemDeleteOp
 	grantAdds      map[model.ID]*GrantAddOp // by grant_id
@@ -47,6 +48,9 @@ func (c *Candidate) Kind() Kind { return c.Wire.Entry.Kind }
 
 // Revokes reports whether the entry revokes device id.
 func (c *Candidate) Revokes(id model.ID) bool { return c.revokedDevices[id] }
+
+// Retires reports whether the entry is device id's device_retire (rev 16).
+func (c *Candidate) Retires(id model.ID) bool { return c.retiredDevices[id] }
 
 // CheckPublic is the public stage of the transition algorithm (§5.5): seq,
 // prev, the header rules, the closed schemas, the public §5.3 rules for the
@@ -77,7 +81,7 @@ func checkPublic(pre *State, pin *crypto.AccountPin, w *Wire, objs ObjectFetcher
 	}
 	c := &Candidate{
 		Wire: w, H: h, Pre: pre, pin: pin,
-		deviceAdds: map[model.ID]*DeviceAddOp{}, revokedDevices: idSet{},
+		deviceAdds: map[model.ID]*DeviceAddOp{}, revokedDevices: idSet{}, retiredDevices: idSet{},
 		puts: map[model.ID]*ItemPutOp{}, deletes: map[model.ID]*ItemDeleteOp{},
 		grantAdds: map[model.ID]*GrantAddOp{}, grantByRecord: map[model.ID]*GrantAddOp{},
 		bundlePuts: map[model.ID]*BundlePutOp{}, revokedGrants: idSet{},
@@ -148,7 +152,7 @@ func CheckHeld(seq uint64, have crypto.Hash, e *Entry) error {
 // opNames lists the (category, id) pairs an op names for the
 // within-entry uniqueness rule of §5.2. Only each op's subject ID counts
 // (rev 10 item 1): item_put/item_delete item_id, device_add cert.device_id,
-// device_revoke device_id, grant_add/bundle_put/grant_revoke grant_id,
+// device_revoke and device_retire device_id, grant_add/bundle_put/grant_revoke grant_id,
 // deploy_op op_id, and the IDs in the retired lists. References such as
 // record_item_id, key_item_id or host_item_id don't.
 type namedID struct {
@@ -161,6 +165,8 @@ func opNames(o Op) []namedID {
 	case *DeviceAddOp:
 		return []namedID{{"device", o.Cert.DeviceID}}
 	case *DeviceRevokeOp:
+		return []namedID{{"device", o.DeviceID}}
+	case *DeviceRetireOp:
 		return []namedID{{"device", o.DeviceID}}
 	case *ItemPutOp:
 		return []namedID{{"item", o.ItemID}}
@@ -227,6 +233,18 @@ func (c *Candidate) collect() error {
 		if count[OpDeviceAdd] != 1 || len(e.Ops) != 1 {
 			return fail(RuleBootstrap, "bootstrap must hold exactly one device_add")
 		}
+	case KindNormal:
+		// A device can retire only itself, with an entry that does
+		// nothing else (rev 16). checkSigs then requires the author, and
+		// so the retired device, to be active in the pre-state.
+		if count[OpDeviceRetire] > 0 {
+			if len(e.Ops) != 1 {
+				return fail(RuleRetireContents, "device_retire must be the entry's only op, the entry holds %d", len(e.Ops))
+			}
+			if r := e.Ops[0].(*DeviceRetireOp); r.DeviceID != e.Author {
+				return fail(RuleRetireSelf, "device_retire names %v, the author is %v", r.DeviceID, e.Author)
+			}
+		}
 	case KindCheckpoint:
 		for _, n := range []string{OpAccountKeys, OpCreds, OpVKWrap, OpRetired} {
 			if count[n] != 1 {
@@ -250,6 +268,8 @@ func (c *Candidate) collect() error {
 			c.deviceAdds[o.Cert.DeviceID] = o
 		case *DeviceRevokeOp:
 			c.revokedDevices[o.DeviceID] = true
+		case *DeviceRetireOp:
+			c.retiredDevices[o.DeviceID] = true
 		case *ItemPutOp:
 			c.puts[o.ItemID] = o
 		case *ItemDeleteOp:
@@ -508,6 +528,17 @@ func (c *Candidate) apply(accountID model.ID) error {
 		}
 		delete(post.Devices, id)
 	}
+	// device_retire removes its author from the active set (rev 16).
+	// checkSigs has already required the author to be active; this repeats
+	// it for the op itself.
+	for id := range c.retiredDevices {
+		if !anchor {
+			if _, ok := pre.Devices[id]; !ok {
+				return fail(RuleAuthorState, "device_retire names %v, which is not active", id)
+			}
+		}
+		delete(post.Devices, id)
+	}
 	for id, d := range c.deviceAdds {
 		if d.Cert.AKV != e.AKV {
 			return fail(RuleCertAKV, "certificate of %v has akv %d, entry akv is %d", id, d.Cert.AKV, e.AKV)
@@ -695,7 +726,7 @@ func (c *Candidate) apply(accountID model.ID) error {
 	} else if !anchor {
 		post.Retired = Retired{
 			ItemIDs:   unionSorted(pre.Retired.ItemIDs, newRetiredItems),
-			DeviceIDs: unionSorted(pre.Retired.DeviceIDs, nil),
+			DeviceIDs: unionSorted(pre.Retired.DeviceIDs, c.retiredDevices),
 			GrantIDs:  unionSorted(pre.Retired.GrantIDs, c.revokedGrants),
 		}
 	}
@@ -806,8 +837,11 @@ func checkDeployUpdate(old, n *DeployOp) error {
 }
 
 // checkRetired: retired = the pre-state retired sets ∪ every item deleted,
-// device revoked and grant revoked since then, including this entry
-// (§5.3). At an anchor the pre-state is unknown; the entry's own
+// device revoked, device retired (rev 16) and grant revoked since then,
+// including this entry (§5.3). The verified state's Retired is already
+// cumulative: every normal entry adds its deletions, grant revocations and
+// retirement to it, so the pre-state sets hold everything since the last
+// checkpoint. At an anchor the pre-state is unknown; the entry's own
 // revocations must still be listed.
 func (c *Candidate) checkRetired() error {
 	r := c.retired

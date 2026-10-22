@@ -18,6 +18,7 @@ const (
 	OpVKWrap       = "vk_wrap"
 	OpDeviceAdd    = "device_add"
 	OpDeviceRevoke = "device_revoke"
+	OpDeviceRetire = "device_retire" // rev 16
 	OpItemPut      = "item_put"
 	OpItemDelete   = "item_delete"
 	OpRetired      = "retired"
@@ -78,6 +79,13 @@ type DeviceAddOp struct {
 
 // DeviceRevokeOp is {op, device_id:id}.
 type DeviceRevokeOp struct {
+	Op       string   `json:"op"`
+	DeviceID model.ID `json:"device_id"`
+}
+
+// DeviceRetireOp is {op, device_id:id} (rev 16): an active device removes
+// itself with a normal entry it signs. Nothing is rotated.
+type DeviceRetireOp struct {
 	Op       string   `json:"op"`
 	DeviceID model.ID `json:"device_id"`
 }
@@ -211,6 +219,7 @@ func (*CredsOp) Name() string        { return OpCreds }
 func (*VKWrapOp) Name() string       { return OpVKWrap }
 func (*DeviceAddOp) Name() string    { return OpDeviceAdd }
 func (*DeviceRevokeOp) Name() string { return OpDeviceRevoke }
+func (*DeviceRetireOp) Name() string { return OpDeviceRetire }
 func (*ItemPutOp) Name() string      { return OpItemPut }
 func (*ItemDeleteOp) Name() string   { return OpItemDelete }
 func (*RetiredOp) Name() string      { return OpRetired }
@@ -314,6 +323,13 @@ func (o *DeviceAddOp) validate() error {
 }
 
 func (o *DeviceRevokeOp) validate() error {
+	if err := checkOpName(o, o.Op); err != nil {
+		return err
+	}
+	return checkID(o.Op, "device_id", o.DeviceID)
+}
+
+func (o *DeviceRetireOp) validate() error {
 	if err := checkOpName(o, o.Op); err != nil {
 		return err
 	}
@@ -528,6 +544,8 @@ func parseOp(raw []byte) (Op, error) {
 		o = new(DeviceAddOp)
 	case OpDeviceRevoke:
 		o = new(DeviceRevokeOp)
+	case OpDeviceRetire:
+		o = new(DeviceRetireOp)
 	case OpItemPut:
 		o = new(ItemPutOp)
 	case OpItemDelete:
@@ -567,7 +585,7 @@ func opAllowed(name string, k Kind) bool {
 		return k == KindCheckpoint
 	case OpItemPut, OpGrantRevoke, OpDeploy:
 		return k == KindCheckpoint || k == KindNormal
-	case OpItemDelete, OpGrantAdd, OpBundlePut:
+	case OpItemDelete, OpGrantAdd, OpBundlePut, OpDeviceRetire:
 		return k == KindNormal
 	}
 	return false
