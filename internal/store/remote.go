@@ -73,6 +73,9 @@ const maxPushAttempts = 8
 func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closing {
+		return nil, 0, nil, ErrClosed
+	}
 	if s.state == nil {
 		return nil, 0, nil, s.lockedErr()
 	}
@@ -91,12 +94,17 @@ func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(
 	return ctx, gen, done, nil
 }
 
-// trackRequest derives a context for requests to the server that Lock
-// cancels (§11.2). It returns the lock generation it started in, and a func
-// that stops tracking the context and cancels it. The caller holds s.mu,
-// and holds it when it calls that func.
+// trackRequest derives a context for requests to the server that Lock and
+// Close cancel (§11.2). It returns the lock generation it started in, and a
+// func that stops tracking the context and cancels it. Once Close has begun
+// the context is cancelled already. The caller holds s.mu, and holds it
+// when it calls that func.
 func (s *Store) trackRequest(ctx context.Context) (context.Context, uint64, func()) {
 	ctx, cancel := context.WithCancel(ctx)
+	if s.closing {
+		cancel()
+		return ctx, s.gen.Load(), func() {}
+	}
 	if s.cancels == nil {
 		s.cancels = map[uint64]context.CancelFunc{}
 	}
@@ -137,7 +145,9 @@ func (s *Store) halt(err error) error {
 // Pull returns ErrDeviceRevoked. A lock while Pull waits discards the
 // response (§11.2).
 func (s *Store) Pull(ctx context.Context, r Remote) error {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return err
+	}
 	defer s.syncMu.Unlock()
 	return s.pullLocked(ctx, r)
 }
@@ -464,7 +474,9 @@ func holdInfo(res merge.Result) *HoldInfo {
 // resolves it. A held head blocks every record behind it. A lock discards
 // whatever is in flight (§11.2).
 func (s *Store) PushHead(ctx context.Context, r Remote) (PushResult, error) {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return PushResult{}, err
+	}
 	defer s.syncMu.Unlock()
 	pushed := uint64(0)
 	for attempt := 0; attempt < maxPushAttempts; attempt++ {

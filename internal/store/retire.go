@@ -347,12 +347,14 @@ func (s *Store) logoutGuards(discardPending bool) error {
 // Once RETIRING is journaled the vault is locked and never unlocks again;
 // the resolution works on its own verified copy.
 func (s *Store) Logout(ctx context.Context, r Retirer, opts LogoutOptions) (LogoutResult, error) {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return LogoutResult{}, err
+	}
 	defer s.syncMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owner == nil {
-		return LogoutResult{}, errClosed
+		return LogoutResult{}, ErrClosed
 	}
 	j, err := s.readRetirement()
 	if err != nil {
@@ -646,9 +648,13 @@ func (s *Store) deleteRetiredRecords(j *retireJournal) error {
 
 // resolveRetirement resolves RETIRING (§11.1) and, once RETIRED, cleans up.
 // It loads its own verified copy of the vault and never installs it. The
-// caller holds s.mu, which every request to the server runs without.
+// caller holds s.mu, which every request to the server runs without. Every
+// request runs in a context that Close (and Lock) cancels; a cancelled one
+// leaves the logout pending, journaled, for the next Logout.
 func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJournal) (LogoutResult, error) {
 	pending := LogoutResult{State: StateRetiring}
+	ctx, _, untrack := s.trackRequest(ctx)
+	defer untrack()
 	v, unlock, err := s.loadVault(true)
 	if err != nil {
 		return pending, err
@@ -662,14 +668,17 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 	defer key.close()
 	auth := key.auth(v.st.Account.AccountID, v.dev.ID)
 
-	// outside runs a request without s.mu; owner says the store is still
-	// open when it returns.
+	// outside runs a request without s.mu, unless Close has begun, and
+	// discards its result if Close began meanwhile.
 	outside := func(f func() error) error {
+		if s.closing {
+			return ErrClosed
+		}
 		s.mu.Unlock()
 		err := f()
 		s.mu.Lock()
-		if s.owner == nil {
-			return errClosed
+		if s.owner == nil || s.closing {
+			return ErrClosed
 		}
 		return err
 	}

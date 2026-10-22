@@ -86,13 +86,15 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if r != nil {
 		// The bootstrap waits on the server without s.mu or the file lock;
 		// syncMu keeps Pull and PushHead out meanwhile.
-		s.syncMu.Lock()
+		if err := s.lockSync(); err != nil {
+			return err
+		}
 		defer s.syncMu.Unlock()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owner == nil {
-		return errClosed
+		return ErrClosed
 	}
 	if err := s.checkRevoked(); err != nil {
 		return err

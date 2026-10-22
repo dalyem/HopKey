@@ -281,7 +281,9 @@ func (s *Store) Publication() (*Publication, error) {
 // pending: ResumePublish finishes it. An equivocation at upload_seq
 // returns a *vaultlog.EquivocationError and leaves it pending.
 func (s *Store) Publish(ctx context.Context, p Publisher, opts PublishOptions) (Publication, error) {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return Publication{}, err
+	}
 	defer s.syncMu.Unlock()
 	j, wires, err := s.beginPublication(opts)
 	if err != nil {
@@ -300,7 +302,9 @@ func (s *Store) Publish(ctx context.Context, p Publisher, opts PublishOptions) (
 // ResumePublish resolves a pending publication (§4.3 step 4), after a
 // crash, a lost response or an unreachable server.
 func (s *Store) ResumePublish(ctx context.Context, p Publisher) (Publication, error) {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return Publication{}, err
+	}
 	defer s.syncMu.Unlock()
 	j, wires, err := s.pendingPublication()
 	if err != nil {

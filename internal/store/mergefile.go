@@ -1177,7 +1177,9 @@ func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams)
 	if err != nil {
 		return MergeStatus{}, err
 	}
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return MergeStatus{}, err
+	}
 	defer s.syncMu.Unlock()
 	next, gen, err := s.mergeNextDevice(p)
 	if err != nil {
@@ -1889,7 +1891,9 @@ func (s *Store) refuseImportingWrite() error {
 // this merge's import records and sets paused. With r nil it refuses if a
 // candidate is live. It returns which items were imported.
 func (s *Store) MergePause(ctx context.Context, r Remote) (MergeStatus, error) {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return MergeStatus{}, err
+	}
 	defer s.syncMu.Unlock()
 	for attempt := 0; attempt < maxPushAttempts; attempt++ {
 		// A pull that fails (the server is unreachable) matters only if an

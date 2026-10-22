@@ -116,7 +116,9 @@ var (
 	// unlocked vault. It is for a lost device key, so it runs only locked.
 	ErrAlreadyUnlocked = errors.New("store: the vault is already unlocked; hop lock first to replace the device key with the password")
 
-	errClosed = errors.New("store: the vault store is closed")
+	// ErrClosed means the Store is closed, or closing: Close refuses every
+	// operation that would wait on the server once it has begun.
+	ErrClosed = errors.New("store: the vault store is closed")
 
 	errLocked = fmt.Errorf("%w; run hop unlock", model.ErrLocked)
 )
@@ -207,8 +209,11 @@ type Store struct {
 	// server says the vault is server-backed (vault/server.json).
 	server bool
 	// syncMu serializes Pull and PushHead. Neither holds mu while it waits
-	// on the server.
+	// on the server. Take it with lockSync.
 	syncMu sync.Mutex
+	// closing is set, under mu, once Close begins: lockSync refuses from
+	// then on, and trackRequest returns contexts already cancelled.
+	closing bool
 	// gen is the generation (Generation): it counts unlocks, locks,
 	// self-locks and revocations. A pull or push started in an earlier
 	// generation discards its result (§11.2); cancels are its in-flight
@@ -329,8 +334,13 @@ func (s *Store) own() error {
 // syncMu) to return before it gives up vault/owner.lock: one that met a
 // revocation records it while this Store still owns the vault, so no other
 // owner can install or use the revoked device meanwhile.
+//
+// Once it has begun, every operation that would wait on the server (each
+// takes syncMu with lockSync) refuses with ErrClosed, including one already
+// queued for syncMu, so none starts work Close could not cancel.
 func (s *Store) Close() error {
 	s.mu.Lock()
+	s.closing = true
 	s.dropLocked(nil)
 	s.mu.Unlock()
 	s.hook("close:drain")
@@ -345,6 +355,20 @@ func (s *Store) Close() error {
 	err := s.owner.Close()
 	s.owner = nil
 	return err
+}
+
+// lockSync takes syncMu, or returns ErrClosed (without it) once Close has
+// begun. The caller releases syncMu.
+func (s *Store) lockSync() error {
+	s.syncMu.Lock()
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing {
+		s.syncMu.Unlock()
+		return ErrClosed
+	}
+	return nil
 }
 
 // lockFile takes the vault's writer lock. Every write, and every unlock
@@ -478,7 +502,7 @@ func (v *loaded) zero() {
 // s.mu.
 func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
 	if s.owner == nil {
-		return nil, nil, errClosed
+		return nil, nil, ErrClosed
 	}
 	if err := s.checkRevoked(); err != nil {
 		// A revocation whose tombstone failed retries it.
