@@ -203,7 +203,7 @@ const (
 	DeviceConfirmed DeviceEnrollState = "confirmed" // the user confirmed the SAS on D
 	DeviceRejected  DeviceEnrollState = "rejected"  // the user rejected the SAS on D; terminal, keys wiped
 	DeviceDone      DeviceEnrollState = "done"
-	DeviceFailed    DeviceEnrollState = "failed" // the deadline passed
+	DeviceFailed    DeviceEnrollState = "failed" // the deadline passed; terminal, keys wiped
 )
 
 type deviceRecord struct {
@@ -229,7 +229,8 @@ type deviceRecord struct {
 // Once REVEALED, the user compares the SAS with A's and records the result
 // with ConfirmSAS or RejectSAS. D accepts a delivery only in CONFIRMED.
 // REJECTED is terminal: the enrollment keys are wiped and every later call
-// fails with ErrSASRejected.
+// fails with ErrSASRejected. FAILED (the deadline passed) is terminal the
+// same way, with ErrEnrollExpired.
 //
 // Messages passed in and returned are copied; the caller may reuse or
 // change its buffers.
@@ -290,6 +291,10 @@ func RestoreDeviceEnrollment(p Persister, state []byte) (*DeviceEnrollment, erro
 
 // RestoreDeviceEnrollmentWithClock loads D's persisted state after a
 // restart. An unfinished attempt whose deadline has passed is failed.
+// A restored challenge and the reconstructed open must pass the same
+// checks the live HandleChal and NewDeviceEnrollment apply: the chal's
+// closed schema and its enroll_id equal to the session's, and open's
+// schema.
 func RestoreDeviceEnrollmentWithClock(p Persister, now Clock, state []byte) (*DeviceEnrollment, error) {
 	var rec deviceRecord
 	if err := canonjson.Unmarshal(state, &rec); err != nil {
@@ -299,10 +304,10 @@ func RestoreDeviceEnrollmentWithClock(p Persister, now Clock, state []byte) (*De
 		return nil, ErrUnsupported
 	}
 	switch rec.State {
-	case DeviceCommitted, DeviceRevealed, DeviceConfirmed, DeviceDone, DeviceFailed:
-	case DeviceRejected:
+	case DeviceCommitted, DeviceRevealed, DeviceConfirmed, DeviceDone:
+	case DeviceRejected, DeviceFailed:
 		// The record holds only the terminal state.
-		if !rec.onlyRejected() {
+		if !rec.onlyState() {
 			return nil, errors.New("crypto: inconsistent enrollment state")
 		}
 		return &DeviceEnrollment{p: p, now: now, rec: rec}, nil
@@ -310,15 +315,27 @@ func RestoreDeviceEnrollmentWithClock(p Persister, now Clock, state []byte) (*De
 		return nil, fmt.Errorf("crypto: unknown enrollment state %q", rec.State)
 	}
 	inconsistent := (rec.State == DeviceDone) != (rec.Cert != nil) || (rec.State == DeviceDone) != (rec.Delivery != nil)
-	if rec.State != DeviceFailed && (rec.State != DeviceCommitted) != (rec.Chal != nil) {
+	if (rec.State != DeviceCommitted) != (rec.Chal != nil) {
 		inconsistent = true
 	}
 	if inconsistent {
 		return nil, errors.New("crypto: inconsistent enrollment state")
 	}
+	if rec.Chal != nil {
+		// As HandleChal accepted it: a valid chal for this session.
+		if err := rec.Chal.Validate(); err != nil {
+			return nil, fmt.Errorf("crypto: restored challenge: %w", err)
+		}
+		if rec.Chal.EnrollID != rec.EnrollID {
+			return nil, ErrWrongEnrollID
+		}
+	}
 	d, err := newDevice(p, now, rec)
 	if err != nil {
 		return nil, err
+	}
+	if err := d.open.Validate(); err != nil {
+		return nil, fmt.Errorf("crypto: restored open: %w", err)
 	}
 	if err := d.checkDeadline(); err != nil && !errors.Is(err, ErrEnrollExpired) {
 		return nil, err
@@ -354,12 +371,16 @@ func (d *DeviceEnrollment) save(rec deviceRecord) error {
 	return nil
 }
 
-// rejectedRecord is the whole persisted record of a REJECTED enrollment.
-func rejectedRecord() deviceRecord { return deviceRecord{V: Version, State: DeviceRejected} }
+// terminalRecord is the whole persisted record of a REJECTED or FAILED
+// enrollment: the state and nothing else.
+func terminalRecord(s DeviceEnrollState) deviceRecord { return deviceRecord{V: Version, State: s} }
 
-// onlyRejected reports whether r holds nothing but the REJECTED state.
-func (r *deviceRecord) onlyRejected() bool {
-	return r.State == DeviceRejected && len(r.KEMSK) == 0 && len(r.SigSeed) == 0 && len(r.ND) == 0 &&
+// terminal reports whether s is REJECTED or FAILED.
+func terminal(s DeviceEnrollState) bool { return s == DeviceRejected || s == DeviceFailed }
+
+// onlyState reports whether r holds nothing but its state.
+func (r *deviceRecord) onlyState() bool {
+	return len(r.KEMSK) == 0 && len(r.SigSeed) == 0 && len(r.ND) == 0 &&
 		r.Name == "" && r.Deadline == 0 && r.EnrollID.IsZero() && r.Chal == nil && r.Cert == nil &&
 		len(r.CertSig) == 0 && r.Delivery == nil
 }
@@ -379,27 +400,42 @@ func (d *DeviceEnrollment) checkDeadline() error {
 	if !expired(d.now(), d.rec.Deadline) {
 		return nil
 	}
-	rec := d.rec
-	rec.State = DeviceFailed
-	if err := d.save(rec); err != nil {
+	// FAILED is terminal: like REJECTED, the persisted record keeps only
+	// the state and the enrollment keys are wiped from memory.
+	if err := d.end(DeviceFailed); err != nil {
 		return err
 	}
 	return ErrEnrollExpired
+}
+
+// end persists the terminal state s (REJECTED or FAILED) as a record that
+// holds nothing else, then wipes D's enrollment keys from memory. If
+// persisting fails, nothing changes.
+func (d *DeviceEnrollment) end(s DeviceEnrollState) error {
+	old := d.rec
+	if err := d.save(terminalRecord(s)); err != nil {
+		return err
+	}
+	clear(old.KEMSK)
+	clear(old.SigSeed)
+	clear(old.ND)
+	d.wipe()
+	return nil
 }
 
 // State returns D's current state.
 func (d *DeviceEnrollment) State() DeviceEnrollState { return d.rec.State }
 
 // Deadline returns the time at which an unfinished attempt fails. A
-// REJECTED enrollment keeps no deadline and returns the zero Timestamp's
-// time.
+// REJECTED or FAILED enrollment keeps no deadline and returns the zero
+// Timestamp's time.
 func (d *DeviceEnrollment) Deadline() time.Time { return d.rec.Deadline.Time() }
 
 // Commit returns the commit message. It is the same after a restart, so an
-// uncertain post can be repeated. A REJECTED enrollment has no commit and
-// returns the zero value.
+// uncertain post can be repeated. A REJECTED or FAILED enrollment has no
+// commit and returns the zero value.
 func (d *DeviceEnrollment) Commit() EnrollCommit {
-	if d.rec.State == DeviceRejected {
+	if terminal(d.rec.State) {
 		return EnrollCommit{}
 	}
 	return EnrollCommit{V: Version, C: Commitment(&d.open)}
@@ -510,15 +546,7 @@ func (d *DeviceEnrollment) RejectSAS() error {
 	if err := d.sasDecision(); err != nil {
 		return err
 	}
-	old := d.rec
-	if err := d.save(rejectedRecord()); err != nil {
-		return err
-	}
-	clear(old.KEMSK)
-	clear(old.SigSeed)
-	clear(old.ND)
-	d.wipe()
-	return nil
+	return d.end(DeviceRejected)
 }
 
 // sasDecision checks that the user can confirm or reject now: REVEALED,
@@ -534,7 +562,8 @@ func (d *DeviceEnrollment) sasDecision() error {
 	return err
 }
 
-// wipe clears D's enrollment keys from memory after REJECTED was persisted.
+// wipe clears D's enrollment keys from memory after REJECTED or FAILED was
+// persisted.
 // The KEM key's internal copy cannot be overwritten from here; dropping the
 // reference leaves it to the garbage collector.
 func (d *DeviceEnrollment) wipe() {
@@ -601,10 +630,13 @@ func (d *DeviceEnrollment) HandleDelivery(in HPKEEnvelope) (*VerifiedDelivery, e
 // persisted delivery. It gives the same certificate, account keys and
 // anchor coordinates after a restart as HandleDelivery did.
 func (d *DeviceEnrollment) Delivered() (*VerifiedDelivery, error) {
-	if d.rec.State == DeviceRejected {
+	switch d.rec.State {
+	case DeviceRejected:
 		return nil, ErrSASRejected
-	}
-	if d.rec.State != DeviceDone {
+	case DeviceFailed:
+		return nil, ErrEnrollExpired
+	case DeviceDone:
+	default:
 		return nil, ErrEnrollState
 	}
 	v, err := d.verify(*d.rec.Delivery)
@@ -615,9 +647,9 @@ func (d *DeviceEnrollment) Delivered() (*VerifiedDelivery, error) {
 }
 
 // DeviceKeys returns D's new device keys. The signing key is a copy. A
-// REJECTED enrollment has no keys and returns nil for both.
+// REJECTED or FAILED enrollment has no keys and returns nil for both.
 func (d *DeviceEnrollment) DeviceKeys() (hpke.PrivateKey, ed25519.PrivateKey) {
-	if d.rec.State == DeviceRejected {
+	if terminal(d.rec.State) {
 		return nil, nil
 	}
 	return d.kem, ed25519.PrivateKey(bytes.Clone(d.sig))

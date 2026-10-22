@@ -401,10 +401,13 @@ func (w *relayWorld) checkInvariants() {
 		if !w.dConfirmed {
 			w.t.Fatalf("D reached %q without its user confirming", w.d.State())
 		}
-	case DeviceRejected:
+	case DeviceRejected, DeviceFailed:
 		var rec deviceRecord
-		if err := canonjson.Unmarshal(w.dp.state, &rec); err != nil || !rec.onlyRejected() {
-			w.t.Fatal("D's rejected record keeps more than the state")
+		if err := canonjson.Unmarshal(w.dp.state, &rec); err != nil || rec.State != w.d.State() || !rec.onlyState() {
+			w.t.Fatalf("D's %s record keeps more than the state", w.d.State())
+		}
+		if kem, sig := w.d.DeviceKeys(); kem != nil || sig != nil {
+			w.t.Fatalf("D returns enrollment keys in %s", w.d.State())
 		}
 	}
 	if ar.State == ApprovalPrepared || ar.State == ApprovalDelivered {

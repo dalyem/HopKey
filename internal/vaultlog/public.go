@@ -462,6 +462,12 @@ func (c *Candidate) apply(accountID model.ID) error {
 	post.VaultID = e.VaultID
 	post.Head = Head{Seq: e.Seq, H: c.H}
 	if c.accountKeys != nil {
+		if !anchor {
+			// The replaced key joins the history that later checkpoints'
+			// keys must differ from (rev 11).
+			old := pre.Account
+			post.PastAccounts = append(post.PastAccounts, PastAccount{AKV: old.AKV, FpKEM: old.FpKEM, FpSig: old.FpSig})
+		}
 		post.Account = accountFromOp(accountID, c.accountKeys)
 		post.KV = c.vkWrap.KV
 		post.Creds = *c.creds
@@ -500,6 +506,12 @@ func (c *Candidate) apply(accountID model.ID) error {
 	for id, d := range c.deviceAdds {
 		if d.Cert.AKV != e.AKV {
 			return fail(RuleCertAKV, "certificate of %v has akv %d, entry akv is %d", id, d.Cert.AKV, e.AKV)
+		}
+		// At a checkpoint anchor the pre-state certificates are unknown,
+		// so only issued_at = the entry's time can be checked (rev 10
+		// item 13).
+		if checkpoint && anchor && d.Cert.IssuedAt != e.Time {
+			return fail(RuleSurvivorCert, "surviving device %v: certificate issued_at is not the entry time", id)
 		}
 		if checkpoint && !anchor {
 			old, ok := pre.Devices[id]
@@ -790,6 +802,12 @@ func (c *Candidate) checkCheckpointCoverage() error {
 	e := &c.Wire.Entry
 	if c.accountKeys.AKV != pre.Account.AKV+1 {
 		return fail(RuleCheckpointAKV, "account_keys.akv %d, want %d", c.accountKeys.AKV, pre.Account.AKV+1)
+	}
+	// The new account keys differ from every earlier account key (rev 11).
+	// Otherwise a revoked device holding an old acct_priv could read
+	// later writes.
+	if err := checkFreshAccountKeys(pre, c.accountKeys.KEMPK, c.accountKeys.SigPK); err != nil {
+		return err
 	}
 	if c.creds.Gen != pre.Creds.Gen+1 {
 		return fail(RuleCheckpointGen, "creds.gen %d, want %d", c.creds.Gen, pre.Creds.Gen+1)

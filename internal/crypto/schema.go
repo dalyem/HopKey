@@ -13,13 +13,16 @@ import (
 )
 
 // SchemaError reports a value that the closed schemas of §3 and §6.5 do not
-// allow.
+// allow. Err, when set, names the rule (for example ErrSSHKeyLine).
 type SchemaError struct {
 	Field  string
 	Reason string
+	Err    error
 }
 
 func (e *SchemaError) Error() string { return "crypto: " + e.Field + ": " + e.Reason }
+
+func (e *SchemaError) Unwrap() error { return e.Err }
 
 func schemaErr(field, format string, args ...any) error {
 	return &SchemaError{Field: field, Reason: fmt.Sprintf(format, args...)}
@@ -141,11 +144,19 @@ func ValidateHost(h *model.Host) error {
 	if err := checkStrs("host_keys", h.HostKeys, 8192); err != nil {
 		return err
 	}
+	// Each host_keys entry is an OpenSSH authorized_keys line (rev 10
+	// item 11).
+	for i, l := range h.HostKeys {
+		if err := checkSSHKeyLine(fmt.Sprintf("host_keys[%d]", i), l); err != nil {
+			return err
+		}
+	}
 	return checkEnum("agent_access", h.AgentAccess, "allow", "deny")
 }
 
 // ValidateKey checks a key plaintext against §6.5. private_key is
-// text≤16384, so a multi-line OpenSSH PEM passes.
+// text≤16384, so a multi-line OpenSSH PEM passes. public_key is an OpenSSH
+// authorized_keys line (rev 10 item 11).
 func ValidateKey(k *model.Key) error {
 	if err := checkHeader(k.Header, model.TypeKey); err != nil {
 		return err
@@ -159,7 +170,10 @@ func ValidateKey(k *model.Key) error {
 	if err := CheckText("private_key", k.PrivateKey, 16384); err != nil {
 		return err
 	}
-	return CheckStr("public_key", k.PublicKey, 8192)
+	if err := CheckStr("public_key", k.PublicKey, 8192); err != nil {
+		return err
+	}
+	return checkSSHKeyLine("public_key", k.PublicKey)
 }
 
 // ValidateCredential checks a credential plaintext against §6.5.

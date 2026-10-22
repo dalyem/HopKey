@@ -2,10 +2,12 @@ package vaultlog
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -374,6 +376,116 @@ func TestCheckpointRules(t *testing.T) {
 	})
 }
 
+// mixedAccount returns account keys for akv whose KEM key comes from
+// kemLabel and whose signing key comes from sigLabel (labels as in
+// fixedAccount).
+func mixedAccount(t testing.TB, akv uint32, kemLabel, sigLabel string) *crypto.AccountKeys {
+	t.Helper()
+	kem, err := crypto.DeriveKEMKey(fixedBytes(kemLabel+"-kem", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := crypto.NewAccountKeys(idAccount, akv, kem, fixedBytes(sigLabel+"-sig", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// A checkpoint's account_keys.kem_pk and sig_pk MUST both differ from every
+// earlier account key, and the new VK MUST differ from the pre-state VK
+// (rev 11). The builder refuses each before building; a hand-built entry
+// is refused by Transition.
+func TestCheckpointFreshKeys(t *testing.T) {
+	w := newWorld(t).withItems()
+	var vk1 crypto.SymKey
+	copy(vk1[:], fixedBytes("vk1", 32)) // the genesis VK
+	if !sameKey(&vk1, &w.sec.VK) {
+		t.Fatal("fixture VK changed")
+	}
+	cases := []struct {
+		name string
+		rule Rule
+		f    func(p *CheckpointParams)
+	}{
+		{"reused KEM key", RuleCheckpointFreshKeys, func(p *CheckpointParams) {
+			p.NewAccount = mixedAccount(t, 2, "account1", "account2")
+		}},
+		{"reused signing key", RuleCheckpointFreshKeys, func(p *CheckpointParams) {
+			p.NewAccount = mixedAccount(t, 2, "account2", "account1")
+		}},
+		{"both keys reused", RuleCheckpointFreshKeys, func(p *CheckpointParams) {
+			p.NewAccount = mixedAccount(t, 2, "account1", "account1")
+		}},
+		{"reused VK", RuleCheckpointFreshVK, func(p *CheckpointParams) { p.NewVK = vk1 }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := w.checkpointParams(idDevB)
+			c.f(&p)
+			p.Creds = credsFor(t, p.NewAccount, "creds2")
+			_, _, _, err := BuildCheckpoint(w.st, w.sec, w.devA(), p)
+			wantRule(t, err, c.rule)
+			wantRule(t, w.transition(w.unverifiedCheckpoint(p)), c.rule)
+		})
+	}
+	t.Run("reused VK passes the public stage", func(t *testing.T) {
+		// Only the plaintext stage can see the VK.
+		p := w.checkpointParams(idDevB)
+		p.NewVK = vk1
+		if _, err := CheckPublic(w.st, w.unverifiedCheckpoint(p), w.archive); err != nil {
+			t.Fatalf("public stage: %v", err)
+		}
+	})
+
+	// The history reaches back past the pre-state key: after akv 1 → 2,
+	// akv 3 may not reuse akv 1's keys either.
+	p2 := w.checkpointParams()
+	wire, st2, sec2, err := BuildCheckpoint(w.st, w.sec, w.devA(), p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.record(wire)
+	if len(st2.PastAccounts) != 1 || st2.PastAccounts[0].AKV != 1 || !st2.PastAccounts[0].FpSig.Equal(w.st.Account.FpSig) ||
+		!st2.PastAccounts[0].FpKEM.Equal(w.st.Account.FpKEM) {
+		t.Fatalf("past accounts after the checkpoint: %+v", st2.PastAccounts)
+	}
+	var vk3 crypto.SymKey
+	copy(vk3[:], fixedBytes("vk3", 32))
+	for _, c := range []struct {
+		name string
+		na   *crypto.AccountKeys
+		vk   crypto.SymKey
+		rule Rule
+	}{
+		{"akv 3 reuses the akv 1 KEM key", mixedAccount(t, 3, "account1", "account3"), vk3, RuleCheckpointFreshKeys},
+		{"akv 3 reuses the akv 1 signing key", mixedAccount(t, 3, "account3", "account1"), vk3, RuleCheckpointFreshKeys},
+		{"akv 3 reuses the akv 2 signing key", mixedAccount(t, 3, "account3", "account2"), vk3, RuleCheckpointFreshKeys},
+		{"akv 3 keeps VK[2]", mixedAccount(t, 3, "account3", "account3"), p2.NewVK, RuleCheckpointFreshVK},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := CheckpointParams{NewAccount: c.na, NewVK: c.vk, Creds: credsFor(t, c.na, "creds3"), Time: w.now()}
+			_, _, _, err := BuildCheckpoint(st2, sec2, w.devA(), p)
+			wantRule(t, err, c.rule)
+			bad, err := buildCheckpointWire(st2, sec2, w.devA(), p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = Transition(st2, sec2, w.devA(), bad, w.archive)
+			wantRule(t, err, c.rule)
+		})
+	}
+	t.Run("akv 3 with fresh keys and VK", func(t *testing.T) {
+		na := mixedAccount(t, 3, "account3", "account3")
+		p := CheckpointParams{NewAccount: na, NewVK: vk3, Creds: credsFor(t, na, "creds3"), Time: w.now()}
+		_, st3, _, err := BuildCheckpoint(st2, sec2, w.devA(), p)
+		mustAccept(t, err)
+		if len(st3.PastAccounts) != 2 || st3.PastAccounts[1].AKV != 2 {
+			t.Fatalf("past accounts: %+v", st3.PastAccounts)
+		}
+	})
+}
+
 func TestItemRules(t *testing.T) {
 	w := full(t).deleteC1()
 	base := w.unverified(Changes{Put: []crypto.Item{w.item(idH2), newSnippet(fixedID(0x68))}})
@@ -647,9 +759,10 @@ func TestDeployRules(t *testing.T) {
 		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleDeployMaterial)
 	})
 	t.Run("key_type changes once the op is closed", func(t *testing.T) {
+		// Rev 11: SSH material is frozen whether or not an op is pending.
 		k := w.item(idK2).(*model.Key)
 		k.KeyType = "rsa"
-		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})))
+		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleKeyMaterial)
 	})
 	t.Run("key rename while incomplete is fine", func(t *testing.T) {
 		k := w.item(idK1).(*model.Key)
@@ -668,6 +781,60 @@ func TestDeployRules(t *testing.T) {
 	})
 	t.Run("host of an abandoned op can be deleted", func(t *testing.T) {
 		mustAccept(t, w.transition(w.unverified(Changes{Delete: []model.ID{idH1}})))
+	})
+}
+
+// An item_put on an existing key item keeps key_type, private_key and
+// public_key whether or not a deploy_op is pending; replacing an SSH key
+// always creates a new item ID (rev 11). Metadata edits and rewraps stay
+// allowed.
+func TestKeyMaterialFrozen(t *testing.T) {
+	w := newWorld(t).withItems() // no deploy_op exists at all
+	if len(w.st.DeployOps) != 0 {
+		t.Fatal("fixture has deploy ops")
+	}
+	replaced := func(f func(k *model.Key)) *model.Key {
+		k := w.item(idK1).(*model.Key)
+		f(k)
+		return k
+	}
+	cases := []struct {
+		name string
+		k    *model.Key
+	}{
+		{"whole key replaced", func() *model.Key {
+			n := keyItem(t, idK1, "k3")
+			n.Name = "k1"
+			return n
+		}()},
+		{"public_key replaced", replaced(func(k *model.Key) { k.PublicKey, _ = sshKey(t, "k3") })},
+		{"private_key replaced", replaced(func(k *model.Key) { k.PrivateKey += " changed" })},
+		{"key_type changed", replaced(func(k *model.Key) { k.KeyType = "rsa" })},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// The builder refuses it, and so does a transition.
+			_, _, _, err := BuildNormal(w.st, w.sec, w.devA(), Changes{Put: []crypto.Item{c.k}}, w.now(), w.archive)
+			wantRule(t, err, RuleKeyMaterial)
+			wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{c.k}})), RuleKeyMaterial)
+		})
+	}
+	t.Run("metadata-only edit", func(t *testing.T) {
+		k := w.item(idK1).(*model.Key)
+		k.Name = "renamed"
+		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})))
+	})
+	t.Run("dedicated_grant edit", func(t *testing.T) {
+		k := w.item(idK2).(*model.Key)
+		k.DedicatedGrant = fixedID(0x83)
+		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})))
+	})
+	t.Run("rewrap in a checkpoint", func(t *testing.T) {
+		_, _, _, err := BuildCheckpoint(w.st, w.sec, w.devA(), w.checkpointParams())
+		mustAccept(t, err)
+	})
+	t.Run("new key under a new ID", func(t *testing.T) {
+		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{keyItem(t, idK3, "k3")}})))
 	})
 }
 
@@ -714,24 +881,26 @@ func TestDeployKeyVersion(t *testing.T) {
 }
 
 // key.public_key and every host.host_keys entry MUST parse as an OpenSSH
-// authorized_keys line, "<type> <base64> [comment]" (rev 10 item 11).
+// authorized_keys line, "<type> <base64> [comment]" (rev 10 item 11). The
+// rule lives in crypto.ValidateKey and crypto.ValidateHost, so the builder
+// refuses such a plaintext, and a transition refuses one sealed by hand.
 func TestSSHKeyLines(t *testing.T) {
 	w := full(t)
 	pub, _ := sshKey(t, "k3")
 	f := strings.Fields(pub)
-	key := func(line string) Changes {
+	key := func(line string) crypto.Item {
 		k := keyItem(t, idK3, "k3")
 		k.PublicKey = line
-		return Changes{Put: []crypto.Item{k}}
+		return k
 	}
-	hostKeys := func(lines ...string) Changes {
+	hostKeys := func(lines ...string) crypto.Item {
 		h := w.host(idH2)
 		h.HostKeys = lines
-		return Changes{Put: []crypto.Item{h}}
+		return h
 	}
 	cases := []struct {
 		name string
-		ch   Changes
+		it   crypto.Item
 	}{
 		{"public_key empty", key("")},
 		{"public_key without a blob", key(f[0])},
@@ -742,11 +911,40 @@ func TestSSHKeyLines(t *testing.T) {
 		{"host_keys entry is not a key line", hostKeys(pub, "not a key")},
 	}
 	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) { wantRule(t, w.transition(w.unverified(c.ch)), RuleSSHKeyLine) })
+		t.Run(c.name, func(t *testing.T) {
+			_, err := buildNormalWire(w.st, w.sec, w.devA(), Changes{Put: []crypto.Item{c.it}}, w.now())
+			wantRule(t, err, RuleSSHKeyLine)
+			_, _, _, err = BuildNormal(w.st, w.sec, w.devA(), Changes{Put: []crypto.Item{c.it}}, w.now(), w.archive)
+			wantRule(t, err, RuleSSHKeyLine)
+
+			// By hand: a valid entry for the same item, resealed with the
+			// malformed plaintext and re-signed.
+			h, _ := crypto.ItemHeader(c.it)
+			var good crypto.Item = keyItem(t, idK3, "k3")
+			ik, err := crypto.NewSymKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.ItemID == idH2 {
+				good, ik = w.item(idH2), w.sec.Items[idH2].IK
+			}
+			wire := w.unverified(Changes{Put: []crypto.Item{good}})
+			resealRaw(t, wire, w.st, w.sec.VK, ik, c.it)
+			resign(t, wire, w.normalSigners())
+			wantRule(t, w.transition(wire), RuleSSHKeyLine)
+		})
 	}
 	t.Run("lines with and without a comment", func(t *testing.T) {
-		mustAccept(t, w.transition(w.unverified(key(f[0]+" "+f[1]))))
-		mustAccept(t, w.transition(w.unverified(hostKeys(pub, f[0]+" "+f[1]))))
+		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{key(f[0] + " " + f[1])}})))
+		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{hostKeys(pub, f[0]+" "+f[1])}})))
+	})
+	t.Run("raw reseal of a valid plaintext is accepted", func(t *testing.T) {
+		// The by-hand path itself is sound: the same reseal of a valid
+		// plaintext passes.
+		wire := w.unverified(Changes{Put: []crypto.Item{w.item(idH2)}})
+		resealRaw(t, wire, w.st, w.sec.VK, w.sec.Items[idH2].IK, hostKeys(pub))
+		resign(t, wire, w.normalSigners())
+		mustAccept(t, w.transition(wire))
 	})
 }
 
@@ -900,6 +1098,14 @@ func TestAnchorRules(t *testing.T) {
 		}},
 		{"missing device signature", RuleSigRoles, func(_ *Entry, wr *Wire) { wr.Sigs = wr.Sigs[1:] }},
 		{"author does not survive", RuleDeviceCover, func(e *Entry, _ *Wire) { e.Author = idDevB }},
+		// A survivor certificate's issued_at is the entry's time; that is
+		// the only part of rev 10 item 13 an anchor can check.
+		{"survivor certificate issued earlier", RuleSurvivorCert, func(e *Entry, _ *Wire) {
+			d := deviceAddFor(t, e, idDevA)
+			d.Cert.IssuedAt--
+			resignCert(t, d, na)
+		}},
+		{"entry time differs from issued_at", RuleSurvivorCert, func(e *Entry, _ *Wire) { e.Time++ }},
 	})
 	t.Run("account_new signed by another key", func(t *testing.T) {
 		bad := mutate(t, cp, map[Role]signer{RoleAccountNew: acctSigner(w.acct)}, func(*Entry, *Wire) {})
@@ -1015,8 +1221,202 @@ func TestStateSerialization(t *testing.T) {
 	if _, err := ParseState(bytes.Replace(b, []byte(`"kv":`), []byte(`"x":1,"kv":`), 1)); err == nil {
 		t.Fatal("unknown member accepted")
 	}
+	// past_accounts (rev 11) round-trips and must stay below the current
+	// akv in ascending order.
+	_, st2, _, err := BuildCheckpoint(w.st, w.sec, w.devA(), w.checkpointParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err = st2.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b2, []byte(`"past_accounts":[{"akv":1,`)) {
+		t.Fatalf("past_accounts not serialized: %s", b2)
+	}
+	if s2, err := ParseState(b2); err != nil || len(s2.PastAccounts) != 1 {
+		t.Fatalf("parse with past_accounts: %v", err)
+	}
+	if _, err := ParseState(bytes.Replace(b2, []byte(`"past_accounts":[{"akv":1,`), []byte(`"past_accounts":[{"akv":2,`), 1)); err == nil {
+		t.Fatal("past account at the current akv accepted")
+	}
+	if _, err := ParseState(bytes.Replace(b, []byte(`"past_accounts":[],`), nil, 1)); err == nil {
+		t.Fatal("state without past_accounts accepted")
+	}
 	// A parsed state keeps working as a pre-state.
 	if _, _, err := Transition(s, w.sec, w.devA(), w.unverified(Changes{Put: []crypto.Item{w.item(idH2)}}), nil); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// A checkpoint whose item is resealed under the wrong iv and validly
+// re-signed. When the item_put declares the wrong iv, the public stage
+// rejects it from the op alone, before any decryption. When the item_put
+// declares the right iv but the objects were sealed under another one, the
+// iv is bound only inside the AEAD AADs (§6.4), which the public stage can't
+// open: it passes, and the plaintext stage refuses to decrypt.
+func TestCheckpointResealedWrongIV(t *testing.T) {
+	w := full(t).deleteC1()
+	p := w.checkpointParams(idDevB)
+	base := w.unverifiedCheckpoint(p)
+	signers := w.checkpointSigners(p.NewAccount)
+	oldIV := w.st.Items[idS1].IV
+
+	t.Run("item_put declares the old iv", func(t *testing.T) {
+		bad := cloneWire(t, base)
+		ik, err := crypto.NewSymKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reseal(t, bad, w.st, p.NewVK, ik, w.item(idS1), func(q *ItemPutOp) { q.IV = oldIV })
+		resign(t, bad, signers)
+		// Consistent objects: the item opens under its declared context.
+		q := putFor(t, &bad.Entry, idS1)
+		if _, err := crypto.UnwrapItemKey(&p.NewVK, itemContext(w.st, q), mustAEAD(t, bad, q.WrapSHA256)); err != nil {
+			t.Fatalf("fixture: resealed wrap does not open: %v", err)
+		}
+		_, err = CheckPublic(w.st, bad, w.archive)
+		wantRule(t, err, RuleItemIV)
+	})
+	t.Run("objects sealed under the old iv", func(t *testing.T) {
+		bad := cloneWire(t, base)
+		ik, err := crypto.NewSymKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reseal(t, bad, w.st, p.NewVK, ik, w.item(idS1), func(q *ItemPutOp) { q.IV = oldIV })
+		putFor(t, &bad.Entry, idS1).IV = oldIV + 1 // the op is right again
+		resign(t, bad, signers)
+		c, err := CheckPublic(w.st, bad, w.archive)
+		if err != nil {
+			t.Fatalf("public stage: %v", err)
+		}
+		_, _, err = c.CheckPlaintext(w.sec, w.devA())
+		wantRule(t, err, RuleDecrypt)
+		wantRule(t, w.transition(bad), RuleDecrypt)
+	})
+}
+
+func mustAEAD(t testing.TB, w *Wire, h crypto.Hash) crypto.AEADEnvelope {
+	t.Helper()
+	objs, err := WireObjects(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := crypto.ParseAEADEnvelope(objs[h])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// Expired-but-unrevoked grants are active for every log rule (§5.3, §8.6):
+// editing an item an expired grant lists still needs a bundle_put, and the
+// builder writes one. Only the token client enforces expiry.
+func TestExpiredGrantMaintenance(t *testing.T) {
+	w := newWorld(t).withItems()
+	tok, err := crypto.NewToken(idGrant, ed25519.PublicKey(w.st.Account.SigPK))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.token = tok
+	tauth, err := tok.Auth()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := w.grantRecord()
+	rec.ExpiresAt = ts(t, "2020-01-01T00:00:00Z") // long before every entry's time
+	w.normal(Changes{Grants: []NewGrant{{Record: rec, TAuthSHA256: crypto.SHA256(tauth)}}})
+	if _, ok := w.st.Grants[idGrant]; !ok {
+		t.Fatal("expired grant is not active")
+	}
+
+	s1 := w.item(idS1).(*model.Snippet)
+	s1.Command = "uptime -p"
+	ch := Changes{Put: []crypto.Item{s1}}
+
+	t.Run("edit without a bundle_put", func(t *testing.T) {
+		bad := w.unverified(ch)
+		removeOps(&bad.Entry, func(o Op) bool { return o.Name() == OpBundlePut })
+		resign(t, bad, w.normalSigners())
+		wantRule(t, w.transition(bad), RuleBundleRequired)
+	})
+	t.Run("the builder adds the bundle_put", func(t *testing.T) {
+		wire, st, _, err := BuildNormal(w.st, w.sec, w.devA(), ch, w.now(), w.archive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		puts := opsOf[*BundlePutOp](&wire.Entry)
+		if len(puts) != 1 || puts[0].GrantID != idGrant || puts[0].BundleVersion != 2 || st.Grants[idGrant].BundleVersion != 2 {
+			t.Fatalf("bundle_puts %+v", puts)
+		}
+		// The token client refuses the bundle: it has expired.
+		objs, err := WireObjects(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := crypto.ParseHPKEEnvelope(objs[puts[0].EnvelopeSHA256])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := crypto.OpenBundle(tok, env, 2, rec.ExpiresAt.Time().Add(-time.Hour)); err != nil {
+			t.Fatalf("bundle before expiry: %v", err)
+		}
+		if _, err := crypto.OpenBundle(tok, env, 2, rec.ExpiresAt.Time()); err == nil {
+			t.Fatal("token client accepted an expired bundle")
+		}
+	})
+}
+
+// substFetcher answers one digest with another object's bytes.
+type substFetcher struct {
+	ObjectMap
+	from, to crypto.Hash
+}
+
+func (f substFetcher) FetchObject(h crypto.Hash) ([]byte, error) {
+	if h.Equal(f.from) {
+		h = f.to
+	}
+	return f.ObjectMap.FetchObject(h)
+}
+
+// OpenSecrets uses only objects whose SHA-256 equals the digest the state
+// names (§5.5). A server that substitutes another object, or a state that
+// names a digest found only in history, is refused.
+func TestOpenSecretsDigestSubstitution(t *testing.T) {
+	w := full(t)
+	h2 := w.host(idH2)
+	oldBody := w.st.Items[idH2].BodySHA256
+	h2.Name = "h2-renamed"
+	w.normal(Changes{Put: []crypto.Item{h2}})
+	if _, err := OpenSecrets(w.st, w.devA(), w.archive); err != nil {
+		t.Fatal(err)
+	}
+	st := w.st
+	d := st.Devices[idDevA]
+	for name, f := range map[string]substFetcher{
+		"item body":         {w.archive, st.Items[idS1].BodySHA256, st.Items[idK1].BodySHA256},
+		"item wrap":         {w.archive, st.Items[idS1].WrapSHA256, st.Items[idK1].WrapSHA256},
+		"older item body":   {w.archive, st.Items[idH2].BodySHA256, oldBody},
+		"VK envelope":       {w.archive, st.VKWrap.EnvelopeSHA256, d.UnlockSHA256},
+		"unlock blob":       {w.archive, d.UnlockSHA256, st.Devices[idDevB].UnlockSHA256},
+		"grant record body": {w.archive, st.Items[idRecord].BodySHA256, st.Items[idS1].BodySHA256},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := OpenSecrets(st, w.devA(), f)
+			wantRule(t, err, RuleObjectDigest)
+		})
+	}
+	t.Run("state names a digest found only in history", func(t *testing.T) {
+		s := st.clone()
+		it := s.Items[idH2]
+		it.BodySHA256 = oldBody // present in the archive, with the right digest
+		s.Items[idH2] = it
+		if st.Usable(oldBody) || !s.Usable(oldBody) {
+			t.Fatal("fixture: the old body must be usable only in the tampered state")
+		}
+		_, err := OpenSecrets(s, w.devA(), w.archive)
+		wantRule(t, err, RuleDecrypt)
+	})
 }

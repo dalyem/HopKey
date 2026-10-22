@@ -200,7 +200,7 @@ func testHost(id model.ID, version uint64) *model.Host {
 	return &model.Host{
 		Header: model.Header{V: 1, ItemID: id, Type: model.TypeHost, ItemVersion: version},
 		Name:   "web-1", Aliases: []string{"w1"}, Addresses: []string{"10.0.0.1"}, Port: 22, User: "root",
-		Tags: []string{"prod"}, Route: "auto", HostKeys: []string{"ssh-ed25519 AAAA"}, AgentAccess: "allow",
+		Tags: []string{"prod"}, Route: "auto", HostKeys: []string{testSSHLine}, AgentAccess: "allow",
 	}
 }
 

@@ -850,3 +850,173 @@ func TestRestoreDeviceDecisionStates(t *testing.T) {
 		}
 	}
 }
+
+// A restored chal and the reconstructed open pass the checks the live
+// HandleChal and NewDeviceEnrollment apply: the chal's schema and its
+// enroll_id equal to the session's, and open's schema. A record that fails
+// them is refused.
+func TestRestoreValidatesChalAndOpen(t *testing.T) {
+	r := newEnrollRig(t)
+	r.runToOpen(t, fixedID(0x80))
+	revealed := r.d.rec
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
+	confirmed := r.d.rec
+	for _, base := range []deviceRecord{revealed, confirmed} {
+		// The unmodified record restores.
+		j, err := canonjson.Marshal(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RestoreDeviceEnrollmentWithClock(&memPersister{}, r.clock.now, j); err != nil {
+			t.Fatalf("%s: %v", base.State, err)
+		}
+		for name, f := range map[string]func(rec *deviceRecord){
+			"short nA":            func(rec *deviceRecord) { rec.Chal.NA = rec.Chal.NA[:EnrollNonceSize-1] },
+			"unsupported chal v":  func(rec *deviceRecord) { rec.Chal.V = 2 },
+			"other enroll ID":     func(rec *deviceRecord) { rec.Chal.EnrollID = fixedID(0x81) },
+			"empty enroll ID":     func(rec *deviceRecord) { rec.Chal.EnrollID, rec.EnrollID = model.ID{}, model.ID{} },
+			"empty account ID":    func(rec *deviceRecord) { rec.Chal.AccountID = model.ID{} },
+			"name too long":       func(rec *deviceRecord) { rec.Name = string(bytes.Repeat([]byte("n"), 65)) },
+			"name with a control": func(rec *deviceRecord) { rec.Name = "laptop\n" },
+		} {
+			rec := base
+			ch := *base.Chal
+			ch.NA = bytes.Clone(base.Chal.NA)
+			rec.Chal = &ch
+			f(&rec)
+			j, err := canonjson.Marshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := RestoreDeviceEnrollmentWithClock(&memPersister{}, r.clock.now, j); err == nil {
+				t.Errorf("%s with %s: restored", base.State, name)
+			}
+		}
+	}
+	// A COMMITTED record's open is checked too.
+	committed := revealed
+	committed.State, committed.Chal, committed.Name = DeviceCommitted, nil, string(bytes.Repeat([]byte("n"), 65))
+	j, err := canonjson.Marshal(committed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreDeviceEnrollmentWithClock(&memPersister{}, r.clock.now, j); err == nil {
+		t.Error("committed with a long name: restored")
+	}
+}
+
+// §7: when the deadline passes, the attempt is a failure. Like REJECTED,
+// FAILED is terminal: the persisted record keeps only the state, the
+// enrollment keys are wiped from memory, and DeviceKeys returns nil.
+func TestDeviceFailedWipesKeys(t *testing.T) {
+	want, err := canonjson.Marshal(deviceRecord{V: Version, State: DeviceFailed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(name string, d *DeviceEnrollment, p *memPersister, secrets, held [][]byte) {
+		t.Helper()
+		if d.State() != DeviceFailed {
+			t.Fatalf("%s: state %q", name, d.State())
+		}
+		if !bytes.Equal(p.state, want) {
+			t.Fatalf("%s: failed record = %s", name, p.state)
+		}
+		for _, sec := range secrets {
+			if len(sec) == 0 {
+				t.Fatalf("%s: no key material to look for", name)
+			}
+			for _, enc := range []string{base64.RawURLEncoding.EncodeToString(sec), base64.StdEncoding.EncodeToString(sec)} {
+				if bytes.Contains(p.state, []byte(enc)) || bytes.Contains(p.state, sec) {
+					t.Fatalf("%s: the failed record contains private key material", name)
+				}
+			}
+		}
+		for _, b := range held {
+			if !bytes.Equal(b, make([]byte, len(b))) {
+				t.Fatalf("%s: private key bytes left in memory", name)
+			}
+		}
+		if d.kem != nil || d.sig != nil || d.open.KEMPK != nil {
+			t.Fatalf("%s: D still references its enrollment keys", name)
+		}
+		if kem, sig := d.DeviceKeys(); kem != nil || sig != nil {
+			t.Fatalf("%s: DeviceKeys after FAILED returned keys", name)
+		}
+		if c := d.Commit(); c != (EnrollCommit{}) {
+			t.Fatalf("%s: Commit after FAILED returned a commitment", name)
+		}
+		if _, err := d.Delivered(); !errors.Is(err, ErrEnrollExpired) {
+			t.Fatalf("%s: Delivered after FAILED: %v", name, err)
+		}
+		r := mustRestore(t, p, time.Now)
+		if kem, sig := r.DeviceKeys(); r.State() != DeviceFailed || kem != nil || sig != nil {
+			t.Fatalf("%s: restored FAILED enrollment returns keys", name)
+		}
+	}
+	keys := func(d *DeviceEnrollment) (secrets, held [][]byte) {
+		kemSK, seed, sigKey := d.rec.KEMSK, d.rec.SigSeed, d.sig
+		return [][]byte{bytes.Clone(kemSK), bytes.Clone(seed), bytes.Clone(sigKey)}, [][]byte{kemSK, seed, sigKey}
+	}
+
+	// Expiry while running, in CONFIRMED.
+	r := newEnrollRig(t)
+	r.runToOpen(t, fixedID(0x80))
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
+	if kem, sig := r.d.DeviceKeys(); kem == nil || sig == nil {
+		t.Fatal("no keys before the deadline")
+	}
+	secrets, held := keys(r.d)
+	r.clock.advance(EnrollDeadline)
+	if _, err := r.d.SAS(); !errors.Is(err, ErrEnrollExpired) {
+		t.Fatalf("SAS at the deadline: %v", err)
+	}
+	check("in memory", r.d, r.dp, secrets, held)
+
+	// Expiry found on restore, in COMMITTED.
+	dp := &memPersister{}
+	clock := &fakeClock{t: r.clock.t}
+	if _, _, err := NewDeviceEnrollmentWithClock(dp, clock.now, "n"); err != nil {
+		t.Fatal(err)
+	}
+	var committed deviceRecord
+	if err := canonjson.Unmarshal(dp.state, &committed); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance(EnrollDeadline + time.Minute)
+	d, err := RestoreDeviceEnrollmentWithClock(dp, clock.now, dp.state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("restored", d, dp, [][]byte{committed.KEMSK, committed.SigSeed, committed.ND}, nil)
+
+	// If persisting FAILED fails, nothing changes and the keys stay.
+	r2 := newEnrollRig(t)
+	r2.runToOpen(t, fixedID(0x80))
+	r2.clock.advance(EnrollDeadline)
+	r2.dp.fail = true
+	if _, err := r2.d.SAS(); !errors.Is(err, errPersist) || r2.d.State() != DeviceRevealed {
+		t.Fatalf("failed persist: %v, %q", err, r2.d.State())
+	}
+	if kem, sig := r2.d.DeviceKeys(); kem == nil || sig == nil {
+		t.Fatal("keys wiped although FAILED was not persisted")
+	}
+
+	// A FAILED record that still holds key material is refused.
+	for name, rec := range map[string]deviceRecord{
+		"failed with keys":   {V: Version, State: DeviceFailed, KEMSK: r2.d.rec.KEMSK},
+		"failed with a seed": {V: Version, State: DeviceFailed, SigSeed: r2.d.rec.SigSeed},
+		"failed with a chal": {V: Version, State: DeviceFailed, Chal: r2.d.rec.Chal},
+	} {
+		j, err := canonjson.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RestoreDeviceEnrollmentWithClock(&memPersister{}, time.Now, j); err == nil {
+			t.Errorf("%s: restored", name)
+		}
+	}
+}

@@ -164,7 +164,7 @@ func (b *builder) itemPut(vk, ik *crypto.SymKey, ctx crypto.ItemContext, it cryp
 	}
 	body, err := crypto.SealItem(ik, ctx, it)
 	if err != nil {
-		return err
+		return itemErr(RuleSchema, err, "item %v", ctx.ItemID)
 	}
 	wh, err := b.object(wrap)
 	if err != nil {
@@ -532,6 +532,15 @@ func BuildCheckpoint(pre *State, sec *Secrets, dev DeviceKey, p CheckpointParams
 	na := p.NewAccount
 	if na == nil || na.AccountID != pre.Account.AccountID || na.AKV != pre.Account.AKV+1 {
 		return nil, nil, nil, errors.New("vaultlog: checkpoint needs new account keys for akv + 1")
+	}
+	// Fresh keys and a fresh VK (rev 11), checked before anything is
+	// built. The transition below checks them again.
+	pub := na.Public()
+	if err := checkFreshAccountKeys(pre, pub.KEMPK, pub.SigPK); err != nil {
+		return nil, nil, nil, err
+	}
+	if sec != nil && sameKey(&p.NewVK, &sec.VK) {
+		return nil, nil, nil, fail(RuleCheckpointFreshVK, "the new VK equals the current VK")
 	}
 	w, err := buildCheckpointWire(pre, sec, dev, p)
 	if err != nil {

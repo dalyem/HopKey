@@ -4,15 +4,11 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/hpke"
-	"crypto/sha256"
-	"encoding/base64"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
-	"strings"
-
-	"golang.org/x/crypto/ssh"
 
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/model"
@@ -137,6 +133,11 @@ func (c *Candidate) CheckPlaintext(sec *Secrets, dev DeviceKey) (*State, *Secret
 		if err != nil {
 			return nil, nil, err
 		}
+		// The new VK differs from the pre-state VK (rev 11). Only the
+		// plaintext stage can see it.
+		if sameKey(&vk, &sec.VK) {
+			return nil, nil, fail(RuleCheckpointFreshVK, "checkpoint keeps the pre-state VK")
+		}
 	}
 	items := maps.Clone(sec.Items)
 	for id := range c.deletes {
@@ -216,10 +217,7 @@ func (c *Candidate) openItem(s *State, vk crypto.SymKey, p *ItemPutOp) (PlainIte
 	}
 	it, err := crypto.OpenItem(&ik, ctx, c.aead[p.BodySHA256])
 	if err != nil {
-		return PlainItem{}, failErr(RuleDecrypt, err, "body of %v", p.ItemID)
-	}
-	if err := checkSSHLines(p.ItemID, it); err != nil {
-		return PlainItem{}, err
+		return PlainItem{}, itemErr(RuleDecrypt, err, "body of %v", p.ItemID)
 	}
 	return PlainItem{IK: ik, Item: it}, nil
 }
@@ -278,8 +276,23 @@ func (c *Candidate) checkTransitionPlain(pre, next *Secrets) error {
 			continue
 		}
 		newKey, ok := next.Items[o.KeyItemID].Item.(*model.Key)
-		if !ok || oldKey.KeyType != newKey.KeyType || oldKey.PrivateKey != newKey.PrivateKey || oldKey.PublicKey != newKey.PublicKey {
+		if !ok || !sameSSHMaterial(oldKey, newKey) {
 			return fail(RuleDeployMaterial, "key %v changes its SSH material while deploy_op %v is incomplete", o.KeyItemID, id)
+		}
+	}
+	// An item_put on an existing key item keeps key_type, private_key and
+	// public_key, whether or not a deploy_op is pending: replacing an SSH
+	// key always creates a new item ID (rev 11, §10.3). Metadata edits and
+	// rewraps stay allowed. The check above names the pending op when
+	// there is one.
+	for _, id := range sortedKeys(c.puts) {
+		oldKey, ok := pre.Items[id].Item.(*model.Key)
+		if !ok {
+			continue
+		}
+		newKey, ok := next.Items[id].Item.(*model.Key)
+		if !ok || !sameSSHMaterial(oldKey, newKey) {
+			return fail(RuleKeyMaterial, "item_put of key %v changes its SSH material; a new key needs a new item ID", id)
 		}
 	}
 	// Normal entries only: an entry that changes or deletes an item listed
@@ -313,6 +326,15 @@ func (c *Candidate) checkTransitionPlain(pre, next *Secrets) error {
 		}
 	}
 	return nil
+}
+
+// sameKey compares two symmetric keys in constant time.
+func sameKey(a, b *crypto.SymKey) bool { return subtle.ConstantTimeCompare(a[:], b[:]) == 1 }
+
+// sameSSHMaterial reports whether two key plaintexts have the same SSH
+// material: key_type, private_key and public_key (rev 10 item 8).
+func sameSSHMaterial(a, b *model.Key) bool {
+	return a.KeyType == b.KeyType && a.PrivateKey == b.PrivateKey && a.PublicKey == b.PublicKey
 }
 
 // allDeployOps returns every op incomplete in the pre-state or the
@@ -428,55 +450,18 @@ func checkPlainSnapshot(s *State, sec *Secrets) error {
 
 // SSHFingerprint returns ssh_pk_fp for an OpenSSH public-key line: "SHA256:"
 // and the unpadded standard base64 of the SHA-256 of the public-key wire
-// blob (§10.3).
-func SSHFingerprint(publicKey string) (string, error) {
-	blob, err := parseSSHLine(publicKey)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(blob)
-	return "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]), nil
-}
+// blob (§10.3). It is crypto.SSHFingerprint.
+func SSHFingerprint(publicKey string) (string, error) { return crypto.SSHFingerprint(publicKey) }
 
-// parseSSHLine parses an OpenSSH authorized_keys line without options,
-// "<type> <base64> [comment]" (rev 10 item 11), and returns the key's wire
-// blob. The blob must parse as a key of the named type.
-func parseSSHLine(line string) ([]byte, error) {
-	f := strings.Fields(line)
-	if len(f) < 2 {
-		return nil, errors.New("vaultlog: not an OpenSSH public-key line")
+// itemErr classifies an error from sealing or opening an item: a
+// key.public_key or host.host_keys entry that is not an OpenSSH line
+// (crypto.ValidateKey and crypto.ValidateHost, rev 10 item 11) is
+// RuleSSHKeyLine; anything else is r.
+func itemErr(r Rule, err error, format string, args ...any) error {
+	if errors.Is(err, crypto.ErrSSHKeyLine) {
+		r = RuleSSHKeyLine
 	}
-	blob, err := base64.StdEncoding.DecodeString(f[1])
-	if err != nil {
-		return nil, fmt.Errorf("vaultlog: OpenSSH public-key line: %w", err)
-	}
-	pk, err := ssh.ParsePublicKey(blob)
-	if err != nil {
-		return nil, fmt.Errorf("vaultlog: OpenSSH public-key line: %w", err)
-	}
-	if pk.Type() != f[0] {
-		return nil, errors.New("vaultlog: OpenSSH public-key line: type does not match its blob")
-	}
-	return blob, nil
-}
-
-// checkSSHLines requires key.public_key and every host.host_keys entry to
-// parse as OpenSSH public-key lines (rev 10 item 11). internal/crypto
-// checks only their length and characters.
-func checkSSHLines(id model.ID, it crypto.Item) error {
-	switch it := it.(type) {
-	case *model.Key:
-		if _, err := parseSSHLine(it.PublicKey); err != nil {
-			return failErr(RuleSSHKeyLine, err, "%v.public_key", id)
-		}
-	case *model.Host:
-		for i, l := range it.HostKeys {
-			if _, err := parseSSHLine(l); err != nil {
-				return failErr(RuleSSHKeyLine, err, "%v.host_keys[%d]", id, i)
-			}
-		}
-	}
-	return nil
+	return failErr(r, err, format, args...)
 }
 
 // AnchorID is the anchor identity (account_id, vault_id, akv, fp_kem,
@@ -617,10 +602,7 @@ func OpenSecretsWithAccount(s *State, acct *crypto.AccountKeys, objs ObjectFetch
 		}
 		it, err := crypto.OpenItem(&ik, ctx, body)
 		if err != nil {
-			return nil, failErr(RuleDecrypt, err, "body of %v", id)
-		}
-		if err := checkSSHLines(id, it); err != nil {
-			return nil, err
+			return nil, itemErr(RuleDecrypt, err, "body of %v", id)
 		}
 		sec.Items[id] = PlainItem{IK: ik, Item: it}
 	}
