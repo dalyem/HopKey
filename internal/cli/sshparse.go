@@ -36,16 +36,20 @@ type hostLoc struct {
 //     reports as applied can be checked for the alias it applied to;
 //   - the lines that use a Match criterion which runs a command (exec), which
 //     make ssh -G run that command;
-//   - the Include lines it could not resolve or read. ssh -G reads those
-//     files all the same, so nothing the scan says about the config is
-//     complete while that list is not empty.
+//   - the Include lines it could not resolve or read. Host names in the files
+//     they name are not among the aliases.
+//
+// The scan is a best-effort view, not a boundary: ssh -G is the evaluator, and
+// it can read files this scan resolves differently (glob dialects, symlinks)
+// or not at all. The import shows the findings to the user and gets consent
+// to run ssh -G over the config; nothing here blocks the import.
 type configScan struct {
 	home    string // the passwd home: what OpenSSH expands ~ to
 	skipDir string // Include of anything under here is skipped for aliases: hop's own output
 
 	aliases   []configAlias
 	hostLines map[hostLoc][]string // positive literal words of each Host line
-	matchExec []string             // file:line
+	matchExec []execLine           // Match lines that run a command
 	unscanned []string             // file:line: Include "x": why it is not scanned
 
 	seen      map[string]bool
@@ -53,7 +57,13 @@ type configScan struct {
 	globFiles func(string) ([]string, error)
 }
 
-// maxIncludeDepth is OpenSSH's own limit.
+// execLine is a Match line that makes ssh run a command.
+type execLine struct {
+	source string // file:line
+	text   string // the line, trimmed
+}
+
+// maxIncludeDepth is OpenSSH's own limit. Here it only stops include loops.
 const maxIncludeDepth = 16
 
 func newConfigScan(home, skipDir string) *configScan {
@@ -111,7 +121,7 @@ func (s *configScan) file(path string, depth int, aliases bool) error {
 			}
 		case "match":
 			if matchRunsCommand(args) {
-				s.matchExec = append(s.matchExec, source)
+				s.matchExec = append(s.matchExec, execLine{source, strings.TrimSpace(text)})
 			}
 		case "include":
 			for _, pat := range args {
@@ -123,7 +133,7 @@ func (s *configScan) file(path string, depth int, aliases bool) error {
 }
 
 // include scans the files one Include argument names. Anything it cannot
-// resolve or read goes to s.unscanned, because ssh -G will still read it.
+// resolve or read goes to s.unscanned: ssh -G may still read it.
 func (s *configScan) include(source, raw string, depth int, aliases bool) {
 	fail := func(why string) {
 		s.unscanned = append(s.unscanned, fmt.Sprintf("%s: Include %q %s", source, raw, why))
@@ -210,8 +220,8 @@ var matchCriteriaWithArg = map[string]bool{
 // the way OpenSSH reads them (a word, an optional leading "!", then the
 // argument of the criteria that take one), so `Match host exec` is a host
 // named exec, not a command. A word hop does not know could take an argument
-// or not, so a line with one counts as exec if any word is: this is a consent
-// check, and it errs toward asking.
+// or not, so a line with one counts as exec if any word is: the result feeds a
+// warning list, and it errs toward listing.
 func matchRunsCommand(args []string) bool {
 	for i := 0; i < len(args); i++ {
 		name := strings.ToLower(strings.TrimPrefix(args[i], "!"))

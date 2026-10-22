@@ -10,11 +10,13 @@ hop exec <target> [--timeout D] [--sudo] [--json] -- <cmd...>
 hop check|which|trust <target>    diagnose, explain resolution, pin the server's host key
 hop ls [tag] | info <target> | add | edit | rm
 hop key add <path> | ls | rm
-hop import ssh-config [path] [--with-keys] [--allow-match-exec]
+hop import ssh-config [path] [--with-keys] [--dry-run] [--yes]
 hop ts import | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
 hop setup                         put `Include ~/.ssh/hop/config` above every other directive in ~/.ssh/config
 hop status | daemon [stop]
 ```
+
+`hop import ssh-config` reads your config with `ssh -G`, the way `ssh <host>` does, so it runs any `Match exec` commands in it and may do DNS lookups. It lists what its own scan found (best effort, not a guarantee) and asks before it runs ssh; without a terminal, or with `--json`, it refuses unless you pass `--yes`. Importing your config carries the same trust as using it.
 
 Every command takes `--json`. hop's own failures exit 255, and `hop <target>` and `hop exec` pass the remote exit code through. Resolution is interactive (DNS, fuzzy match, picker, plain-ssh fallback) only when stdout is a terminal and `--json` is not given; otherwise it stops after the Tailscale step and returns candidates. `hop exec` is never fuzzy.
 

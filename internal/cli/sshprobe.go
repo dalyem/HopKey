@@ -50,12 +50,18 @@ func (s sshSettings) traceProblem() string {
 }
 
 // errTraceUnverified is the error of an ssh whose -v output hop cannot use to
-// tell which Host blocks applied. The import stops: guessing would import
-// settings from blocks that ssh did not apply.
+// tell which Host blocks applied: missing, in a form hop does not know, or too
+// long to keep. The import stops: guessing would import settings from blocks
+// that ssh did not apply.
 type errTraceUnverified struct{ why string }
 
 func (e *errTraceUnverified) Error() string {
 	return "can't verify which Host blocks applied with this OpenSSH version: " + e.why + "; nothing was imported"
+}
+
+func isTraceError(err error) bool {
+	var te *errTraceUnverified
+	return errors.As(err, &te)
 }
 
 // sshProbeTimeout bounds one ssh -G. ssh -G does no network I/O unless the
@@ -98,9 +104,17 @@ func (p *sshProber) run(ctx context.Context, config, name string, trace bool) (s
 	cmd.Env = p.environ()
 	cmd.Stdin = nil // /dev/null
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &limitedBuffer{buf: &stderr, max: 1 << 20}
+	errBuf := &limitedBuffer{buf: &stderr, max: maxProbeStderr}
+	cmd.Stdout, cmd.Stderr = &stdout, errBuf
 	cmd.WaitDelay = time.Second
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	// Output that did not fit was dropped, and with it possibly the line that
+	// says which Host blocks applied, so nothing read from this probe can be
+	// trusted, whether or not ssh succeeded.
+	if errBuf.overflow {
+		return sshSettings{}, &errTraceUnverified{fmt.Sprintf("ssh wrote more than %d bytes to stderr, which hop does not keep", maxProbeStderr)}
+	}
+	if err != nil {
 		if ctx.Err() != nil {
 			return sshSettings{}, fmt.Errorf("ssh -G timed out after %v", sshProbeTimeout)
 		}
@@ -141,16 +155,23 @@ func (p *sshProber) verifyTrace(ctx context.Context) error {
 	return nil
 }
 
-// limitedBuffer drops what exceeds max, so a noisy ssh cannot fill memory.
+// maxProbeStderr is how much of one probe's stderr hop keeps.
+const maxProbeStderr = 1 << 20
+
+// limitedBuffer drops what exceeds max, so a noisy ssh cannot fill memory, and
+// records that it did.
 type limitedBuffer struct {
-	buf *bytes.Buffer
-	max int
+	buf      *bytes.Buffer
+	max      int
+	overflow bool
 }
 
 func (l *limitedBuffer) Write(p []byte) (int, error) {
-	if room := l.max - l.buf.Len(); room > 0 {
-		l.buf.Write(p[:min(len(p), room)])
+	room := max(l.max-l.buf.Len(), 0)
+	if len(p) > room {
+		l.overflow = true
 	}
+	l.buf.Write(p[:min(len(p), room)])
 	return len(p), nil
 }
 

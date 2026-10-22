@@ -39,10 +39,15 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 		return failf("import needs a source: ssh-config")
 	}
 	fs := newFlags(e, "import ssh-config", commands["import"].usage)
+	usage := fs.Usage
+	fs.Usage = func() {
+		usage()
+		fmt.Fprint(e.Stderr, "\nThe import reads the config with ssh -G, as connecting does: that runs any `Match exec` commands in it and may do DNS lookups.\n"+
+			"hop lists what its scan found (best effort) and asks first; importing your config carries the same trust as using it.\n")
+	}
 	withKeys := fs.Bool("with-keys", false, "import the private keys named by IdentityFile (default: only record the reference)")
 	dryRun := fs.Bool("dry-run", false, "show what would be imported")
-	allowExec := fs.Bool("allow-match-exec", false, "let ssh run the commands of `Match exec` lines while it reads the config")
-	allowUnscanned := fs.Bool("allow-unscanned-includes", false, "read the config although some Include files cannot be checked for `Match exec` first")
+	yes := fs.Bool("yes", false, "agree to read the config with ssh -G without asking (needed when stdin is not a terminal or with --json)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	pos, _, err := parseFlags(fs, args[1:])
 	if err != nil {
@@ -76,32 +81,32 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	if err := scan.scan(path); err != nil {
 		return failf("%v", err)
 	}
-	if len(scan.matchExec) > 0 && !*allowExec {
-		return failf("%s uses `Match exec` (%s). Reading the config with ssh -G would run those commands. "+
-			"Check what they do, then pass --allow-match-exec to import anyway",
-			path, strings.Join(scan.matchExec, ", "))
+	// ssh -G reads the config as a connection would: it runs the commands of
+	// `Match exec` lines and may resolve names for canonicalization. The scan
+	// above is a best-effort list of what that could involve, not a boundary:
+	// the user's consent is the gate.
+	if !*asJSON {
+		fmt.Fprint(e.Stderr, consentNotice(path, scan))
 	}
-	if len(scan.unscanned) > 0 {
-		if !*allowUnscanned {
-			return failf("hop cannot check every file ssh -G would read from %s, so it cannot tell whether they run commands (`Match exec`):\n  %s\n"+
-				"Use paths hop can resolve, or pass --allow-unscanned-includes to read the config anyway",
-				path, strings.Join(scan.unscanned, "\n  "))
+	if !*yes {
+		switch {
+		case *asJSON:
+			return failf("import ssh-config reads %s with ssh -G, which runs any `Match exec` commands in it; confirmation needed but --json cannot ask; pass --yes", path)
+		case !e.StdinTTY:
+			return failf("import ssh-config reads %s with ssh -G, which runs any `Match exec` commands in it; confirmation needed but stdin is not a terminal; pass --yes", path)
 		}
-		// hop cannot know whether the unscanned files hold `Match exec`, so
-		// reading them is consent to run whatever they contain.
-		if !*allowExec {
-			return failf("hop cannot check these Include files for `Match exec`:\n  %s\n"+
-				"Reading them with ssh -G could run commands, so --allow-unscanned-includes also needs --allow-match-exec",
-				strings.Join(scan.unscanned, "\n  "))
+		ok, err := confirm(e, false, "Read this config with ssh -G?")
+		if err != nil {
+			return err
 		}
-		for _, u := range scan.unscanned {
-			warnings = append(warnings, "not checked for Match exec (--allow-unscanned-includes): "+u)
+		if !ok {
+			return failf("not confirmed; nothing was read or imported")
 		}
 	}
+	scanWarns := scanWarnings(scan)
 	prober := &sshProber{env: e, bin: sshBin, home: home}
 	if err := prober.verifyTrace(ctx); err != nil {
-		var te *errTraceUnverified
-		if errors.As(err, &te) {
+		if isTraceError(err) {
 			return failf("%v", err)
 		}
 		return failf("ssh -G: %v", err)
@@ -115,7 +120,7 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	if err := imp.run(); err != nil {
 		return failf("%v", err)
 	}
-	imp.report.Warnings = append(warnings, imp.warnings...)
+	imp.report.Warnings = slices.Concat(warnings, scanWarns, imp.warnings)
 	if *asJSON {
 		return printJSON(e, imp.report)
 	}
@@ -126,13 +131,80 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 		}
 		e.printf("%s\n", line)
 	}
-	for _, w := range imp.report.Warnings {
+	// The scan's findings were printed with the notice.
+	for _, w := range slices.Concat(warnings, imp.warnings) {
 		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", w)
 	}
 	if !*dryRun && slices.ContainsFunc(imp.report.Entries, func(en ImportEntry) bool { return en.Kind == "host" && en.Status == "imported" }) {
 		fmt.Fprintf(e.Stderr, "hop: imported hosts have no pinned host keys yet; pin each with: hop trust <host>\n")
 	}
 	return nil
+}
+
+// consentNotice says what reading the config with ssh -G involves and lists
+// what hop's scan found. The scan is best effort, so an empty list is not a
+// promise.
+func consentNotice(path string, s *configScan) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "hop import ssh-config reads %s with OpenSSH (ssh -G), exactly as connecting would.\n", path)
+	sb.WriteString("That runs any `Match exec` commands in the config and may do DNS lookups (CanonicalizeHostname).\n")
+	if len(s.matchExec) == 0 && len(s.unscanned) == 0 {
+		sb.WriteString("hop's scan found no `Match exec` lines and no Include it could not inspect; hop's scan is best effort.\n")
+		return sb.String()
+	}
+	sb.WriteString("What hop's scan found (best effort):\n")
+	if len(s.matchExec) > 0 {
+		sb.WriteString("  Match exec lines, which run these commands:\n")
+		for _, m := range s.matchExec {
+			fmt.Fprintf(&sb, "    %s: %s\n", printable(m.source), printable(m.text))
+		}
+	}
+	if len(s.unscanned) > 0 {
+		sb.WriteString("  Include patterns hop could not inspect (ssh may read them and run what they hold):\n")
+		for _, u := range s.unscanned {
+			fmt.Fprintf(&sb, "    %s\n", printable(u))
+		}
+		sb.WriteString("  Host names in the files those Includes name are not enumerated, so they are not imported.\n")
+	}
+	return sb.String()
+}
+
+// scanWarnings is the scan's findings as report warnings.
+func scanWarnings(s *configScan) []string {
+	var out []string
+	for _, m := range s.matchExec {
+		out = append(out, fmt.Sprintf("Match exec, run by ssh -G: %s: %s", printable(m.source), printable(m.text)))
+	}
+	for _, u := range s.unscanned {
+		out = append(out, "Include hop could not inspect: "+printable(u))
+	}
+	if len(s.unscanned) > 0 {
+		out = append(out, "Host names in the files those Includes name were not enumerated, so they are not imported (import them with their own path, or hop add)")
+	}
+	return out
+}
+
+// maxShown caps one line of config text echoed back to the user.
+const maxShown = 200
+
+// printable makes text from a config file safe to show: control characters,
+// which could rewrite what the terminal displays, become '?', and a long line
+// is cut.
+func printable(s string) string {
+	r := []rune(s)
+	cut := len(r) > maxShown
+	if cut {
+		r = r[:maxShown]
+	}
+	for i, c := range r {
+		if c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0) {
+			r[i] = '?'
+		}
+	}
+	if cut {
+		return string(r) + "..."
+	}
+	return string(r)
 }
 
 // candidate is a host the import is working out: one Host line's worth of
@@ -216,6 +288,9 @@ func (im *importer) run() error {
 		}
 		set, err := im.prober.run(im.ctx, im.config, a.Name, true)
 		if err != nil {
+			if isTraceError(err) {
+				return err
+			}
 			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, err.Error())
 			continue
 		}
@@ -226,6 +301,9 @@ func (im *importer) run() error {
 		// value equal to it is a default, not something the config set.
 		def, err := im.prober.defaults(im.ctx, a.Name)
 		if err != nil {
+			if isTraceError(err) {
+				return err
+			}
 			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, err.Error())
 			continue
 		}
