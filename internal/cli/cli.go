@@ -21,6 +21,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/version"
 )
 
@@ -44,6 +45,11 @@ type Env struct {
 
 	// OpenStore opens the vault for `hop daemon`.
 	OpenStore func() (model.Store, error)
+	// DataDir is where hop init creates the vault and the device key file.
+	// Empty means $XDG_DATA_HOME/hop, or ~/.local/share/hop.
+	DataDir string
+	// Keyring is the OS keychain hop init uses. Nil means the real one.
+	Keyring store.Keyring
 	// ReadPassword prompts for a secret without echo. Nil disables prompts.
 	ReadPassword func(prompt string) ([]byte, error)
 
@@ -123,6 +129,10 @@ func init() {
 		"setup":   {runSetup, "hop setup [--yes]"},
 		"daemon":  {runDaemon, "hop daemon [stop]"},
 		"status":  {runStatus, "hop status [--json]"},
+		"init":    {runInit, "hop init [--device-key-store keychain|file] [--kit-file PATH]"},
+		"lock":    {runLock, "hop lock"},
+		"unlock":  {runUnlock, "hop unlock [--password]"},
+		"passwd":  {runPasswd, "hop passwd [--kit-file PATH]"},
 	}
 }
 
@@ -132,6 +142,7 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop ls [tag] | info <target> | add | edit | rm
        hop key add|ls|rm | import ssh-config | ts import|link
        hop setup | status | daemon
+       hop init | lock | unlock [--password] | passwd
 
 Every command takes --json. Run "hop <command> -h" for its flags.
 `

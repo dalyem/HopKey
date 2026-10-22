@@ -150,7 +150,12 @@ func Start(opts Options) (*Daemon, error) {
 		started: time.Now(), live: live, agent: agentSrv, control: control,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 	}
-	if err := d.reload(ctx); err != nil {
+	if err := d.reload(ctx); errors.Is(err, model.ErrLocked) && d.canUnlock() {
+		// A locked vault (its device key unreadable, say) still gets a
+		// daemon, so hop unlock can reach it.
+		d.state.Store(lockedState())
+		logf("the vault is locked: %v", err)
+	} else if err != nil {
 		d.shutdown()
 		return nil, fmt.Errorf("daemon: loading the vault: %w", err)
 	}

@@ -1,0 +1,193 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+
+	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/sshagent"
+	"github.com/dalyem/hopkey/internal/store"
+)
+
+// Vault ops. They need a store that implements Vault (internal/store); with
+// any other store they are refused.
+const (
+	OpLock    = "lock"
+	OpUnlock  = "unlock"
+	OpPasswd  = "passwd"
+	OpKit     = "kit"     // the pending Emergency Kit, if any
+	OpKitDone = "kit_ack" // the user has the pending kit
+)
+
+// More error codes.
+const (
+	CodeWrongPassword = "wrong_password"
+	CodeNeedSecretKey = "need_secret_key"
+	CodeKitPending    = "kit_pending"
+)
+
+// Vault is the locking side of the encrypted store.
+type Vault interface {
+	Head() (store.Head, error)
+	Info() store.Info
+	Lock()
+	Unlock(ctx context.Context) error
+	UnlockWithPassword(ctx context.Context, password []byte, secretKey string) error
+	ChangePassword(ctx context.Context, current, next []byte) (store.Kit, error)
+	PendingKit() *store.Kit
+	AckKit() error
+}
+
+// UnlockParams is the request for OpUnlock. With no password, the device
+// key unlocks; with one, pw_blob does (hop unlock --password), using
+// SecretKey when the device has none stored.
+type UnlockParams struct {
+	Password  string `json:"password,omitempty"`
+	SecretKey string `json:"secret_key,omitempty"`
+}
+
+// PasswdParams is the request for OpPasswd.
+type PasswdParams struct {
+	Current string `json:"current"`
+	New     string `json:"new"`
+}
+
+// KitResult answers OpPasswd and OpKit. Kit is nil when none is pending.
+// It is the one response that carries secrets (the new Secret Key and
+// Recovery Key), over the same-uid control socket, so the CLI can print
+// them once.
+type KitResult struct {
+	Kit *store.Kit `json:"kit"`
+}
+
+// canUnlock reports whether the store is a Vault: a locked one is worth
+// serving, since hop unlock can open it.
+func (d *Daemon) canUnlock() bool {
+	_, ok := d.store.(Vault)
+	return ok
+}
+
+func (d *Daemon) vault() (Vault, error) {
+	v, ok := d.store.(Vault)
+	if !ok {
+		return nil, invalidf("this vault store cannot lock or change passwords")
+	}
+	return v, nil
+}
+
+// dispatchVault handles the vault ops. handled is false for any other op.
+func (d *Daemon) dispatchVault(ctx context.Context, req Request, decode func(any) error) (result any, handled bool, err error) {
+	switch req.Op {
+	case OpLock, OpUnlock, OpPasswd, OpKit, OpKitDone:
+	default:
+		return nil, false, nil
+	}
+	v, err := d.vault()
+	if err != nil {
+		return nil, true, err
+	}
+	switch req.Op {
+	case OpLock:
+		d.lockVault(v)
+		return nil, true, nil
+	case OpUnlock:
+		var p UnlockParams
+		if len(req.Params) > 0 {
+			if err := decode(&p); err != nil {
+				return nil, true, err
+			}
+		}
+		return nil, true, d.unlockVault(ctx, v, p)
+	case OpPasswd:
+		var p PasswdParams
+		if err := decode(&p); err != nil {
+			return nil, true, err
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		kit, err := v.ChangePassword(ctx, []byte(p.Current), []byte(p.New))
+		if err != nil {
+			return nil, true, err
+		}
+		if _, err := d.reloadLocked(ctx); err != nil {
+			d.logf("reload after the password change: %v", err)
+		}
+		return &KitResult{Kit: &kit}, true, nil
+	case OpKit:
+		return &KitResult{Kit: v.PendingKit()}, true, nil
+	case OpKitDone:
+		return nil, true, v.AckKit()
+	}
+	return nil, false, nil
+}
+
+// lockVault drops the store's secrets, empties the agent and forgets the
+// last snapshot.
+func (d *Daemon) lockVault(v Vault) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v.Lock()
+	old := d.live.swap(sshagent.NewKeyring())
+	old.RemoveAll()
+	d.state.Store(lockedState())
+	d.logf("vault locked")
+}
+
+func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var err error
+	if p.Password != "" {
+		err = v.UnlockWithPassword(ctx, []byte(p.Password), p.SecretKey)
+	} else {
+		err = v.Unlock(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = d.reloadLocked(ctx)
+	return err
+}
+
+// lockedState is the daemon state while the vault is locked: nothing in
+// the agent and no hosts.
+func lockedState() *state {
+	return &state{locked: true, ssh: map[string]HostSSH{}}
+}
+
+// vaultError maps the store's errors to control error codes.
+func vaultError(err error) *Error {
+	switch {
+	case errors.Is(err, store.ErrWrongPassword):
+		return &Error{Code: CodeWrongPassword, Message: err.Error()}
+	case errors.Is(err, store.ErrNeedSecretKey):
+		return &Error{Code: CodeNeedSecretKey, Message: err.Error()}
+	case errors.Is(err, store.ErrKitPending):
+		return &Error{Code: CodeKitPending, Message: err.Error()}
+	case errors.Is(err, model.ErrLocked):
+		return &Error{Code: CodeLocked, Message: err.Error()}
+	}
+	return nil
+}
+
+// vaultStatus describes the vault for OpStatus, or nil for a store that is
+// not a Vault.
+func (d *Daemon) vaultStatus() *store.Info {
+	v, ok := d.store.(Vault)
+	if !ok {
+		return nil
+	}
+	info := v.Info()
+	return &info
+}
+
+// storeHead returns the store's head when it can say, so fresh can skip
+// rebuilding from an unchanged vault.
+func (d *Daemon) storeHead() (store.Head, bool) {
+	v, ok := d.store.(interface{ Head() (store.Head, error) })
+	if !ok {
+		return store.Head{}, false
+	}
+	h, err := v.Head()
+	return h, err == nil
+}
