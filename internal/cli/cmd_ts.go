@@ -44,7 +44,7 @@ type TSEntry struct {
 	Node   string `json:"node"`
 	NodeID string `json:"node_id"`
 	Host   string `json:"host,omitempty"`
-	Status string `json:"status"` // created, linked, already_linked, skipped (or would_* with --dry-run)
+	Status string `json:"status"` // created, linked, already_linked, ambiguous, skipped (or would_* with --dry-run)
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -69,6 +69,77 @@ func tsLink(h *model.Host, n tailscale.Node, pin bool) int {
 		}
 	}
 	return added
+}
+
+// tsMatch reports whether the unlinked host h is evidently the node n: one of
+// its names is the node's host name or MagicDNS label, or one of its stored
+// addresses names the node.
+func tsMatch(st *tailscale.Status, h model.Host, n tailscale.Node) bool {
+	byName := slices.ContainsFunc(resolve.Names(h), func(x string) bool {
+		return strings.EqualFold(x, n.HostName) || strings.EqualFold(x, n.ShortName())
+	})
+	return byName || slices.ContainsFunc(h.Addresses, func(a string) bool {
+		return slices.ContainsFunc(st.Find(a), func(f tailscale.Node) bool { return f.ID == n.ID })
+	})
+}
+
+// tsPairs is the candidate graph between unlinked vault hosts and tailnet
+// nodes, built before anything is linked so that the order of the peers in
+// the status output cannot decide who gets which host.
+type tsPairs struct {
+	byNode map[string][]int // node ID -> indexes of the hosts it could be
+	byHost map[int][]string // host index -> IDs of the nodes it could be
+	nodes  map[string]tailscale.Node
+}
+
+func tsCandidates(st *tailscale.Status, hosts []model.Host) *tsPairs {
+	p := &tsPairs{byNode: map[string][]int{}, byHost: map[int][]string{}, nodes: map[string]tailscale.Node{}}
+	for _, n := range st.Nodes() {
+		p.nodes[n.ID] = n
+		for i, h := range hosts {
+			if h.Tailscale == nil && tsMatch(st, h, n) {
+				p.byNode[n.ID] = append(p.byNode[n.ID], i)
+				p.byHost[i] = append(p.byHost[i], n.ID)
+			}
+		}
+	}
+	return p
+}
+
+func (p *tsPairs) hostsFor(nodeID string) []int { return p.byNode[nodeID] }
+
+// ambiguous is true when the node matches several hosts, or when a host it
+// matches could equally be another node.
+func (p *tsPairs) ambiguous(nodeID string) bool {
+	hs := p.byNode[nodeID]
+	if len(hs) > 1 {
+		return true
+	}
+	return len(hs) == 1 && len(p.byHost[hs[0]]) > 1
+}
+
+func (p *tsPairs) reason(hosts []model.Host, n tailscale.Node) string {
+	var names []string
+	for _, i := range p.byNode[n.ID] {
+		names = append(names, hosts[i].Name)
+		for _, other := range p.byHost[i] {
+			if other != n.ID {
+				names = append(names, "node "+p.nodes[other].DNSName)
+			}
+		}
+	}
+	slices.Sort(names)
+	names = slices.Compact(names)
+	return fmt.Sprintf("could be more than one host or node (%s); nothing was linked or pinned. Pick one: hop ts link <host> %s", strings.Join(names, ", "), n.ID)
+}
+
+// findNode finds the node a user means for hop ts link: by stable node ID,
+// else by name or IP.
+func findNode(st *tailscale.Status, s string) []tailscale.Node {
+	if n, ok := st.NodeByID(s); ok {
+		return []tailscale.Node{n}
+	}
+	return st.Find(s)
 }
 
 func firstV4(ips []string) string {
@@ -164,6 +235,7 @@ func runTSImport(ctx context.Context, e *Env, args []string) error {
 		err := call(ctx, e, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved)
 		return saved, err
 	}
+	ambiguity := tsCandidates(st, hosts)
 	for _, n := range nodes {
 		entry := TSEntry{Node: n.HostName, NodeID: n.ID}
 		would := func(s string) string {
@@ -179,25 +251,13 @@ func runTSImport(ctx context.Context, e *Env, args []string) error {
 			report = append(report, entry)
 			continue
 		}
-		// An unlinked host that is evidently this node.
-		var matches []int
-		for i, h := range hosts {
-			if h.Tailscale != nil {
-				continue
-			}
-			byName := slices.ContainsFunc(resolve.Names(h), func(x string) bool {
-				return strings.EqualFold(x, n.HostName) || strings.EqualFold(x, n.ShortName())
-			})
-			byAddr := slices.ContainsFunc(h.Addresses, func(a string) bool {
-				return len(st.Find(a)) == 1 && st.Find(a)[0].ID == n.ID
-			})
-			if byName || byAddr {
-				matches = append(matches, i)
-			}
-		}
+		// An unlinked host that is evidently this node. A host that could
+		// be several nodes, or a node that could be several hosts, is never
+		// linked automatically: the pin from Tailscale would go to a guess.
+		matches := ambiguity.hostsFor(n.ID)
 		switch {
-		case len(matches) > 1:
-			entry.Status, entry.Reason = "skipped", "several hosts could be this node; use hop ts link <host> "+n.HostName
+		case ambiguity.ambiguous(n.ID):
+			entry.Status, entry.Reason = "ambiguous", ambiguity.reason(hosts, n)
 		case len(matches) == 1:
 			h := hosts[matches[0]]
 			tsLink(&h, n, !*noPin)
@@ -255,7 +315,7 @@ func printTSReport(e *Env, asJSON bool, report []TSEntry) error {
 }
 
 func runTSLink(ctx context.Context, e *Env, args []string) error {
-	fs := newFlags(e, "ts link", "hop ts link <host> <tailscale-name> [--force] [--no-pin] [--json]")
+	fs := newFlags(e, "ts link", "hop ts link <host> <node-id-or-dns-name> [--force] [--no-pin] [--json]")
 	force := fs.Bool("force", false, "replace an existing link")
 	noPin := fs.Bool("no-pin", false, "do not pin the host keys Tailscale publishes")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
@@ -278,7 +338,7 @@ func runTSLink(ctx context.Context, e *Env, args []string) error {
 	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
 		return failf("%s", describeUnresolved(rr.Result))
 	}
-	nodes := st.Find(pos[1])
+	nodes := findNode(st, pos[1])
 	switch {
 	case len(nodes) == 0:
 		return failf("no tailscale node matches %q", pos[1])
@@ -287,7 +347,7 @@ func runTSLink(ctx context.Context, e *Env, args []string) error {
 		for _, n := range nodes {
 			ids = append(ids, fmt.Sprintf("%s (%s)", n.DNSName, n.ID))
 		}
-		return failf("%q matches several tailscale nodes: %s; use the full DNS name or the IP", pos[1], strings.Join(ids, ", "))
+		return failf("%q matches several tailscale nodes: %s; use the node ID, the full DNS name or the IP", pos[1], strings.Join(ids, ", "))
 	}
 	n := nodes[0]
 	l, err := listAll(ctx, e)

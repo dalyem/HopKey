@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/dalyem/hopkey/internal/daemon"
@@ -136,6 +137,12 @@ func (im *importer) run() {
 			im.add("host", name, "exists", fmt.Sprintf("already in the vault as %q", owner))
 			continue
 		}
+		if len(b.Unsupported) > 0 {
+			reason := strings.Join(b.Unsupported, "; ")
+			im.add("host", name, "skipped", reason)
+			im.warnf("host %s (%s) was not imported: %s", name, b.Source, reason)
+			continue
+		}
 		h, err := im.hostFor(b, names)
 		if err != nil {
 			im.add("host", name, "skipped", err.Error())
@@ -256,8 +263,69 @@ func uniqueKeyName(l *daemon.ListResult, base string) string {
 	return name
 }
 
+// jumpSpec is a single ProxyJump hop: [user@]host[:port].
+type jumpSpec struct {
+	user, host, port string
+}
+
+func parseJump(s string) jumpSpec {
+	var j jumpSpec
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		j.user, s = s[:i], s[i+1:]
+	}
+	switch {
+	case strings.HasPrefix(s, "["):
+		// [v6]:port
+		if end := strings.Index(s, "]"); end > 0 {
+			j.host = s[1:end]
+			j.port = strings.TrimPrefix(s[end+1:], ":")
+			return j
+		}
+	case strings.Count(s, ":") == 1:
+		s, j.port, _ = strings.Cut(s, ":")
+	}
+	j.host = s
+	return j
+}
+
+// jumpTarget finds the vault host a ProxyJump names. The first step that
+// matches anything decides, and a step that matches several hosts is
+// ambiguous: hop does not pick one. Steps: a name or alias, then an address.
+func (im *importer) jumpTarget(host string) (target *model.Host, ambiguous []string) {
+	steps := []func(h model.Host) bool{
+		func(h model.Host) bool {
+			return slices.ContainsFunc(resolve.Names(h), func(n string) bool { return strings.EqualFold(n, host) })
+		},
+		func(h model.Host) bool {
+			return slices.ContainsFunc(h.Addresses, func(a string) bool { return strings.EqualFold(a, host) })
+		},
+	}
+	for _, match := range steps {
+		var found []*model.Host
+		for i := range im.l.Hosts {
+			if match(im.l.Hosts[i]) {
+				found = append(found, &im.l.Hosts[i])
+			}
+		}
+		switch len(found) {
+		case 0:
+			continue
+		case 1:
+			return found[0], nil
+		}
+		for _, h := range found {
+			ambiguous = append(ambiguous, h.Name)
+		}
+		return nil, ambiguous
+	}
+	return nil, nil
+}
+
 // linkJumps sets jump hosts once every host exists. Only a single ProxyJump
-// hop is understood.
+// hop that the vault host reproduces exactly is imported: a user or port on
+// the hop that differs from the vault host's own would change which account
+// or service the jump connects to, so the host is left without the jump and
+// a warning says so.
 func (im *importer) linkJumps(blocks []sshBlock) {
 	for _, b := range blocks {
 		if b.ProxyJump == "" || strings.EqualFold(b.ProxyJump, "none") {
@@ -265,27 +333,27 @@ func (im *importer) linkJumps(blocks []sshBlock) {
 		}
 		name := b.concrete()[0]
 		if strings.Contains(b.ProxyJump, ",") {
-			im.warnf("host %s: ProxyJump %q has several hops; only single-hop jumps are imported", name, b.ProxyJump)
+			im.warnf("host %s: ProxyJump %q has several hops; only single-hop jumps are imported, so %s was imported without it", name, b.ProxyJump, name)
 			continue
 		}
-		jump := b.ProxyJump
-		if i := strings.LastIndex(jump, "@"); i >= 0 {
-			jump = jump[i+1:]
+		jump := parseJump(b.ProxyJump)
+		target, ambiguous := im.jumpTarget(jump.host)
+		switch {
+		case len(ambiguous) > 0:
+			im.warnf("host %s: ProxyJump host %q matches several vault hosts (%s); %s was imported without the jump, pick one with hop edit %s --jump <host>",
+				name, jump.host, strings.Join(ambiguous, ", "), name, name)
+			continue
+		case target == nil:
+			im.warnf("host %s: ProxyJump host %q is not in the vault; add it, then hop edit %s --jump <host>", name, jump.host, name)
+			continue
 		}
-		if i := strings.LastIndex(jump, ":"); i >= 0 && !strings.Contains(jump[:i], ":") {
-			jump = jump[:i]
+		if strings.EqualFold(target.Name, name) {
+			im.warnf("host %s: ProxyJump %q is the host itself; %s was imported without the jump", name, b.ProxyJump, name)
+			continue
 		}
-		var target *model.Host
-		for i := range im.l.Hosts {
-			h := &im.l.Hosts[i]
-			if slices.ContainsFunc(resolve.Names(*h), func(n string) bool { return strings.EqualFold(n, jump) }) ||
-				slices.ContainsFunc(h.Addresses, func(a string) bool { return strings.EqualFold(a, jump) }) {
-				target = h
-				break
-			}
-		}
-		if target == nil {
-			im.warnf("host %s: ProxyJump host %q is not in the vault; add it, then hop edit %s --jump <host>", name, jump, name)
+		if why := jumpOverride(jump, *target); why != "" {
+			im.warnf("host %s: ProxyJump %q %s; hop cannot import that, so %s was imported without the jump (hop edit %s --jump %s uses the vault host as it is)",
+				name, b.ProxyJump, why, name, name, target.Name)
 			continue
 		}
 		saved, ok := im.saved[strings.ToLower(name)]
@@ -295,9 +363,33 @@ func (im *importer) linkJumps(blocks []sshBlock) {
 		saved.JumpHostID = target.ItemID
 		var again model.Host
 		if err := call(im.ctx, im.e, daemon.OpPutHost, daemon.PutHostParams{Host: saved}, &again); err != nil {
-			im.warnf("host %s: setting jump host %s: %v", name, jump, err)
+			im.warnf("host %s: setting jump host %s: %v", name, target.Name, err)
 			continue
 		}
 		im.saved[strings.ToLower(name)] = again
 	}
+}
+
+// jumpOverride says how the hop's own user or port differs from the vault
+// host it resolved to, or "" when the vault host already does what the hop
+// asks for.
+func jumpOverride(j jumpSpec, h model.Host) string {
+	var diffs []string
+	if j.user != "" && j.user != h.User {
+		if h.User == "" {
+			diffs = append(diffs, fmt.Sprintf("logs in as %q but the vault host %s has no user", j.user, h.Name))
+		} else {
+			diffs = append(diffs, fmt.Sprintf("logs in as %q but the vault host %s uses %q", j.user, h.Name, h.User))
+		}
+	}
+	if j.port != "" {
+		port := h.Port
+		if port == 0 {
+			port = 22
+		}
+		if n, err := strconv.Atoi(j.port); err != nil || uint32(n) != port {
+			diffs = append(diffs, fmt.Sprintf("uses port %s but the vault host %s uses %d", j.port, h.Name, port))
+		}
+	}
+	return strings.Join(diffs, " and ")
 }

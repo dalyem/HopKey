@@ -11,8 +11,8 @@ hop check|which|trust <target>    diagnose, explain resolution, pin the server's
 hop ls [tag] | info <target> | add | edit | rm
 hop key add <path> | ls | rm
 hop import ssh-config [path] [--with-keys]
-hop ts import | ts link <host> <tailscale-name>
-hop setup                         put `Include ~/.ssh/hop/config` at the top of ~/.ssh/config
+hop ts import | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
+hop setup                         put `Include ~/.ssh/hop/config` above every other directive in ~/.ssh/config
 hop status | daemon [stop]
 ```
 

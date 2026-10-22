@@ -235,7 +235,7 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 	}
 	e.printf("route:        %s\n", v.Route)
 	if v.ChosenRoute != nil {
-		e.printf("would use:    %s:%d via %s (%s)\n", v.ChosenRoute.Address, v.ChosenRoute.Port, v.ChosenRoute.Chosen, v.ChosenRoute.Reason)
+		e.printf("would use:    %s:%d via %s\n", v.ChosenRoute.Address, v.ChosenRoute.Port, v.ChosenRoute.Label())
 	}
 	e.printf("agent access: %s\n", v.AgentAccess)
 	if t := v.Tailscale; t != nil {

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/sshkeys"
 	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
@@ -24,6 +25,11 @@ type Route struct {
 	Address string `json:"address"`
 	Port    int    `json:"port"`
 	Reason  string `json:"reason"`
+	// TailscaleSSH is set when the host is reached only through Tailscale SSH:
+	// it has no key of its own to offer, or its pinned host keys are the ones
+	// Tailscale publishes, which the direct sshd does not share. The route is
+	// then the tailnet with no direct fallback.
+	TailscaleSSH bool `json:"tailscale_ssh,omitempty"`
 	// Fallback is the address to try if Chosen was the tailnet under
 	// "auto" and the connection fails. "Online" only means the peer reaches
 	// Tailscale's control plane, not that ssh answers.
@@ -34,6 +40,47 @@ var (
 	cgnat      = netip.MustParsePrefix("100.64.0.0/10")
 	tailnetULA = netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 )
+
+// Label describes the route for people: the route chosen and why.
+func (r Route) Label() string {
+	if r.TailscaleSSH {
+		return r.Chosen + " (Tailscale SSH)"
+	}
+	return r.Chosen + " (" + r.Reason + ")"
+}
+
+// TailscaleSSHOnly reports whether h can only be reached through Tailscale SSH,
+// and why. That is a host Tailscale marks as running Tailscale SSH that either
+// has no key (Tailscale authenticates the tailnet identity, so no key is
+// offered) or is pinned to the host keys Tailscale publishes for its node
+// (the direct sshd has different ones, so a direct connection could only
+// fail the pin). The second case needs the live node to compare against;
+// without it the host takes the ordinary route.
+func TailscaleSSHOnly(h model.Host, ts *tailscale.Status) (why string, only bool) {
+	if h.Tailscale == nil || h.Tailscale.SSH != "yes" {
+		return "", false
+	}
+	if h.KeyID.IsZero() {
+		return "the host has no key", true
+	}
+	n, ok := ts.NodeByID(h.Tailscale.StableNodeID)
+	if !ok || len(h.HostKeys) == 0 || len(n.SSHHostKeys) == 0 {
+		return "", false
+	}
+	published := map[string]bool{}
+	for _, line := range n.SSHHostKeys {
+		if k, err := sshkeys.ParsePublic(line); err == nil {
+			published[string(k.Marshal())] = true
+		}
+	}
+	for _, line := range h.HostKeys {
+		k, err := sshkeys.ParsePublic(line)
+		if err != nil || !published[string(k.Marshal())] {
+			return "", false
+		}
+	}
+	return "its pinned host keys are the ones Tailscale publishes", true
+}
 
 // IsTailnetAddr reports whether addr lives on the tailnet: a Tailscale IP, a
 // *.ts.net name, or a name under the given MagicDNS suffix (which may be "").
@@ -57,6 +104,10 @@ func IsTailnetAddr(addr, magicDNSSuffix string) bool {
 //   - auto: the tailnet address when local Tailscale is running and the peer
 //     is online, otherwise the direct address, and the tailnet address only
 //     if the host has nothing else.
+//
+// A host reached only through Tailscale SSH (see TailscaleSSHOnly) always gets
+// its tailnet address, with no direct fallback; asking for "direct" is an
+// error.
 func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	setting := h.Route
 	if setting == "" {
@@ -80,6 +131,20 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	tailnet, node, haveNode := tailnetAddress(h, ts)
 
 	r := Route{Setting: setting, Port: port}
+	if why, only := TailscaleSSHOnly(h, ts); only {
+		switch {
+		case setting == RouteDirect:
+			return Route{}, fmt.Errorf("host %q is reached only through Tailscale SSH (%s), so route direct cannot work; set the route to tailnet or auto", h.Name, why)
+		case tailnet == "":
+			return Route{}, fmt.Errorf("host %q is reached only through Tailscale SSH (%s) but has no tailnet address", h.Name, why)
+		}
+		r.Chosen, r.Address, r.TailscaleSSH = RouteTailnet, tailnet, true
+		r.Reason = "Tailscale SSH: " + why
+		if ts == nil || !ts.Available {
+			r.Reason += "; tailscale is not running here, so the connection may fail"
+		}
+		return r, nil
+	}
 	useDirect := func(why string) (Route, error) {
 		if len(direct) == 0 {
 			return Route{}, fmt.Errorf("host %q has no address outside the tailnet (%s)", h.Name, why)

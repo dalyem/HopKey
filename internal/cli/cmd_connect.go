@@ -452,7 +452,10 @@ func printWhich(e *Env, rr *daemon.ResolveResult, w *WhichResult) {
 	}
 	if rr.Route != nil {
 		r := rr.Route
-		e.printf("address:  %s:%d via %s (%s)\n", r.Address, r.Port, r.Chosen, r.Reason)
+		e.printf("address:  %s:%d via %s\n", r.Address, r.Port, r.Label())
+		if r.TailscaleSSH && strings.Contains(r.Reason, "may fail") {
+			e.printf("note:     %s\n", r.Reason)
+		}
 		if r.Fallback != "" {
 			e.printf("fallback: %s (direct) if the tailnet address does not answer\n", r.Fallback)
 		}
@@ -605,6 +608,10 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 	// itself goes through the jump host, which auth_ok exercises.
 	viaJump := rr.Host != nil && !rr.Host.JumpHostID.IsZero()
 	const jumpReason = "skipped: the host is reached through a jump host, so it is not probed directly"
+	// Likewise for a host reached only through Tailscale SSH: the tailnet is
+	// the one route, and ssh going over it is what auth_ok tests.
+	tsOnly := rr.Route != nil && rr.Route.TailscaleSSH
+	const tsReason = "skipped: the host is reached through Tailscale SSH, so a direct probe says nothing; auth_ok tries the real route"
 
 	var addr string
 	var port int
@@ -615,15 +622,18 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		}
 		route = rr.Route
 		addr, port = route.Address, route.Port
-		return stepPass, fmt.Sprintf("%s:%d via %s (%s)", addr, port, route.Chosen, route.Reason)
+		return stepPass, fmt.Sprintf("%s:%d via %s", addr, port, route.Label())
 	})
 
 	probe := func(name string, deps []string, fn func() (string, string)) {
-		if viaJump {
+		switch {
+		case viaJump:
 			c.skip(name, jumpReason)
-			return
+		case tsOnly:
+			c.skip(name, tsReason)
+		default:
+			c.run(name, deps, fn)
 		}
-		c.run(name, deps, fn)
 	}
 	probe("tcp_reachable", []string{"route"}, func() (string, string) {
 		err := tcpReachable(ctx, addr, port, e.dialTimeout())

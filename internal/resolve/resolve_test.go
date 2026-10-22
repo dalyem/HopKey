@@ -216,6 +216,27 @@ func TestResolveAmbiguity(t *testing.T) {
 			t.Errorf("got %+v", r)
 		}
 	})
+	t.Run("duplicate tailscale host name, neither node linked", func(t *testing.T) {
+		// A vault host that DNS and fuzzy matching would both find. Neither
+		// may be reached by falling through, interactive or not.
+		hosts := []model.Host{host(1, "builder", func(h *model.Host) { h.Addresses = []string{"192.0.2.9"} })}
+		ts := tsStatus(node("nB1", "build", "build.tn.ts.net", true, "100.64.0.3"), node("nB2", "build", "build-1.tn.ts.net", true, "100.64.0.4"))
+		lookup := func(context.Context, string) ([]string, error) { return []string{"192.0.2.9"}, nil }
+		for _, interactive := range []bool{false, true} {
+			r, err := Resolve(context.Background(), Input{Target: "build", Hosts: hosts, Tailscale: ts, Interactive: interactive, LookupHost: lookup})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Status != StatusAmbiguous || r.Rule != RuleTailscale || r.Host != nil || len(r.Candidates) != 2 {
+				t.Errorf("interactive=%v: got %+v", interactive, r)
+			}
+			for _, c := range r.Candidates {
+				if c.HostID != "" || c.NodeID == "" {
+					t.Errorf("interactive=%v: candidate %+v should be a bare tailnet node", interactive, c)
+				}
+			}
+		}
+	})
 	t.Run("two hosts claim one node", func(t *testing.T) {
 		hosts := []model.Host{host(1, "a", linked("nB1", "")), host(2, "b", linked("nB1", ""))}
 		ts := tsStatus(node("nB1", "build", "build.tn.ts.net", true))

@@ -112,7 +112,7 @@ func init() {
 		"rm":      {runRm, "hop rm <target> [--yes]"},
 		"key":     {runKey, "hop key add <path> [--name N] | hop key ls | hop key rm <name> [--yes]"},
 		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run]"},
-		"ts":      {runTS, "hop ts import [name...] [--user U] [--key K] [--tag T] [--no-pin] [--dry-run] | hop ts link <host> <tailscale-name>"},
+		"ts":      {runTS, "hop ts import [name...] [--user U] [--key K] [--tag T] [--no-pin] [--dry-run] | hop ts link <host> <node-id-or-dns-name>"},
 		"setup":   {runSetup, "hop setup [--yes]"},
 		"daemon":  {runDaemon, "hop daemon [stop]"},
 		"status":  {runStatus, "hop status [--json]"},

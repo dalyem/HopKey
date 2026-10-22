@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"net"
@@ -11,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -595,5 +599,370 @@ func TestControlSocketIsPrivate(t *testing.T) {
 	fi, err := os.Stat(f.paths.RunDir)
 	if err != nil || fi.Mode().Perm() != 0o700 {
 		t.Errorf("run dir: %v %v", fi, err)
+	}
+}
+
+func TestKeylessTailscaleSSHHostsGetABlockWithNoKey(t *testing.T) {
+	pin := genKey(t)
+	node := tailscale.Node{ID: "nTS", HostName: "tshost", DNSName: "tshost.tn.ts.net", Online: true, IPs: []string{"100.64.0.7"}, SSHHostKeys: []string{pin.line()}}
+	st := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net", Self: tailscale.Node{ID: "nSELF", HostName: "me", IPs: []string{"100.64.0.1"}}, Peers: []tailscale.Node{node}}
+	f := newFixture(t, fakeTS{st})
+	ctx := context.Background()
+
+	keyless := func(ssh string, mod func(*model.Host)) func(*model.Host) {
+		return func(h *model.Host) {
+			h.KeyID = model.ID{}
+			h.Addresses = []string{"203.0.113.50"}
+			h.Tailscale = &model.Tailscale{StableNodeID: "nTS", DNSName: "tshost.tn.ts.net", SSH: ssh}
+			h.HostKeys = []string{pin.line()}
+			if mod != nil {
+				mod(h)
+			}
+		}
+	}
+	ok := f.put(f.host("tsok", keyless("yes", nil)))
+	unknown := f.put(f.host("tsunknown", keyless("unknown", nil)))
+	direct := f.put(f.host("tsdirect", keyless("yes", func(h *model.Host) { h.Route = "direct" })))
+	f.put(f.host("keyed", func(h *model.Host) { h.HostKeys = []string{pin.line()} }))
+	if err := f.client().Call(ctx, OpReload, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	l := f.list()
+	if info := l.SSH[ok.ItemID.String()]; info.Alias != "tsok" || info.Problem != "" {
+		t.Fatalf("a keyless Tailscale SSH host is valid: %+v", info)
+	}
+	if p := l.SSH[unknown.ItemID.String()].Problem; !strings.Contains(p, "no key assigned") {
+		t.Errorf("keyless without Tailscale SSH: problem %q", p)
+	}
+	if p := l.SSH[direct.ItemID.String()].Problem; !strings.Contains(p, "route direct cannot work") {
+		t.Errorf("keyless with route direct: problem %q", p)
+	}
+
+	cfg := f.config()
+	block := func(alias string) string {
+		_, rest, found := strings.Cut(cfg, "Host "+alias+"\n")
+		if !found {
+			t.Fatalf("no Host %s in:\n%s", alias, cfg)
+		}
+		block, _, _ := strings.Cut(rest, "\nHost ")
+		return block
+	}
+	b := block("tsok")
+	// The tailnet address, not the direct one; no key file; nothing from the agent.
+	for _, want := range []string{"HostName 100.64.0.7\n", "IdentitiesOnly yes\n", "StrictHostKeyChecking yes\n", "HostKeyAlias tsok\n"} {
+		if !strings.Contains(b, want) {
+			t.Errorf("block lacks %q:\n%s", want, b)
+		}
+	}
+	if strings.Contains(b, "IdentityFile") || strings.Contains(b, "203.0.113.50") {
+		t.Errorf("a keyless block must name no key and no direct address:\n%s", b)
+	}
+	// A host with a key still gets its key file.
+	if !strings.Contains(block("keyed"), "IdentityFile ") {
+		t.Errorf("keyed host lost its IdentityFile:\n%s", block("keyed"))
+	}
+	if strings.Contains(cfg, "Host tsunknown") || strings.Contains(cfg, "Host tsdirect") {
+		t.Errorf("hosts with a problem are in the config:\n%s", cfg)
+	}
+}
+
+// rawConn is a plain connection to the control socket, for requests the
+// client library would never send.
+func (f *fixture) rawConn() net.Conn {
+	f.t.Helper()
+	c, err := net.Dial("unix", f.d.ControlSocket())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.t.Cleanup(func() { c.Close() })
+	return c
+}
+
+func readResponse(t *testing.T, c net.Conn) Response {
+	t.Helper()
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	line, err := bufio.NewReader(c).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("reading a response: %v", err)
+	}
+	var resp Response
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatalf("response %q: %v", line, err)
+	}
+	return resp
+}
+
+func TestOversizedControlRequestIsRejected(t *testing.T) {
+	f := newFixture(t, nil)
+
+	// A request that fits, at the limit, is served.
+	pad := func(n int) []byte {
+		line := []byte(`{"op":"status","params":"`)
+		line = append(line, bytes.Repeat([]byte("x"), n)...)
+		return append(line, '"', '}', '\n')
+	}
+	c := f.rawConn()
+	big := pad(maxRequest - 64)
+	if len(big) >= maxRequest {
+		t.Fatalf("test bug: %d bytes", len(big))
+	}
+	go c.Write(big)
+	if resp := readResponse(t, c); !resp.OK {
+		t.Fatalf("a request just under the limit was refused: %+v", resp.Error)
+	}
+
+	// One byte over is refused with a reason, and the connection is closed.
+	c = f.rawConn()
+	over := pad(maxRequest + 1)
+	go c.Write(over)
+	resp := readResponse(t, c)
+	if resp.OK || resp.Error == nil || resp.Error.Code != CodeInvalid || !strings.Contains(resp.Error.Message, "larger than") {
+		t.Fatalf("oversized request: %+v", resp)
+	}
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Error("the connection stayed open after an oversized request")
+	}
+
+	// And the daemon carries on for everyone else.
+	if err := f.client().Call(context.Background(), OpStatus, nil, nil); err != nil {
+		t.Errorf("daemon after an oversized request: %v", err)
+	}
+}
+
+func TestSlowClientHitsTheDeadlineWithoutBlockingOthers(t *testing.T) {
+	oldIdle := idleTimeout
+	t.Cleanup(func() { idleTimeout = oldIdle }) // registered first, so it runs after the daemon has stopped
+	idleTimeout = 400 * time.Millisecond
+	f := newFixture(t, nil)
+
+	// One client sends half a request and stalls; another never sends
+	// anything; a third drips bytes, each within the deadline.
+	stalled := f.rawConn()
+	stalled.Write([]byte(`{"op":"sta`))
+	silent := f.rawConn()
+	dripper := f.rawConn()
+	stopDrip := make(chan struct{})
+	t.Cleanup(func() { close(stopDrip) })
+	go func() {
+		for _, b := range []byte(`{"op":"status","params":"` + strings.Repeat("y", 200)) {
+			select {
+			case <-stopDrip:
+				return
+			case <-time.After(30 * time.Millisecond):
+			}
+			if _, err := dripper.Write([]byte{b}); err != nil {
+				return
+			}
+		}
+	}()
+
+	// While they hang around, other clients are served at once.
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		if err := f.client().Call(context.Background(), OpStatus, nil, nil); err != nil {
+			t.Fatalf("a normal client while others stall: %v", err)
+		}
+	}
+	if d := time.Since(start); d > 300*time.Millisecond {
+		t.Errorf("five requests took %v while slow clients were connected", d)
+	}
+
+	// Each slow connection is closed by the daemon soon after the deadline.
+	for name, c := range map[string]net.Conn{"half a request": stalled, "silence": silent, "dripping": dripper} {
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		began := time.Now()
+		if _, err := c.Read(make([]byte, 1)); err == nil {
+			t.Errorf("%s: got data, want the connection closed", name)
+		} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Errorf("%s: still open after %v; the deadline did not fire", name, time.Since(began))
+		}
+	}
+	if err := f.client().Call(context.Background(), OpStatus, nil, nil); err != nil {
+		t.Errorf("daemon afterwards: %v", err)
+	}
+}
+
+type flakyStore struct {
+	model.Store
+	fail atomic.Bool
+}
+
+func (s *flakyStore) Snapshot(ctx context.Context) (model.Snapshot, error) {
+	if s.fail.Load() {
+		return model.Snapshot{}, errors.New("disk on fire")
+	}
+	return s.Store.Snapshot(ctx)
+}
+
+func TestFailedReloadKeepsThePreviousKeyringAndConfig(t *testing.T) {
+	base := shortDir(t)
+	paths := Paths{RunDir: filepath.Join(base, "run"), ConfigDir: filepath.Join(base, "home", ".ssh", "hop")}
+	inner := modeltest.New()
+	store := &flakyStore{Store: inner}
+	k1, k2 := genKey(t), genKey(t)
+	ctx := context.Background()
+	key1, err := inner.PutKey(ctx, model.Key{Name: "k1", KeyType: "ed25519", PrivateKey: k1.pem, PublicKey: k1.line()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mkHost := func(name string, key model.Key) model.Host {
+		return model.Host{Name: name, Addresses: []string{"203.0.113.10"}, Port: 22, User: "deploy", KeyID: key.ItemID, Route: "auto", AgentAccess: "allow"}
+	}
+	if _, err := inner.PutHost(ctx, mkHost("one", key1)); err != nil {
+		t.Fatal(err)
+	}
+	d, err := Start(Options{Paths: paths, Store: store, Version: "test", Tailscale: fakeTS{}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	c, err := Dial(ctx, d.ControlSocket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	agentKeys := func() []string {
+		t.Helper()
+		conn, err := net.Dial("unix", d.AgentSocket())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		keys, err := agent.NewClient(conn).List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, k := range keys {
+			out = append(out, k.Comment)
+		}
+		slices.Sort(out)
+		return out
+	}
+	readConfig := func() string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(paths.ConfigDir, "config"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	wantBefore := readConfig()
+	if got := agentKeys(); !slices.Equal(got, []string{"k1"}) || !strings.Contains(wantBefore, "Host one\n") {
+		t.Fatalf("starting point: keys %v\n%s", got, wantBefore)
+	}
+
+	// The vault gains a key and a host, but the next reload fails.
+	key2, err := inner.PutKey(ctx, model.Key{Name: "k2", KeyType: "ed25519", PrivateKey: k2.pem, PublicKey: k2.line()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inner.PutHost(ctx, mkHost("two", key2)); err != nil {
+		t.Fatal(err)
+	}
+	unchanged := func(when string) {
+		t.Helper()
+		if got := agentKeys(); !slices.Equal(got, []string{"k1"}) {
+			t.Errorf("%s: the agent serves %v, want the previous keyring [k1]", when, got)
+		}
+		if got := readConfig(); got != wantBefore {
+			t.Errorf("%s: the ssh config changed:\n%s", when, got)
+		}
+	}
+
+	// 1. The store cannot be read.
+	store.fail.Store(true)
+	if err := c.Call(ctx, OpReload, nil, nil); err == nil || !strings.Contains(err.Error(), "disk on fire") {
+		t.Fatalf("reload with a broken store: %v", err)
+	}
+	unchanged("store failure")
+	if st := d.state.Load(); st == nil || st.lastError != "disk on fire" {
+		t.Errorf("the failure was not recorded: %+v", st)
+	}
+	store.fail.Store(false)
+
+	// 2. The new config cannot be written: the keys directory is in the way.
+	keysDir := filepath.Join(paths.ConfigDir, "keys")
+	if err := os.Rename(keysDir, keysDir+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keysDir, []byte("in the way"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Call(ctx, OpReload, nil, nil); err == nil {
+		t.Fatal("reload succeeded with the keys directory blocked")
+	}
+	unchanged("write failure")
+	if st := d.state.Load(); st == nil || st.lastError == "" {
+		t.Errorf("the write failure was not recorded: %+v", st)
+	}
+
+	// 3. Once the fault is gone the same reload goes through.
+	os.Remove(keysDir)
+	if err := os.Rename(keysDir+".moved", keysDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Call(ctx, OpReload, nil, nil); err != nil {
+		t.Fatalf("reload after the fault cleared: %v", err)
+	}
+	if got := agentKeys(); !slices.Equal(got, []string{"k1", "k2"}) || !strings.Contains(readConfig(), "Host two\n") {
+		t.Errorf("after recovery: keys %v\n%s", got, readConfig())
+	}
+	if st := d.state.Load(); st.lastError != "" {
+		t.Errorf("lastError = %q after a good reload", st.lastError)
+	}
+}
+
+// A host pinned to the keys Tailscale publishes for its node must not fall
+// back to the direct address: the direct sshd has other host keys, so the pin
+// could only fail there.
+func TestHostsPinnedFromTailscaleStayOnTheTailnet(t *testing.T) {
+	published, other := genKey(t), genKey(t)
+	// An offline peer: a plain "auto" host would go direct.
+	node := tailscale.Node{ID: "nOFF", HostName: "off", DNSName: "off.tn.ts.net", Online: false, IPs: []string{"100.64.0.8"}, SSHHostKeys: []string{published.line()}}
+	st := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net", Self: tailscale.Node{ID: "nSELF", HostName: "me", IPs: []string{"100.64.0.1"}}, Peers: []tailscale.Node{node}}
+	f := newFixture(t, fakeTS{st})
+	mk := func(name string, pin testKey, sshHint string) model.Host {
+		return f.put(f.host(name, func(h *model.Host) {
+			h.Addresses = []string{"203.0.113.50"}
+			h.Tailscale = &model.Tailscale{StableNodeID: "nOFF", DNSName: "off.tn.ts.net", SSH: sshHint}
+			h.HostKeys = []string{pin.line()}
+		}))
+	}
+	mk("pinned-ts", published, "yes")
+	mk("pinned-other", other, "yes")
+	mk("pinned-ts-no-hint", published, "unknown")
+	if err := f.client().Call(context.Background(), OpReload, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg := f.config()
+	hostName := func(alias string) string {
+		_, rest, found := strings.Cut(cfg, "Host "+alias+"\n")
+		if !found {
+			t.Fatalf("no Host %s in:\n%s", alias, cfg)
+		}
+		block, _, _ := strings.Cut(rest, "\nHost ")
+		for _, l := range strings.Split(block, "\n") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(l), "HostName "); ok {
+				return v
+			}
+		}
+		return ""
+	}
+	if got := hostName("pinned-ts"); got != "100.64.0.8" {
+		t.Errorf("pinned-ts: HostName %q, want the tailnet address even though the peer is offline", got)
+	}
+	if got := hostName("pinned-other"); got != "203.0.113.50" {
+		t.Errorf("pinned-other: HostName %q, want the direct address (its pin is not Tailscale's)", got)
+	}
+	if got := hostName("pinned-ts-no-hint"); got != "203.0.113.50" {
+		t.Errorf("pinned-ts-no-hint: HostName %q: without ssh=yes the host takes the ordinary route", got)
+	}
+	// It still has its key: only the route is forced.
+	if !strings.Contains(cfg, "IdentityFile ") {
+		t.Errorf("no IdentityFile in the config:\n%s", cfg)
 	}
 }
