@@ -10,9 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/dalyem/hopkey/internal/filelock"
 )
 
 func newPub(t *testing.T) ssh.PublicKey {
@@ -168,8 +172,46 @@ func TestContentIDIsFirst16HexOfSHA256(t *testing.T) {
 // temp dir.
 func testOpts(t *testing.T) Options {
 	t.Helper()
+	opts, _ := testOptsClock(t)
+	return opts
+}
+
+// fakeClock is the clock behind Options.now in tests. step, if set, is added
+// on every reading.
+type fakeClock struct {
+	mu   sync.Mutex
+	t    time.Time
+	step time.Duration
+}
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(c.step)
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// graceForTests is the PruneGrace that testOptsClock sets.
+const graceForTests = time.Hour
+
+// testOptsClock is testOpts with a clock the test controls and a one hour
+// prune grace.
+func testOptsClock(t *testing.T) (Options, *fakeClock) {
+	t.Helper()
 	dir := filepath.Join(t.TempDir(), "hop")
-	return Options{Dir: dir, AgentSocket: filepath.Join(dir, "agent.sock")}
+	clk := &fakeClock{t: time.Now()}
+	return Options{
+		Dir:         dir,
+		AgentSocket: filepath.Join(dir, "agent.sock"),
+		PruneGrace:  graceForTests,
+		now:         clk.now,
+	}, clk
 }
 
 // names lists the entries of dir that match glob, sorted.
@@ -252,7 +294,7 @@ func TestWrite(t *testing.T) {
 }
 
 func TestWriteDropsRemovedHostOnceItsGenerationIsOld(t *testing.T) {
-	opts := testOpts(t)
+	opts, clk := testOptsClock(t)
 	hostA := Host{Alias: "a", HostName: "h", PublicKey: newPub(t)}
 	hostB := Host{Alias: "b", HostName: "h", PublicKey: newPub(t)}
 	bFile := contentID(ssh.MarshalAuthorizedKey(hostB.PublicKey)) + ".pub"
@@ -271,9 +313,10 @@ func TestWriteDropsRemovedHostOnceItsGenerationIsOld(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(opts.Dir, "keys", bFile)); err != nil {
 		t.Errorf("previous generation's key file was pruned too early: %v", err)
 	}
+	clk.advance(2 * graceForTests)
 	mustWrite(t, opts, hostA)
 	if _, err := os.Stat(filepath.Join(opts.Dir, "keys", bFile)); !os.IsNotExist(err) {
-		t.Errorf("key file of host b should be gone two generations later, stat error = %v", err)
+		t.Errorf("key file of host b should be gone once it is past the grace period, stat error = %v", err)
 	}
 }
 
@@ -296,7 +339,7 @@ func snapshot(t *testing.T, dir string) map[string]string {
 }
 
 func TestFailureBeforeConfigRenameKeepsOldGeneration(t *testing.T) {
-	opts := testOpts(t)
+	opts, clk := testOptsClock(t)
 	old := []Host{{Alias: "a", HostName: "h", PublicKey: newPub(t), HostKeys: []ssh.PublicKey{newPub(t)}}}
 	mustWrite(t, opts, old...)
 	before := snapshot(t, opts.Dir)
@@ -338,7 +381,7 @@ func TestFailureBeforeConfigRenameKeepsOldGeneration(t *testing.T) {
 
 	// The next successful Write sweeps up the orphans of the failed one.
 	testHookBeforeConfig = nil
-	mustWrite(t, opts, old...)
+	clk.advance(2 * graceForTests)
 	mustWrite(t, opts, old...)
 	if got := len(snapshot(t, opts.Dir)); got != len(before) {
 		t.Errorf("%d files after recovery, want %d: %v", got, len(before), snapshot(t, opts.Dir))
@@ -360,7 +403,7 @@ func ownFiles(snap map[string]string) []string {
 }
 
 func TestPruneKeepsPreviousGenerationOnly(t *testing.T) {
-	opts := testOpts(t)
+	opts, clk := testOptsClock(t)
 	gen := func() []Host {
 		return []Host{{Alias: "a", HostName: "h", PublicKey: newPub(t), HostKeys: []ssh.PublicKey{newPub(t)}}}
 	}
@@ -370,6 +413,7 @@ func TestPruneKeepsPreviousGenerationOnly(t *testing.T) {
 
 	mustWrite(t, opts, gen()...)
 	gen1 := snapshot(t, opts.Dir)
+	clk.advance(2 * graceForTests)
 	mustWrite(t, opts, gen()...)
 	gen2 := snapshot(t, opts.Dir)
 
@@ -386,7 +430,9 @@ func TestPruneKeepsPreviousGenerationOnly(t *testing.T) {
 		}
 	}
 
-	// The third write drops generation 1 and keeps 2.
+	// The third write drops generation 1, which is past the grace period,
+	// and keeps 2.
+	clk.advance(2 * graceForTests)
 	mustWrite(t, opts, gen()...)
 	gen3 := snapshot(t, opts.Dir)
 	if k, p := count(); k != 2 || p != 2 {
@@ -400,6 +446,207 @@ func TestPruneKeepsPreviousGenerationOnly(t *testing.T) {
 	for _, name := range ownFiles(gen1) {
 		if _, ok := gen3[name]; ok {
 			t.Errorf("generation 1 file %s survived two generations", name)
+		}
+	}
+}
+
+// Two consecutive writes that drop host a must not delete its files while a
+// reader of the old generation may still hold them: the grace period decides.
+func TestPruneKeepsUnreferencedFilesWithinGrace(t *testing.T) {
+	opts, clk := testOptsClock(t)
+	hostA := Host{Alias: "a", HostName: "h", PublicKey: newPub(t), HostKeys: []ssh.PublicKey{newPub(t)}}
+	hostB := Host{Alias: "b", HostName: "h", PublicKey: newPub(t)}
+	fa, err := render(opts, []Host{hostA, hostB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// hostA's own files: its key file, and the known_hosts that only a
+	// config with its pins would name.
+	aKey := filepath.Join(opts.Dir, "keys", contentID(ssh.MarshalAuthorizedKey(hostA.PublicKey))+".pub")
+	aPins := filepath.Join(opts.Dir, fa.knownHostsName)
+	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
+
+	mustWrite(t, opts, hostA, hostB)
+	clk.advance(time.Minute)
+	mustWrite(t, opts, hostB) // drops a; the previous config still names its files
+	clk.advance(time.Minute)
+	mustWrite(t, opts, hostB) // neither config names them any more
+	for _, p := range []string{aKey, aPins} {
+		if !exists(p) {
+			t.Errorf("%s was deleted two writes after it was dropped, inside the grace period", filepath.Base(p))
+		}
+	}
+
+	clk.advance(graceForTests / 2)
+	mustWrite(t, opts, hostB)
+	for _, p := range []string{aKey, aPins} {
+		if !exists(p) {
+			t.Errorf("%s was deleted before the grace period ended", filepath.Base(p))
+		}
+	}
+
+	clk.advance(graceForTests)
+	mustWrite(t, opts, hostB)
+	for _, p := range []string{aKey, aPins} {
+		if exists(p) {
+			t.Errorf("%s survived past the grace period", filepath.Base(p))
+		}
+	}
+	// What the config still names is untouched.
+	cfg, err := os.ReadFile(filepath.Join(opts.Dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ref := range referencedFiles(cfg) {
+		p := filepath.Join(opts.Dir, ref)
+		if strings.HasSuffix(ref, ".pub") {
+			p = filepath.Join(opts.Dir, "keys", ref)
+		}
+		if !exists(p) {
+			t.Errorf("config refers to %s, which is missing", ref)
+		}
+	}
+}
+
+// A file that is re-referenced after sitting unreferenced is young again: the
+// grace period counts from the last config that named it.
+func TestReferencedFileGraceRestartsWhenDropped(t *testing.T) {
+	opts, clk := testOptsClock(t)
+	hostA := Host{Alias: "a", HostName: "h", PublicKey: newPub(t)}
+	hostB := Host{Alias: "b", HostName: "h", PublicKey: newPub(t)}
+	aKey := filepath.Join(opts.Dir, "keys", contentID(ssh.MarshalAuthorizedKey(hostA.PublicKey))+".pub")
+
+	mustWrite(t, opts, hostA, hostB)
+	clk.advance(10 * graceForTests) // a has been in the config for a long time
+	mustWrite(t, opts, hostB)       // dropped now
+	mustWrite(t, opts, hostB)       // a is unreferenced, but only just
+	if _, err := os.Stat(aKey); err != nil {
+		t.Errorf("a long-lived file was deleted the moment it was dropped: %v", err)
+	}
+}
+
+func TestPruneSweepsOnlyOldTempFiles(t *testing.T) {
+	opts, clk := testOptsClock(t)
+	host := Host{Alias: "a", HostName: "h", PublicKey: newPub(t)}
+	mustWrite(t, opts, host)
+
+	oldTemps := []string{
+		filepath.Join(opts.Dir, ".config.tmp111"),
+		filepath.Join(opts.Dir, ".known_hosts-0123456789abcdef.tmp222"),
+		filepath.Join(opts.Dir, "keys", ".0123456789abcdef.pub.tmp333"),
+	}
+	freshTemp := filepath.Join(opts.Dir, ".config.tmp444")
+	for _, p := range append(oldTemps, freshTemp) {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	past := clk.now().Add(-2 * graceForTests)
+	for _, p := range oldTemps {
+		if err := os.Chtimes(p, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := clk.now()
+	if err := os.Chtimes(freshTemp, fresh, fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	mustWrite(t, opts, host)
+	for _, p := range oldTemps {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("stale temp file %s was not swept: %v", p, err)
+		}
+	}
+	if _, err := os.Stat(freshTemp); err != nil {
+		t.Errorf("fresh temp file was swept: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(opts.Dir, lockName)); err != nil {
+		t.Errorf("lock file is gone: %v", err)
+	}
+}
+
+// Write must wait for config.lock, which another process (or Write) may hold.
+func TestWriteWaitsForConfigLock(t *testing.T) {
+	opts := testOpts(t)
+	host := Host{Alias: "a", HostName: "h", PublicKey: newPub(t)}
+	mustWrite(t, opts, host)
+	held, err := filelock.TryLock(filepath.Join(opts.Dir, lockName))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	other := Host{Alias: "b", HostName: "h", PublicKey: newPub(t)}
+	done := make(chan error, 1)
+	go func() { done <- Write(opts, []Host{other}) }()
+	select {
+	case err := <-done:
+		t.Fatalf("Write finished while config.lock was held: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if cfg, _ := os.ReadFile(filepath.Join(opts.Dir, "config")); strings.Contains(string(cfg), "Host b") {
+		t.Error("config was replaced while config.lock was held")
+	}
+	held.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Write after the lock was released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Write did not finish after the lock was released")
+	}
+}
+
+// Concurrent Writes must each succeed, and whichever lands last must leave a
+// config whose files all exist. The clock jumps past the grace on every
+// reading, so an unserialized Write would prune its neighbour's new files.
+func TestConcurrentWritesLeaveConsistentDirectory(t *testing.T) {
+	opts, clk := testOptsClock(t)
+	clk.step = 2 * graceForTests
+	// Widen the window between "files are on disk" and "config is renamed".
+	testHookBeforeConfig = func() error { time.Sleep(2 * time.Millisecond); return nil }
+	t.Cleanup(func() { testHookBeforeConfig = nil })
+
+	const writers, rounds = 4, 6
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*rounds)
+	for w := range writers {
+		hosts := []Host{{
+			Alias: "h" + string(rune('a'+w)), HostName: "h", PublicKey: newPub(t),
+			HostKeys: []ssh.PublicKey{newPub(t)},
+		}}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				errs <- Write(opts, hosts)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Write: %v", err)
+		}
+	}
+
+	cfg, err := os.ReadFile(filepath.Join(opts.Dir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := referencedFiles(cfg)
+	if len(refs) != 2 {
+		t.Fatalf("final config refers to %v, want 1 key file and 1 known_hosts", refs)
+	}
+	for ref := range refs {
+		p := filepath.Join(opts.Dir, ref)
+		if strings.HasSuffix(ref, ".pub") {
+			p = filepath.Join(opts.Dir, "keys", ref)
+		}
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("final config refers to %s: %v", ref, err)
 		}
 	}
 }

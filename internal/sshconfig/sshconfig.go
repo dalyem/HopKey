@@ -24,9 +24,11 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/dalyem/hopkey/internal/filelock"
 	"github.com/dalyem/hopkey/internal/safepath"
 )
 
@@ -44,6 +46,32 @@ type Host struct {
 type Options struct {
 	Dir         string // absolute; receives config, known_hosts-<id> and keys/
 	AgentSocket string // absolute path of the sshagent socket
+
+	// PruneGrace is how long a file that no config refers to any more is
+	// kept. Zero means DefaultPruneGrace.
+	PruneGrace time.Duration
+
+	now func() time.Time // tests replace the clock; nil means time.Now
+}
+
+// DefaultPruneGrace is the reader-lifetime policy: an ssh that read a config
+// is assumed to be done with the files it names within this long. A reader
+// delayed past it can still lose them, and ssh then fails closed (no key
+// file, no pins), never open.
+const DefaultPruneGrace = 24 * time.Hour
+
+func (o Options) grace() time.Duration {
+	if o.PruneGrace == 0 {
+		return DefaultPruneGrace
+	}
+	return o.PruneGrace
+}
+
+func (o Options) clock() time.Time {
+	if o.now != nil {
+		return o.now()
+	}
+	return time.Now()
 }
 
 var (
@@ -51,6 +79,9 @@ var (
 	hostNameRe = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
 	userRe     = regexp.MustCompile(`^[A-Za-z0-9._@+-]+$`)
 )
+
+// lockName serializes Write across processes. It is never deleted.
+const lockName = "config.lock"
 
 // testHookBeforeConfig, if set, runs after every file the new config refers
 // to is on disk and before the config itself is renamed into place. Tests use
@@ -67,13 +98,19 @@ var testHookBeforeConfig func() error
 // as the last step. A running ssh therefore sees either the old config with
 // all its files or the new config with all its files.
 //
-// Afterwards Write removes the key and known_hosts files that neither the new
-// config nor the config it replaced refers to. Keeping the previous
-// generation means an ssh that read the old config a moment ago can still
-// open the files that config names.
+// Afterwards Write removes generated files that neither the new config nor
+// the config it replaced refers to, and only once they are older than
+// opts.PruneGrace (24 hours by default). Each Write sets the modification
+// time of every file those two configs refer to, so a file's age is the time
+// since it last belonged to the current or previous config. That is the
+// reader-lifetime policy: an ssh that read an older generation can still open
+// its files for the grace period. A reader that stays delayed past the grace
+// can still lose them. Stale temp files from a crashed Write are swept under
+// the same age rule.
 //
-// Write does not lock: callers must not run two Writes on one directory at
-// the same time.
+// Write holds an exclusive flock on config.lock in opts.Dir for its whole
+// run, so concurrent Writes, in this process or another, take turns. The lock
+// file is never removed.
 func Write(opts Options, hosts []Host) error {
 	for _, p := range []string{opts.Dir, opts.AgentSocket} {
 		if !filepath.IsAbs(p) {
@@ -91,6 +128,11 @@ func Write(opts Options, hosts []Host) error {
 	if err != nil {
 		return fmt.Errorf("sshconfig: %w", err)
 	}
+	lock, err := filelock.Lock(filepath.Join(dir, lockName))
+	if err != nil {
+		return fmt.Errorf("sshconfig: %w", err)
+	}
+	defer lock.Close()
 	// Render with the resolved directory, so the paths in the config do not
 	// depend on a symlink that could be repointed later.
 	opts.Dir = dir
@@ -129,7 +171,11 @@ func Write(opts Options, hosts []Host) error {
 	}
 
 	keep := referencedFiles(f.config, prevConfig)
-	if err := prune(dir, keysDir, keep); err != nil {
+	now := opts.clock()
+	if err := touch(dir, keysDir, keep, now); err != nil {
+		return fmt.Errorf("sshconfig: new config is in place, but refreshing file times failed: %w", err)
+	}
+	if err := prune(dir, keysDir, keep, now, opts.grace()); err != nil {
 		return fmt.Errorf("sshconfig: new config is in place, but removing old files failed: %w", err)
 	}
 	return nil
@@ -310,9 +356,32 @@ func referencedFiles(configs ...[]byte) map[string]bool {
 	return keep
 }
 
+// touch sets the modification time of every kept file to now, so that age
+// counts from the last Write that still referred to the file. A name in keep
+// that is not on disk (the previous config may name a file already gone) is
+// skipped.
+func touch(dir, keysDir string, keep map[string]bool, now time.Time) error {
+	for name := range keep {
+		d := dir
+		if strings.HasSuffix(name, ".pub") {
+			d = keysDir
+		}
+		if err := os.Chtimes(filepath.Join(d, name), now, now); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// isTemp reports whether name is a leftover of writeFileAtomic.
+func isTemp(name string) bool {
+	return strings.HasPrefix(name, ".") && strings.Contains(name, ".tmp")
+}
+
 // prune removes <id>.pub files from keysDir and known_hosts files from dir
-// that are not in keep.
-func prune(dir, keysDir string, keep map[string]bool) error {
+// that are not in keep and whose modification time is more than grace before
+// now. It also removes temp files older than grace.
+func prune(dir, keysDir string, keep map[string]bool, now time.Time, grace time.Duration) error {
 	remove := func(d string, match func(name string) bool) error {
 		entries, err := os.ReadDir(d)
 		if err != nil {
@@ -320,7 +389,17 @@ func prune(dir, keysDir string, keep map[string]bool) error {
 		}
 		for _, e := range entries {
 			name := e.Name()
-			if e.IsDir() || keep[name] || !match(name) {
+			if e.IsDir() || keep[name] || !(match(name) || isTemp(name)) {
+				continue
+			}
+			info, err := e.Info()
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if now.Sub(info.ModTime()) <= grace {
 				continue
 			}
 			if err := os.Remove(filepath.Join(d, name)); err != nil && !errors.Is(err, os.ErrNotExist) {

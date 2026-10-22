@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+
+	"github.com/dalyem/hopkey/internal/filelock"
 )
 
 // shortTempDir avoids t.TempDir, whose paths can approach the sockaddr_un limit.
@@ -228,6 +231,97 @@ func TestStaleSocketIsReplaced(t *testing.T) {
 	_, pubs := startServer(t, path, 1)
 	if _, err := dial(t, path).Sign(pubs[0], []byte("x")); err != nil {
 		t.Errorf("Sign on the replacement server: %v", err)
+	}
+}
+
+// A listener that ignores agent.lock is still a live server: Listen must
+// report ErrInUse and leave its socket working.
+func TestLiveListenerWithoutLockIsInUse(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Write([]byte("ok"))
+			c.Close()
+		}
+	}()
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := Listen(path, NewKeyring().Agent())
+	if srv != nil {
+		srv.Close()
+	}
+	if !errors.Is(err, ErrInUse) {
+		t.Fatalf("Listen error = %v, want ErrInUse", err)
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("the live listener's socket was replaced or removed: %v", err)
+	}
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("live listener no longer reachable: %v", err)
+	}
+	defer c.Close()
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ok" {
+		t.Errorf("live listener answered %q, %v; want ok", buf, err)
+	}
+	// The failed Listen must also have released agent.lock.
+	if f, err := filelock.TryLock(filepath.Join(filepath.Dir(path), lockName)); err != nil {
+		t.Errorf("agent.lock still held after a failed Listen: %v", err)
+	} else {
+		f.Close()
+	}
+}
+
+// Only a refused connection proves a socket is stale. A timeout or any other
+// failure to probe must leave the file alone.
+func TestUnprobeableSocketIsNotRemoved(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	stale.Close()
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := dialExisting
+	t.Cleanup(func() { dialExisting = orig })
+	dialExisting = func(string) (net.Conn, error) { return nil, os.ErrDeadlineExceeded }
+
+	srv, err := Listen(path, NewKeyring().Agent())
+	if srv != nil {
+		srv.Close()
+		t.Fatal("Listen succeeded although the socket could not be probed")
+	}
+	if err == nil || errors.Is(err, ErrInUse) {
+		t.Fatalf("Listen error = %v, want a probe failure that is not ErrInUse", err)
+	}
+	after, statErr := os.Lstat(path)
+	if statErr != nil || !os.SameFile(before, after) {
+		t.Errorf("socket file was removed or replaced after a probe error: %v", statErr)
 	}
 }
 

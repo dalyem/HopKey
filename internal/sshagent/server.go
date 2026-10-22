@@ -7,9 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
+	"time"
 
 	"golang.org/x/crypto/ssh/agent"
 
+	"github.com/dalyem/hopkey/internal/filelock"
 	"github.com/dalyem/hopkey/internal/safepath"
 )
 
@@ -22,7 +25,8 @@ const maxSocketPath = 103
 // process opens it is a race.
 const lockName = "agent.lock"
 
-// ErrInUse means another server holds the socket directory's lock.
+// ErrInUse means another server holds the socket directory's lock, or a live
+// listener that does not use the lock is already on the socket path.
 var ErrInUse = errors.New("sshagent: socket is in use")
 
 // Server serves an agent on a Unix socket.
@@ -57,8 +61,11 @@ type Server struct {
 // safepath.EnsurePrivateDir: no unsafe ancestors, owned by the current user,
 // mode 0700. The server holds an exclusive flock on agent.lock in that
 // directory until Close; a second Listen on the same directory returns
-// ErrInUse and touches nothing. Once the lock is held, any socket file at
-// path belongs to a dead process and is replaced. The socket is 0600.
+// ErrInUse and touches nothing. Once the lock is held, a socket file at path
+// is probed by dialing it: a live listener (one that does not use the lock)
+// yields ErrInUse and is left alone, a refused connection marks the file as
+// stale and it is replaced, and any other dial error is returned without
+// touching the file. The socket is 0600.
 //
 // Path reports the socket's path with symlinks in the directory resolved.
 func Listen(path string, ag agent.ExtendedAgent) (*Server, error) {
@@ -74,9 +81,12 @@ func Listen(path string, ag agent.ExtendedAgent) (*Server, error) {
 		return nil, fmt.Errorf("sshagent: socket path is %d bytes, the limit is %d", len(path), maxSocketPath)
 	}
 
-	lock, err := lockFile(filepath.Join(dir, lockName))
+	lock, err := filelock.TryLock(filepath.Join(dir, lockName))
+	if errors.Is(err, filelock.ErrLocked) {
+		return nil, ErrInUse
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("sshagent: %w", err)
 	}
 	srv, err := listenLocked(path, ag, lock)
 	if err != nil {
@@ -88,13 +98,13 @@ func Listen(path string, ag agent.ExtendedAgent) (*Server, error) {
 
 // listenLocked does the work of Listen while the caller holds the lock.
 func listenLocked(path string, ag agent.ExtendedAgent, lock *os.File) (*Server, error) {
-	// With the lock held nobody else is serving here, so a socket file is
-	// left over from a process that died without cleaning up.
+	// With the lock held no cooperating server is running here, but a
+	// process that ignores the lock may still be listening on the path.
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("sshagent: %s exists and is not a socket", path)
 		}
-		if err := os.Remove(path); err != nil {
+		if err := removeStaleSocket(path, fi); err != nil {
 			return nil, err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -133,6 +143,43 @@ func listenLocked(path string, ag agent.ExtendedAgent, lock *os.File) (*Server, 
 		conns:     make(map[net.Conn]struct{}),
 		done:      make(chan struct{}),
 	}, nil
+}
+
+// dialExisting probes a socket file left at the path. Tests replace it.
+var dialExisting = func(path string) (net.Conn, error) {
+	return net.DialTimeout("unix", path, 2*time.Second)
+}
+
+// removeStaleSocket unlinks the socket file fi at path if nothing listens on
+// it. A successful dial means a live listener: ErrInUse. Only a refused
+// connection proves the file is stale; any other error (a timeout, a full
+// backlog, a permission problem) leaves the file alone and is returned.
+// The file is removed only if it is still the inode fi describes. There is a
+// small window between that check and the unlink that the filesystem API
+// cannot close; the private directory keeps other users out of it.
+func removeStaleSocket(path string, fi os.FileInfo) error {
+	conn, err := dialExisting(path)
+	if err == nil {
+		conn.Close()
+		return ErrInUse
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return fmt.Errorf("sshagent: cannot tell whether the socket at %s is live: %w", path, err)
+	}
+	cur, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(fi, cur) {
+		return fmt.Errorf("sshagent: %s changed while it was being checked", path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Path returns the socket path.
