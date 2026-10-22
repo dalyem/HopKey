@@ -44,6 +44,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 			return failf("%v", err)
 		}
 		e.printf("vault unlocked\n")
+		vaultWarnings(ctx, e, c)
 		return kitReminder(ctx, e, c)
 	}
 	if e.ReadPassword == nil {
@@ -72,7 +73,20 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 		return failf("%v", err)
 	}
 	e.printf("vault unlocked with the master password; this device has a new device key\n")
+	vaultWarnings(ctx, e, c)
 	return kitReminder(ctx, e, c)
+}
+
+// vaultWarnings prints the vault's warnings (a lost Emergency Kit, stale
+// devices to revoke) to stderr.
+func vaultWarnings(ctx context.Context, e *Env, c *daemon.Client) {
+	var st daemon.StatusResult
+	if err := c.Call(ctx, daemon.OpStatus, nil, &st); err != nil || st.Vault == nil {
+		return
+	}
+	for _, w := range st.Vault.Warnings {
+		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", w)
+	}
 }
 
 // kitReminder mentions a password change whose kit is still unconfirmed.
@@ -105,5 +119,8 @@ func printVaultStatus(e *Env, v *store.Info) {
 	}
 	if v.KitPending {
 		e.printf("warning:      a new Emergency Kit is waiting to be confirmed; run hop passwd\n")
+	}
+	for _, w := range v.Warnings {
+		e.printf("warning:      %s\n", w)
 	}
 }

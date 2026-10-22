@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -63,9 +64,12 @@ func TestEncryptedVaultOps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Commit(); err != nil {
+	s0, err := p.Commit()
+	if err != nil {
 		t.Fatal(err)
 	}
+	s0.Close() // the daemon below owns the vault
+
 	ring.m = map[string]string{} // the keychain entry is lost
 
 	ctx := context.Background()
@@ -135,6 +139,11 @@ func TestEncryptedVaultOps(t *testing.T) {
 		t.Errorf("%d keys in the agent, want 1", len(keys))
 	}
 
+	// The lost device key's device is stale until hop passwd revokes it.
+	var unlocked StatusResult
+	if err := c.Call(ctx, OpStatus, nil, &unlocked); err != nil || unlocked.Vault.StaleDevices != 1 || len(unlocked.Vault.Warnings) != 1 {
+		t.Errorf("status after a password unlock: %v %+v", err, unlocked.Vault)
+	}
 	if err := c.Call(ctx, OpPasswd, PasswdParams{Current: "wrong password", New: "another password"}, nil); !IsCode(err, CodeWrongPassword) {
 		t.Errorf("passwd with a wrong current password: %v", err)
 	}
@@ -163,4 +172,22 @@ func TestEncryptedVaultOps(t *testing.T) {
 	if keys, _ := d.live.List(); len(keys) != 1 {
 		t.Errorf("%d keys in the agent after unlock, want 1", len(keys))
 	}
+	var after StatusResult
+	if err := c.Call(ctx, OpStatus, nil, &after); err != nil || after.Vault.StaleDevices != 0 || len(after.Vault.Warnings) != 0 {
+		t.Errorf("status after passwd: %v %+v", err, after.Vault)
+	}
+
+	// The daemon owns the vault until it stops, and then lets it go.
+	if _, err := store.Open(ctx, cfg); !errors.Is(err, store.ErrVaultBusy) {
+		t.Errorf("open while the daemon runs: %v, want ErrVaultBusy", err)
+	}
+	c.Close()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open after the daemon stopped: %v", err)
+	}
+	s2.Close()
 }

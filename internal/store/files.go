@@ -34,6 +34,7 @@ func (l layout) deviceConfig() string  { return filepath.Join(l.data, "device.js
 func (l layout) deviceKeyFile() string { return filepath.Join(l.data, "device.key") }
 func (l layout) vault() string         { return filepath.Join(l.data, "vault") }
 func (l layout) lockFile() string      { return filepath.Join(l.vault(), "lock") }
+func (l layout) ownerLock() string     { return filepath.Join(l.vault(), "owner.lock") }
 func (l layout) entries() string       { return filepath.Join(l.vault(), "entries") }
 func (l layout) objects() string       { return filepath.Join(l.vault(), "objects") }
 func (l layout) journal() string       { return filepath.Join(l.vault(), "journal") }

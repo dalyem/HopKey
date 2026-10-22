@@ -273,8 +273,15 @@ func TestVaultEndToEnd(t *testing.T) {
 	code, stdout, _ = v.hop(t, "status")
 	t.Logf("hop status at the end:\n%s", stdout)
 
-	// Nothing secret is on disk under the data directory.
+	// Nothing secret is on disk under the data directory. The kit file
+	// hop init wrote on request (kitFile, outside it) is the one place the
+	// Secret Key and Recovery Key are meant to be in the clear.
 	needles := []string{hostName, alias, "127.0.0.1", "vault-deploy-key", password, newPassword}
+	for _, kit := range [][][]string{firstKit, secondKit} {
+		for _, m := range kit {
+			needles = append(needles, m[2])
+		}
+	}
 	for _, p := range []string{storedPEM, string(filePEM)} {
 		lines := strings.Split(strings.TrimSpace(p), "\n")
 		for _, l := range lines[2 : len(lines)-1] {
@@ -284,7 +291,7 @@ func TestVaultEndToEnd(t *testing.T) {
 		}
 	}
 	files := 0
-	filepath.WalkDir(v.dataDir, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(v.dataDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -300,6 +307,9 @@ func TestVaultEndToEnd(t *testing.T) {
 		}
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("scanning %s: %v", v.dataDir, err)
+	}
 	t.Logf("scanned %d files under %s for %d strings", files, v.dataDir, len(needles))
 	if files < 10 {
 		t.Errorf("only %d files under the data directory", files)

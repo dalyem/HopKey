@@ -93,3 +93,12 @@ func ownerOf(fi os.FileInfo) (uint32, bool) {
 	}
 	return uint32(st.Uid), true
 }
+
+func syncDirOS(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}

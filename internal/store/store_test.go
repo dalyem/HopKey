@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -92,12 +93,40 @@ func newVault(t *testing.T, cfg Config) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	track(t, cfg, s)
 	return &fixture{cfg: cfg, kit: p.Kit(), s: s}
+}
+
+// owners holds the Store that has each test vault open. One Store owns a
+// vault at a time, so opening it again first closes the current owner, as
+// restarting the daemon would.
+var owners sync.Map // DataDir → *Store
+
+func track(t *testing.T, cfg Config, s *Store) {
+	owners.Store(cfg.DataDir, s)
+	t.Cleanup(func() { s.Close() })
+}
+
+func release(cfg Config) {
+	if v, ok := owners.LoadAndDelete(cfg.DataDir); ok {
+		v.(*Store).Close()
+	}
+}
+
+// tryOpen closes the vault's current owner and opens it again.
+func tryOpen(t *testing.T, cfg Config) (*Store, error) {
+	t.Helper()
+	release(cfg)
+	s, err := Open(context.Background(), cfg)
+	if err == nil {
+		track(t, cfg, s)
+	}
+	return s, err
 }
 
 func open(t *testing.T, cfg Config) *Store {
 	t.Helper()
-	s, err := Open(context.Background(), cfg)
+	s, err := tryOpen(t, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +276,7 @@ func TestInitAfterAnInterruptedInit(t *testing.T) {
 	if err := os.WriteFile(p.s.l.deviceConfig(), []byte(`{"v":1,"store":"keychain","account_id":"`+p.Kit().AccountID+`"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(context.Background(), cfg); !errors.Is(err, ErrNoVault) {
+	if _, err := tryOpen(t, cfg); !errors.Is(err, ErrNoVault) {
 		t.Errorf("open after an interrupted init: %v, want ErrNoVault", err)
 	}
 	f := newVault(t, cfg)
@@ -295,7 +324,7 @@ func TestTamperedObjectFailsClosed(t *testing.T) {
 	if err := os.WriteFile(target, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(context.Background(), cfg)
+	_, err = tryOpen(t, cfg)
 	if !errors.Is(err, ErrObjectDigest) || !strings.Contains(err.Error(), filepath.Base(target)) {
 		t.Fatalf("open with a tampered object: %v, want ErrObjectDigest naming the file", err)
 	}
@@ -321,7 +350,7 @@ func TestTamperedEntryFailsClosed(t *testing.T) {
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = Open(context.Background(), cfg)
+	_, err = tryOpen(t, cfg)
 	if !errors.Is(err, ErrCorrupt) || !strings.HasPrefix(string(vaultlog.RuleOf(err)), "sig.") {
 		t.Fatalf("open with a tampered entry: %v (rule %q), want a signature failure", err, vaultlog.RuleOf(err))
 	}
@@ -337,7 +366,7 @@ func TestDeletedLastEntryIsDetected(t *testing.T) {
 	if err := os.Remove(filepath.Join(cfg.DataDir, "vault", "entries", fmt.Sprintf("%d.json", head.Seq))); err != nil {
 		t.Fatal(err)
 	}
-	_, err := Open(context.Background(), cfg)
+	_, err := tryOpen(t, cfg)
 	if !errors.Is(err, ErrCorrupt) || !strings.Contains(err.Error(), "state head") {
 		t.Fatalf("open with the last entry gone: %v", err)
 	}
@@ -381,6 +410,9 @@ func TestCrashBetweenEntryAndStateIsRecovered(t *testing.T) {
 	if string(readState(t, cfg)) == string(before) {
 		t.Error("state.json was not brought forward")
 	}
+	if !slices.ContainsFunc(s.Info().Warnings, func(w string) bool { return strings.Contains(w, "crash interrupted") }) {
+		t.Errorf("warnings = %q", s.Info().Warnings)
+	}
 }
 
 // An entry past the state head is applied only if it verifies: a bad one
@@ -405,7 +437,7 @@ func TestUnverifiedEntryPastStateIsRefused(t *testing.T) {
 	}
 	os.WriteFile(path, b, 0o600)
 
-	s, err := Open(context.Background(), cfg)
+	s, err := tryOpen(t, cfg)
 	if err == nil {
 		t.Fatalf("a tampered entry past the state head was accepted; hosts %v", names(snapshot(t, s)))
 	}
@@ -414,40 +446,34 @@ func TestUnverifiedEntryPastStateIsRefused(t *testing.T) {
 	}
 }
 
-// Two stores on one vault (two processes) write in turn under the lock;
-// each catches up with the other's entries, verified, before it writes.
-func TestTwoWritersAreSerialized(t *testing.T) {
+// One Store owns a vault: a second Open, which a second process would
+// make, is refused until the owner closes. The daemon is that owner.
+func TestSecondOpenIsRefused(t *testing.T) {
 	cfg := testConfig(t)
-	newVault(t, cfg)
-	a, b := open(t, cfg), open(t, cfg)
-	privPEM, pub := sshKey(t)
-	ctx := context.Background()
-	var wg sync.WaitGroup
-	errs := make(chan error, 20)
-	for i, s := range []*Store{a, b} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range 5 {
-				name := fmt.Sprintf("w%d-%d", i, j)
-				if _, err := s.PutKey(ctx, model.Key{Name: name, KeyType: "ed25519", PrivateKey: privPEM, PublicKey: pub}); err != nil {
-					errs <- err
-				}
-			}
-		}()
+	f := newVault(t, cfg) // Commit's store owns the vault
+	if _, err := Open(context.Background(), cfg); !errors.Is(err, ErrVaultBusy) {
+		t.Fatalf("open while init's store is open: %v, want ErrVaultBusy", err)
 	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
+	addHost(t, f.s, "web-1")
+	s := open(t, cfg) // closes f.s first
+	if _, err := Open(context.Background(), cfg); !errors.Is(err, ErrVaultBusy) || !strings.Contains(err.Error(), "daemon") {
+		t.Fatalf("second open: %v, want ErrVaultBusy naming the daemon", err)
 	}
-	c := open(t, cfg)
-	if n := len(snapshot(t, c).Keys); n != 10 {
-		t.Errorf("%d keys after two writers, want 10", n)
+	if got := names(snapshot(t, s)); len(got) != 1 {
+		t.Errorf("hosts = %v", got)
 	}
-	if h, _ := c.Head(); h.Seq != 10 {
-		t.Errorf("head seq %d, want 10", h.Seq)
+	// A closed store holds nothing and cannot be unlocked again.
+	if err := f.s.Unlock(context.Background()); err == nil {
+		t.Error("a closed store unlocked")
 	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("open after close: %v", err)
+	}
+	again.Close()
 }
 
 func TestLockDropsSecrets(t *testing.T) {
@@ -541,6 +567,7 @@ func TestFileBackend(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			track(t, cfg, s)
 			addHost(t, s, "web-1")
 			raw, err := os.ReadFile(filepath.Join(cfg.DataDir, "device.key"))
 			if err != nil {
@@ -731,8 +758,23 @@ func TestNoPlaintextOnDisk(t *testing.T) {
 	if _, err := f.s.PutCredential(context.Background(), model.Credential{Name: "db", Username: "db.admin.user", Password: "credential.password.xyzzy"}); err != nil {
 		t.Fatal(err)
 	}
-	needles := []string{h.Name, h.Aliases[0], h.Addresses[0], testPassword, "credential.password.xyzzy", "db.admin.user"}
+	needles := []string{h.Name, h.Aliases[0], h.Addresses[0], testPassword, "credential.password.xyzzy", "db.admin.user",
+		f.kit.SecretKey, f.kit.RecoveryKey}
 	needles = append(needles, pemSecretLines(k.PrivateKey)...)
+	needles = append(needles, keyNeedles(t, f.s)...)
+	scanForPlaintext(t, cfg.DataDir, needles)
+
+	// Again with a password change committed and its kit not confirmed:
+	// the journal holds the new Secret Key and Recovery Key, sealed.
+	kit, err := f.s.ChangePassword(context.Background(), []byte(testPassword), []byte("a much better password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.s.PendingKit() == nil {
+		t.Fatal("no kit pending")
+	}
+	needles = append(needles, kit.SecretKey, kit.RecoveryKey, "a much better password")
+	needles = append(needles, keyNeedles(t, f.s)...)
 	scanForPlaintext(t, cfg.DataDir, needles)
 }
 
@@ -750,10 +792,14 @@ func pemSecretLines(privPEM string) []string {
 	return out
 }
 
+// scanForPlaintext reads every file under dir, the vault and the device
+// key file, for the needles. The Emergency Kit file a user asks hop init or
+// hop passwd to write (--kit-file) is the one place the Secret Key and the
+// Recovery Key are meant to be in the clear; it is never under dir.
 func scanForPlaintext(t *testing.T, dir string, needles []string) {
 	t.Helper()
 	files := 0
-	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -769,6 +815,9 @@ func scanForPlaintext(t *testing.T, dir string, needles []string) {
 		}
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("scanning %s: %v", dir, err)
+	}
 	if files < 5 {
 		t.Fatalf("scanned only %d files under %s", files, dir)
 	}

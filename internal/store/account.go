@@ -76,17 +76,17 @@ func (s *Store) writeAccountFile() error {
 	return writeFileAtomic(s.l.accountFile(), b)
 }
 
-// readAccountFile reads account.json. If it is behind state.json (a crash
-// between the two writes), it is rebuilt from state.json. Neither is
-// trusted here: the account keys a password opens are checked against the
-// log by the replay that follows.
-func (s *Store) readAccountFile() (*accountFile, *vaultlog.State, error) {
-	stored, err := s.readStoredState()
+// readAccountFile reads account.json, with state.json parsed and raw. If
+// account.json is behind state.json (a crash between the two writes), it is
+// rebuilt from state.json. Neither is trusted here: the account keys a
+// password opens are checked against the log by the replay that follows.
+func (s *Store) readAccountFile() (*accountFile, *vaultlog.State, []byte, error) {
+	stored, raw, err := s.readStoredState()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if stored == nil {
-		return nil, nil, fmt.Errorf("%w: a password unlock needs state.json", ErrCorrupt)
+		return nil, nil, nil, fmt.Errorf("%w: a password unlock needs state.json", ErrCorrupt)
 	}
 	var a accountFile
 	b, err := os.ReadFile(s.l.accountFile())
@@ -96,11 +96,11 @@ func (s *Store) readAccountFile() (*accountFile, *vaultlog.State, error) {
 	if err != nil || a.V != 1 || a.Gen != stored.Creds.Gen || a.AccountID != stored.Account.AccountID {
 		fresh, ferr := accountOf(stored, objectDir(s.l.objects()))
 		if ferr != nil {
-			return nil, nil, ferr
+			return nil, nil, nil, ferr
 		}
 		a = *fresh
 	}
-	return &a, stored, nil
+	return &a, stored, raw, nil
 }
 
 // Kit is the Emergency Kit (§4.3, §12): the Secret Key and the Recovery Key
