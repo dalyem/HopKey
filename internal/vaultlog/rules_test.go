@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -393,14 +397,14 @@ func mixedAccount(t testing.TB, akv uint32, kemLabel, sigLabel string) *crypto.A
 }
 
 // A checkpoint's account_keys.kem_pk and sig_pk MUST both differ from every
-// earlier account key, and the new VK MUST differ from the pre-state VK
-// (rev 11). The builder refuses each before building; a hand-built entry
-// is refused by Transition.
+// earlier account key, and the new VK MUST differ from every earlier VK
+// (rev 11; global through the history since rev 12). The builder refuses
+// each before building; a hand-built entry is refused by Transition.
 func TestCheckpointFreshKeys(t *testing.T) {
 	w := newWorld(t).withItems()
 	var vk1 crypto.SymKey
 	copy(vk1[:], fixedBytes("vk1", 32)) // the genesis VK
-	if !sameKey(&vk1, &w.sec.VK) {
+	if vk1 != w.sec.VK {
 		t.Fatal("fixture VK changed")
 	}
 	cases := []struct {
@@ -446,9 +450,11 @@ func TestCheckpointFreshKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.record(wire)
-	if len(st2.PastAccounts) != 1 || st2.PastAccounts[0].AKV != 1 || !st2.PastAccounts[0].FpSig.Equal(w.st.Account.FpSig) ||
-		!st2.PastAccounts[0].FpKEM.Equal(w.st.Account.FpKEM) {
-		t.Fatalf("past accounts after the checkpoint: %+v", st2.PastAccounts)
+	h := st2.History
+	if len(h.Accounts) != 2 || !h.Accounts[0].matches(&w.st.Account) || !h.Accounts[1].matches(&st2.Account) ||
+		len(h.VKCommits) != 2 || h.VKCommits[0] != (VKRow{KV: 1, Commit: crypto.VKCommit(&vk1)}) ||
+		h.VKCommits[1] != (VKRow{KV: 2, Commit: crypto.VKCommit(&p2.NewVK)}) {
+		t.Fatalf("history after the checkpoint: %+v", h)
 	}
 	var vk3 crypto.SymKey
 	copy(vk3[:], fixedBytes("vk3", 32))
@@ -480,8 +486,10 @@ func TestCheckpointFreshKeys(t *testing.T) {
 		p := CheckpointParams{NewAccount: na, NewVK: vk3, Creds: credsFor(t, na, "creds3"), Time: w.now()}
 		_, st3, _, err := BuildCheckpoint(st2, sec2, w.devA(), p)
 		mustAccept(t, err)
-		if len(st3.PastAccounts) != 2 || st3.PastAccounts[1].AKV != 2 {
-			t.Fatalf("past accounts: %+v", st3.PastAccounts)
+		h := st3.History
+		if len(h.Accounts) != 3 || !h.Accounts[2].matches(&st3.Account) || h.Accounts[1] != st2.History.Accounts[1] ||
+			len(h.VKCommits) != 3 || h.VKCommits[2] != (VKRow{KV: 3, Commit: crypto.VKCommit(&vk3)}) {
+			t.Fatalf("history: %+v", h)
 		}
 	})
 }
@@ -747,21 +755,24 @@ func TestDeployRules(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) { wantRule(t, w.transition(w.unverified(c.ch)), c.rule) })
 	}
 	t.Run("key material changes while incomplete", func(t *testing.T) {
+		// The same key, encoded differently: private_key and public_key
+		// are compared as strings.
 		k := w.item(idK1).(*model.Key)
-		k.PrivateKey += " changed"
+		k.PrivateKey = sshPrivateKeyComment("k1", "re-encoded")
 		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleDeployMaterial)
 		k = w.item(idK1).(*model.Key)
-		k.PublicKey, _ = sshKey(t, "k3")
+		k.PublicKey = recomment(k.PublicKey, "other")
 		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleDeployMaterial)
-		// key_type is SSH material too (rev 10 item 8).
+		// key_type is SSH material too (rev 10 item 8). Since rev 12 it
+		// must match the private key, so it changes only with the key.
 		k = w.item(idK1).(*model.Key)
-		k.KeyType = "rsa"
+		k.KeyType, k.PrivateKey, k.PublicKey = ecdsaKey(t)
 		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleDeployMaterial)
 	})
 	t.Run("key_type changes once the op is closed", func(t *testing.T) {
 		// Rev 11: SSH material is frozen whether or not an op is pending.
 		k := w.item(idK2).(*model.Key)
-		k.KeyType = "rsa"
+		k.KeyType, k.PrivateKey, k.PublicKey = ecdsaKey(t)
 		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleKeyMaterial)
 	})
 	t.Run("key rename while incomplete is fine", func(t *testing.T) {
@@ -807,9 +818,9 @@ func TestKeyMaterialFrozen(t *testing.T) {
 			n.Name = "k1"
 			return n
 		}()},
-		{"public_key replaced", replaced(func(k *model.Key) { k.PublicKey, _ = sshKey(t, "k3") })},
-		{"private_key replaced", replaced(func(k *model.Key) { k.PrivateKey += " changed" })},
-		{"key_type changed", replaced(func(k *model.Key) { k.KeyType = "rsa" })},
+		{"public_key line changed", replaced(func(k *model.Key) { k.PublicKey = recomment(k.PublicKey, "other") })},
+		{"private_key re-encoded", replaced(func(k *model.Key) { k.PrivateKey = sshPrivateKeyComment("k1", "re-encoded") })},
+		{"key_type changed with its key", replaced(func(k *model.Key) { k.KeyType, k.PrivateKey, k.PublicKey = ecdsaKey(t) })},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -908,7 +919,12 @@ func TestSSHKeyLines(t *testing.T) {
 		{"public_key blob is not a key", key(f[0] + " " + base64.StdEncoding.EncodeToString([]byte("not a key")))},
 		{"public_key type differs from its blob", key("ssh-rsa " + f[1])},
 		{"public_key with options", key(`from="10.0.0.1" ` + pub)},
+		// The line grammar is ASCII only, and SP is ASCII spaces or tabs
+		// (rev 12).
+		{"public_key with a non-breaking space separator", key(f[0] + "\u00a0" + f[1])},
+		{"public_key with trailing whitespace", key(pub + " ")},
 		{"host_keys entry is not a key line", hostKeys(pub, "not a key")},
+		{"host_keys entry with an em space separator", hostKeys(f[0] + "\u2003" + f[1])},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -945,6 +961,53 @@ func TestSSHKeyLines(t *testing.T) {
 		resealRaw(t, wire, w.st, w.sec.VK, w.sec.Items[idH2].IK, hostKeys(pub))
 		resign(t, wire, w.normalSigners())
 		mustAccept(t, w.transition(wire))
+	})
+}
+
+// key.private_key is an unencrypted OpenSSH private key whose public key is
+// public_key's and whose algorithm matches key_type (rev 12). Builders
+// refuse anything else, and a transition that decrypts it rejects the
+// entry.
+func TestSSHPrivateKey(t *testing.T) {
+	w := full(t)
+	key := func(f func(k *model.Key)) crypto.Item {
+		k := keyItem(t, idK3, "k3")
+		f(k)
+		return k
+	}
+	blk, err := ssh.MarshalPrivateKeyWithPassphrase(ed25519.NewKeyFromSeed(fixedBytes("k3", 32)), "", []byte("passphrase"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted := string(pem.EncodeToMemory(blk))
+	cases := []struct {
+		name string
+		it   crypto.Item
+	}{
+		{"private_key empty", key(func(k *model.Key) { k.PrivateKey = "" })},
+		{"private_key garbage", key(func(k *model.Key) {
+			k.PrivateKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+		})},
+		{"private_key encrypted", key(func(k *model.Key) { k.PrivateKey = encrypted })},
+		{"private_key of another key", key(func(k *model.Key) { k.PrivateKey = sshPrivateKey("k1") })},
+		{"key_type differs from the key", key(func(k *model.Key) { k.KeyType = "rsa" })},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := buildNormalWire(w.st, w.sec, w.devA(), Changes{Put: []crypto.Item{c.it}}, w.now())
+			wantRule(t, err, RuleSSHPrivateKey)
+			wire := w.unverified(Changes{Put: []crypto.Item{keyItem(t, idK3, "k3")}})
+			ik, err := crypto.NewSymKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			resealRaw(t, wire, w.st, w.sec.VK, ik, c.it)
+			resign(t, wire, w.normalSigners())
+			wantRule(t, w.transition(wire), RuleSSHPrivateKey)
+		})
+	}
+	t.Run("matching key accepted", func(t *testing.T) {
+		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{keyItem(t, idK3, "k3")}})))
 	})
 }
 
@@ -1221,8 +1284,8 @@ func TestStateSerialization(t *testing.T) {
 	if _, err := ParseState(bytes.Replace(b, []byte(`"kv":`), []byte(`"x":1,"kv":`), 1)); err == nil {
 		t.Fatal("unknown member accepted")
 	}
-	// past_accounts (rev 11) round-trips and must stay below the current
-	// akv in ascending order.
+	// The history (rev 12) round-trips, runs from version 1 through the
+	// current akv and kv, and ends at the current account keys.
 	_, st2, _, err := BuildCheckpoint(w.st, w.sec, w.devA(), w.checkpointParams())
 	if err != nil {
 		t.Fatal(err)
@@ -1231,17 +1294,42 @@ func TestStateSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(b2, []byte(`"past_accounts":[{"akv":1,`)) {
-		t.Fatalf("past_accounts not serialized: %s", b2)
+	if !bytes.Contains(b2, []byte(`"history":{"accounts":[{"akv":1,`)) || !bytes.Contains(b2, []byte(`{"akv":2,`)) {
+		t.Fatalf("history not serialized: %s", b2)
 	}
-	if s2, err := ParseState(b2); err != nil || len(s2.PastAccounts) != 1 {
-		t.Fatalf("parse with past_accounts: %v", err)
+	if s2, err := ParseState(b2); err != nil || len(s2.History.Accounts) != 2 || len(s2.History.VKCommits) != 2 {
+		t.Fatalf("parse with history: %v", err)
 	}
-	if _, err := ParseState(bytes.Replace(b2, []byte(`"past_accounts":[{"akv":1,`), []byte(`"past_accounts":[{"akv":2,`), 1)); err == nil {
-		t.Fatal("past account at the current akv accepted")
+	badState := func(f func(s *State)) []byte {
+		c := st2.clone()
+		f(c)
+		j, err := canonjson.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j
 	}
-	if _, err := ParseState(bytes.Replace(b, []byte(`"past_accounts":[],`), nil, 1)); err == nil {
-		t.Fatal("state without past_accounts accepted")
+	for name, f := range map[string]func(s *State){
+		"no account rows":             func(s *State) { s.History.Accounts = nil },
+		"akv rows not contiguous":     func(s *State) { s.History.Accounts[1].AKV = 3 },
+		"last row is not the account": func(s *State) { s.History.Accounts[1].FpSig = s.History.Accounts[0].FpSig },
+		"history ends before akv":     func(s *State) { s.History.Accounts = s.History.Accounts[:1] },
+		"history ends before kv":      func(s *State) { s.History.VKCommits = s.History.VKCommits[:1] },
+		"kv rows not contiguous":      func(s *State) { s.History.VKCommits[0].KV = 2 },
+	} {
+		if _, err := ParseState(badState(f)); err == nil {
+			t.Errorf("state with %s accepted", name)
+		}
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "history")
+	if nb, err := json.Marshal(m); err != nil {
+		t.Fatal(err)
+	} else if _, err := ParseState(nb); err == nil {
+		t.Fatal("state without history accepted")
 	}
 	// A parsed state keeps working as a pre-state.
 	if _, _, err := Transition(s, w.sec, w.devA(), w.unverified(Changes{Put: []crypto.Item{w.item(idH2)}}), nil); err != nil {

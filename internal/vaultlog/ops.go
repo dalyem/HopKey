@@ -25,6 +25,7 @@ const (
 	OpBundlePut    = "bundle_put"
 	OpGrantRevoke  = "grant_revoke"
 	OpDeploy       = "deploy_op"
+	OpHistory      = "history"
 )
 
 // Op is one operation of an entry. The set is closed: only the types in
@@ -164,6 +165,47 @@ type DeployOp struct {
 	Targets        []Target `json:"targets"`
 }
 
+// AccountRow is one {akv:u32, fp_kem:h, fp_sig:h} of history.accounts:
+// the fingerprints of the account keys for akv.
+type AccountRow struct {
+	AKV   uint32      `json:"akv"`
+	FpKEM crypto.Hash `json:"fp_kem"`
+	FpSig crypto.Hash `json:"fp_sig"`
+}
+
+// VKRow is one {kv:u32, commit:h} of history.vk_commits, where commit is
+// vk_commit(VK[kv]) (crypto.VKCommit).
+type VKRow struct {
+	KV     uint32      `json:"kv"`
+	Commit crypto.Hash `json:"commit"`
+}
+
+// History is the signed, cumulative account-key and VK-commitment history
+// (rev 12). Both lists are in ascending version order and run from version
+// 1 up to and including the current akv and kv.
+type History struct {
+	Accounts  []AccountRow `json:"accounts"`
+	VKCommits []VKRow      `json:"vk_commits"`
+}
+
+func (h *History) clone() History {
+	return History{Accounts: slices.Clone(h.Accounts), VKCommits: slices.Clone(h.VKCommits)}
+}
+
+// HistoryOp is {op, accounts:[{akv:u32, fp_kem:h, fp_sig:h}],
+// vk_commits:[{kv:u32, commit:h}]} (rev 12). Genesis and every checkpoint
+// carry exactly one.
+type HistoryOp struct {
+	Op        string       `json:"op"`
+	Accounts  []AccountRow `json:"accounts"`
+	VKCommits []VKRow      `json:"vk_commits"`
+}
+
+// History returns a copy of the op's lists.
+func (o *HistoryOp) History() History {
+	return History{Accounts: slices.Clone(o.Accounts), VKCommits: slices.Clone(o.VKCommits)}
+}
+
 func (*AccountKeysOp) Name() string  { return OpAccountKeys }
 func (*CredsOp) Name() string        { return OpCreds }
 func (*VKWrapOp) Name() string       { return OpVKWrap }
@@ -176,6 +218,7 @@ func (*GrantAddOp) Name() string     { return OpGrantAdd }
 func (*BundlePutOp) Name() string    { return OpBundlePut }
 func (*GrantRevokeOp) Name() string  { return OpGrantRevoke }
 func (*DeployOp) Name() string       { return OpDeploy }
+func (*HistoryOp) Name() string      { return OpHistory }
 
 func schemaFail(op, format string, args ...any) error {
 	return fail(RuleSchema, "%s: %s", op, fmt.Sprintf(format, args...))
@@ -402,6 +445,33 @@ func (o *DeployOp) validate() error {
 	return nil
 }
 
+func (o *HistoryOp) validate() error {
+	if err := checkOpName(o, o.Op); err != nil {
+		return err
+	}
+	return checkHistoryRows(o.Accounts, o.VKCommits)
+}
+
+// checkHistoryRows requires both history lists to be in ascending version
+// order, contiguous from version 1 (rev 12). A list that runs through the
+// current version has at least one row.
+func checkHistoryRows(accounts []AccountRow, vks []VKRow) error {
+	if len(accounts) == 0 || len(vks) == 0 {
+		return fail(RuleHistoryRows, "history has an empty list")
+	}
+	for i, r := range accounts {
+		if r.AKV != uint32(i+1) {
+			return fail(RuleHistoryRows, "history.accounts[%d] has akv %d, want %d", i, r.AKV, i+1)
+		}
+	}
+	for i, r := range vks {
+		if r.KV != uint32(i+1) {
+			return fail(RuleHistoryRows, "history.vk_commits[%d] has kv %d, want %d", i, r.KV, i+1)
+		}
+	}
+	return nil
+}
+
 // Closed reports whether every target is done or abandoned (§10.3). An op
 // that is not closed is incomplete. A valid op has at least one target
 // (rev 10 item 9).
@@ -472,6 +542,8 @@ func parseOp(raw []byte) (Op, error) {
 		o = new(GrantRevokeOp)
 	case OpDeploy:
 		o = new(DeployOp)
+	case OpHistory:
+		o = new(HistoryOp)
 	default:
 		return nil, fail(RuleUnknownOp, "unknown op %q", name)
 	}
@@ -487,7 +559,7 @@ func parseOp(raw []byte) (Op, error) {
 // opAllowed is the "Allowed in" column of §5.2.
 func opAllowed(name string, k Kind) bool {
 	switch name {
-	case OpAccountKeys, OpCreds, OpVKWrap:
+	case OpAccountKeys, OpCreds, OpVKWrap, OpHistory:
 		return k == KindGenesis || k == KindCheckpoint
 	case OpDeviceAdd:
 		return true

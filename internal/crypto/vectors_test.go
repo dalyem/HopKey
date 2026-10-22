@@ -148,6 +148,11 @@ func TestVectorsEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 	v.hex("sig_log_entry", sig)
+	// vk_commit(VK) = SHA-256(lp("hopkey/v1/vk-commit") || VK) (rev 12).
+	var vk SymKey
+	copy(vk[:], fixedBytes("vk", 32))
+	v.hex("vk", vk[:])
+	v["vk_commit"] = VKCommit(&vk).String()
 	want := compareVectors(t, "encoding", v)
 	if err := Verify(pub.SigPK, LabelLogEntry, obj, unhex(t, want, "sig_log_entry")); err != nil {
 		t.Errorf("stored signature: %v", err)

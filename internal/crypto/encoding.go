@@ -52,6 +52,7 @@ const (
 	LabelTokenAuth        = "hopkey/v1/token-auth"
 	LabelTokenKEM         = "hopkey/v1/token-kem"
 	LabelGrantBundle      = "hopkey/v1/grant-bundle"
+	LabelVKCommit         = "hopkey/v1/vk-commit"
 )
 
 const labelPrefix = "hopkey/v1/"
@@ -216,6 +217,11 @@ func FpKEM(pk []byte) Hash { return sha256.Sum256(cat(lps(LabelKEMPK), LP(pk))) 
 
 // FpSig returns fp_sig(pk) = SHA-256(lp("hopkey/v1/sig-pk") || lp(pk)).
 func FpSig(pk []byte) Hash { return sha256.Sum256(cat(lps(LabelSigPK), LP(pk))) }
+
+// VKCommit returns vk_commit(VK) = SHA-256(lp("hopkey/v1/vk-commit") || VK)
+// (rev 12). VK is not length-prefixed. Genesis and checkpoint history ops
+// publish it; it reveals nothing usable, because VK is 256 random bits.
+func VKCommit(vk *SymKey) Hash { return sha256.Sum256(cat(lps(LabelVKCommit), vk[:])) }
 
 // SHA256 is a convenience for stored-hash fields (auth_sha256 and the like).
 func SHA256(b []byte) Hash { return sha256.Sum256(b) }

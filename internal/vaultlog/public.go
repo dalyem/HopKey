@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"errors"
+	"slices"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -25,6 +26,7 @@ type Candidate struct {
 	creds       *CredsOp
 	vkWrap      *VKWrapOp
 	retired     *RetiredOp
+	history     *HistoryOp
 
 	deviceAdds     map[model.ID]*DeviceAddOp // by device_id
 	revokedDevices idSet
@@ -212,10 +214,14 @@ func (c *Candidate) collect() error {
 		}
 		return fail(RuleOpDupID, "%d ops name %s %v", len(ops), n.cat, n.id)
 	}
+	// Genesis and every checkpoint carry exactly one history op (rev 12).
+	if (e.Kind == KindGenesis || e.Kind == KindCheckpoint) && count[OpHistory] != 1 {
+		return fail(RuleHistoryCount, "%s holds %d history ops, want exactly 1", e.Kind, count[OpHistory])
+	}
 	switch e.Kind {
 	case KindGenesis:
-		if count[OpAccountKeys] != 1 || count[OpCreds] != 1 || count[OpDeviceAdd] != 1 || count[OpVKWrap] != 1 || len(e.Ops) != 4 {
-			return fail(RuleGenesis, "genesis must hold exactly account_keys, creds, one device_add and vk_wrap")
+		if count[OpAccountKeys] != 1 || count[OpCreds] != 1 || count[OpDeviceAdd] != 1 || count[OpVKWrap] != 1 || len(e.Ops) != 5 {
+			return fail(RuleGenesis, "genesis must hold exactly account_keys, creds, one device_add, vk_wrap and history")
 		}
 	case KindBootstrap:
 		if count[OpDeviceAdd] != 1 || len(e.Ops) != 1 {
@@ -238,6 +244,8 @@ func (c *Candidate) collect() error {
 			c.vkWrap = o
 		case *RetiredOp:
 			c.retired = o
+		case *HistoryOp:
+			c.history = o
 		case *DeviceAddOp:
 			c.deviceAdds[o.Cert.DeviceID] = o
 		case *DeviceRevokeOp:
@@ -462,12 +470,9 @@ func (c *Candidate) apply(accountID model.ID) error {
 	post.VaultID = e.VaultID
 	post.Head = Head{Seq: e.Seq, H: c.H}
 	if c.accountKeys != nil {
-		if !anchor {
-			// The replaced key joins the history that later checkpoints'
-			// keys must differ from (rev 11).
-			old := pre.Account
-			post.PastAccounts = append(post.PastAccounts, PastAccount{AKV: old.AKV, FpKEM: old.FpKEM, FpSig: old.FpSig})
-		}
+		// checkHistory, below, ties the history to the pre-state and to
+		// account_keys.
+		post.History = c.history.History()
 		post.Account = accountFromOp(accountID, c.accountKeys)
 		post.KV = c.vkWrap.KV
 		post.Creds = *c.creds
@@ -705,8 +710,46 @@ func (c *Candidate) apply(accountID model.ID) error {
 			return fail(RuleGenesis, "genesis needs account_keys.akv = 1, creds.gen = 1 and vk_wrap.kv = 1")
 		}
 	}
+	if c.history != nil {
+		if err := c.checkHistory(); err != nil {
+			return err
+		}
+	}
 	c.Post = post
 	return nil
+}
+
+// checkHistory applies the public history rules of rev 12 to a genesis or
+// checkpoint. Both lists run through the entry's akv and kv, and the last
+// account row matches account_keys (and, at an anchor, the pinned
+// fingerprints). A transition's history is the pre-state history plus
+// exactly one account row and one VK row. The new account fingerprints
+// differ from every earlier row; at a transition the earlier rows are the
+// pre-state's, so the check reaches back past any anchor. The VK rows need
+// the plaintext stage.
+func (c *Candidate) checkHistory() error {
+	e := &c.Wire.Entry
+	h := c.history
+	if len(h.Accounts) != int(e.AKV) || len(h.VKCommits) != int(e.KV) {
+		return fail(RuleHistoryRows, "history runs to akv %d and kv %d, the entry has akv %d and kv %d",
+			len(h.Accounts), len(h.VKCommits), e.AKV, e.KV)
+	}
+	last := h.Accounts[len(h.Accounts)-1]
+	if p := c.pin; p != nil && (last.AKV != p.AKV || !last.FpKEM.Equal(p.FpKEM) || !last.FpSig.Equal(p.FpSig)) {
+		return fail(RuleAnchorPin, "the last history account row does not match the pinned account")
+	}
+	ak := c.accountKeys
+	if last.AKV != ak.AKV || !last.FpKEM.Equal(crypto.FpKEM(ak.KEMPK)) || !last.FpSig.Equal(crypto.FpSig(ak.SigPK)) {
+		return fail(RuleHistoryAccount, "the last history account row does not match account_keys")
+	}
+	if pre := c.Pre; pre != nil {
+		ph := &pre.History
+		if len(h.Accounts) != len(ph.Accounts)+1 || len(h.VKCommits) != len(ph.VKCommits)+1 ||
+			!slices.Equal(h.Accounts[:len(ph.Accounts)], ph.Accounts) || !slices.Equal(h.VKCommits[:len(ph.VKCommits)], ph.VKCommits) {
+			return fail(RuleHistoryExtend, "history is not the pre-state history plus one account row and one VK row")
+		}
+	}
+	return checkFreshAccount(h.Accounts[:len(h.Accounts)-1], last.FpKEM, last.FpSig)
 }
 
 func (s *State) deployOp(id model.ID) (DeployOp, bool) {
@@ -804,11 +847,8 @@ func (c *Candidate) checkCheckpointCoverage() error {
 		return fail(RuleCheckpointAKV, "account_keys.akv %d, want %d", c.accountKeys.AKV, pre.Account.AKV+1)
 	}
 	// The new account keys differ from every earlier account key (rev 11).
-	// Otherwise a revoked device holding an old acct_priv could read
-	// later writes.
-	if err := checkFreshAccountKeys(pre, c.accountKeys.KEMPK, c.accountKeys.SigPK); err != nil {
-		return err
-	}
+	// Otherwise a revoked device holding an old acct_priv could read later
+	// writes. checkHistory compares them with every earlier history row.
 	if c.creds.Gen != pre.Creds.Gen+1 {
 		return fail(RuleCheckpointGen, "creds.gen %d, want %d", c.creds.Gen, pre.Creds.Gen+1)
 	}

@@ -150,6 +150,16 @@ func (b *builder) vkWrap(vaultID model.ID, acct *crypto.AccountKeys, kv uint32, 
 	return nil
 }
 
+// history adds the history op: prev plus one account row for acct and one
+// VK row for vk (rev 12). Genesis passes an empty prev.
+func (b *builder) history(prev History, acct *crypto.AccountKeys, vk *crypto.SymKey) {
+	pin := acct.Pin()
+	h := prev.clone()
+	h.Accounts = append(h.Accounts, AccountRow{AKV: uint32(len(prev.Accounts) + 1), FpKEM: pin.FpKEM, FpSig: pin.FpSig})
+	h.VKCommits = append(h.VKCommits, VKRow{KV: uint32(len(prev.VKCommits) + 1), Commit: crypto.VKCommit(vk)})
+	b.op(&HistoryOp{Op: OpHistory, Accounts: h.Accounts, VKCommits: h.VKCommits})
+}
+
 func accountKeysOp(acct *crypto.AccountKeys) *AccountKeysOp {
 	pub := acct.Public()
 	return &AccountKeysOp{Op: OpAccountKeys, AKV: acct.AKV, KEMPK: pub.KEMPK, SigPK: slices.Clone([]byte(pub.SigPK))}
@@ -224,8 +234,9 @@ type GenesisParams struct {
 	Time    model.Timestamp
 }
 
-// BuildGenesis builds the genesis entry (§5.3) and verifies it with the
-// anchor algorithm. It returns the wire to post and the verified state.
+// BuildGenesis builds the genesis entry (§5.3), with the history op for
+// akv 1 and kv 1 (rev 12), and verifies it with the anchor algorithm. It
+// returns the wire to post and the verified state.
 func BuildGenesis(p GenesisParams) (*Wire, *State, *Secrets, error) {
 	acct := p.Account
 	if acct == nil || acct.AKV != 1 {
@@ -242,6 +253,7 @@ func BuildGenesis(p GenesisParams) (*Wire, *State, *Secrets, error) {
 	if err := b.vkWrap(p.VaultID, acct, 1, &p.VK); err != nil {
 		return nil, nil, nil, err
 	}
+	b.history(History{}, acct, &p.VK)
 	if err := b.signAccount(RoleAccount, acct); err != nil {
 		return nil, nil, nil, err
 	}
@@ -523,8 +535,9 @@ type CheckpointParams struct {
 // BuildCheckpoint builds a checkpoint from the verified pre-state (§5.3,
 // §10.1): new account keys, creds and VK; recertified survivors with new
 // unlock blobs; every live item re-put under a fresh IK, iv + 1 and the new
-// kv; every active grant revoked; every deploy_op repeated; and the
-// cumulative retired sets. dev is the authoring device and must survive.
+// kv; every active grant revoked; every deploy_op repeated; the cumulative
+// retired sets; and the history extended by one account row and one VK row
+// (rev 12). dev is the authoring device and must survive.
 // The result is verified as a transition of pre by dev. A survivor's new
 // certificate keeps its name and enroll_transcript, and issued_at is the
 // checkpoint time (rev 10 item 13).
@@ -533,14 +546,18 @@ func BuildCheckpoint(pre *State, sec *Secrets, dev DeviceKey, p CheckpointParams
 	if na == nil || na.AccountID != pre.Account.AccountID || na.AKV != pre.Account.AKV+1 {
 		return nil, nil, nil, errors.New("vaultlog: checkpoint needs new account keys for akv + 1")
 	}
-	// Fresh keys and a fresh VK (rev 11), checked before anything is
-	// built. The transition below checks them again.
-	pub := na.Public()
-	if err := checkFreshAccountKeys(pre, pub.KEMPK, pub.SigPK); err != nil {
+	// Keys and a VK that differ from every earlier one in the history
+	// (rev 11, rev 12), checked before anything is built. The transition
+	// below checks them again.
+	pin := na.Pin()
+	if err := checkFreshAccount(pre.History.Accounts, pin.FpKEM, pin.FpSig); err != nil {
 		return nil, nil, nil, err
 	}
-	if sec != nil && sameKey(&p.NewVK, &sec.VK) {
-		return nil, nil, nil, fail(RuleCheckpointFreshVK, "the new VK equals the current VK")
+	commit := crypto.VKCommit(&p.NewVK)
+	for _, r := range pre.History.VKCommits {
+		if commit.Equal(r.Commit) {
+			return nil, nil, nil, fail(RuleCheckpointFreshVK, "the new VK equals VK[%d]", r.KV)
+		}
 	}
 	w, err := buildCheckpointWire(pre, sec, dev, p)
 	if err != nil {
@@ -570,6 +587,7 @@ func buildCheckpointWire(pre *State, sec *Secrets, dev DeviceKey, p CheckpointPa
 	if err := b.vkWrap(pre.VaultID, na, kv, &p.NewVK); err != nil {
 		return nil, err
 	}
+	b.history(pre.History, na, &p.NewVK)
 	revoke := setOf(p.Revoke)
 	for _, id := range sortedKeys(pre.Devices) {
 		d := pre.Devices[id]

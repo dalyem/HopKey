@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/hpke"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"maps"
@@ -133,10 +132,14 @@ func (c *Candidate) CheckPlaintext(sec *Secrets, dev DeviceKey) (*State, *Secret
 		if err != nil {
 			return nil, nil, err
 		}
-		// The new VK differs from the pre-state VK (rev 11). Only the
-		// plaintext stage can see it.
-		if sameKey(&vk, &sec.VK) {
-			return nil, nil, fail(RuleCheckpointFreshVK, "checkpoint keeps the pre-state VK")
+		// The pre-state VK matches its own history row, and the new VK
+		// matches the new row and differs from every earlier VK (rev 11,
+		// rev 12). Only the plaintext stage can see them.
+		if !crypto.VKCommit(&sec.VK).Equal(pre.History.lastVK().Commit) {
+			return nil, nil, fail(RuleHistoryVKCommit, "the pre-state VK does not match its history row")
+		}
+		if err := checkVKCommits(post.History.VKCommits, &vk); err != nil {
+			return nil, nil, err
 		}
 	}
 	items := maps.Clone(sec.Items)
@@ -170,6 +173,22 @@ func (c *Candidate) CheckPlaintext(sec *Secrets, dev DeviceKey) (*State, *Secret
 		return nil, nil, err
 	}
 	return post, next, nil
+}
+
+// checkVKCommits requires vk to match the last row of rows and to differ
+// from the VK of every earlier row (rev 12).
+func checkVKCommits(rows []VKRow, vk *crypto.SymKey) error {
+	commit := crypto.VKCommit(vk)
+	last := rows[len(rows)-1]
+	if !commit.Equal(last.Commit) {
+		return fail(RuleHistoryVKCommit, "VK[%d] does not match its history row", last.KV)
+	}
+	for _, r := range rows[:len(rows)-1] {
+		if commit.Equal(r.Commit) {
+			return fail(RuleCheckpointFreshVK, "VK[%d] reuses VK[%d]", last.KV, r.KV)
+		}
+	}
+	return nil
 }
 
 // checkSecrets requires sec to belong to the verified state.
@@ -328,9 +347,6 @@ func (c *Candidate) checkTransitionPlain(pre, next *Secrets) error {
 	return nil
 }
 
-// sameKey compares two symmetric keys in constant time.
-func sameKey(a, b *crypto.SymKey) bool { return subtle.ConstantTimeCompare(a[:], b[:]) == 1 }
-
 // sameSSHMaterial reports whether two key plaintexts have the same SSH
 // material: key_type, private_key and public_key (rev 10 item 8).
 func sameSSHMaterial(a, b *model.Key) bool {
@@ -456,10 +472,14 @@ func SSHFingerprint(publicKey string) (string, error) { return crypto.SSHFingerp
 // itemErr classifies an error from sealing or opening an item: a
 // key.public_key or host.host_keys entry that is not an OpenSSH line
 // (crypto.ValidateKey and crypto.ValidateHost, rev 10 item 11) is
-// RuleSSHKeyLine; anything else is r.
+// RuleSSHKeyLine, a key.private_key that fails rev 12 is
+// RuleSSHPrivateKey, and anything else is r.
 func itemErr(r Rule, err error, format string, args ...any) error {
-	if errors.Is(err, crypto.ErrSSHKeyLine) {
+	switch {
+	case errors.Is(err, crypto.ErrSSHKeyLine):
 		r = RuleSSHKeyLine
+	case errors.Is(err, crypto.ErrSSHPrivateKey):
+		r = RuleSSHPrivateKey
 	}
 	return failErr(r, err, format, args...)
 }
@@ -523,6 +543,12 @@ func (c *Candidate) anchorPlaintext(acct *crypto.AccountKeys) (*State, *Secrets,
 	if err != nil {
 		return nil, nil, err
 	}
+	// The VK matches the last commitment of the imported history (rev 12),
+	// and, as a transition into this entry would have required, differs
+	// from every earlier one.
+	if err := checkVKCommits(s.History.VKCommits, &vk); err != nil {
+		return nil, nil, err
+	}
 	sec := &Secrets{Account: acct, VK: vk, Items: map[model.ID]PlainItem{}}
 	for _, id := range sortedKeys(c.puts) {
 		pi, err := c.openItem(s, vk, c.puts[id])
@@ -582,6 +608,9 @@ func OpenSecretsWithAccount(s *State, acct *crypto.AccountKeys, objs ObjectFetch
 	vk, err := openVK(s, acct, env)
 	if err != nil {
 		return nil, err
+	}
+	if !crypto.VKCommit(&vk).Equal(s.History.lastVK().Commit) {
+		return nil, fail(RuleHistoryVKCommit, "VK[%d] does not match its history row", s.KV)
 	}
 	sec := &Secrets{Account: acct, VK: vk, Items: map[model.ID]PlainItem{}}
 	for _, id := range sortedKeys(s.Items) {

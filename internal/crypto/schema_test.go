@@ -1,14 +1,8 @@
 package crypto
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/rsa"
-	"encoding/pem"
 	"strings"
 	"testing"
-
-	"golang.org/x/crypto/ssh"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/model"
@@ -20,7 +14,7 @@ func hdr(t model.Type, id byte) model.Header {
 
 func testKey(id byte, grant model.ID) *model.Key {
 	return &model.Key{Header: hdr(model.TypeKey, id), Name: "k", KeyType: "ed25519",
-		PrivateKey: "PRIVATE", PublicKey: testSSHLine, DedicatedGrant: grant}
+		PrivateKey: testKeyPEM, PublicKey: testKeyLine, DedicatedGrant: grant}
 }
 
 func TestItemSchemasValid(t *testing.T) {
@@ -136,27 +130,16 @@ func TestOtherSchemasReject(t *testing.T) {
 }
 
 // key.private_key is text≤16384 (§6.5), so a real multi-line OpenSSH PEM,
-// generated here, passes. A CRLF copy passes after CRLFToLF.
+// generated here, passes with its own public_key and key_type. A CRLF copy
+// passes after CRLFToLF.
 func TestPrivateKeyPEMAccepted(t *testing.T) {
-	_, edKey, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 3072)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, key := range map[string]any{"ed25519": edKey, "rsa-3072": rsaKey} {
-		blk, err := ssh.MarshalPrivateKey(key, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		pemText := string(pem.EncodeToMemory(blk))
+	for name, kt := range map[string]string{"ed25519": "ed25519", "ecdsa-p256": "ecdsa-p256", "rsa-3072": "rsa"} {
+		pemText, line := genSSHKey(t, name)
 		if !strings.HasPrefix(pemText, "-----BEGIN OPENSSH PRIVATE KEY-----\n") || strings.Count(pemText, "\n") < 3 {
 			t.Fatalf("%s: not a multi-line OpenSSH PEM: %q", name, pemText)
 		}
 		k := testKey(2, model.ID{})
-		k.PrivateKey = pemText
+		k.KeyType, k.PrivateKey, k.PublicKey = kt, pemText, line
 		if err := ValidateKey(k); err != nil {
 			t.Errorf("%s PEM rejected: %v", name, err)
 		}
