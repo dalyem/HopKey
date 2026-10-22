@@ -190,12 +190,28 @@ func (ts *Timestamp) UnmarshalText(b []byte) error {
 }
 
 // Snapshot is every live, decrypted item in a vault at one log head.
+//
+// In a server-backed vault it is the overlay: verified state with the
+// queued outbox changes applied (crypto spec §11.1). Marks then names
+// every item a queued change affects; it is nil when nothing is queued.
 type Snapshot struct {
 	Hosts       []Host
 	Keys        []Key
 	Credentials []Credential
 	Snippets    []Snippet
+	Marks       map[ID]Mark
 }
+
+// Mark says why a Snapshot item is not (only) verified state.
+type Mark string
+
+const (
+	// MarkPending: a queued change to the item has not committed yet.
+	MarkPending Mark = "pending"
+	// MarkHeld: a queued change to the item is held until the user
+	// resolves it.
+	MarkHeld Mark = "held"
+)
 
 // ErrNotFound means no live item has the requested ID.
 var ErrNotFound = errors.New("model: item not found")

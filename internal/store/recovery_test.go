@@ -714,10 +714,10 @@ func TestDeviceRecordSchema(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(slices.Sorted(maps.Keys(m)), ","); got != "account_id,device_id,kem_sk,secret_key,sig_seed,v" {
+	if got := strings.Join(slices.Sorted(maps.Keys(m)), ","); got != "account_id,device_id,kem_sk,local_key,secret_key,sig_seed,v" {
 		t.Errorf("members %s", got)
 	}
-	if m["secret_key"] != f.kit.SecretKey || m["device_id"] != f.s.dev.ID.String() || m["v"] != float64(1) {
+	if m["secret_key"] != f.kit.SecretKey || m["device_id"] != f.s.dev.ID.String() || m["v"] != float64(2) {
 		t.Errorf("record %v %v %v", m["v"], m["device_id"], m["secret_key"] == f.kit.SecretKey)
 	}
 	if _, err := parseDeviceRecord([]byte(raw)); err != nil {
@@ -736,8 +736,13 @@ func TestDeviceRecordSchema(t *testing.T) {
 	}
 	bad := map[string]string{
 		"unknown member":          with(func(m map[string]any) { m["name"] = "x" }),
-		"v 2":                     with(func(m map[string]any) { m["v"] = 2 }),
-		"v as a string":           with(func(m map[string]any) { m["v"] = "1" }),
+		"v 3":                     with(func(m map[string]any) { m["v"] = 3 }),
+		"v 1 with a local_key":    with(func(m map[string]any) { m["v"] = 1 }),
+		"v as a string":           with(func(m map[string]any) { m["v"] = "2" }),
+		"local_key 31 bytes":      with(func(m map[string]any) { m["local_key"] = b64(make([]byte, 31)) }),
+		"local_key 33 bytes":      with(func(m map[string]any) { m["local_key"] = b64(make([]byte, 33)) }),
+		"local_key empty":         with(func(m map[string]any) { m["local_key"] = "" }),
+		"local_key null":          with(func(m map[string]any) { m["local_key"] = nil }),
 		"account_id not an ID":    with(func(m map[string]any) { m["account_id"] = "nope" }),
 		"device_id a number":      with(func(m map[string]any) { m["device_id"] = 7 }),
 		"kem_sk null":             with(func(m map[string]any) { m["kem_sk"] = nil }),
@@ -803,7 +808,7 @@ func TestDeviceRecordSchema(t *testing.T) {
 	if err := json.Unmarshal(fm["key"], &km); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(slices.Sorted(maps.Keys(km)), ","); got != "account_id,device_id,kem_sk,secret_key,sig_seed,v" {
+	if got := strings.Join(slices.Sorted(maps.Keys(km)), ","); got != "account_id,device_id,kem_sk,local_key,secret_key,sig_seed,v" {
 		t.Errorf("device.key key members %s", got)
 	}
 	km["extra"] = true
@@ -835,7 +840,7 @@ func preRev15(t *testing.T, rec *deviceRecord) string {
 		KEMSK     []byte   `json:"kem_sk"`
 		SigSeed   []byte   `json:"sig_seed"`
 		SecretKey string   `json:"secret_key"`
-	}{rec.V, rec.AccountID, rec.DeviceID, rec.KEMSK, rec.SigSeed, rec.SecretKey})
+	}{1, rec.AccountID, rec.DeviceID, rec.KEMSK, rec.SigSeed, rec.SecretKey})
 	if err != nil {
 		t.Fatal(err)
 	}

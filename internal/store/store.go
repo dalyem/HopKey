@@ -18,6 +18,10 @@
 //	vault/state.json           the verified state (§5.5)
 //	vault/account.json         account_id, salt, kdf_version, pw_blob, rk_blob, verifier hashes
 //	vault/journal/<seq>.json   checkpoint candidates, sealed to the device key (§10.1)
+//	vault/wal.json             the write-ahead journal of a multi-file commit (wal.go)
+//	vault/server.json          present in a server-backed vault (§11.1)
+//	vault/outbox/<n>.json      outbox records, sealed under local_key (outbox.go)
+//	vault/outbox.json          the outbox counter
 //
 // One process owns the vault at a time: Open takes vault/owner.lock for the
 // life of the Store, and a second Open fails with ErrVaultBusy. That process
@@ -31,6 +35,12 @@
 // state.json must be, byte for byte, the state the replay computes at its
 // head (rev 12 makes that state the same on every client); any other
 // state.json fails closed.
+//
+// A server-backed vault (§11.1, EnableServerMode) writes nothing to the log
+// itself. Item writes become outbox records; Pull writes only entries
+// verified from the server, each in one write-ahead-journaled commit with
+// state.json and the outbox records it settles; PushHead posts the head
+// record. Snapshot shows the overlay.
 package store
 
 import (
@@ -153,6 +163,20 @@ type Store struct {
 	kitSKDurable bool
 	// repaired says what the last unlock finished after a crash.
 	repaired string
+
+	// server says the vault is server-backed (vault/server.json).
+	server bool
+	// syncMu serializes Pull and PushHead. Neither holds mu while it waits
+	// on the server.
+	syncMu sync.Mutex
+	// gen counts locks. A pull or push started in an earlier generation
+	// discards its result (§11.2); cancels are its in-flight requests.
+	gen      uint64
+	cancels  map[uint64]context.CancelFunc
+	cancelID uint64
+	// syncHalt is the error that stopped syncing (an equivocation or a
+	// rule violation in a server entry).
+	syncHalt error
 
 	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
@@ -283,6 +307,13 @@ func (s *Store) dropLocked(reason error) {
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
 	s.lockErr = reason
+	// §11.2: locking stops pulls and pushes. In-flight requests are
+	// cancelled, and their responses are discarded by generation.
+	s.gen++
+	for id, cancel := range s.cancels {
+		cancel()
+		delete(s.cancels, id)
+	}
 }
 
 // Unlock reads the device key, verifies the log on disk and loads the
@@ -317,13 +348,28 @@ func (s *Store) unlockLocked() error {
 	}
 	dev, err := rec.device()
 	if err != nil {
+		rec.zero()
 		return err
 	}
 	unlock, err := s.lockFile()
 	if err != nil {
+		rec.zero()
 		return err
 	}
 	defer unlock()
+	// A v1 record becomes v2 with a local_key, durably, before anything
+	// uses it (§11, rev 16). If that fails, the vault stays locked.
+	if err := s.deviceStore(cfg).upgradeRecord(rec); err != nil {
+		rec.zero()
+		return err
+	}
+	if err := s.replayWAL(); err != nil {
+		return err
+	}
+	server, err := s.l.serverBacked()
+	if err != nil {
+		return err
+	}
 
 	stored, raw, err := s.readStoredState()
 	if err != nil {
@@ -337,11 +383,14 @@ func (s *Store) unlockLocked() error {
 	if err != nil {
 		return err
 	}
-	s.state, s.sec, s.dev, s.rec, s.repaired = st, sec, dev, rec, repaired
+	s.state, s.sec, s.dev, s.rec, s.repaired, s.server = st, sec, dev, rec, repaired, server
 	if err := s.reconcileDevice(); err != nil {
 		return err
 	}
 	if err := s.writeAccountFile(); err != nil {
+		return err
+	}
+	if err := s.settleAtUnlock(); err != nil {
 		return err
 	}
 	return s.recoverJournal()
@@ -562,6 +611,13 @@ func (s *Store) Info() Info {
 	if s.repaired != "" {
 		info.Warnings = append(info.Warnings, s.repaired)
 	}
+	if m, err := s.readOutboxMeta(); err == nil && m.Lost > 0 {
+		info.Warnings = append(info.Warnings, fmt.Sprintf("%d queued change(s), pending or held, were lost when hop unlock --password "+
+			"replaced an unreadable device key; make them again", m.Lost))
+	}
+	if s.syncHalt != nil {
+		info.Warnings = append(info.Warnings, s.syncHalt.Error())
+	}
 	return info
 }
 
@@ -643,14 +699,28 @@ func (s *Store) write(ch vaultlog.Changes, check func() error) error {
 	return nil
 }
 
-// Snapshot returns every live item, decrypted.
+// Snapshot returns every live item, decrypted. In a server-backed vault it
+// is the overlay (§11.1): verified state with the queued records applied in
+// order, and Marks naming the items they affect.
 func (s *Store) Snapshot(context.Context) (model.Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
 		return model.Snapshot{}, errLocked
 	}
-	return snapshotOf(s.sec), nil
+	if !s.server {
+		return snapshotOf(s.sec), nil
+	}
+	unlock, err := s.lockFile()
+	if err != nil {
+		return model.Snapshot{}, err
+	}
+	defer unlock()
+	ov, err := s.overlayLocked()
+	if err != nil {
+		return model.Snapshot{}, err
+	}
+	return ov.snapshot()
 }
 
 func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
@@ -754,7 +824,9 @@ func header(it crypto.Item) *model.Header {
 }
 
 // put creates (zero ItemID) or replaces an item. A replacement names the
-// live item's current version; the store writes version + 1.
+// live item's current version; the store writes version + 1. In a
+// server-backed vault the write is queued in the outbox, and the result is
+// the overlay item it shows.
 func put[T any](s *Store, it *T, typ model.Type) (*T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -771,6 +843,12 @@ func put[T any](s *Store, it *T, typ model.Type) (*T, error) {
 		h.ItemID, h.ItemVersion = id, 0
 	}
 	h.V, h.Type = crypto.Version, typ
+	if s.server {
+		if err := s.queuePut(it, isNew); err != nil {
+			return nil, err
+		}
+		return it, nil
+	}
 	check := func() error { return s.checkPut(it, isNew) }
 	if err := s.write(vaultlog.Changes{Put: []crypto.Item{it}}, check); err != nil {
 		return nil, err
@@ -815,12 +893,16 @@ func (s *Store) checkPut(it crypto.Item, isNew bool) error {
 	return nil
 }
 
-// Delete deletes a live item. References to it must be gone first.
+// Delete deletes a live item. References to it must be gone first. In a
+// server-backed vault the delete is queued in the outbox.
 func (s *Store) Delete(_ context.Context, id model.ID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
 		return errLocked
+	}
+	if s.server {
+		return s.queueDelete(id)
 	}
 	if _, ok := s.state.Items[id]; !ok {
 		return model.ErrNotFound

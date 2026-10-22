@@ -65,13 +65,19 @@ type deviceConfig struct {
 }
 
 // deviceRecord is what the device key store keeps: this device's private
-// keys and the account Secret Key, so the SK never has to be typed again on
-// this device (§11, rev 15). It is the keychain entry and the device key
-// file's key (sealed, or raw when unsealed):
+// keys, the account Secret Key, so the SK never has to be typed again on
+// this device (§11, rev 15), and the device-local key that seals the outbox
+// (§11, rev 16). It is the keychain entry and the device key file's key
+// (sealed, or raw when unsealed):
 //
-//	JCS({"v":1, "account_id":id, "device_id":id, "kem_sk":b64, "sig_seed":b64(32), "secret_key":str≤64})
+//	JCS({"v":2, "account_id":id, "device_id":id, "kem_sk":b64, "sig_seed":b64(32), "secret_key":str≤64, "local_key":b64(32)})
 //
-// and is read with parseDeviceRecord, which refuses anything else.
+// and is read with parseDeviceRecord, which refuses anything else except a
+// phase 1 record (v 1, no local_key). Unlock upgrades that one durably
+// before the store is used (upgradeRecord). Only v 2 is ever written.
+//
+// local_key never leaves the machine. Every rewrite carries it unchanged,
+// and a replacement record takes the old one's when that is readable.
 type deviceRecord struct {
 	V         int      `json:"v"`
 	AccountID model.ID `json:"account_id"`
@@ -79,7 +85,21 @@ type deviceRecord struct {
 	KEMSK     []byte   `json:"kem_sk"`
 	SigSeed   []byte   `json:"sig_seed"`
 	SecretKey string   `json:"secret_key"`
+	LocalKey  []byte   `json:"local_key"`
 }
+
+// deviceRecordV1 is the phase 1 record, read only to upgrade it.
+type deviceRecordV1 struct {
+	V         int      `json:"v"`
+	AccountID model.ID `json:"account_id"`
+	DeviceID  model.ID `json:"device_id"`
+	KEMSK     []byte   `json:"kem_sk"`
+	SigSeed   []byte   `json:"sig_seed"`
+	SecretKey string   `json:"secret_key"`
+}
+
+// localKeySize is the length of local_key (§11).
+const localKeySize = 32
 
 // parseDeviceRecord strictly decodes a device record: unknown, missing,
 // duplicate and wrongly typed members are refused, and so is a record with
@@ -89,13 +109,28 @@ type deviceRecord struct {
 // the keys.
 func parseDeviceRecord(b []byte) (*deviceRecord, error) {
 	var rec deviceRecord
-	if err := canonjson.Unmarshal(b, &rec); err != nil {
-		rec.zero()
-		return nil, err
+	err := canonjson.Unmarshal(b, &rec)
+	if err == nil && rec.V != 2 {
+		err = fmt.Errorf("device record version %d with a local_key", rec.V)
 	}
-	var err error
+	if err != nil {
+		rec.zero()
+		// A phase 1 record has no local_key; it is read only to upgrade it.
+		var v1 deviceRecordV1
+		if err1 := canonjson.Unmarshal(b, &v1); err1 != nil || v1.V != 1 {
+			clear(v1.KEMSK)
+			clear(v1.SigSeed)
+			return nil, err
+		}
+		rec = deviceRecord{
+			V: 1, AccountID: v1.AccountID, DeviceID: v1.DeviceID,
+			KEMSK: v1.KEMSK, SigSeed: v1.SigSeed, SecretKey: v1.SecretKey,
+		}
+	}
 	switch {
-	case rec.V != 1:
+	case rec.V == 2 && len(rec.LocalKey) != localKeySize:
+		err = errors.New("device record: local_key is not 32 bytes")
+	case rec.V != 1 && rec.V != 2:
 		err = fmt.Errorf("device record version %d", rec.V)
 	case rec.AccountID.IsZero() || rec.DeviceID.IsZero():
 		err = errors.New("device record: empty account_id or device_id")
@@ -121,7 +156,36 @@ func parseDeviceRecord(b []byte) (*deviceRecord, error) {
 func (r *deviceRecord) zero() {
 	clear(r.KEMSK)
 	clear(r.SigSeed)
+	clear(r.LocalKey)
 	r.SecretKey = ""
+}
+
+// jcs returns the record's canonical encoding. Only a v 2 record is ever
+// written.
+func (r *deviceRecord) jcs() ([]byte, error) {
+	if r.V != 2 || len(r.LocalKey) != localKeySize {
+		return nil, errors.New("store: only a v2 device record with a local_key is written")
+	}
+	return canonjson.Marshal(r)
+}
+
+// localKey returns local_key as an AEAD key.
+func (r *deviceRecord) localKey() (*crypto.SymKey, error) {
+	if r.V != 2 || len(r.LocalKey) != localKeySize {
+		return nil, ErrLocalKey
+	}
+	var k crypto.SymKey
+	copy(k[:], r.LocalKey)
+	return &k, nil
+}
+
+// newLocalKey returns 32 bytes from the OS CSPRNG.
+func newLocalKey() ([]byte, error) {
+	k := make([]byte, localKeySize)
+	if _, err := rand.Read(k); err != nil {
+		return nil, err
+	}
+	return k, nil
 }
 
 // device returns the in-memory DeviceKey for the record.
@@ -145,7 +209,7 @@ func (r *deviceRecord) secretKey() (*crypto.SecretKey, error) {
 }
 
 // newDeviceRecord generates a device: an X-Wing key and an Ed25519 key
-// under a new device ID.
+// under a new device ID, and a new local_key.
 func newDeviceRecord(accountID model.ID, sk string) (*deviceRecord, vaultlog.DeviceInfo, error) {
 	id, err := vaultlog.NewID()
 	if err != nil {
@@ -164,9 +228,13 @@ func newDeviceRecord(accountID model.ID, sk string) (*deviceRecord, vaultlog.Dev
 		return nil, vaultlog.DeviceInfo{}, err
 	}
 	sig := ed25519.NewKeyFromSeed(seed)
+	local, err := newLocalKey()
+	if err != nil {
+		return nil, vaultlog.DeviceInfo{}, err
+	}
 	rec := &deviceRecord{
-		V: 1, AccountID: accountID, DeviceID: id,
-		KEMSK: append([]byte(nil), kemSK...), SigSeed: seed, SecretKey: sk,
+		V: 2, AccountID: accountID, DeviceID: id,
+		KEMSK: append([]byte(nil), kemSK...), SigSeed: seed, SecretKey: sk, LocalKey: local,
 	}
 	info := vaultlog.DeviceInfo{
 		ID: id, KEMPK: kem.PublicKey().Bytes(), SigPK: append([]byte(nil), sig.Public().(ed25519.PublicKey)...),
@@ -352,7 +420,7 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 func (d *deviceStore) save(rec *deviceRecord) error {
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
-		b, err := canonjson.Marshal(rec)
+		b, err := rec.jcs()
 		if err != nil {
 			return err
 		}
@@ -362,7 +430,7 @@ func (d *deviceStore) save(rec *deviceRecord) error {
 		}
 		return nil
 	case DeviceStoreFile:
-		pt, err := canonjson.Marshal(rec)
+		pt, err := rec.jcs()
 		if err != nil {
 			return err
 		}
@@ -424,19 +492,34 @@ func (d *deviceStore) sync() error {
 	return syncDir(filepath.Dir(path))
 }
 
-// storeDurably saves rec and checks that the store gives it back: the
-// file store has fsynced device.key and its directory once save returns,
-// and a keychain entry is read back. The caller holds the file lock.
+// storeDurably saves rec, makes it durable, rereads it and checks it byte
+// for byte (§11, rev 16): the file store's save fsyncs device.key and its
+// directory, and sync does both again; a keychain entry is read back. Any
+// failed step is an error even if the reread succeeds, and the caller must
+// then not use the record. The caller holds the file lock.
 func (d *deviceStore) storeDurably(rec *deviceRecord) error {
+	want, err := rec.jcs()
+	if err != nil {
+		return err
+	}
+	defer clear(want)
 	if err := d.save(rec); err != nil {
+		return err
+	}
+	if err := d.sync(); err != nil {
 		return err
 	}
 	got, err := d.load()
 	if err != nil {
 		return err
 	}
-	same := got.equal(rec)
+	b, err := got.jcs()
 	got.zero()
+	if err != nil {
+		return err
+	}
+	same := bytes.Equal(b, want)
+	clear(b)
 	if !same {
 		return errors.New("the device key store gave back a different device key than was saved")
 	}
@@ -446,7 +529,8 @@ func (d *deviceStore) storeDurably(rec *deviceRecord) error {
 // equal reports whether r and o are the same record.
 func (r *deviceRecord) equal(o *deviceRecord) bool {
 	return r.V == o.V && r.AccountID == o.AccountID && r.DeviceID == o.DeviceID &&
-		bytes.Equal(r.KEMSK, o.KEMSK) && bytes.Equal(r.SigSeed, o.SigSeed) && r.SecretKey == o.SecretKey
+		bytes.Equal(r.KEMSK, o.KEMSK) && bytes.Equal(r.SigSeed, o.SigSeed) && r.SecretKey == o.SecretKey &&
+		bytes.Equal(r.LocalKey, o.LocalKey)
 }
 
 // clone returns a copy of the record that shares no memory with it.
@@ -454,7 +538,39 @@ func (r *deviceRecord) clone() *deviceRecord {
 	c := *r
 	c.KEMSK = append([]byte(nil), r.KEMSK...)
 	c.SigSeed = append([]byte(nil), r.SigSeed...)
+	c.LocalKey = append([]byte(nil), r.LocalKey...)
 	return &c
+}
+
+// upgradeRecord turns a phase 1 (v 1) record into v 2 with a new local_key
+// and stores it durably (§11, rev 16). Unlock runs it before anything uses
+// the record; if any durability step fails, the record is not used and the
+// vault stays locked. A v 2 record from the file store is made durable
+// again instead: an earlier save may have renamed it into place and then
+// failed to fsync, and its local_key is trusted only once it is durable.
+// The caller holds the file lock.
+func (d *deviceStore) upgradeRecord(rec *deviceRecord) error {
+	if rec.V == 2 {
+		if err := d.sync(); err != nil {
+			return fmt.Errorf("%w: the device key is not durable: %v", ErrDeviceKey, err)
+		}
+		return nil
+	}
+	next := rec.clone()
+	next.V = 2
+	local, err := newLocalKey()
+	if err != nil {
+		next.zero()
+		return err
+	}
+	next.LocalKey = local
+	if err := d.storeDurably(next); err != nil {
+		next.zero()
+		return fmt.Errorf("%w: the device record could not be upgraded durably: %v", ErrDeviceKey, err)
+	}
+	rec.zero()
+	*rec = *next
+	return nil
 }
 
 // reconcileDevice brings device.json up to date with the device key in use

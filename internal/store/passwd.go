@@ -29,7 +29,33 @@ import (
 // cannot, the journal is kept and Info warns that its kit is lost.
 //
 // A wrong password leaves the store as it was, locked or not.
-func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretKey string) (err error) {
+//
+// The new device record keeps the old one's local_key when the old record
+// is readable, so queued outbox records stay valid (§11). If it is not,
+// every queued record is sealed under a key that is gone: they are deleted
+// and their number is recorded before anything else is written, and Info
+// and LostIntents report it until AckLostIntents.
+//
+// A server-backed vault needs the server for the bootstrap: use
+// UnlockWithPasswordRemote.
+func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretKey string) error {
+	return s.unlockWithPassword(ctx, nil, password, secretKey)
+}
+
+// UnlockWithPasswordRemote is UnlockWithPassword for a server-backed vault:
+// it catches up with the server through verified transitions, posts the
+// bootstrap entry there, and uses it only once it is verified from the
+// server's log. If the post fails or its outcome is unknown, nothing is
+// saved and the new device stays listed as stale, so the next hop passwd
+// revokes it if it committed.
+func (s *Store) UnlockWithPasswordRemote(ctx context.Context, r Remote, password []byte, secretKey string) error {
+	if r == nil {
+		return errors.New("store: no server")
+	}
+	return s.unlockWithPassword(ctx, r, password, secretKey)
+}
+
+func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byte, secretKey string) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owner == nil {
@@ -72,6 +98,16 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 		return err
 	}
 	defer unlock()
+	if err := s.replayWAL(); err != nil {
+		return err
+	}
+	server, err := s.l.serverBacked()
+	if err != nil {
+		return err
+	}
+	if server && r == nil {
+		return fmt.Errorf("%w: use the server to unlock with the password", ErrServerBacked)
+	}
 	a, stored, raw, err := s.readAccountFile()
 	if err != nil {
 		return err
@@ -91,7 +127,20 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err != nil && s.rec != rec {
+			rec.zero()
+		}
+	}()
 	info.Name = s.deviceName()
+	// §11: local_key carries over from a readable record. Otherwise the
+	// queued records can never be opened again: report how many are lost
+	// before going on.
+	if old != nil && old.V == 2 {
+		copy(rec.LocalKey, old.LocalKey)
+	} else if err := s.dropLostRecords(); err != nil {
+		return err
+	}
 	dev, err := rec.device()
 	if err != nil {
 		return err
@@ -123,18 +172,23 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 	if err := s.writeDeviceConfig(next); err != nil {
 		return err
 	}
-	w, st, sec, err := vaultlog.BuildBootstrap(st, sec, info, s.now())
-	if err != nil {
+	if r == nil {
+		var w *vaultlog.Wire
+		if w, st, sec, err = vaultlog.BuildBootstrap(st, sec, info, s.now()); err != nil {
+			return err
+		}
+		if err := s.commit(w, st); err != nil {
+			return err
+		}
+	} else if st, sec, err = s.bootstrapRemote(ctx, r, st, sec, info); err != nil {
 		return err
 	}
-	if err := s.commit(w, st); err != nil {
-		return err
-	}
-	if err := s.deviceStore(cfg).save(rec); err != nil {
+	// The new record is used only once it is durable (§11).
+	if err := s.deviceStore(cfg).storeDurably(rec); err != nil {
 		return fmt.Errorf("store: the new device key was not saved: %w", err)
 	}
 	s.dropLocked(nil)
-	s.state, s.sec, s.dev, s.rec, s.devCfg, s.repaired = st, sec, dev, rec, next, repaired
+	s.state, s.sec, s.dev, s.rec, s.devCfg, s.repaired, s.server = st, sec, dev, rec, next, repaired, server
 	// device.json still names the old device: reconciling moves it to the
 	// stale list and takes the new one off.
 	if err := s.reconcileDevice(); err != nil {
@@ -143,7 +197,89 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 	if err := s.writeAccountFile(); err != nil {
 		return err
 	}
+	if err := s.settleAtUnlock(); err != nil {
+		return err
+	}
 	return s.recoverJournal()
+}
+
+// dropLostRecords deletes every queued outbox record, which no readable
+// device record can open, and adds their number to the count LostIntents
+// reports, in one commit (§11). The caller holds the file lock.
+func (s *Store) dropLostRecords() error {
+	ns, err := s.l.outboxNumbers()
+	if err != nil || len(ns) == 0 {
+		return err
+	}
+	m, err := s.readOutboxMeta()
+	if err != nil {
+		return err
+	}
+	t := &txn{}
+	for _, n := range ns {
+		t.remove(outboxRel(n))
+		m.Next = max(m.Next, n+1)
+	}
+	m.Lost += uint64(len(ns))
+	if err := putOutboxMeta(t, m); err != nil {
+		return err
+	}
+	return s.commitTxn(t)
+}
+
+// bootstrapRemote catches (st, sec) up with the server through verified
+// transitions, posts a bootstrap entry for info, and returns the state once
+// the server's log shows it, verified. Outbox records are settled later, by
+// settleAtUnlock. The caller holds s.mu and the file lock.
+func (s *Store) bootstrapRemote(ctx context.Context, r Remote, st *vaultlog.State, sec *vaultlog.Secrets, info vaultlog.DeviceInfo) (*vaultlog.State, *vaultlog.Secrets, error) {
+	catchUp := func() error {
+		for {
+			entries, head, err := r.Since(ctx, st.Head.Seq)
+			if err != nil {
+				return err
+			}
+			before := st.Head.Seq
+			st, sec, err = s.applyEntries(st, sec, nil, entries, false)
+			if err != nil {
+				return err
+			}
+			if head.Seq <= st.Head.Seq {
+				return nil
+			}
+			if st.Head.Seq == before {
+				return fmt.Errorf("store: the server reports head %d but returned no entry past %d", head.Seq, before)
+			}
+		}
+	}
+	for attempt := 0; attempt < maxPushAttempts; attempt++ {
+		if err := catchUp(); err != nil {
+			return nil, nil, err
+		}
+		w, _, _, err := vaultlog.BuildBootstrap(st, sec, info, s.now())
+		if err != nil {
+			return nil, nil, err
+		}
+		h, err := w.Entry.Hash()
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err := r.Post(ctx, w); err != nil && !errors.Is(err, ErrHeadConflict) {
+			return nil, nil, err
+		}
+		if err := catchUp(); err != nil {
+			return nil, nil, err
+		}
+		if st.Head.Seq >= w.Entry.Seq {
+			got, err := s.entryHash(w.Entry.Seq)
+			if err != nil {
+				return nil, nil, err
+			}
+			if got.Equal(h) {
+				return st, sec, nil
+			}
+		}
+	}
+	return nil, nil, errors.New("store: the bootstrap entry did not commit; another device keeps writing first")
 }
 
 // ChangePassword changes the master password (§10.1). It is a full
@@ -164,6 +300,11 @@ func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, 
 	}
 	if s.kit != nil {
 		return Kit{}, ErrKitPending
+	}
+	if s.server {
+		// A checkpoint goes to the server directly, with its own journal
+		// (§10.1, §11.1); it never commits locally.
+		return Kit{}, ErrServerBacked
 	}
 	unlock, err := s.lockFile()
 	if err != nil {

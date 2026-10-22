@@ -57,7 +57,7 @@ func (l *layout) ensureDirs() error {
 		return err
 	}
 	l.data = data
-	for _, d := range []string{l.vault(), l.entries(), l.objects(), l.journal()} {
+	for _, d := range []string{l.vault(), l.entries(), l.objects(), l.journal(), l.outbox()} {
 		if _, err := safepath.EnsurePrivateDir(d); err != nil {
 			return err
 		}
