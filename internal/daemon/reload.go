@@ -31,6 +31,7 @@ type state struct {
 	lastError   string // set on a copy of the state when a later reload failed
 
 	locked  bool           // the vault is locked: nothing is loaded
+	revoked bool           // and for good: this device was revoked
 	snap    model.Snapshot // what it was built from, when head is set
 	head    store.Head     // the store's head at the time, if it has one
 	hasHead bool
@@ -71,13 +72,17 @@ func (d *Daemon) reload(ctx context.Context) error {
 // returns it. On failure the previous keyring and config stay in place and
 // the failure is recorded in the state.
 func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
+	// The generation is read before the snapshot: if the store locks or
+	// unlocks in between, the keyring is fenced off until the next reload.
+	gen := d.live.generation()
 	head, hasHead := d.storeHead()
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
 		d.noteError(err)
+		d.followStore(err)
 		return model.Snapshot{}, err
 	}
-	next, err := d.apply(ctx, snap)
+	next, err := d.apply(ctx, snap, gen)
 	if err != nil {
 		d.noteError(err)
 		return model.Snapshot{}, err
@@ -98,18 +103,23 @@ func (d *Daemon) noteError(err error) {
 
 // fresh returns the current snapshot, reloading first if the store has
 // changed since the last reload (another device synced, say). A store that
-// reports its log head is asked only for that while it is unchanged.
+// reports its log head is asked only for that while it is unchanged. A
+// keyring from an earlier store generation (the vault locked and unlocked
+// again) is always reloaded.
 func (d *Daemon) fresh(ctx context.Context) (model.Snapshot, *state, error) {
 	if h, ok := d.storeHead(); ok {
-		if cur := d.state.Load(); cur != nil && cur.hasHead && cur.head == h {
+		if cur := d.state.Load(); cur != nil && cur.hasHead && cur.head == h && !d.live.stale() {
 			return cur.snap, cur, nil
 		}
 	}
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
+		d.mu.Lock()
+		d.followStore(err)
+		d.mu.Unlock()
 		return model.Snapshot{}, nil, err
 	}
-	if cur := d.state.Load(); cur != nil && cur.fingerprint == fingerprint(snap) {
+	if cur := d.state.Load(); cur != nil && cur.fingerprint == fingerprint(snap) && !d.live.stale() {
 		return snap, cur, nil
 	}
 	d.mu.Lock()
@@ -149,8 +159,9 @@ type plan struct {
 	problem  string   // why the host gets none
 }
 
-// apply builds the keyring and ssh config from snap and installs them.
-func (d *Daemon) apply(ctx context.Context, snap model.Snapshot) (*state, error) {
+// apply builds the keyring and ssh config from snap, read in store
+// generation gen, and installs them.
+func (d *Daemon) apply(ctx context.Context, snap model.Snapshot, gen uint64) (*state, error) {
 	st := &state{fingerprint: fingerprint(snap), loadedAt: time.Now(), ssh: map[string]HostSSH{}}
 	warn := func(format string, args ...any) {
 		st.warnings = append(st.warnings, fmt.Sprintf(format, args...))
@@ -214,7 +225,7 @@ func (d *Daemon) apply(ctx context.Context, snap model.Snapshot) (*state, error)
 	}
 
 	slices.Sort(st.warnings)
-	old := d.live.swap(kr)
+	old := d.live.swap(kr, gen)
 	old.RemoveAll() // best effort: drop the old key material
 	return st, nil
 }

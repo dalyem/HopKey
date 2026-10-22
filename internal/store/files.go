@@ -57,7 +57,7 @@ func (l *layout) ensureDirs() error {
 		return err
 	}
 	l.data = data
-	for _, d := range []string{l.vault(), l.entries(), l.objects(), l.journal()} {
+	for _, d := range []string{l.vault(), l.entries(), l.objects(), l.journal(), l.outbox()} {
 		if _, err := safepath.EnsurePrivateDir(d); err != nil {
 			return err
 		}
@@ -249,8 +249,24 @@ func writeTemp(path string, data []byte) (string, error) {
 	return name, nil
 }
 
-// syncDir fsyncs a directory. It is a variable so tests can make it fail.
-var syncDir = fsyncDir
+// syncDir fsyncs a directory, and syncFile a file. They are variables so
+// tests can watch them or make them fail.
+var (
+	syncDir  = fsyncDir
+	syncFile = fsyncFile
+)
+
+func fsyncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 func fsyncDir(dir string) error {
 	d, err := os.Open(dir)

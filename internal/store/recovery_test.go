@@ -40,20 +40,38 @@ func hasWarning(info Info, sub string) bool {
 	return slices.ContainsFunc(info.Warnings, func(w string) bool { return strings.Contains(w, sub) })
 }
 
-// storedRecord reads the device record from the keychain, as a restart
-// would.
+// storedRecord reads the device record from the device key store, as a
+// restart would. It must belong to accountID.
 func storedRecord(t *testing.T, cfg Config, accountID string) deviceRecord {
 	t.Helper()
-	raw, err := cfg.Keyring.Get(keychainService, "device:"+accountID)
+	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
+	dc, err := s.readDeviceConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec, err := parseDeviceRecord([]byte(raw))
+	rec, err := s.deviceStore(dc).load()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if rec.AccountID.String() != accountID {
+		t.Fatalf("the stored record belongs to account %v", rec.AccountID)
 	}
 	return *rec
 }
+
+// deviceSlot is the keychain entry of the device that device.json in cfg's
+// data directory names.
+func deviceSlot(t *testing.T, cfg Config) string {
+	t.Helper()
+	var c deviceConfig
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(cfg.DataDir, "device.json"))), &c); err != nil {
+		t.Fatal(err)
+	}
+	return slotOf(c.AccountID, c.DeviceID)
+}
+
+// slotOf is the keychain entry of device dev on account acct.
+func slotOf(acct, dev model.ID) string { return "device:" + acct.String() + ":" + dev.String() }
 
 // Item 1, key still readable: a password change committed, its kit not yet
 // confirmed, and then hop unlock --password replaces the device key. The
@@ -702,7 +720,7 @@ func TestNoPlaintextOnDiskSealedFile(t *testing.T) {
 func TestDeviceRecordSchema(t *testing.T) {
 	cfg := testConfig(t)
 	f := newVault(t, cfg)
-	user := "device:" + f.kit.AccountID
+	user := deviceSlot(t, cfg)
 	raw, err := cfg.Keyring.Get(keychainService, user)
 	if err != nil {
 		t.Fatal(err)
@@ -714,10 +732,10 @@ func TestDeviceRecordSchema(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(slices.Sorted(maps.Keys(m)), ","); got != "account_id,device_id,kem_sk,secret_key,sig_seed,v" {
+	if got := strings.Join(slices.Sorted(maps.Keys(m)), ","); got != "account_id,device_id,kem_sk,local_key,secret_key,sig_seed,v" {
 		t.Errorf("members %s", got)
 	}
-	if m["secret_key"] != f.kit.SecretKey || m["device_id"] != f.s.dev.ID.String() || m["v"] != float64(1) {
+	if m["secret_key"] != f.kit.SecretKey || m["device_id"] != f.s.dev.ID.String() || m["v"] != float64(2) {
 		t.Errorf("record %v %v %v", m["v"], m["device_id"], m["secret_key"] == f.kit.SecretKey)
 	}
 	if _, err := parseDeviceRecord([]byte(raw)); err != nil {
@@ -736,8 +754,13 @@ func TestDeviceRecordSchema(t *testing.T) {
 	}
 	bad := map[string]string{
 		"unknown member":          with(func(m map[string]any) { m["name"] = "x" }),
-		"v 2":                     with(func(m map[string]any) { m["v"] = 2 }),
-		"v as a string":           with(func(m map[string]any) { m["v"] = "1" }),
+		"v 3":                     with(func(m map[string]any) { m["v"] = 3 }),
+		"v 1 with a local_key":    with(func(m map[string]any) { m["v"] = 1 }),
+		"v as a string":           with(func(m map[string]any) { m["v"] = "2" }),
+		"local_key 31 bytes":      with(func(m map[string]any) { m["local_key"] = b64(make([]byte, 31)) }),
+		"local_key 33 bytes":      with(func(m map[string]any) { m["local_key"] = b64(make([]byte, 33)) }),
+		"local_key empty":         with(func(m map[string]any) { m["local_key"] = "" }),
+		"local_key null":          with(func(m map[string]any) { m["local_key"] = nil }),
 		"account_id not an ID":    with(func(m map[string]any) { m["account_id"] = "nope" }),
 		"device_id a number":      with(func(m map[string]any) { m["device_id"] = 7 }),
 		"kem_sk null":             with(func(m map[string]any) { m["kem_sk"] = nil }),
@@ -803,7 +826,7 @@ func TestDeviceRecordSchema(t *testing.T) {
 	if err := json.Unmarshal(fm["key"], &km); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(slices.Sorted(maps.Keys(km)), ","); got != "account_id,device_id,kem_sk,secret_key,sig_seed,v" {
+	if got := strings.Join(slices.Sorted(maps.Keys(km)), ","); got != "account_id,device_id,kem_sk,local_key,secret_key,sig_seed,v" {
 		t.Errorf("device.key key members %s", got)
 	}
 	km["extra"] = true
@@ -835,7 +858,7 @@ func preRev15(t *testing.T, rec *deviceRecord) string {
 		KEMSK     []byte   `json:"kem_sk"`
 		SigSeed   []byte   `json:"sig_seed"`
 		SecretKey string   `json:"secret_key"`
-	}{rec.V, rec.AccountID, rec.DeviceID, rec.KEMSK, rec.SigSeed, rec.SecretKey})
+	}{1, rec.AccountID, rec.DeviceID, rec.KEMSK, rec.SigSeed, rec.SecretKey})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -930,10 +953,10 @@ func TestPasswdAfterAFailedPasswordUnlockRevokesTheAbandonedDevice(t *testing.T)
 	}
 	ring.fail = false
 	disk, err := s.readDeviceConfig()
-	if err != nil || len(disk.StaleDevices) != 1 {
-		t.Fatalf("setup: device.json %+v, %v; want the new device recorded as stale", disk, err)
+	if err != nil || disk.pendingID().IsZero() || disk.DeviceID != cur {
+		t.Fatalf("setup: device.json %+v, %v; want the new device recorded as pending", disk, err)
 	}
-	abandoned := disk.StaleDevices[0]
+	abandoned := disk.pendingID()
 	if s.dev == nil || s.dev.ID != cur {
 		t.Fatal("setup: the store is not unlocked with the old key")
 	}

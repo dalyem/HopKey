@@ -23,6 +23,7 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/safepath"
 	"github.com/dalyem/hopkey/internal/sshagent"
+	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
@@ -133,7 +134,7 @@ func Start(opts Options) (*Daemon, error) {
 	}
 	opts.Paths.RunDir = runDir
 
-	live := newLiveAgent()
+	live := newLiveAgent(fenceOf(opts.Store))
 	agentSrv, err := sshagent.Listen(opts.Paths.AgentSocket(), live)
 	if errors.Is(err, sshagent.ErrInUse) {
 		return nil, ErrAlreadyRunning
@@ -154,15 +155,19 @@ func Start(opts Options) (*Daemon, error) {
 		started: time.Now(), live: live, agent: agentSrv, control: control,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 	}
-	if err := d.reload(ctx); errors.Is(err, model.ErrLocked) && d.canUnlock() {
+	if err := d.reload(ctx); (errors.Is(err, model.ErrLocked) || errors.Is(err, store.ErrDeviceRevoked)) && d.canUnlock() {
 		// A locked vault (its device key unreadable, say) still gets a
-		// daemon, so hop unlock can reach it.
-		d.state.Store(lockedState())
+		// daemon, so hop unlock can reach it, and a revoked one so hop
+		// status can say so.
+		if cur := d.state.Load(); cur == nil || !cur.locked {
+			d.state.Store(lockedState())
+		}
 		logf("the vault is locked: %v", err)
 	} else if err != nil {
 		d.shutdown()
 		return nil, fmt.Errorf("daemon: loading the vault: %w", err)
 	}
+	d.watchRevoked()
 
 	d.wg.Add(2)
 	go func() {

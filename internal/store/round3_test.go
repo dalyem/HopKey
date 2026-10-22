@@ -218,7 +218,7 @@ func TestPasswdAbortsWhenTheDeviceKeyCannotBeSaved(t *testing.T) {
 func TestDeviceRecordRefusesABadSecretKey(t *testing.T) {
 	cfg := testConfig(t)
 	f := newVault(t, cfg)
-	user := "device:" + f.kit.AccountID
+	user := deviceSlot(t, cfg)
 	raw, err := cfg.Keyring.Get(keychainService, user)
 	if err != nil {
 		t.Fatal(err)

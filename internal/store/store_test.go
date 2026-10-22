@@ -508,7 +508,7 @@ func TestKeychainBackend(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Keyring = OSKeyring{}
 	f := newVault(t, cfg)
-	raw, err := keyring.Get(keychainService, "device:"+f.kit.AccountID)
+	raw, err := keyring.Get(keychainService, deviceSlot(t, cfg))
 	if err != nil {
 		t.Fatalf("no device key in the keychain: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestKeychainBackend(t *testing.T) {
 	}
 
 	// Entry gone from the keychain: the store opens locked and says why.
-	keyring.Delete(keychainService, "device:"+f.kit.AccountID)
+	keyring.Delete(keychainService, deviceSlot(t, cfg))
 	s := open(t, cfg)
 	if info := s.Info(); !info.Locked || !strings.Contains(info.LockReason, "keychain") {
 		t.Errorf("info without the keychain entry = %+v", info)

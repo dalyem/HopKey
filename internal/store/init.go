@@ -144,9 +144,9 @@ func (p *PendingInit) UnsealedFile() (string, bool) {
 	return p.s.l.deviceKeyFile(), p.s.deviceStore(p.devCfg).Unsealed()
 }
 
-// Commit writes the vault: the device key first (so a vault never exists
-// that this device cannot open), then device.json, the genesis objects and
-// entry, state.json and account.json. It returns the unlocked store, which
+// Commit writes the vault: the device key first, durably and read back (so
+// a vault never exists that this device cannot open), then device.json, the
+// genesis objects and entry, state.json and account.json. It returns the unlocked store, which
 // owns the vault (see Open) until Close.
 func (p *PendingInit) Commit() (st *Store, err error) {
 	if p.created {
@@ -176,8 +176,8 @@ func (p *PendingInit) Commit() (st *Store, err error) {
 	} else if ok {
 		return nil, ErrVaultExists
 	}
-	if err := s.deviceStore(p.devCfg).save(p.rec); err != nil {
-		return nil, err
+	if err := s.deviceStore(p.devCfg).storeDurably(p.rec); err != nil {
+		return nil, fmt.Errorf("store: the device key could not be saved durably: %w", err)
 	}
 	if err := s.writeDeviceConfig(p.devCfg); err != nil {
 		return nil, err
@@ -188,6 +188,7 @@ func (p *PendingInit) Commit() (st *Store, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state, s.sec, s.dev, s.rec, s.devCfg = p.state, p.sec, p.dev, p.rec, p.devCfg
+	s.gen.Add(1)
 	if err := s.writeAccountFile(); err != nil {
 		return nil, err
 	}
