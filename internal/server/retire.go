@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ed25519"
 	"errors"
 	"net/http"
@@ -59,6 +60,30 @@ func (s *Server) retireAuth(tx Tx, accountID, deviceID model.ID, chal, sig []byt
 	return ch, d, nil
 }
 
+// spendChallenge consumes a retire-status challenge that authenticated,
+// for a request that answers with refused or fails before its own write
+// commits: an authenticated challenge is spent whatever the answer (R5).
+// It authenticates the challenge again in its own write transaction, since
+// a concurrent request may have spent it meanwhile, and then the answer is
+// that 401. It runs even when r's context has ended (the request ran out
+// of time, or the client went away), until the response's write deadline.
+// It returns refused once the challenge is spent.
+func (s *Server) spendChallenge(r *http.Request, c *call, accountID, deviceID model.ID, chal, sig []byte, refused error) error {
+	ctx, cancel := context.WithDeadline(context.WithoutCancel(r.Context()), c.writeBy)
+	defer cancel()
+	err := s.store.Update(ctx, func(tx Tx) error {
+		ch, _, err := s.retireAuth(tx, accountID, deviceID, chal, sig)
+		if err != nil {
+			return err
+		}
+		return tx.DeleteChallenge(ch.Hash)
+	})
+	if err != nil {
+		return err
+	}
+	return refused
+}
+
 type retireStatusRequest struct {
 	AccountID model.ID    `json:"account_id"`
 	Challenge []byte      `json:"challenge"`
@@ -90,26 +115,32 @@ type retireStatusResponse struct {
 
 // retireStatus: POST /v1/retire-status {account_id, device_id, challenge,
 // sig, h} → {receipt|null, committed, seq|null, head}. In one write
-// transaction, serialized with every commit: retireAuth, the account's
-// bucket, then the challenge is consumed and the answer read: this
-// device's receipt only, whether h is committed in the account's vault and
-// at what seq, and the head (R5).
+// transaction, serialized with every commit: retireAuth, then the
+// challenge is consumed, the account's bucket checked, and the answer read:
+// this device's receipt only, whether h is committed in the account's
+// vault and at what seq, and the head (R5). A refusal by the bucket commits
+// the consumed challenge, and a transaction that fails after retireAuth
+// passed spends it in another.
 func (s *Server) retireStatus(w http.ResponseWriter, r *http.Request, c *call) error {
 	var req retireStatusRequest
 	if err := s.decode(c.body, &req); err != nil {
 		return err
 	}
 	var resp retireStatusResponse
+	var refused error
+	authenticated := false
 	err := s.store.Update(r.Context(), func(tx Tx) error {
 		ch, _, err := s.retireAuth(tx, req.AccountID, req.DeviceID, req.Challenge, req.Sig)
 		if err != nil {
 			return err
 		}
-		if !s.limiter.allow(c.route.pattern+"|account", ch.AccountID.String(), s.rates.Account) {
-			return errRateLimited
-		}
+		authenticated = true
 		if err := tx.DeleteChallenge(ch.Hash); err != nil {
 			return err
+		}
+		if !s.limiter.allow(c.route.pattern+"|account", ch.AccountID.String(), s.rates.Account) {
+			refused = errRateLimited
+			return nil
 		}
 		a, err := tx.Account(ch.AccountID)
 		if err != nil {
@@ -138,7 +169,13 @@ func (s *Server) retireStatus(w http.ResponseWriter, r *http.Request, c *call) e
 		return nil
 	})
 	if err != nil {
+		if authenticated {
+			return s.spendChallenge(r, c, req.AccountID, req.DeviceID, req.Challenge, req.Sig, err)
+		}
 		return err
+	}
+	if refused != nil {
+		return refused
 	}
 	writeJSON(w, http.StatusOK, resp)
 	return nil
@@ -172,10 +209,12 @@ func onlyRetireOf(e *vaultlog.Entry, dev model.ID) bool {
 // the normal commit path: head check, ApplyPublic, R13 admission, receipt
 // and session invalidation, in one transaction that also consumes the
 // challenge. A challenge whose signature verified is consumed whatever
-// the answer: an inactive device (401), a wire for another vault (400) or
-// a refused commit (head_conflict, invalid entry, quota); a retry needs a
-// fresh one (R5). Refusals of the challenge or the signature consume
-// nothing, nor do the checks of the wire alone, before authentication.
+// the answer: an inactive device (401), a wire for another vault (400),
+// the account's bucket (429), a full lock or validation queue or a request
+// out of time (429 busy), or a refused or failed commit (head_conflict,
+// invalid entry, quota); a retry needs a fresh one (R5). Refusals of the
+// challenge or the signature consume nothing, nor do the checks of the
+// wire alone, before authentication.
 func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) error {
 	release, ok := s.validate.acquire(r.Context())
 	if !ok {
@@ -227,49 +266,43 @@ func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) err
 	if err != nil {
 		return err
 	}
+	// The challenge authenticated: every exit from here but a commit
+	// spends it. No account lock is needed for that, since nothing but the
+	// challenge changes.
+	spend := func(refused error) error {
+		return s.spendChallenge(r, c, req.AccountID, req.DeviceID, req.Challenge, req.Sig, refused)
+	}
 	if h := s.hooks.retireRead; h != nil {
 		h()
 	}
 	if !s.limiter.allow(c.route.pattern+"|account", req.AccountID.String(), s.rates.Account) {
-		return errRateLimited
+		return spend(errRateLimited)
 	}
 	if refused != nil {
-		// Consume the challenge in a write transaction that authenticates
-		// it again: a concurrent request may have consumed it since the
-		// read, and then this one gets the 401 of a spent challenge. No
-		// account lock is needed, since nothing but the challenge changes.
-		err = s.store.Update(r.Context(), func(tx Tx) error {
-			ch, _, _, err := authorize(tx)
-			if err != nil {
-				return err
-			}
-			return tx.DeleteChallenge(ch.Hash)
-		})
-		if err != nil {
-			return err
-		}
-		return refused
+		return spend(refused)
 	}
 
 	release()
 	release = func() {}
 	unlock, err := s.accounts.lock(r.Context(), req.AccountID)
 	if err != nil {
-		return err
+		return spend(err)
 	}
 	defer unlock()
 	if release, ok = s.validate.acquire(r.Context()); !ok {
 		release = func() {}
-		return errBusy
+		return spend(errBusy)
 	}
 	var result vaultlog.Head
 	var vaultID model.ID
 	committed := false
+	authenticated := false
 	err = s.store.Update(r.Context(), func(tx Tx) error {
 		ch, a, refusedAuth, err := authorize(tx)
 		if err != nil {
 			return err
 		}
+		authenticated = true
 		if err := tx.DeleteChallenge(ch.Hash); err != nil {
 			return err
 		}
@@ -289,6 +322,10 @@ func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) err
 		return err
 	})
 	if err != nil {
+		if authenticated {
+			// The transaction, and the consumption in it, rolled back.
+			return spend(err)
+		}
 		return err
 	}
 	if refused != nil {

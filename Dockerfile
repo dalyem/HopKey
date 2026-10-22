@@ -1,20 +1,27 @@
 # hop-server, the HopKey sync server.
 #
 #   docker build -t hop-server .
-#   docker network create --internal --subnet 172.30.0.0/24 hop-net
-#   docker run -d --name hop --network hop-net -v hop-data:/data hop-server \
-#       --origin https://hop.example.com --insecure-http --trusted-proxy 172.30.0.2/32
+#   docker network create --internal --subnet 172.30.0.0/24 \
+#       -o com.docker.network.bridge.inhibit_ipv4=true hop-net
+#   docker run -d --name hop --network hop-net --ip 172.30.0.3 -v hop-data:/data \
+#       hop-server --origin https://hop.example.com --insecure-http \
+#       --trusted-proxy 172.30.0.2/32
 #
 # and the TLS proxy (here Caddy, but any will do), which publishes only
-# HTTPS and joins hop-net at the one address the server trusts:
+# HTTPS and joins hop-net at the one address the server trusts. The server
+# takes an explicit address too, so that Docker never hands it the proxy's:
 #
 #   docker create --name proxy -p 443:443 \
 #       caddy caddy reverse-proxy --from hop.example.com --to hop:8080
 #   docker network connect --ip 172.30.0.2 hop-net proxy
 #   docker start proxy
 #
-# The server's own port is never published: hop-net is internal, so only
-# containers on it reach :8080, and --trusted-proxy names the proxy alone.
+# The server's own port is never published, and only containers on hop-net
+# reach :8080: the network is internal, so nothing routes to it from
+# outside, and inhibit_ipv4 leaves the host without an address on its
+# bridge (Docker otherwise gives the host 172.30.0.1 there, and any process
+# on the host could reach the server directly). --trusted-proxy names the
+# proxy alone.
 # (For a proxy on the host instead, publish to loopback only, -p
 # 127.0.0.1:8080:8080, and trust the address the container sees for it:
 # the gateway of the network the container runs on, which docker network

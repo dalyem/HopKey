@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/model"
@@ -335,6 +337,130 @@ func TestRetirePostAuthenticatedRefusalsConsume(t *testing.T) {
 				}
 				return nil
 			})
+		})
+	}
+}
+
+// wantSpent checks that chal, which authenticated for dev, authenticates
+// on neither retirement endpoint any more and is no longer stored.
+func wantSpent(t *testing.T, e *env, v *tvault, dev model.ID, chal, sig []byte) {
+	t.Helper()
+	wantCode(t, e.retireStatusWith(v, dev, chal, sig, hashOf(t, v.log[0])), 401, "unauthorized", "the spent challenge at /retire-status")
+	wantCode(t, e.retirePostWith(v, dev, chal, sig, v.unrecordedRetire(dev)), 401, "unauthorized", "the spent challenge at /retire-status/post")
+	h := crypto.SHA256(chal)
+	if e.count(`SELECT COUNT(*) FROM challenges WHERE hash = ?`, h[:]) != 0 {
+		t.Error("the challenge is still stored")
+	}
+}
+
+// A request refused by the account bucket after its challenge
+// authenticated spends the challenge, on either endpoint: once the bucket
+// refills, the challenge authenticates nowhere (R5, R14).
+func TestRetireRateLimitConsumes(t *testing.T) {
+	rs := crypto.OperationRetireStatus
+	rates := *unlimitedRates()
+	rates.Account = Rate{N: 1, Per: 30 * time.Second}
+	for _, endpoint := range []string{"status", "post"} {
+		t.Run(endpoint, func(t *testing.T) {
+			e := newEnv(t, withRates(rates))
+			v, _, B := twoDevices(t, e)
+			other := newVault(t, "b@example.com")
+			e.publish(other)
+			h := hashOf(t, v.log[0])
+			// Spend the endpoint's one token: a status, or a post refused
+			// after the bucket (a wire for another vault).
+			if endpoint == "status" {
+				wantStatus(t, e.retireStatus(v, B, h), 200, "the first status")
+			} else {
+				chal := e.newChallenge(v, B, rs)
+				wantCode(t, e.retirePostWith(v, B, chal, e.signAuth(v, B, rs, testOrigin, chal), otherVaultRetire(t, v, other, B)),
+					400, "bad_request", "the first post")
+			}
+			chal := e.newChallenge(v, B, rs)
+			sig := e.signAuth(v, B, rs, testOrigin, chal)
+			var r resp
+			if endpoint == "status" {
+				r = e.retireStatusWith(v, B, chal, sig, h)
+			} else {
+				r = e.retirePostWith(v, B, chal, sig, v.unrecordedRetire(B))
+			}
+			wantCode(t, r, 429, "rate_limited", "a request over the account bucket")
+			e.clock.advance(30 * time.Second)
+			wantSpent(t, e, v, B, chal, sig)
+			wantStatus(t, e.retireStatus(v, B, hashOf(t, v.log[0])), 200, "a fresh challenge after the refill")
+		})
+	}
+}
+
+// A post whose challenge authenticated, and that is then refused while it
+// waits to commit, spends the challenge: when its account's lock has no
+// waiting place, when the request runs out of time waiting for that lock,
+// and when no validation slot is free once it holds the lock (R5, R14).
+func TestRetirePostAdmissionRefusalsConsume(t *testing.T) {
+	rs := crypto.OperationRetireStatus
+	for _, c := range []struct {
+		name string
+		lim  func(*Limits)
+		// slot is whether the test takes the post's validation slot while
+		// the post waits for the account lock.
+		slot bool
+	}{
+		{"lock waiters full", func(l *Limits) { l.LockWaitersPerAccount = 0 }, false},
+		{"lock wait deadline", func(l *Limits) { l.RequestDeadline = time.Second }, false},
+		{"validation slot", func(l *Limits) { l.ValidationJobs, l.ValidationQueue = 1, 0 }, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			read := make(chan struct{})
+			var once sync.Once
+			e := newEnv(t, withLimits(c.lim), withHooks(func(s *Server) {
+				s.hooks.retireRead = func() { once.Do(func() { close(read) }) }
+			}))
+			v, _, B := twoDevices(t, e)
+			chal := e.newChallenge(v, B, rs)
+			sig := e.signAuth(v, B, rs, testOrigin, chal)
+			unlock, err := e.srv.accounts.lock(context.Background(), v.accountID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			unlocked := false
+			defer func() {
+				if !unlocked {
+					unlock()
+				}
+			}()
+			post := make(chan resp, 1)
+			go func() { post <- e.retirePostWith(v, B, chal, sig, v.unrecordedRetire(B)) }()
+			select {
+			case <-read:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the post did not authenticate")
+			}
+			release := func() {}
+			if c.slot {
+				// The post holds the only slot until it goes to wait for
+				// the lock; take the slot then, and let the post have the
+				// lock.
+				release = nil
+				for deadline := time.Now().Add(15 * time.Second); release == nil; {
+					if rel, ok := e.srv.validate.acquire(context.Background()); ok {
+						release = rel
+					} else if time.Now().After(deadline) {
+						t.Fatal("the post kept its validation slot")
+					} else {
+						time.Sleep(time.Millisecond)
+					}
+				}
+				unlocked = true
+				unlock()
+			}
+			r := waitResp(t, post)
+			release()
+			if !unlocked {
+				unlocked = true
+				unlock()
+			}
+			wantCode(t, r, 429, "busy", "the refused post")
+			wantSpent(t, e, v, B, chal, sig)
 		})
 	}
 }
