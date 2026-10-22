@@ -54,3 +54,10 @@ func (readOnly) Remove(ssh.PublicKey) error { return errReadOnly }
 func (readOnly) RemoveAll() error           { return errReadOnly }
 func (readOnly) Lock([]byte) error          { return errReadOnly }
 func (readOnly) Unlock([]byte) error        { return errReadOnly }
+
+// Extension is refused outright. The embedded keyring would answer
+// ErrExtensionUnsupported anyway; saying it here keeps the view closed if the
+// keyring ever grows an extension that changes state.
+func (readOnly) Extension(string, []byte) ([]byte, error) {
+	return nil, agent.ErrExtensionUnsupported
+}

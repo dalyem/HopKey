@@ -7,16 +7,22 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"golang.org/x/crypto/ssh/agent"
+
+	"github.com/dalyem/hopkey/internal/safepath"
 )
 
 // maxSocketPath is the longest socket path that fits sockaddr_un on macOS
 // (104 bytes including the NUL). Linux allows 108.
 const maxSocketPath = 103
 
-// ErrInUse means another process is already serving the socket path.
+// lockName is the file next to the socket whose flock says "a server owns
+// this directory". It is never deleted: removing a lock file while another
+// process opens it is a race.
+const lockName = "agent.lock"
+
+// ErrInUse means another server holds the socket directory's lock.
 var ErrInUse = errors.New("sshagent: socket is in use")
 
 // Server serves an agent on a Unix socket.
@@ -28,30 +34,70 @@ type Server struct {
 	ln    *net.UnixListener
 	agent agent.ExtendedAgent
 
+	// lock holds the flock for the server's lifetime; sockInfo identifies
+	// the socket file this server created so Close never unlinks another.
+	lock     *os.File
+	sockInfo os.FileInfo
+
 	// authorize decides whether a peer may talk to the agent. Tests replace
 	// it; the default accepts only the process's own uid.
 	authorize func(*net.UnixConn) error
 
-	mu     sync.Mutex
-	conns  map[net.Conn]struct{}
-	closed bool
-	wg     sync.WaitGroup
+	mu       sync.Mutex
+	conns    map[net.Conn]struct{}
+	closed   bool
+	wg       sync.WaitGroup
+	done     chan struct{} // closed once Close has finished draining
+	closeErr error         // valid after done is closed
 }
 
-// Listen creates the socket at path and starts listening. The parent
-// directory is created and forced to 0700 and the socket is 0600. A stale
-// socket file left by a dead process is replaced; a live one yields ErrInUse.
+// Listen creates the socket at path and starts listening.
+//
+// The parent directory is created if needed and must pass
+// safepath.EnsurePrivateDir: no unsafe ancestors, owned by the current user,
+// mode 0700. The server holds an exclusive flock on agent.lock in that
+// directory until Close; a second Listen on the same directory returns
+// ErrInUse and touches nothing. Once the lock is held, any socket file at
+// path belongs to a dead process and is replaced. The socket is 0600.
+//
+// Path reports the socket's path with symlinks in the directory resolved.
 func Listen(path string, ag agent.ExtendedAgent) (*Server, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("sshagent: socket path %q is not absolute", path)
 	}
+	dir, err := safepath.EnsurePrivateDir(filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("sshagent: socket directory: %w", err)
+	}
+	path = filepath.Join(dir, filepath.Base(path))
 	if len(path) > maxSocketPath {
 		return nil, fmt.Errorf("sshagent: socket path is %d bytes, the limit is %d", len(path), maxSocketPath)
 	}
-	if err := preparePrivateDir(filepath.Dir(path)); err != nil {
+
+	lock, err := lockFile(filepath.Join(dir, lockName))
+	if err != nil {
 		return nil, err
 	}
-	if err := removeStaleSocket(path); err != nil {
+	srv, err := listenLocked(path, ag, lock)
+	if err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return srv, nil
+}
+
+// listenLocked does the work of Listen while the caller holds the lock.
+func listenLocked(path string, ag agent.ExtendedAgent, lock *os.File) (*Server, error) {
+	// With the lock held nobody else is serving here, so a socket file is
+	// left over from a process that died without cleaning up.
+	if fi, err := os.Lstat(path); err == nil {
+		if fi.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("sshagent: %s exists and is not a socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 
@@ -59,18 +105,33 @@ func Listen(path string, ag agent.ExtendedAgent) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Go would unlink by name on Close, even if the path now names someone
+	// else's socket. Close does the unlink itself, after checking the inode.
+	ln.SetUnlinkOnClose(false)
+
+	fail := func(err error) (*Server, error) {
+		ln.Close()
+		os.Remove(path) // ours: we hold the lock and just created it
+		return nil, err
+	}
 	// The socket is created with the umask's permissions. The 0700 parent
 	// keeps other users out until this chmod lands.
 	if err := os.Chmod(path, 0o600); err != nil {
-		ln.Close()
-		return nil, err
+		return fail(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fail(err)
 	}
 	return &Server{
 		path:      path,
 		ln:        ln,
 		agent:     ag,
+		lock:      lock,
+		sockInfo:  info,
 		authorize: requireSameUID,
 		conns:     make(map[net.Conn]struct{}),
+		done:      make(chan struct{}),
 	}, nil
 }
 
@@ -102,22 +163,39 @@ func (s *Server) Serve() error {
 	}
 }
 
-// Close stops accepting, drops open connections, waits for their handlers
-// and removes the socket file.
+// Close stops accepting, drops open connections, waits for their handlers,
+// removes the socket file if it is still the one this server created, and
+// releases the directory lock. Every call returns only after that work has
+// finished; later calls return the first call's error.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return nil
+		<-s.done
+		return s.closeErr
 	}
 	s.closed = true
-	err := s.ln.Close() // also unlinks the socket
+	err := s.ln.Close()
 	for c := range s.conns {
 		c.Close()
 	}
 	s.mu.Unlock()
 
 	s.wg.Wait()
+
+	// Unlink before unlocking, so a server that starts next finds no socket
+	// of ours to trip over. Only our own inode: if the path was replaced,
+	// the replacement is not ours to delete.
+	if cur, statErr := os.Lstat(s.path); statErr == nil && os.SameFile(cur, s.sockInfo) {
+		if rmErr := os.Remove(s.path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) && err == nil {
+			err = rmErr
+		}
+	}
+	if lockErr := s.lock.Close(); lockErr != nil && err == nil {
+		err = lockErr
+	}
+	s.closeErr = err
+	close(s.done)
 	return err
 }
 
@@ -163,45 +241,4 @@ func requireSameUID(c *net.UnixConn) error {
 		return fmt.Errorf("peer uid %d, want %d", uid, want)
 	}
 	return nil
-}
-
-// preparePrivateDir makes sure dir exists, is a real directory we own, and
-// has mode 0700.
-func preparePrivateDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		return err
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("sshagent: %s is not a directory", dir)
-	}
-	if !ownedByCurrentUser(fi) {
-		return fmt.Errorf("sshagent: %s is not owned by the current user", dir)
-	}
-	if fi.Mode().Perm() != 0o700 {
-		return os.Chmod(dir, 0o700)
-	}
-	return nil
-}
-
-// removeStaleSocket deletes path if it is a socket nobody is listening on.
-func removeStaleSocket(path string) error {
-	fi, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if fi.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("sshagent: %s exists and is not a socket", path)
-	}
-	if c, err := net.DialTimeout("unix", path, 250*time.Millisecond); err == nil {
-		c.Close()
-		return ErrInUse
-	}
-	return os.Remove(path)
 }

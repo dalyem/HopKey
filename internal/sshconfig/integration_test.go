@@ -7,12 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -122,6 +124,113 @@ func TestOpenSSHWithoutIdentitiesOnly(t *testing.T) {
 	}
 }
 
+// refused asserts that ssh to the alias stopped at host key verification,
+// before the server saw any authentication attempt.
+func (e *env) refused(t *testing.T, sshBin, to string) {
+	t.Helper()
+	before := e.server.authAttempts.Load()
+	_, stderr, err := e.sshTo(t, sshBin, e.config(), to, "echo", "ok")
+	if err == nil {
+		t.Fatalf("ssh %s succeeded, want it refused", to)
+	}
+	if !strings.Contains(stderr, "Host key verification failed") {
+		t.Errorf("ssh %s: stderr does not report host key verification failure:\n%s", to, stderr)
+	}
+	if got := e.server.authAttempts.Load(); got != before {
+		t.Errorf("ssh %s: server saw %d auth attempts; ssh must stop before authenticating", to, got-before)
+	}
+}
+
+func (e *env) accepted(t *testing.T, sshBin, to string) {
+	t.Helper()
+	stdout, stderr, err := e.sshTo(t, sshBin, e.config(), to, "echo", "ok")
+	if err != nil {
+		t.Fatalf("ssh %s failed: %v\nstderr:\n%s", to, err, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "ok" {
+		t.Errorf("ssh %s: stdout = %q, want ok", to, got)
+	}
+}
+
+// sameEndpoint returns h under another alias, same address, port and keys.
+func sameEndpoint(h sshconfig.Host, newAlias string, pins ...ssh.PublicKey) sshconfig.Host {
+	h.Alias = newAlias
+	h.HostKeys = pins
+	return h
+}
+
+// An alias without pins must be refused even though another alias for the
+// same host and port has a valid pin. Pooling pins by address would let the
+// pinned alias vouch for the unpinned one.
+func TestOpenSSHAliasWithoutPinsIsRefused(t *testing.T) {
+	sshBin := requireSSH(t)
+	e := newEnv(t, false, "hop")
+	e.extra = []sshconfig.Host{sameEndpoint(e.host, "staging")}
+	e.write(t)
+
+	e.accepted(t, sshBin, alias)
+	e.refused(t, sshBin, "staging")
+}
+
+// Two aliases for one endpoint pin different keys. Each accepts only its own,
+// whichever key the server presents.
+func TestOpenSSHPinsArePerAlias(t *testing.T) {
+	sshBin := requireSSH(t)
+	e := newEnv(t, false, "hop")
+	s1 := e.server.hostSigner
+	s2 := newHostSigner(t)
+	e.host.Alias = "one"
+	e.host.HostKeys = []ssh.PublicKey{s1.PublicKey()}
+	e.extra = []sshconfig.Host{sameEndpoint(e.host, "two", s2.PublicKey())}
+	e.write(t)
+
+	// The server presents s1: only "one" accepts it.
+	e.accepted(t, sshBin, "one")
+	e.refused(t, sshBin, "two")
+
+	// The server presents s2: only "two" accepts it.
+	e.server.useHostKey(s2)
+	e.refused(t, sshBin, "one")
+	e.accepted(t, sshBin, "two")
+}
+
+// Aliases differ in case only in what the user typed; the pin lookup must not.
+func TestOpenSSHMixedCaseAlias(t *testing.T) {
+	sshBin := requireSSH(t)
+	e := newEnv(t, false, "hop")
+	e.host.Alias = "Prod-DB"
+	e.write(t)
+
+	e.accepted(t, sshBin, "Prod-DB")
+}
+
+// GlobalKnownHostsFile none must mean "no file". If OpenSSH read it as a
+// relative path, a file named none in the working directory could vouch for
+// an unpinned alias. The control run uses ./none and must succeed, which
+// proves the planted file is valid and would have been read.
+func TestOpenSSHGlobalKnownHostsFileNoneIsNotAFile(t *testing.T) {
+	sshBin := requireSSH(t)
+	e := newEnv(t, false, "hop")
+	e.extra = []sshconfig.Host{sameEndpoint(e.host, "staging")} // no pins
+
+	e.cwd = t.TempDir()
+	planted := fmt.Sprintf("staging %s", ssh.MarshalAuthorizedKey(e.server.hostKey))
+	if err := os.WriteFile(filepath.Join(e.cwd, "none"), []byte(planted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.write(t)
+
+	e.refused(t, sshBin, "staging")
+
+	control := e.writeVariant(t, func(cfg, _ string) string {
+		return strings.ReplaceAll(cfg, "GlobalKnownHostsFile none", "GlobalKnownHostsFile ./none")
+	})
+	_, stderr, err := e.sshTo(t, sshBin, control, "staging", "echo", "ok")
+	if err != nil {
+		t.Fatalf("control: ssh with GlobalKnownHostsFile ./none failed, so the planted file proves nothing: %v\n%s", err, stderr)
+	}
+}
+
 func requireSSH(t *testing.T) string {
 	t.Helper()
 	p, err := exec.LookPath("ssh")
@@ -141,6 +250,8 @@ type env struct {
 	server *testServer
 	opts   sshconfig.Options
 	host   sshconfig.Host
+	extra  []sshconfig.Host // more aliases written next to host
+	cwd    string           // working directory for ssh; empty means the test's
 }
 
 func newEnv(t *testing.T, rsaKey bool, dirName string) *env {
@@ -202,7 +313,7 @@ func newEnv(t *testing.T, rsaKey bool, dirName string) *env {
 
 func (e *env) write(t *testing.T) {
 	t.Helper()
-	if err := sshconfig.Write(e.opts, []sshconfig.Host{e.host}); err != nil {
+	if err := sshconfig.Write(e.opts, append([]sshconfig.Host{e.host}, e.extra...)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -242,6 +353,12 @@ func (e *env) writeVariant(t *testing.T, edit func(cfg, dir string) string) stri
 // args starting with "-" are flags for ssh; the rest is the remote command.
 func (e *env) ssh(t *testing.T, sshBin, cfg string, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
+	return e.sshTo(t, sshBin, cfg, alias, args...)
+}
+
+// sshTo is ssh for an arbitrary alias.
+func (e *env) sshTo(t *testing.T, sshBin, cfg, to string, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -249,10 +366,11 @@ func (e *env) ssh(t *testing.T, sshBin, cfg string, args ...string) (stdout, std
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
 		argv, args = append(argv, args[0]), args[1:]
 	}
-	argv = append(argv, alias)
+	argv = append(argv, to)
 	argv = append(argv, args...)
 
 	cmd := exec.CommandContext(ctx, sshBin, argv...)
+	cmd.Dir = e.cwd
 	// The config names its own agent; make sure a developer's agent cannot
 	// leak in through the environment.
 	for _, kv := range os.Environ() {
@@ -273,32 +391,59 @@ func (e *env) ssh(t *testing.T, sshBin, cfg string, args ...string) (stdout, std
 // answers exec requests: "true" and "echo ok" succeed, anything else exits 127.
 type testServer struct {
 	port         int
-	hostKey      ssh.PublicKey
+	hostKey      ssh.PublicKey // the key presented to new connections
+	hostSigner   ssh.Signer
 	authAttempts atomic.Int32 // public key callbacks, successful or not
+
+	mu       sync.Mutex
+	accepted ssh.PublicKey
+	cfg      *ssh.ServerConfig
 }
 
-func startServer(t *testing.T, accepted ssh.PublicKey) *testServer {
+func newHostSigner(t *testing.T) ssh.Signer {
 	t.Helper()
-	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
+	signer, err := ssh.NewSignerFromKey(priv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := &testServer{hostKey: hostSigner.PublicKey()}
+	return signer
+}
 
+// useHostKey makes the server present signer's key to connections made from
+// now on.
+func (ts *testServer) useHostKey(signer ssh.Signer) {
 	cfg := &ssh.ServerConfig{ // MaxAuthTries left at its default, 6
 		PublicKeyCallback: func(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
 			ts.authAttempts.Add(1)
-			if c.User() == user && bytes.Equal(k.Marshal(), accepted.Marshal()) {
+			if c.User() == user && bytes.Equal(k.Marshal(), ts.accepted.Marshal()) {
 				return nil, nil
 			}
 			return nil, errors.New("key not accepted")
 		},
 	}
-	cfg.AddHostKey(hostSigner)
+	cfg.AddHostKey(signer)
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.cfg = cfg
+	ts.hostSigner = signer
+	ts.hostKey = signer.PublicKey()
+}
+
+func (ts *testServer) config() *ssh.ServerConfig {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.cfg
+}
+
+func startServer(t *testing.T, accepted ssh.PublicKey) *testServer {
+	t.Helper()
+	ts := &testServer{accepted: accepted}
+	ts.useHostKey(newHostSigner(t))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -313,7 +458,7 @@ func startServer(t *testing.T, accepted ssh.PublicKey) *testServer {
 			if err != nil {
 				return
 			}
-			go ts.serve(c, cfg)
+			go ts.serve(c, ts.config())
 		}
 	}()
 	return ts

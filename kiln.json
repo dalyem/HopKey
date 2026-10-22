@@ -10,6 +10,7 @@
   "checks": {
     "vet": "sh scripts/check.sh vet",
     "test": "sh scripts/check.sh test",
+    "race": "sh scripts/check.sh race",
     "gofmt": "sh scripts/check.sh gofmt"
   }
 }

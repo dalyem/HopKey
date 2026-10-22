@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -51,6 +53,12 @@ func startServer(t *testing.T, path string, n int, opts ...func(*Server)) (*Serv
 		}
 		pubs = append(pubs, pub)
 	}
+	return startServerWith(t, path, kr, opts...), pubs
+}
+
+// startServerWith serves kr and registers cleanup that closes the server.
+func startServerWith(t *testing.T, path string, kr *Keyring, opts ...func(*Server)) *Server {
+	t.Helper()
 	srv, err := Listen(path, kr.Agent())
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +74,7 @@ func startServer(t *testing.T, path string, n int, opts ...func(*Server)) (*Serv
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	return srv, pubs
+	return srv
 }
 
 func dial(t *testing.T, path string) agent.ExtendedAgent {
@@ -158,6 +166,17 @@ func TestReadOnly(t *testing.T) {
 		{"remove all", func() error { return c.RemoveAll() }},
 		{"lock", func() error { return c.Lock([]byte("pw")) }},
 		{"unlock", func() error { return c.Unlock([]byte("pw")) }},
+		{"add with confirm-before-use", func() error {
+			return c.Add(agent.AddedKey{PrivateKey: newKey(t), ConfirmBeforeUse: true})
+		}},
+		{"add with lifetime", func() error {
+			return c.Add(agent.AddedKey{PrivateKey: newKey(t), LifetimeSecs: 60})
+		}},
+		{"add with extension constraint", func() error {
+			return c.Add(agent.AddedKey{PrivateKey: newKey(t), ConfirmBeforeUse: true, ConstraintExtensions: []agent.ConstraintExtension{
+				{ExtensionName: "restrict-destination-v00@openssh.com", ExtensionDetails: []byte("x")},
+			}})
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -189,7 +208,7 @@ func TestRejectsForeignPeer(t *testing.T) {
 	}
 }
 
-func TestStaleAndLiveSockets(t *testing.T) {
+func TestStaleSocketIsReplaced(t *testing.T) {
 	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
 
 	// A socket file with no listener, as left behind by a crashed daemon.
@@ -202,11 +221,136 @@ func TestStaleAndLiveSockets(t *testing.T) {
 	}
 	stale.SetUnlinkOnClose(false)
 	stale.Close()
+	if fi, err := os.Lstat(path); err != nil || fi.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("setup: no stale socket at %s: %v", path, err)
+	}
 
+	_, pubs := startServer(t, path, 1)
+	if _, err := dial(t, path).Sign(pubs[0], []byte("x")); err != nil {
+		t.Errorf("Sign on the replacement server: %v", err)
+	}
+}
+
+func TestSecondListenIsInUseAndFirstKeepsWorking(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	_, pubs := startServer(t, path, 1)
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Concurrent attempts all lose, and none of them touches the socket.
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for i := range errs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var s *Server
+			s, errs[i] = Listen(path, NewKeyring().Agent())
+			if s != nil {
+				s.Close()
+			}
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if !errors.Is(err, ErrInUse) {
+			t.Errorf("Listen #%d error = %v, want ErrInUse", i, err)
+		}
+	}
+
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("socket was replaced or removed by the failed Listen: %v", err)
+	}
+	c := dial(t, path)
+	if keys, err := c.List(); err != nil || len(keys) != 1 {
+		t.Fatalf("first server List = %d keys, %v; want 1 key", len(keys), err)
+	}
+	if _, err := c.Sign(pubs[0], []byte("x")); err != nil {
+		t.Errorf("first server Sign: %v", err)
+	}
+}
+
+func TestListenAfterCloseSucceeds(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	srv, _ := startServer(t, path, 1)
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The lock file stays; the lock itself is gone.
 	startServer(t, path, 1)
+}
 
-	if _, err := Listen(path, NewKeyring().Agent()); !errors.Is(err, ErrInUse) {
-		t.Errorf("second Listen error = %v, want ErrInUse", err)
+func TestCloseLeavesReplacedSocketAlone(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	srv, _ := startServer(t, path, 1)
+
+	// Someone removes our socket and puts a different file in its place.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("not ours"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "not ours" {
+		t.Errorf("Close removed or changed a file it did not create: %q, %v", b, err)
+	}
+}
+
+func TestListenRefusesUnsafeAncestor(t *testing.T) {
+	base := shortTempDir(t)
+	loose := filepath.Join(base, "loose")
+	if err := os.Mkdir(loose, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o770); err != nil { // group-writable
+		t.Fatal(err)
+	}
+	path := filepath.Join(loose, "d", "agent.sock")
+	if _, err := Listen(path, NewKeyring().Agent()); err == nil {
+		t.Fatal("Listen accepted a socket directory below a group-writable directory")
+	}
+	if _, err := os.Lstat(path); err == nil {
+		t.Error("a socket was created anyway")
+	}
+}
+
+func TestListenResolvesDirectorySymlinks(t *testing.T) {
+	base := shortTempDir(t)
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	srv, _ := startServer(t, filepath.Join(base, "link", "d", "agent.sock"), 1)
+	if want := filepath.Join(real, "d", "agent.sock"); srv.Path() != want {
+		t.Errorf("Path = %q, want %q", srv.Path(), want)
+	}
+}
+
+func TestListenRefusesSymlinkedSocketDirectory(t *testing.T) {
+	base := shortTempDir(t)
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	// link is the socket's own directory, so it may not be a symlink.
+	if _, err := Listen(filepath.Join(link, "agent.sock"), NewKeyring().Agent()); err == nil {
+		t.Fatal("Listen accepted a symlink as the socket directory")
+	}
+	if _, err := os.Lstat(filepath.Join(real, "agent.sock")); err == nil {
+		t.Error("a socket was created through the symlink")
 	}
 }
 
@@ -257,5 +401,142 @@ func TestCloseDropsConnectionsAndRemovesSocket(t *testing.T) {
 	}
 	if err := srv.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
+	}
+}
+
+func TestExtensionRefused(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	startServer(t, path, 1)
+	c := dial(t, path)
+
+	for _, name := range []string{"session-bind@openssh.com", "query", "anything@example.com"} {
+		if _, err := c.Extension(name, []byte("payload")); !errors.Is(err, agent.ErrExtensionUnsupported) {
+			t.Errorf("Extension(%q) error = %v, want ErrExtensionUnsupported", name, err)
+		}
+	}
+	if keys, err := c.List(); err != nil || len(keys) != 1 {
+		t.Errorf("List after extension requests = %d keys, %v; want 1 key", len(keys), err)
+	}
+
+	// And directly, without the wire in between.
+	if _, err := NewKeyring().Agent().Extension("x", nil); !errors.Is(err, agent.ErrExtensionUnsupported) {
+		t.Errorf("view Extension error = %v, want ErrExtensionUnsupported", err)
+	}
+}
+
+func TestConstrainedAddLeavesKeyringUnchanged(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	startServer(t, path, 1)
+	c := dial(t, path)
+
+	err := c.Add(agent.AddedKey{PrivateKey: newKey(t), Comment: "sneaky", ConfirmBeforeUse: true})
+	if err == nil {
+		t.Fatal("constrained add succeeded")
+	}
+	keys, err := c.List()
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("List = %d keys, %v; want the original single key", len(keys), err)
+	}
+}
+
+// TestUnlockRefusedWhileLocked locks the underlying keyring the way a buggy
+// daemon (or a client, were Lock not refused) could, then shows that a
+// client cannot unlock it. Without the read-only view the Unlock below would
+// succeed and List would return the key again.
+func TestUnlockRefusedWhileLocked(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	kr := NewKeyring()
+	priv := newKey(t)
+	if err := kr.Add(priv, "k"); err != nil {
+		t.Fatal(err)
+	}
+	pub, err := ssh.NewPublicKey(priv.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	startServerWith(t, path, kr)
+	c := dial(t, path)
+
+	if err := kr.kr.Lock([]byte("pw")); err != nil {
+		t.Fatal(err)
+	}
+	if keys, err := c.List(); err != nil || len(keys) != 0 {
+		t.Fatalf("locked keyring: List = %d keys, %v; want 0 keys", len(keys), err)
+	}
+
+	if err := c.Unlock([]byte("pw")); err == nil {
+		t.Fatal("Unlock through the socket succeeded")
+	}
+	if keys, err := c.List(); err != nil || len(keys) != 0 {
+		t.Errorf("keyring was unlocked: List = %d keys, %v", len(keys), err)
+	}
+	if _, err := c.Sign(pub, []byte("x")); err == nil {
+		t.Error("Sign succeeded on a keyring that is still locked")
+	}
+
+	// Control: unlocking the real keyring does bring the key back, so the
+	// assertions above can fail.
+	if err := kr.kr.Unlock([]byte("pw")); err != nil {
+		t.Fatal(err)
+	}
+	if keys, err := c.List(); err != nil || len(keys) != 1 {
+		t.Errorf("after unlocking directly: List = %d keys, %v; want 1 key", len(keys), err)
+	}
+}
+
+// blockingAgent stalls List until release is closed, holding a handler open.
+type blockingAgent struct {
+	agent.ExtendedAgent
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingAgent) List() ([]*agent.Key, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return b.ExtendedAgent.List()
+}
+
+func TestEveryCloseWaitsForHandlers(t *testing.T) {
+	path := filepath.Join(shortTempDir(t), "d", "agent.sock")
+	ba := &blockingAgent{
+		ExtendedAgent: NewKeyring().Agent(),
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	srv, _ := startServer(t, path, 0, func(s *Server) { s.agent = ba })
+
+	c := dial(t, path)
+	go c.List() // parks a handler inside blockingAgent.List
+	select {
+	case <-ba.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	closed := make(chan int, 2)
+	for i := range 2 {
+		go func() {
+			srv.Close()
+			closed <- i
+		}()
+	}
+	select {
+	case i := <-closed:
+		t.Fatalf("Close call #%d returned while a handler was still running", i)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(ba.release)
+	for range 2 {
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Close did not return after the handler finished")
+		}
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("socket still present after every Close returned: %v", err)
 	}
 }
