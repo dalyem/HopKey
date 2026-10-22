@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "projectId": "prj_xgx365evixpd",
+  "name": "hopkey",
+  "runtime": {
+    "image": "golang:1.27-bookworm"
+  },
+  "dev": "sleep infinity",
+  "port": 3000,
+  "checks": {
+    "vet": "sh scripts/check.sh vet",
+    "test": "sh scripts/check.sh test",
+    "gofmt": "sh scripts/check.sh gofmt"
+  }
+}

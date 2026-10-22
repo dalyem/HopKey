@@ -1,0 +1,12 @@
+# Build output
+/bin/
+/hop
+/hop-server
+*.test
+*.out
+
+# Local state and secrets
+.env
+.env.*
+*.pem
+*.key
