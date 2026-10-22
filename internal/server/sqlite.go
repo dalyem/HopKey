@@ -25,8 +25,6 @@ const schemaVersion = "2"
 
 // schema is the multi-tenant SQLite schema. IDs and digests are BLOBs of
 // their raw bytes; times are Unix seconds.
-//
-// The enrollment relay (slice C2) adds its own tables.
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (
 	k TEXT PRIMARY KEY,
@@ -142,6 +140,27 @@ CREATE TABLE IF NOT EXISTS registrations (
 	ack_digest     BLOB,
 	ack_seq        INTEGER,
 	ack_h          BLOB
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS enrollments (
+	enroll_id    BLOB PRIMARY KEY,
+	routing_code TEXT NOT NULL UNIQUE,
+	token_hash   BLOB NOT NULL,
+	commit_msg   BLOB NOT NULL,
+	ip           TEXT NOT NULL,
+	account_id   BLOB,
+	device_id    BLOB,
+	expires_at   INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS enrollments_ip ON enrollments (ip, expires_at);
+CREATE INDEX IF NOT EXISTS enrollments_expiry ON enrollments (expires_at);
+
+CREATE TABLE IF NOT EXISTS enroll_messages (
+	enroll_id BLOB NOT NULL REFERENCES enrollments (enroll_id),
+	n         INTEGER NOT NULL,
+	type      TEXT NOT NULL,
+	body      BLOB NOT NULL,
+	PRIMARY KEY (enroll_id, n)
 ) STRICT;
 `
 
@@ -614,11 +633,114 @@ func (t *sqliteTx) ConsumeRegistration(capHash crypto.Hash, a *Ack, at time.Time
 	return nil
 }
 
+const mailboxCols = `enroll_id, routing_code, token_hash, commit_msg, ip, account_id, device_id, expires_at`
+
+func scanMailbox(r *sql.Row) (*Mailbox, error) {
+	var m Mailbox
+	var id, tok, aid, did []byte
+	var exp int64
+	if err := r.Scan(&id, &m.RoutingCode, &tok, &m.Commit, &m.IP, &aid, &did, &exp); err != nil {
+		return nil, mapErr(err)
+	}
+	m.ExpiresAt = fromUnix(exp)
+	if err := errors.Join(scanID(id, &m.ID), scanHash(tok, &m.TokenHash)); err != nil {
+		return nil, err
+	}
+	if aid != nil || did != nil {
+		m.AccountID, m.DeviceID = new(model.ID), new(model.ID)
+		if err := errors.Join(scanID(aid, m.AccountID), scanID(did, m.DeviceID)); err != nil {
+			return nil, err
+		}
+	}
+	return &m, nil
+}
+
+func (t *sqliteTx) InsertMailbox(m *Mailbox) error {
+	var aid, did []byte
+	if m.AccountID != nil && m.DeviceID != nil {
+		aid, did = m.AccountID[:], m.DeviceID[:]
+	}
+	return t.exec(`INSERT INTO enrollments (`+mailboxCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID[:], m.RoutingCode, m.TokenHash[:], m.Commit, m.IP, aid, did, unix(m.ExpiresAt))
+}
+
+func (t *sqliteTx) Mailbox(id model.ID) (*Mailbox, error) {
+	return scanMailbox(t.row(`SELECT `+mailboxCols+` FROM enrollments WHERE enroll_id = ?`, id[:]))
+}
+
+func (t *sqliteTx) MailboxByCode(code string) (*Mailbox, error) {
+	return scanMailbox(t.row(`SELECT `+mailboxCols+` FROM enrollments WHERE routing_code = ?`, code))
+}
+
+func (t *sqliteTx) ClaimMailbox(id, accountID, deviceID model.ID) error {
+	res, err := t.tx.ExecContext(t.ctx, `UPDATE enrollments SET account_id = ?, device_id = ?
+		WHERE enroll_id = ? AND account_id IS NULL AND device_id IS NULL`, accountID[:], deviceID[:], id[:])
+	if err != nil {
+		return mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (t *sqliteTx) CountMailboxes(now time.Time, ip *string) (int, error) {
+	q := `SELECT COUNT(*) FROM enrollments WHERE expires_at > ?`
+	args := []any{unix(now)}
+	if ip != nil {
+		q += ` AND ip = ?`
+		args = append(args, *ip)
+	}
+	var n int
+	err := t.row(q, args...).Scan(&n)
+	return n, mapErr(err)
+}
+
+func (t *sqliteTx) MailboxMessages(id model.ID, after uint64) ([]MailboxMessage, error) {
+	if after >= math.MaxInt64 {
+		return nil, nil
+	}
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT n, type, body FROM enroll_messages
+		WHERE enroll_id = ? AND n > ? ORDER BY n`, id[:], after)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MailboxMessage
+	for rows.Next() {
+		var m MailboxMessage
+		if err := rows.Scan(&m.N, &m.Type, &m.Body); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (t *sqliteTx) InsertMailboxMessage(id model.ID, m *MailboxMessage) error {
+	return t.exec(`INSERT INTO enroll_messages (enroll_id, n, type, body) VALUES (?, ?, ?, ?)`,
+		id[:], m.N, m.Type, m.Body)
+}
+
+func (t *sqliteTx) DeleteExpiredMailboxes(now time.Time) error {
+	n := unix(now)
+	return errors.Join(
+		t.exec(`DELETE FROM enroll_messages WHERE enroll_id IN
+			(SELECT enroll_id FROM enrollments WHERE expires_at <= ?)`, n),
+		t.exec(`DELETE FROM enrollments WHERE expires_at <= ?`, n),
+	)
+}
+
 func (t *sqliteTx) DeleteExpired(now time.Time) error {
 	n := unix(now)
 	return errors.Join(
 		t.exec(`DELETE FROM sessions WHERE expires_at <= ?`, n),
 		t.exec(`DELETE FROM login_tokens WHERE expires_at <= ?`, n),
 		t.exec(`DELETE FROM challenges WHERE expires_at <= ?`, n),
+		t.DeleteExpiredMailboxes(now),
 	)
 }

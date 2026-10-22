@@ -75,7 +75,10 @@ func (b *syncBuffer) String() string {
 // rate-limit tests use DefaultRates.
 func unlimitedRates() *Rates {
 	r := Rate{N: 1 << 30, Per: time.Second}
-	return &Rates{r, r, r, r, r, r, r}
+	return &Rates{
+		PreloginIP: r, PreloginEmail: r, LoginIP: r, LoginAccount: r, IP: r, Account: r, Device: r,
+		EnrollIP: r, Claim: r,
+	}
 }
 
 // envConfig is what envOpts set: the server's Config, and test hooks

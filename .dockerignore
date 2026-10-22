@@ -1,0 +1,8 @@
+# Only go.mod, go.sum, cmd/ and internal/ go into the build.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+**/*_test.go
+**/testdata/

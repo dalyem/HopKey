@@ -98,8 +98,29 @@ type Tx interface {
 	// acknowledgment.
 	ConsumeRegistration(capHash crypto.Hash, ack *Ack, at time.Time) error
 
-	// DeleteExpired removes sessions, login tokens and challenges that
-	// expired before now.
+	// InsertMailbox stores a new enrollment mailbox. It fails with
+	// ErrDuplicate when the enroll ID or the routing code is taken, by a
+	// live mailbox or by an expired one not yet deleted.
+	InsertMailbox(m *Mailbox) error
+	Mailbox(id model.ID) (*Mailbox, error)
+	MailboxByCode(code string) (*Mailbox, error)
+	// ClaimMailbox binds an unclaimed mailbox to an account and an
+	// approving device. It fails with ErrNotFound when the mailbox is
+	// absent or already claimed.
+	ClaimMailbox(id, accountID, deviceID model.ID) error
+	// CountMailboxes counts unexpired mailboxes: all of them, or those
+	// created from one IP key when ip is not nil.
+	CountMailboxes(now time.Time, ip *string) (int, error)
+	// MailboxMessages returns a mailbox's messages with n > after, in
+	// order.
+	MailboxMessages(id model.ID, after uint64) ([]MailboxMessage, error)
+	InsertMailboxMessage(id model.ID, m *MailboxMessage) error
+	// DeleteExpiredMailboxes removes mailboxes that expired before now,
+	// with their messages.
+	DeleteExpiredMailboxes(now time.Time) error
+
+	// DeleteExpired removes sessions, login tokens, challenges and
+	// mailboxes that expired before now.
 	DeleteExpired(now time.Time) error
 }
 
@@ -266,4 +287,26 @@ type Ack struct {
 	VaultID   model.ID
 	Digest    crypto.Hash
 	Head      vaultlog.Head
+}
+
+// Mailbox is an enrollment relay mailbox (R7): created by a new device D
+// with its commit message, and claimed once by an approving device A.
+type Mailbox struct {
+	ID          model.ID
+	RoutingCode string      // 10 Crockford symbols, canonical form
+	TokenHash   crypto.Hash // SHA-256 of the mailbox token
+	Commit      []byte      // the canonical commit message
+	IP          string      // ipKey of the creating client, for R8
+	// The claim: both set, or both nil while unclaimed.
+	AccountID *model.ID
+	DeviceID  *model.ID
+	ExpiresAt time.Time
+}
+
+// MailboxMessage is one relayed enrollment message (R12). Body is the
+// canonical message body.
+type MailboxMessage struct {
+	N    uint64
+	Type string
+	Body []byte
 }
