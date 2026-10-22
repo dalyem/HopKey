@@ -2,9 +2,12 @@ package vaultlog
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/model"
 )
@@ -52,7 +55,11 @@ func TestHeaderRules(t *testing.T) {
 	runMutations(t, w.transition, base, w.normalSigners(), []mutation{
 		{"vault_id differs", RuleVault, func(e *Entry, _ *Wire) { e.VaultID = fixedID(0xee) }},
 		{"seq skips", RuleSeq, func(e *Entry, _ *Wire) { e.Seq++ }},
-		{"prev is not the head", RulePrev, func(e *Entry, _ *Wire) { e.Prev[0] ^= 1 }},
+		{"prev is not the head", RulePrev, func(e *Entry, _ *Wire) {
+			h, _ := e.Prev.Get()
+			h[0] ^= 1
+			e.Prev = crypto.SomeHash(h)
+		}},
 		{"prev empty", RulePrev, func(e *Entry, _ *Wire) { e.Prev = crypto.OptHash{} }},
 		{"normal changes kv", RuleVersions, func(e *Entry, _ *Wire) { e.KV++ }},
 		{"normal changes akv", RuleVersions, func(e *Entry, _ *Wire) { e.AKV++ }},
@@ -90,7 +97,7 @@ func TestHeaderRules(t *testing.T) {
 		wantRule(t, w.transition(bad), RuleAuthorState)
 	})
 	t.Run("every certificate uses the resulting akv", func(t *testing.T) {
-		enroll := w.unverified(Changes{Devices: []DeviceInfo{w.infos[idDevC]}})
+		enroll := w.unverified(Changes{Devices: []DeviceInfo{w.enrolled(idDevC)}})
 		mustAccept(t, w.transition(enroll))
 		bad := mutate(t, enroll, w.normalSigners(), func(e *Entry, _ *Wire) {
 			opsOf[*DeviceAddOp](e)[0].Cert.AKV = 2
@@ -105,7 +112,7 @@ func TestGenesisRules(t *testing.T) {
 	check := func(wr *Wire) error { _, err := CheckPublic(nil, wr, nil); return err }
 	runMutations(t, check, g, map[Role]signer{RoleAccount: acctSigner(w.acct)}, []mutation{
 		{"seq 1", RuleGenesisHdr, func(e *Entry, _ *Wire) { e.Seq = 1 }},
-		{"prev set", RuleGenesisHdr, func(e *Entry, _ *Wire) { e.Prev[0] = 1 }},
+		{"prev set", RuleGenesisHdr, func(e *Entry, _ *Wire) { e.Prev = crypto.SomeHash(crypto.Hash{1}) }},
 		{"akv 2", RuleGenesisHdr, func(e *Entry, _ *Wire) { e.AKV = 2 }},
 		{"kv 2", RuleGenesisHdr, func(e *Entry, _ *Wire) { e.KV = 2 }},
 		{"creds gen 2", RuleGenesis, func(e *Entry, _ *Wire) { opsOf[*CredsOp](e)[0].Gen = 2 }},
@@ -123,6 +130,9 @@ func TestGenesisRules(t *testing.T) {
 		}},
 		{"author is a device", RuleAuthor, func(e *Entry, _ *Wire) { e.Author = idDevA }},
 		{"vk_wrap to another recipient", RuleSnapRecipient, func(e *Entry, _ *Wire) { opsOf[*VKWrapOp](e)[0].Recipient = idDevA }},
+		// creds.kdf_version MUST be 1 in suite 1 (rev 10 item 15).
+		{"creds kdf_version 2", RuleKDFVersion, func(e *Entry, _ *Wire) { opsOf[*CredsOp](e)[0].KDFVersion = 2 }},
+		{"creds kdf_version 0", RuleKDFVersion, func(e *Entry, _ *Wire) { opsOf[*CredsOp](e)[0].KDFVersion = 0 }},
 	})
 	t.Run("signed by another key", func(t *testing.T) {
 		other := fixedAccount(t, 1, "other")
@@ -155,7 +165,7 @@ func TestBootstrapRules(t *testing.T) {
 	signers := map[Role]signer{RoleAccount: acctSigner(w.acct)}
 	runMutations(t, w.transition, base, signers, []mutation{
 		{"enroll_transcript set", RuleBootstrap, func(e *Entry, _ *Wire) {
-			opsOf[*DeviceAddOp](e)[0].Cert.EnrollTranscript[0] = 1
+			opsOf[*DeviceAddOp](e)[0].Cert.EnrollTranscript = crypto.SomeHash(crypto.Hash{1})
 		}},
 		{"two device_adds", RuleBootstrap, func(e *Entry, _ *Wire) {
 			d := *opsOf[*DeviceAddOp](e)[0]
@@ -284,6 +294,25 @@ func TestCheckpointRules(t *testing.T) {
 			opsOf[*RetiredOp](e)[0].ItemIDs = []model.ID{idK1, idC1}
 		}},
 		{"vk_wrap to another recipient", RuleSnapRecipient, func(e *Entry, _ *Wire) { opsOf[*VKWrapOp](e)[0].Recipient = idDevA }},
+		{"creds kdf_version 2", RuleKDFVersion, func(e *Entry, _ *Wire) { opsOf[*CredsOp](e)[0].KDFVersion = 2 }},
+		// A survivor's certificate keeps name and enroll_transcript, and
+		// issued_at is the entry's time (rev 10 item 13).
+		{"survivor certificate renamed", RuleSurvivorCert, func(e *Entry, _ *Wire) {
+			d := deviceAddFor(t, e, idDevA)
+			d.Cert.Name = "renamed"
+			resignCert(t, d, p.NewAccount)
+		}},
+		{"survivor certificate gains an enroll_transcript", RuleSurvivorCert, func(e *Entry, _ *Wire) {
+			d := deviceAddFor(t, e, idDevA)
+			d.Cert.EnrollTranscript = crypto.SomeHash(crypto.Hash{1})
+			resignCert(t, d, p.NewAccount)
+		}},
+		{"survivor certificate issued earlier", RuleSurvivorCert, func(e *Entry, _ *Wire) {
+			d := deviceAddFor(t, e, idDevA)
+			d.Cert.IssuedAt--
+			resignCert(t, d, p.NewAccount)
+		}},
+		{"entry time differs from issued_at", RuleSurvivorCert, func(e *Entry, _ *Wire) { e.Time++ }},
 	})
 	t.Run("account_old signed by the new key", func(t *testing.T) {
 		bad := mutate(t, base, map[Role]signer{RoleAccountOld: acctSigner(p.NewAccount)}, func(*Entry, *Wire) {})
@@ -378,6 +407,18 @@ func TestItemRules(t *testing.T) {
 		{"object body tampered", RuleObjectDigest, func(_ *Entry, wr *Wire) {
 			o := &wr.Objects[0]
 			o.Body = bytes.Replace(o.Body, []byte(`"v":1`), []byte(`"v":2`), 1)
+		}},
+		// Wire objects are envelopes only (rev 10 item 17).
+		{"certificate as a wire object", RuleObjectEnvelope, func(_ *Entry, wr *Wire) {
+			body, err := canonjson.Marshal(w.st.Devices[idDevA].Cert)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wr.Objects = append(wr.Objects, Object{SHA256: crypto.SHA256(body), Body: body})
+		}},
+		{"envelope with an extra member", RuleObjectEnvelope, func(_ *Entry, wr *Wire) {
+			body := bytes.Replace(wr.Objects[0].Body, []byte(`"v":1`), []byte(`"v":1,"x":1`), 1)
+			wr.Objects = append(wr.Objects, Object{SHA256: crypto.SHA256(body), Body: body})
 		}},
 	})
 	t.Run("edit changes the IK", func(t *testing.T) {
@@ -581,6 +622,14 @@ func TestDeployRules(t *testing.T) {
 		{"new op reuses an item ID", RuleUniqueID, Changes{Deploy: []DeployOp{{OpID: idS1, Action: ActionDeploy,
 			SSHPKFp: w.fpK1, KeyItemID: idK1, KeyItemVersion: 1, Targets: []Target{{HostItemID: idH1, State: TargetPending}}}}}},
 		{"delete a host an incomplete op targets", RuleDeployRefs, Changes{Delete: []model.ID{idH1}}},
+		// A deploy_op MUST have at least one target (rev 10 item 9).
+		{"new op without targets", RuleDeployTargets, Changes{Deploy: []DeployOp{{OpID: fixedID(0x94), Action: ActionDeploy,
+			SSHPKFp: w.fpK1, KeyItemID: idK1, KeyItemVersion: 1, Targets: []Target{}}}}},
+		{"update drops every target", RuleDeployTargets, update(func(d *DeployOp) { d.Targets = []Target{} }, d2)},
+		// A new op's key_item_version is the key's current version (rev 10
+		// item 10).
+		{"new op names a future key version", RuleDeployKeyVersion, Changes{Deploy: []DeployOp{{OpID: fixedID(0x94), Action: ActionDeploy,
+			SSHPKFp: w.fpK1, KeyItemID: idK1, KeyItemVersion: 2, Targets: []Target{{HostItemID: idH1, State: TargetPending}}}}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { wantRule(t, w.transition(w.unverified(c.ch)), c.rule) })
@@ -592,6 +641,15 @@ func TestDeployRules(t *testing.T) {
 		k = w.item(idK1).(*model.Key)
 		k.PublicKey, _ = sshKey(t, "k3")
 		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleDeployMaterial)
+		// key_type is SSH material too (rev 10 item 8).
+		k = w.item(idK1).(*model.Key)
+		k.KeyType = "rsa"
+		wantRule(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})), RuleDeployMaterial)
+	})
+	t.Run("key_type changes once the op is closed", func(t *testing.T) {
+		k := w.item(idK2).(*model.Key)
+		k.KeyType = "rsa"
+		mustAccept(t, w.transition(w.unverified(Changes{Put: []crypto.Item{k}})))
 	})
 	t.Run("key rename while incomplete is fine", func(t *testing.T) {
 		k := w.item(idK1).(*model.Key)
@@ -610,6 +668,85 @@ func TestDeployRules(t *testing.T) {
 	})
 	t.Run("host of an abandoned op can be deleted", func(t *testing.T) {
 		mustAccept(t, w.transition(w.unverified(Changes{Delete: []model.ID{idH1}})))
+	})
+}
+
+// A new deploy_op's key_item_version is the key item's current version in
+// the candidate post-state (rev 10 item 10).
+func TestDeployKeyVersion(t *testing.T) {
+	w := full(t)
+	k2 := w.item(idK2).(*model.Key)
+	k2.Name = "renamed"
+	w.normal(Changes{Put: []crypto.Item{k2}}) // K2 is at version 2
+	op := func(id model.ID, key model.ID, fp string, v uint64) DeployOp {
+		return DeployOp{OpID: id, Action: ActionRemove, SSHPKFp: fp, KeyItemID: key, KeyItemVersion: v,
+			Targets: []Target{{HostItemID: idH2, State: TargetPending}}}
+	}
+	t.Run("stale version", func(t *testing.T) {
+		ch := Changes{Deploy: []DeployOp{op(fixedID(0x94), idK2, w.fpK2, 1)}}
+		wantRule(t, w.transition(w.unverified(ch)), RuleDeployKeyVersion)
+	})
+	t.Run("current version", func(t *testing.T) {
+		ch := Changes{Deploy: []DeployOp{op(fixedID(0x94), idK2, w.fpK2, 2)}}
+		mustAccept(t, w.transition(w.unverified(ch)))
+	})
+	t.Run("key edited in the same entry", func(t *testing.T) {
+		k := w.item(idK2).(*model.Key)
+		k.Name = "again"
+		ch := Changes{Put: []crypto.Item{k}, Deploy: []DeployOp{op(fixedID(0x94), idK2, w.fpK2, 2)}}
+		wantRule(t, w.transition(w.unverified(ch)), RuleDeployKeyVersion)
+		ch.Deploy[0].KeyItemVersion = 3
+		mustAccept(t, w.transition(w.unverified(ch)))
+	})
+	t.Run("key created in the same entry", func(t *testing.T) {
+		_, fp3 := sshKey(t, "k3")
+		ch := Changes{Put: []crypto.Item{keyItem(t, idK3, "k3")}, Deploy: []DeployOp{op(fixedID(0x94), idK3, fp3, 1)}}
+		mustAccept(t, w.transition(w.unverified(ch)))
+	})
+	t.Run("new op names a deleted key", func(t *testing.T) {
+		h2 := w.host(idH2)
+		h2.KeyID = model.ID{}
+		d := op(fixedID(0x94), idK2, w.fpK2, 2)
+		d.Targets[0].State = TargetDone
+		ch := Changes{Put: []crypto.Item{h2}, Delete: []model.ID{idK2}, Deploy: []DeployOp{d}}
+		wantRule(t, w.transition(w.unverified(ch)), RuleDeployRefs)
+	})
+}
+
+// key.public_key and every host.host_keys entry MUST parse as an OpenSSH
+// authorized_keys line, "<type> <base64> [comment]" (rev 10 item 11).
+func TestSSHKeyLines(t *testing.T) {
+	w := full(t)
+	pub, _ := sshKey(t, "k3")
+	f := strings.Fields(pub)
+	key := func(line string) Changes {
+		k := keyItem(t, idK3, "k3")
+		k.PublicKey = line
+		return Changes{Put: []crypto.Item{k}}
+	}
+	hostKeys := func(lines ...string) Changes {
+		h := w.host(idH2)
+		h.HostKeys = lines
+		return Changes{Put: []crypto.Item{h}}
+	}
+	cases := []struct {
+		name string
+		ch   Changes
+	}{
+		{"public_key empty", key("")},
+		{"public_key without a blob", key(f[0])},
+		{"public_key blob is not base64", key(f[0] + " !!!!")},
+		{"public_key blob is not a key", key(f[0] + " " + base64.StdEncoding.EncodeToString([]byte("not a key")))},
+		{"public_key type differs from its blob", key("ssh-rsa " + f[1])},
+		{"public_key with options", key(`from="10.0.0.1" ` + pub)},
+		{"host_keys entry is not a key line", hostKeys(pub, "not a key")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) { wantRule(t, w.transition(w.unverified(c.ch)), RuleSSHKeyLine) })
+	}
+	t.Run("lines with and without a comment", func(t *testing.T) {
+		mustAccept(t, w.transition(w.unverified(key(f[0]+" "+f[1]))))
+		mustAccept(t, w.transition(w.unverified(hostKeys(pub, f[0]+" "+f[1]))))
 	})
 }
 
@@ -643,8 +780,15 @@ func TestReferenceIntegrity(t *testing.T) {
 
 func TestSnapshotCertRules(t *testing.T) {
 	w := full(t)
-	enroll := w.unverified(Changes{Devices: []DeviceInfo{w.infos[idDevC]}})
+	enroll := w.unverified(Changes{Devices: []DeviceInfo{w.enrolled(idDevC)}})
 	runMutations(t, w.transition, enroll, w.normalSigners(), []mutation{
+		// A device_add in a normal entry comes only from enrollment
+		// (rev 10 item 14).
+		{"enrolled certificate without enroll_transcript", RuleEnrollTranscript, func(e *Entry, _ *Wire) {
+			d := opsOf[*DeviceAddOp](e)[0]
+			d.Cert.EnrollTranscript = crypto.OptHash{}
+			resignCert(t, d, w.acct)
+		}},
 		{"certificate not signed by the account", RuleSnapCert, func(e *Entry, _ *Wire) {
 			opsOf[*DeviceAddOp](e)[0].Cert.Name = "forged"
 		}},
@@ -657,6 +801,10 @@ func TestSnapshotCertRules(t *testing.T) {
 		{"re-adding an active device", RuleUniqueID, func(e *Entry, _ *Wire) {
 			opsOf[*DeviceAddOp](e)[0].Cert.DeviceID = idDevB
 		}},
+	})
+	t.Run("builder refuses a device without enroll_transcript", func(t *testing.T) {
+		_, _, _, err := BuildNormal(w.st, w.sec, w.devA(), Changes{Devices: []DeviceInfo{w.infos[idDevC]}}, w.now(), w.archive)
+		wantRule(t, err, RuleEnrollTranscript)
 	})
 }
 
@@ -831,7 +979,7 @@ func TestParse(t *testing.T) {
 		bad := []Op{
 			&RetiredOp{Op: OpRetired, ItemIDs: []model.ID{idK2, idK1}, DeviceIDs: []model.ID{}, GrantIDs: []model.ID{}},
 			&RetiredOp{Op: OpRetired, ItemIDs: []model.ID{idK1, idK1}, DeviceIDs: []model.ID{}, GrantIDs: []model.ID{}},
-			&CredsOp{Op: OpCreds, Salt: make([]byte, 15)},
+			&CredsOp{Op: OpCreds, KDFVersion: 1, Salt: make([]byte, 15)},
 			&DeployOp{Op: OpDeploy, OpID: idOpD1, Action: ActionDeploy, KeyItemID: idK1,
 				Targets: []Target{{HostItemID: idH1, State: TargetDone}, {HostItemID: idH1, State: TargetDone}}},
 			&ItemPutOp{Op: OpItemPut, ItemID: idK1, Type: "note"},

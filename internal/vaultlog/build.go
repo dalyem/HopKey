@@ -25,7 +25,8 @@ func NewID() (model.ID, error) {
 
 // DeviceInfo describes a device to certify: its ID, name and public keys.
 // EnrollTranscript is SHA-256(T) for a device enrolled by approval (§7) and
-// "" otherwise.
+// "" otherwise. A device added by a normal entry needs one (rev 10 item
+// 14).
 type DeviceInfo struct {
 	ID               model.ID
 	Name             string
@@ -253,7 +254,7 @@ func BuildGenesis(p GenesisParams) (*Wire, *State, *Secrets, error) {
 
 func nextEntry(pre *State, k Kind, author model.ID, t model.Timestamp) Entry {
 	return Entry{
-		VaultID: pre.VaultID, Seq: pre.Head.Seq + 1, Prev: crypto.OptHash(pre.Head.H), Kind: k,
+		VaultID: pre.VaultID, Seq: pre.Head.Seq + 1, Prev: crypto.SomeHash(pre.Head.H), Kind: k,
 		AKV: pre.Account.AKV, KV: pre.KV, Author: author, Time: t,
 	}
 }
@@ -524,12 +525,9 @@ type CheckpointParams struct {
 // unlock blobs; every live item re-put under a fresh IK, iv + 1 and the new
 // kv; every active grant revoked; every deploy_op repeated; and the
 // cumulative retired sets. dev is the authoring device and must survive.
-// The result is verified as a transition of pre by dev.
-//
-// SPEC GAP (§5.3, §10.1): a survivor's new certificate must keep its
-// device_id and keys under the new akv; its other fields are not
-// specified. This code keeps name and enroll_transcript and sets issued_at
-// to the checkpoint time.
+// The result is verified as a transition of pre by dev. A survivor's new
+// certificate keeps its name and enroll_transcript, and issued_at is the
+// checkpoint time (rev 10 item 13).
 func BuildCheckpoint(pre *State, sec *Secrets, dev DeviceKey, p CheckpointParams) (*Wire, *State, *Secrets, error) {
 	na := p.NewAccount
 	if na == nil || na.AccountID != pre.Account.AccountID || na.AKV != pre.Account.AKV+1 {

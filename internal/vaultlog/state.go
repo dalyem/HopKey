@@ -85,11 +85,7 @@ type Retired struct {
 // State is the verified durable state of §5.5. It holds only public data
 // (digests and metadata); plaintexts and keys are in Secrets. The caller
 // persists it, together with Secrets, in one durable commit before using
-// either.
-//
-// SPEC GAP (§5.5): the state list does not name vault_id. It is kept
-// because every transition must stay in the same vault, §6.3 and §6.4 bind
-// it, and the anchor identity names it.
+// either. It also holds vault_id (rev 10 item 3).
 type State struct {
 	VaultID   model.ID                 `json:"vault_id"`
 	Head      Head                     `json:"head"`
@@ -247,12 +243,9 @@ func (s idSet) equal(o idSet) bool {
 	return true
 }
 
-// allIDs returns every ID in the live sets (items, devices, grants, deploy
-// ops) and in retired, with a count of how often each occurs.
-//
-// SPEC GAP (§5.3, §5.5): "the live sets" are not enumerated. This code
-// counts items, active devices, active grants and every deploy_op op_id
-// (op_ids are never removed and "can never be recreated").
+// allIDs returns every ID in the live sets and in retired, with a count of
+// how often each occurs. The live sets are the live item IDs, the active
+// device IDs, the active grant IDs and every deploy_op ID (rev 10 item 4).
 func (s *State) allIDs() map[model.ID]int {
 	n := map[model.ID]int{}
 	for id := range s.Items {

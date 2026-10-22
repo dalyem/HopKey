@@ -144,15 +144,11 @@ func CheckHeld(seq uint64, have crypto.Hash, e *Entry) error {
 }
 
 // opNames lists the (category, id) pairs an op names for the
-// within-entry uniqueness rule of §5.2.
-//
-// SPEC GAP (§5.2 vs §5.3): read literally, "no two ops may name the same
-// item_id" forbids a grant_add whose record_item_id equals an item_put's
-// item_id, which the grant rule requires. This code counts only each op's
-// subject ID (item_put/item_delete item_id, device_add cert.device_id,
+// within-entry uniqueness rule of §5.2. Only each op's subject ID counts
+// (rev 10 item 1): item_put/item_delete item_id, device_add cert.device_id,
 // device_revoke device_id, grant_add/bundle_put/grant_revoke grant_id,
-// deploy_op op_id, and the retired lists), not cross-references such as
-// record_item_id, key_item_id or host_item_id.
+// deploy_op op_id, and the IDs in the retired lists. References such as
+// record_item_id, key_item_id or host_item_id don't.
 type namedID struct {
 	cat string
 	id  model.ID
@@ -305,7 +301,7 @@ func (c *Candidate) checkHeader() error {
 		if e.Seq != pre.Head.Seq+1 {
 			return fail(RuleSeq, "seq %d, want %d", e.Seq, pre.Head.Seq+1)
 		}
-		if crypto.Hash(e.Prev) != pre.Head.H {
+		if !e.Prev.Equal(pre.Head.H) {
 			return fail(RulePrev, "prev does not name the verified head")
 		}
 	}
@@ -340,11 +336,9 @@ func (c *Candidate) accountID() (model.ID, error) {
 	return model.ID{}, fail(RuleGenesis, "genesis has no device_add")
 }
 
-// requiredRoles is the signature set for each kind (§5.3).
-//
-// SPEC GAP (§5.1, §5.3): the spec lists the signatures each kind needs but
-// not whether wire.sigs may carry others. This code requires exactly the
-// listed roles, each once.
+// requiredRoles is the signature set for each kind (§5.3). wire.sigs
+// carries exactly these roles, with no extras and no duplicates (rev 10
+// item 2).
 func requiredRoles(k Kind) []Role {
 	switch k {
 	case KindGenesis, KindBootstrap:
@@ -426,11 +420,9 @@ func (c *Candidate) checkSigs(accountID model.ID) error {
 			if err := c.checkPin(); err != nil {
 				return err
 			}
-			// SPEC GAP (§5.5 anchor): only account_new is listed. The
-			// account_old key is unknown at an anchor and cannot be
-			// verified. The device signature is verified against the
-			// author's own device_add in the entry (the author survives
-			// every checkpoint, so a valid checkpoint always has one).
+			// account_old can't be checked at an anchor. The device
+			// signature is verified against the author's own device_add
+			// in the entry (rev 10 item 7).
 			d, ok := c.deviceAdds[e.Author]
 			if !ok {
 				return fail(RuleDeviceCover, "the authoring device does not survive the checkpoint")
@@ -517,14 +509,22 @@ func (c *Candidate) apply(accountID model.ID) error {
 			if !bytes.Equal(old.KEMPK, d.KEMPK) || !bytes.Equal(old.SigPK, d.SigPK) {
 				return fail(RuleSurvivorKeys, "surviving device %v changes its public keys", id)
 			}
+			// The new certificate keeps name and enroll_transcript, and
+			// issued_at is the entry's time (rev 10 item 13).
+			if d.Cert.Name != old.Cert.Name || d.Cert.EnrollTranscript != old.Cert.EnrollTranscript || d.Cert.IssuedAt != e.Time {
+				return fail(RuleSurvivorCert, "surviving device %v: certificate changes name or enroll_transcript, or issued_at is not the entry time", id)
+			}
 		} else if err := addNew(id, "device"); err != nil {
 			return err
 		}
-		// SPEC GAP (§5.3, §7): bootstrap requires enroll_transcript = "";
-		// nothing requires a non-empty one for a device_add in a normal
-		// entry (enrollment by approval), so that is not checked.
+		// Bootstrap requires enroll_transcript = "". A device_add in a
+		// normal entry comes only from enrollment and needs a non-empty
+		// one (rev 10 item 14).
 		if e.Kind == KindBootstrap && !d.Cert.EnrollTranscript.IsZero() {
 			return fail(RuleBootstrap, "bootstrap certificate must have enroll_transcript \"\"")
+		}
+		if e.Kind == KindNormal && d.Cert.EnrollTranscript.IsZero() {
+			return fail(RuleEnrollTranscript, "certificate of %v has no enroll_transcript", id)
 		}
 		post.Devices[id] = *d
 	}
@@ -575,9 +575,8 @@ func (c *Candidate) apply(accountID model.ID) error {
 			if err := addNew(id, "item"); err != nil {
 				return err
 			}
-			// SPEC GAP (§5.3): a checkpoint must re-put every live item;
-			// whether it may also create items is not said. §10.1 builds
-			// it from the pre-state only, so new items are rejected.
+			// A checkpoint can't create items: every item_put names a
+			// pre-state live item (rev 10 item 5).
 			if checkpoint {
 				return fail(RuleCheckpointItems, "checkpoint creates item %v", id)
 			}
@@ -641,17 +640,26 @@ func (c *Candidate) apply(accountID model.ID) error {
 				return err
 			}
 		} else {
-			// SPEC GAP (§10.3): key_item_version is "the originating
-			// revision", but no rule ties a new op's value to the key's
-			// current item_version, so it is not checked.
 			if err := addNew(id, "deploy_op"); err != nil {
 				return err
 			}
-			// SPEC GAP (§5.3): whether a checkpoint may start a new
-			// deploy_op is not said; it must repeat every pre-state op
-			// "unchanged", so new ones are rejected.
+			// A checkpoint can't create deploy_ops: it only repeats
+			// pre-state ops (rev 10 item 6).
 			if checkpoint && !anchor {
 				return fail(RuleCheckpointDeploy, "checkpoint creates deploy_op %v", id)
+			}
+			// A new op's key_item_version is the key item's current
+			// version (rev 10 item 10). At an anchor every op is a
+			// repeat, not a creation.
+			if !anchor {
+				k, ok := post.Items[d.KeyItemID]
+				if !ok || k.Type != model.TypeKey {
+					return fail(RuleDeployRefs, "new deploy_op %v names %v, which is not a live key", id, d.KeyItemID)
+				}
+				if d.KeyItemVersion != k.ItemVersion {
+					return fail(RuleDeployKeyVersion, "new deploy_op %v has key_item_version %d, key %v is at %d",
+						id, d.KeyItemVersion, d.KeyItemID, k.ItemVersion)
+				}
 			}
 		}
 		post.DeployOps[id] = n

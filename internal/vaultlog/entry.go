@@ -1,11 +1,12 @@
 // Package vaultlog implements HopKey's vault log (crypto spec §5, with the
 // parts of §6, §8 and §10 it refers to; https://plan.23d.dev/p/xuu5z9q2,
-// rev 8). It decides which state a client trusts.
+// rev 10). It decides which state a client trusts.
 //
 // The package is pure logic: no network, no disk and no clock. Objects come
 // through an ObjectFetcher, device private keys through a DeviceKey, and the
-// caller persists the State and Secrets it gets back. Places where the spec
-// is silent or contradictory are marked SPEC GAP.
+// caller persists the State and Secrets it gets back. Comments citing "rev
+// 10 item N" refer to the numbered vault-log clarifications in the spec's
+// "Changes from rev 9".
 //
 // The entry points are:
 //
@@ -87,8 +88,9 @@ type Sig struct {
 	Sig  []byte `json:"sig"`
 }
 
-// Object is one {"sha256":h, "body":envelope-or-certificate-object} of
-// wire.objects. Its digest is SHA-256(JCS(body)) (§3).
+// Object is one {"sha256":h, "body":envelope} of wire.objects. Its digest
+// is SHA-256(JCS(body)) (§3). Bodies are AEAD or HPKE envelopes only;
+// certificates travel inside device_add (rev 10 item 17).
 type Object struct {
 	SHA256 crypto.Hash   `json:"sha256"`
 	Body   canonjson.Raw `json:"body"`
@@ -256,8 +258,9 @@ func (m ObjectMap) Add(body []byte) (crypto.Hash, error) {
 	return h, nil
 }
 
-// WireObjects checks that every object's sha256 is the digest of its body
-// and that no digest repeats, and returns them as an ObjectMap.
+// WireObjects checks that every object's sha256 is the digest of its body,
+// that every body is an envelope (rev 10 item 17) and that no digest
+// repeats, and returns them as an ObjectMap.
 func WireObjects(w *Wire) (ObjectMap, error) {
 	m := make(ObjectMap, len(w.Objects))
 	for _, o := range w.Objects {
@@ -268,10 +271,23 @@ func WireObjects(w *Wire) (ObjectMap, error) {
 		if !h.Equal(o.SHA256) {
 			return nil, fail(RuleObjectDigest, "object %v has digest %v", o.SHA256, h)
 		}
+		if !isEnvelope(o.Body) {
+			return nil, fail(RuleObjectEnvelope, "object %v is not an AEAD or HPKE envelope", h)
+		}
 		if _, dup := m[h]; dup {
 			return nil, fail(RuleSchema, "object %v listed twice", h)
 		}
 		m[h] = o.Body
 	}
 	return m, nil
+}
+
+// isEnvelope reports whether body is an AEAD or an HPKE envelope under its
+// closed schema (§3).
+func isEnvelope(body []byte) bool {
+	if _, err := crypto.ParseAEADEnvelope(body); err == nil {
+		return true
+	}
+	_, err := crypto.ParseHPKEEnvelope(body)
+	return err == nil
 }

@@ -218,6 +218,9 @@ func (c *Candidate) openItem(s *State, vk crypto.SymKey, p *ItemPutOp) (PlainIte
 	if err != nil {
 		return PlainItem{}, failErr(RuleDecrypt, err, "body of %v", p.ItemID)
 	}
+	if err := checkSSHLines(p.ItemID, it); err != nil {
+		return PlainItem{}, err
+	}
 	return PlainItem{IK: ik, Item: it}, nil
 }
 
@@ -252,21 +255,17 @@ func (c *Candidate) checkTransitionPlain(pre, next *Secrets) error {
 		}
 	}
 	// An item of type grant can be deleted only once its grant has an
-	// explicit grant_revoke in the log (§5.3).
-	//
-	// SPEC GAP (§5.3): whether a grant_revoke in the same entry counts as
-	// "in the log" is not said. This code checks the post-state, so it does.
+	// explicit grant_revoke in the log (§5.3). A grant_revoke in the same
+	// entry counts (rev 10 item 16), so this checks the post-state.
 	retiredGrants := setOf(post.Retired.GrantIDs)
 	for id := range c.deletes {
 		if rec, ok := pre.Items[id].Item.(*model.Grant); ok && !retiredGrants[rec.GrantID] {
 			return fail(RuleGrantRecordDelete, "grant record %v deleted before grant %v is revoked", id, rec.GrantID)
 		}
 	}
-	// While an op is incomplete, the key item's SSH material MUST stay
-	// unchanged (§10.3).
-	//
-	// SPEC GAP (§10.3): "SSH material" is not defined field by field. This
-	// code freezes private_key and public_key.
+	// While an op is incomplete, the key item's SSH material (key_type,
+	// private_key and public_key, rev 10 item 8) MUST stay unchanged
+	// (§10.3).
 	for id, o := range c.allDeployOps() {
 		if o.Closed() {
 			continue
@@ -279,7 +278,7 @@ func (c *Candidate) checkTransitionPlain(pre, next *Secrets) error {
 			continue
 		}
 		newKey, ok := next.Items[o.KeyItemID].Item.(*model.Key)
-		if !ok || oldKey.PrivateKey != newKey.PrivateKey || oldKey.PublicKey != newKey.PublicKey {
+		if !ok || oldKey.KeyType != newKey.KeyType || oldKey.PrivateKey != newKey.PrivateKey || oldKey.PublicKey != newKey.PublicKey {
 			return fail(RuleDeployMaterial, "key %v changes its SSH material while deploy_op %v is incomplete", o.KeyItemID, id)
 		}
 	}
@@ -394,12 +393,9 @@ func checkPlainSnapshot(s *State, sec *Secrets) error {
 		}
 	}
 	// Active grants: the record matches the grant's immutable metadata and
-	// passes the §8.7 binding rules against the current plaintexts.
-	//
-	// SPEC GAP (§5.3, §8.7): §8.7's bundle-closure and key_policy rules are
-	// stated for records that produce bundles. They are applied here to
-	// the records of active grants only; revoked grants' records must still
-	// satisfy reference integrity above.
+	// passes the §8.7 binding rules against the current plaintexts. §8.7
+	// applies to active grants' records only; revoked grants' records need
+	// reference integrity above (rev 10 item 12).
 	for _, g := range sortedKeys(s.Grants) {
 		gs := s.Grants[g]
 		rec, ok := items[gs.RecordItemID].(*model.Grant)
@@ -433,28 +429,54 @@ func checkPlainSnapshot(s *State, sec *Secrets) error {
 // SSHFingerprint returns ssh_pk_fp for an OpenSSH public-key line: "SHA256:"
 // and the unpadded standard base64 of the SHA-256 of the public-key wire
 // blob (§10.3).
-//
-// SPEC GAP (§6.5): the text form of key.public_key is not pinned beyond
-// "str≤8192". This code reads it as an OpenSSH line, "type base64
-// [comment]", and requires the blob to parse as a key of that type.
 func SSHFingerprint(publicKey string) (string, error) {
-	f := strings.Fields(publicKey)
-	if len(f) < 2 {
-		return "", errors.New("vaultlog: public_key is not an OpenSSH public-key line")
-	}
-	blob, err := base64.StdEncoding.DecodeString(f[1])
+	blob, err := parseSSHLine(publicKey)
 	if err != nil {
-		return "", fmt.Errorf("vaultlog: public_key: %w", err)
-	}
-	pk, err := ssh.ParsePublicKey(blob)
-	if err != nil {
-		return "", fmt.Errorf("vaultlog: public_key: %w", err)
-	}
-	if pk.Type() != f[0] {
-		return "", errors.New("vaultlog: public_key type does not match its blob")
+		return "", err
 	}
 	sum := sha256.Sum256(blob)
 	return "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]), nil
+}
+
+// parseSSHLine parses an OpenSSH authorized_keys line without options,
+// "<type> <base64> [comment]" (rev 10 item 11), and returns the key's wire
+// blob. The blob must parse as a key of the named type.
+func parseSSHLine(line string) ([]byte, error) {
+	f := strings.Fields(line)
+	if len(f) < 2 {
+		return nil, errors.New("vaultlog: not an OpenSSH public-key line")
+	}
+	blob, err := base64.StdEncoding.DecodeString(f[1])
+	if err != nil {
+		return nil, fmt.Errorf("vaultlog: OpenSSH public-key line: %w", err)
+	}
+	pk, err := ssh.ParsePublicKey(blob)
+	if err != nil {
+		return nil, fmt.Errorf("vaultlog: OpenSSH public-key line: %w", err)
+	}
+	if pk.Type() != f[0] {
+		return nil, errors.New("vaultlog: OpenSSH public-key line: type does not match its blob")
+	}
+	return blob, nil
+}
+
+// checkSSHLines requires key.public_key and every host.host_keys entry to
+// parse as OpenSSH public-key lines (rev 10 item 11). internal/crypto
+// checks only their length and characters.
+func checkSSHLines(id model.ID, it crypto.Item) error {
+	switch it := it.(type) {
+	case *model.Key:
+		if _, err := parseSSHLine(it.PublicKey); err != nil {
+			return failErr(RuleSSHKeyLine, err, "%v.public_key", id)
+		}
+	case *model.Host:
+		for i, l := range it.HostKeys {
+			if _, err := parseSSHLine(l); err != nil {
+				return failErr(RuleSSHKeyLine, err, "%v.host_keys[%d]", id, i)
+			}
+		}
+	}
+	return nil
 }
 
 // AnchorID is the anchor identity (account_id, vault_id, akv, fp_kem,
@@ -596,6 +618,9 @@ func OpenSecretsWithAccount(s *State, acct *crypto.AccountKeys, objs ObjectFetch
 		it, err := crypto.OpenItem(&ik, ctx, body)
 		if err != nil {
 			return nil, failErr(RuleDecrypt, err, "body of %v", id)
+		}
+		if err := checkSSHLines(id, it); err != nil {
+			return nil, err
 		}
 		sec.Items[id] = PlainItem{IK: ik, Item: it}
 	}
