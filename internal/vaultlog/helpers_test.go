@@ -1,9 +1,14 @@
 package vaultlog
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"slices"
@@ -100,6 +105,29 @@ func sshKey(t testing.TB, label string) (string, string) {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pk))) + " " + label, ssh.FingerprintSHA256(pk)
 }
 
+// sshPrivateKey returns the unencrypted OpenSSH private key (PEM) that
+// matches sshKey(label), in the openssh-key-v1 format. ssh.MarshalPrivateKey
+// draws random check bytes; fixed ones keep a key item's plaintext the same
+// every time a test builds it.
+func sshPrivateKey(label string) string { return sshPrivateKeyComment(label, label) }
+
+// sshPrivateKeyComment is sshPrivateKey with another comment: the same key
+// in a different encoding.
+func sshPrivateKeyComment(label, comment string) string {
+	priv := ed25519.NewKeyFromSeed(fixedBytes(label, 32))
+	pub := priv[ed25519.SeedSize:]
+	str := func(b []byte) []byte { return append(binary.BigEndian.AppendUint32(nil, uint32(len(b))), b...) }
+	algo := []byte(ssh.KeyAlgoED25519)
+	pubBlob := slices.Concat(str(algo), str(pub))
+	sec := slices.Concat([]byte{1, 2, 3, 4, 1, 2, 3, 4}, str(algo), str(pub), str(priv), str([]byte(comment)))
+	for i := byte(1); len(sec)%8 != 0; i++ {
+		sec = append(sec, i)
+	}
+	body := slices.Concat([]byte("openssh-key-v1\x00"), str([]byte("none")), str([]byte("none")), str(nil),
+		[]byte{0, 0, 0, 1}, str(pubBlob), str(sec))
+	return string(pem.EncodeToMemory(&pem.Block{Type: "OPENSSH PRIVATE KEY", Bytes: body}))
+}
+
 var (
 	idAccount = fixedID(0x10)
 	idVault   = fixedID(0x20)
@@ -154,9 +182,35 @@ func keyItem(t testing.TB, id model.ID, label string) *model.Key {
 	pub, _ := sshKey(t, label)
 	return &model.Key{
 		Header: model.Header{ItemID: id, Type: model.TypeKey}, Name: label, KeyType: "ed25519",
-		PrivateKey: "-----BEGIN OPENSSH PRIVATE KEY----- " + label + " -----END OPENSSH PRIVATE KEY-----",
+		PrivateKey: sshPrivateKey(label),
 		PublicKey:  pub,
 	}
+}
+
+// ecdsaKey returns the key_type, a fresh unencrypted OpenSSH private key
+// and the public-key line of an ECDSA P-256 key.
+func ecdsaKey(t testing.TB) (keyType, privateKey, publicKey string) {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blk, err := ssh.MarshalPrivateKey(k, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, err := ssh.NewPublicKey(&k.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "ecdsa-p256", string(pem.EncodeToMemory(blk)), strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pk)))
+}
+
+// recomment returns an OpenSSH public-key line with another comment: the
+// same key in a different line.
+func recomment(line, comment string) string {
+	f := strings.Fields(line)
+	return f[0] + " " + f[1] + " " + comment
 }
 
 func hostItem(id model.ID, name string, key, cred model.ID) *model.Host {

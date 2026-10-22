@@ -5,7 +5,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -35,22 +34,12 @@ func (c *client) apply(t *testing.T, wire *Wire, server ObjectFetcher) {
 }
 
 // sameView requires two clients to hold byte-identical state and the same
-// item keys and plaintexts. The one exception is past_accounts: a client
-// knows only the account keys from its anchor on (rev 11), so a client
-// anchored later holds a suffix of the other's history.
+// item keys and plaintexts. An anchor imports the signed history, so this
+// holds for clients anchored at different entries too (rev 12).
 func sameView(t *testing.T, a, b *client) {
 	t.Helper()
-	pa, pb := a.st.PastAccounts, b.st.PastAccounts
-	if len(pa) < len(pb) {
-		pa, pb = pb, pa
-	}
-	if !slices.Equal(pa[len(pa)-len(pb):], pb) {
-		t.Fatalf("%s and %s hold unrelated account histories: %+v, %+v", a.name, b.name, a.st.PastAccounts, b.st.PastAccounts)
-	}
 	marshal := func(s *State) []byte {
-		c := s.clone()
-		c.PastAccounts = []PastAccount{}
-		b, err := c.Marshal()
+		b, err := s.Marshal()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,6 +87,7 @@ func TestScenario(t *testing.T) {
 	}
 	w.record(genesis)
 	a := &client{name: "A", dev: w.devA(), st: st, sec: sec}
+	genesisAccount := st.Account
 
 	// Password login on B: open pw_blob, anchor at genesis, bootstrap.
 	var enc1 crypto.SymKey
@@ -305,14 +295,15 @@ func TestScenario(t *testing.T) {
 		t.Fatal("checkpoint state is not as declared")
 	}
 
-	// The akv 1 key joins A's account history (rev 11).
-	if len(a.st.PastAccounts) != 1 || a.st.PastAccounts[0].AKV != 1 {
-		t.Fatalf("A's past accounts: %+v", a.st.PastAccounts)
+	// The history holds both account keys and both VK commitments (rev 12).
+	if h := a.st.History; len(h.Accounts) != 2 || !h.Accounts[0].matches(&genesisAccount) || !h.Accounts[1].matches(&a.st.Account) ||
+		len(h.VKCommits) != 2 || h.VKCommits[0].Commit != crypto.VKCommit(&vk1) || h.VKCommits[1].Commit != crypto.VKCommit(&vk2) {
+		t.Fatalf("A's history: %+v", h)
 	}
 
 	// A fresh client F logs in with the new password: it opens the new
 	// pw_blob, anchors at the checkpoint for akv 2, and must reach the
-	// identical state, except that it knows no account key before akv 2.
+	// byte-identical state, history included.
 	var enc2 crypto.SymKey
 	copy(enc2[:], fixedBytes("creds2-enc", 32))
 	pw2, err := crypto.ParseAEADEnvelope(server[a.st.Creds.PwBlobSHA256])
@@ -366,7 +357,8 @@ func TestScenario(t *testing.T) {
 	}
 }
 
-// TestLogEntryVector pins H(E) for a fixed genesis entry (§13, §5.1).
+// TestLogEntryVector pins H(E) for a fixed genesis entry (§13, §5.1),
+// including its history op (rev 12).
 func TestLogEntryVector(t *testing.T) {
 	acct := fixedAccount(t, 1, "account1")
 	_, dev := fixedDevice(t, idDevA, "dev-a")
@@ -379,6 +371,8 @@ func TestLogEntryVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var vk crypto.SymKey
+	copy(vk[:], fixedBytes("vk1", 32))
 	e := Entry{
 		V: 1, Suite: 1, VaultID: idVault, Seq: 0, Kind: KindGenesis, AKV: 1, KV: 1, Author: idAccount, Time: issued,
 		Ops: []Op{
@@ -389,6 +383,9 @@ func TestLogEntryVector(t *testing.T) {
 			&DeviceAddOp{Op: OpDeviceAdd, Cert: cert, CertSig: certSig, KEMPK: dev.KEMPK, SigPK: dev.SigPK,
 				UnlockSHA256: crypto.SHA256([]byte("unlock"))},
 			&VKWrapOp{Op: OpVKWrap, KV: 1, Recipient: idAccount, EnvelopeSHA256: crypto.SHA256([]byte("vk"))},
+			&HistoryOp{Op: OpHistory,
+				Accounts:  []AccountRow{{AKV: 1, FpKEM: acct.Pin().FpKEM, FpSig: acct.Pin().FpSig}},
+				VKCommits: []VKRow{{KV: 1, Commit: crypto.VKCommit(&vk)}}},
 		},
 	}
 	jcs, err := e.Marshal()

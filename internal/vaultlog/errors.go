@@ -43,8 +43,8 @@ const (
 	RuleCheckpointAKV       Rule = "checkpoint.akv"
 	RuleCheckpointGen       Rule = "checkpoint.gen"
 	RuleCheckpointKV        Rule = "checkpoint.kv"
-	RuleCheckpointFreshKeys Rule = "checkpoint.fresh-keys" // account_keys reuse an earlier account key (rev 11)
-	RuleCheckpointFreshVK   Rule = "checkpoint.fresh-vk"   // the new VK equals the pre-state VK (rev 11, plaintext stage)
+	RuleCheckpointFreshKeys Rule = "checkpoint.fresh-keys" // account_keys reuse a key of any earlier history row (rev 11, rev 12)
+	RuleCheckpointFreshVK   Rule = "checkpoint.fresh-vk"   // the new VK's commitment equals an earlier one (rev 11, rev 12; plaintext stage)
 	RuleSurvivorKeys        Rule = "checkpoint.survivor-keys"
 	RuleSurvivorCert        Rule = "checkpoint.survivor-cert" // name, enroll_transcript kept; issued_at = entry time (rev 10 item 13)
 	RuleDeviceCover         Rule = "checkpoint.devices"       // survivors ∪ revoked = pre-state active set, author survives
@@ -60,8 +60,9 @@ const (
 	RuleItemIV              Rule = "item.iv"
 	RuleItemIK              Rule = "item.ik" // same IK for ordinary edits, a fresh one in a checkpoint
 	RuleItemLive            Rule = "item.live"
-	RuleSSHKeyLine          Rule = "item.ssh-key"      // key.public_key or a host_keys entry is not an OpenSSH line (rev 10 item 11; enforced by crypto.ValidateKey/ValidateHost)
-	RuleGrantRecordDelete   Rule = "item.grant-delete" // a grant record is deleted before its grant_revoke
+	RuleSSHKeyLine          Rule = "item.ssh-key"         // key.public_key or a host_keys entry is not an OpenSSH line (rev 10 item 11, rev 12; enforced by crypto.ValidateKey/ValidateHost)
+	RuleSSHPrivateKey       Rule = "item.ssh-private-key" // key.private_key is not an unencrypted OpenSSH key for public_key and key_type (rev 12; crypto.ValidateKey)
+	RuleGrantRecordDelete   Rule = "item.grant-delete"    // a grant record is deleted before its grant_revoke
 	RuleGrantAdd            Rule = "grant.add"
 	RuleGrantNewRecord      Rule = "grant.new-record" // a new grant record without its grant_add
 	RuleGrantActive         Rule = "grant.active"
@@ -82,6 +83,16 @@ const (
 	RuleObjectDigest        Rule = "object.digest"
 	RuleObjectEnvelope      Rule = "object.envelope" // a wire object is not an envelope (rev 10 item 17)
 	RuleDecrypt             Rule = "object.decrypt"
+)
+
+// History rules (rev 12): genesis and every checkpoint carry the signed,
+// cumulative account-key and VK-commitment history.
+const (
+	RuleHistoryCount    Rule = "history.count"     // a genesis or checkpoint without exactly one history op
+	RuleHistoryRows     Rule = "history.rows"      // a list not contiguous from version 1, or not ending at the entry's akv and kv
+	RuleHistoryExtend   Rule = "history.extend"    // a transition's history is not the pre-state history plus one row each
+	RuleHistoryAccount  Rule = "history.account"   // the last account row does not match account_keys
+	RuleHistoryVKCommit Rule = "history.vk-commit" // a VK does not match its commitment row (plaintext stage)
 )
 
 // Common snapshot invariants (§5.5).

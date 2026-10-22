@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 
@@ -50,15 +51,6 @@ func accountFromOp(accountID model.ID, o *AccountKeysOp) Account {
 	}
 }
 
-// PastAccount is the fingerprint pair of an account key the state has
-// replaced. A checkpoint's new account keys MUST differ from every earlier
-// account key (rev 11), so the state keeps them.
-type PastAccount struct {
-	AKV   uint32      `json:"akv"`
-	FpKEM crypto.Hash `json:"fp_kem"`
-	FpSig crypto.Hash `json:"fp_sig"`
-}
-
 // ItemState is item_id → {type, item_version, iv, kv, body_sha256,
 // wrap_sha256} (§5.5).
 type ItemState struct {
@@ -94,24 +86,24 @@ type Retired struct {
 // State is the verified durable state of §5.5. It holds only public data
 // (digests and metadata); plaintexts and keys are in Secrets. The caller
 // persists it, together with Secrets, in one durable commit before using
-// either. It also holds vault_id (rev 10 item 3) and the fingerprints of
-// every earlier account key seen since the anchor (rev 11).
+// either. It also holds vault_id (rev 10 item 3) and the signed account-key
+// and VK-commitment history (rev 12).
 type State struct {
 	VaultID model.ID `json:"vault_id"`
 	Head    Head     `json:"head"`
 	Account Account  `json:"account"`
-	// PastAccounts are the account keys before Account, in ascending akv.
-	// A client knows only the keys from its anchor on: an anchored state
-	// starts with none.
-	PastAccounts []PastAccount            `json:"past_accounts"`
-	KV           uint32                   `json:"kv"`
-	Creds        CredsOp                  `json:"creds"`
-	VKWrap       VKWrapOp                 `json:"vk_wrap"`
-	Devices      map[model.ID]DeviceAddOp `json:"devices"` // active devices, each with its complete device_add
-	Items        map[model.ID]ItemState   `json:"items"`
-	Grants       map[model.ID]GrantState  `json:"grants"`
-	DeployOps    map[model.ID]DeployOp    `json:"deploy_ops"` // incomplete and closed
-	Retired      Retired                  `json:"retired"`
+	// History runs from version 1 through Account.AKV and KV. An anchor
+	// imports it whole, so every client at the same head holds the same
+	// state (rev 12).
+	History   History                  `json:"history"`
+	KV        uint32                   `json:"kv"`
+	Creds     CredsOp                  `json:"creds"`
+	VKWrap    VKWrapOp                 `json:"vk_wrap"`
+	Devices   map[model.ID]DeviceAddOp `json:"devices"` // active devices, each with its complete device_add
+	Items     map[model.ID]ItemState   `json:"items"`
+	Grants    map[model.ID]GrantState  `json:"grants"`
+	DeployOps map[model.ID]DeployOp    `json:"deploy_ops"` // incomplete and closed
+	Retired   Retired                  `json:"retired"`
 }
 
 // Marshal returns the deterministic (JCS) serialization of the state.
@@ -152,30 +144,34 @@ func (s *State) selfCheck() error {
 			return err
 		}
 	}
-	for i, p := range s.PastAccounts {
-		if p.AKV >= s.Account.AKV || i > 0 && p.AKV <= s.PastAccounts[i-1].AKV {
-			return errors.New("vaultlog: state past accounts are not in ascending akv below the current akv")
-		}
+	h := &s.History
+	if err := checkHistoryRows(h.Accounts, h.VKCommits); err != nil {
+		return fmt.Errorf("vaultlog: state history: %w", err)
+	}
+	if last := h.Accounts[len(h.Accounts)-1]; !last.matches(&s.Account) || len(h.VKCommits) != int(s.KV) {
+		return errors.New("vaultlog: state history does not end at the current account keys and kv")
 	}
 	return nil
 }
 
-// accountKeyUsed reports whether a KEM or signing public key equals the
-// current or an earlier account key the state knows.
-func (s *State) accountKeyUsed(kemPK, sigPK []byte) (kem, sig bool) {
-	fk, fs := crypto.FpKEM(kemPK), crypto.FpSig(sigPK)
-	kem, sig = fk.Equal(s.Account.FpKEM), fs.Equal(s.Account.FpSig)
-	for _, p := range s.PastAccounts {
-		kem = kem || fk.Equal(p.FpKEM)
-		sig = sig || fs.Equal(p.FpSig)
-	}
-	return kem, sig
+// matches reports whether the row names a's akv and fingerprints.
+func (r AccountRow) matches(a *Account) bool {
+	return r.AKV == a.AKV && r.FpKEM.Equal(a.FpKEM) && r.FpSig.Equal(a.FpSig)
 }
 
-// checkFreshAccountKeys requires a checkpoint's account_keys.kem_pk and
-// sig_pk to differ from every earlier account key in s (rev 11).
-func checkFreshAccountKeys(s *State, kemPK, sigPK []byte) error {
-	kem, sig := s.accountKeyUsed(kemPK, sigPK)
+// lastAccount and lastVK return the rows for the current akv and kv.
+func (h *History) lastAccount() AccountRow { return h.Accounts[len(h.Accounts)-1] }
+func (h *History) lastVK() VKRow           { return h.VKCommits[len(h.VKCommits)-1] }
+
+// checkFreshAccount requires an account key pair with fingerprints fk and
+// fs to differ from every key in earlier, the earlier history rows (rev 11;
+// global since rev 12).
+func checkFreshAccount(earlier []AccountRow, fk, fs crypto.Hash) error {
+	var kem, sig bool
+	for _, r := range earlier {
+		kem = kem || fk.Equal(r.FpKEM)
+		sig = sig || fs.Equal(r.FpSig)
+	}
 	switch {
 	case kem && sig:
 		return fail(RuleCheckpointFreshKeys, "account_keys reuse an earlier KEM key and an earlier signing key")
@@ -230,7 +226,7 @@ func (s *State) clone() *State {
 	c := *s
 	c.Account.KEMPK = slices.Clone(s.Account.KEMPK)
 	c.Account.SigPK = slices.Clone(s.Account.SigPK)
-	c.PastAccounts = slices.Clone(s.PastAccounts)
+	c.History = s.History.clone()
 	c.Creds.Salt = slices.Clone(s.Creds.Salt)
 	c.Devices = maps.Clone(s.Devices)
 	c.Items = maps.Clone(s.Items)
@@ -246,12 +242,12 @@ func (s *State) clone() *State {
 
 func emptyState() *State {
 	return &State{
-		PastAccounts: []PastAccount{},
-		Devices:      map[model.ID]DeviceAddOp{},
-		Items:        map[model.ID]ItemState{},
-		Grants:       map[model.ID]GrantState{},
-		DeployOps:    map[model.ID]DeployOp{},
-		Retired:      Retired{ItemIDs: []model.ID{}, DeviceIDs: []model.ID{}, GrantIDs: []model.ID{}},
+		History:   History{Accounts: []AccountRow{}, VKCommits: []VKRow{}},
+		Devices:   map[model.ID]DeviceAddOp{},
+		Items:     map[model.ID]ItemState{},
+		Grants:    map[model.ID]GrantState{},
+		DeployOps: map[model.ID]DeployOp{},
+		Retired:   Retired{ItemIDs: []model.ID{}, DeviceIDs: []model.ID{}, GrantIDs: []model.ID{}},
 	}
 }
 

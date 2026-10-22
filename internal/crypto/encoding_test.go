@@ -371,3 +371,19 @@ func TestCheckSecretHash(t *testing.T) {
 		t.Error("stored hash accepted as the secret")
 	}
 }
+
+// vk_commit(VK) = SHA-256(lp("hopkey/v1/vk-commit") || VK), with VK not
+// length-prefixed (rev 12). The known-answer value is in encoding.json.
+func TestVKCommit(t *testing.T) {
+	var vk SymKey
+	copy(vk[:], fixedBytes("vk", 32))
+	want := sha256.Sum256(append(LP([]byte("hopkey/v1/vk-commit")), vk[:]...))
+	if got := VKCommit(&vk); got != Hash(want) {
+		t.Fatalf("VKCommit = %v, want %x", got, want)
+	}
+	other := vk
+	other[31] ^= 1
+	if VKCommit(&other) == VKCommit(&vk) {
+		t.Fatal("different VKs share a commitment")
+	}
+}

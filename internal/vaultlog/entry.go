@@ -1,6 +1,6 @@
 // Package vaultlog implements HopKey's vault log (crypto spec §5, with the
 // parts of §6, §8 and §10 it refers to; https://plan.23d.dev/p/xuu5z9q2,
-// rev 10). It decides which state a client trusts.
+// rev 12). It decides which state a client trusts.
 //
 // The package is pure logic: no network, no disk and no clock. Objects come
 // through an ObjectFetcher, device private keys through a DeviceKey, and the

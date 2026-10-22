@@ -147,16 +147,17 @@ func ValidateHost(h *model.Host) error {
 	// Each host_keys entry is an OpenSSH authorized_keys line (rev 10
 	// item 11).
 	for i, l := range h.HostKeys {
-		if err := checkSSHKeyLine(fmt.Sprintf("host_keys[%d]", i), l); err != nil {
+		if _, err := checkSSHKeyLine(fmt.Sprintf("host_keys[%d]", i), l); err != nil {
 			return err
 		}
 	}
 	return checkEnum("agent_access", h.AgentAccess, "allow", "deny")
 }
 
-// ValidateKey checks a key plaintext against §6.5. private_key is
-// text≤16384, so a multi-line OpenSSH PEM passes. public_key is an OpenSSH
-// authorized_keys line (rev 10 item 11).
+// ValidateKey checks a key plaintext against §6.5. public_key is an
+// OpenSSH authorized_keys line (rev 10 item 11). private_key is text≤16384
+// and an unencrypted OpenSSH private key whose public key equals
+// public_key's blob and whose algorithm matches key_type (rev 12).
 func ValidateKey(k *model.Key) error {
 	if err := checkHeader(k.Header, model.TypeKey); err != nil {
 		return err
@@ -173,7 +174,11 @@ func ValidateKey(k *model.Key) error {
 	if err := CheckStr("public_key", k.PublicKey, 8192); err != nil {
 		return err
 	}
-	return checkSSHKeyLine("public_key", k.PublicKey)
+	blob, err := checkSSHKeyLine("public_key", k.PublicKey)
+	if err != nil {
+		return err
+	}
+	return checkPrivateKey(k.KeyType, k.PrivateKey, blob)
 }
 
 // ValidateCredential checks a credential plaintext against §6.5.
