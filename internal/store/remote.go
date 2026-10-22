@@ -280,8 +280,9 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 // harmless if a crash leaves them unreferenced), then, in one transaction,
 // the entry, state.json and every outbox record it settles (§11.1). A
 // record whose candidate is this entry is deleted; a record whose live
-// candidate was at this seq with another H has it marked dead. rec opens
-// the outbox. The caller holds s.mu and the file lock.
+// candidate was at this seq with another H has it marked dead, and a login
+// merge's receipt for an import it settles is written with it (§4.4). rec
+// opens the outbox. The caller holds s.mu and the file lock.
 func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.State, rec *deviceRecord) error {
 	if err := s.l.writeObjects(w); err != nil {
 		return err
@@ -353,6 +354,7 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 	if err != nil {
 		return err
 	}
+	receipts := map[model.ID][]mergeReceipt{}
 	for _, r := range recs {
 		c := r.live()
 		if c == nil || c.Seq > head {
@@ -364,11 +366,21 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 		}
 		if h.Equal(c.H) {
 			t.remove(outboxRel(r.N))
+			if !r.Import.IsZero() {
+				// A login merge's import: its receipt is written in this
+				// same commit (§4.4).
+				receipts[r.Import] = append(receipts[r.Import], mergeReceipt{ItemID: r.Intent.ItemID, Seq: c.Seq, H: c.H})
+			}
 			continue
 		}
 		c.Status = statusDead
 		delete(r.Wires, c.H)
 		if err := s.putRecordAs(t, r, rec, vaultID); err != nil {
+			return err
+		}
+	}
+	for txnID, rs := range receipts {
+		if err := s.addReceipts(t, rec, txnID, rs); err != nil {
 			return err
 		}
 	}

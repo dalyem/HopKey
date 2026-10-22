@@ -474,6 +474,11 @@ func (s *Store) EnableServerMode() error {
 		return err
 	}
 	defer unlock()
+	// A publication switches the mode itself, once it is verified; a frozen
+	// merge source never becomes server-backed.
+	if err := s.refuseLocalAppend(); err != nil {
+		return err
+	}
 	t := &txn{}
 	if err := serverModeOps(t); err != nil {
 		return err

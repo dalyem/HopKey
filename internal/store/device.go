@@ -72,6 +72,18 @@ type deviceConfig struct {
 	DeviceID     model.ID       `json:"device_id,omitzero"`
 	Pending      *pendingDevice `json:"pending,omitempty"`
 	StaleDevices []model.ID     `json:"stale_devices,omitempty"`
+	// Next is the destination device of a login merge (mergefile.go), of
+	// another account: its record is durable in the device key store (its
+	// keychain entry, or device.next.key) from sign-in on, and it replaces
+	// this device once the destination vault is installed (promoteNext).
+	// It is never self and never a source of this vault's device key.
+	Next *nextDevice `json:"next,omitempty"`
+}
+
+// nextDevice is device.json's next member: {"account_id":id, "device_id":id}.
+type nextDevice struct {
+	AccountID model.ID `json:"account_id"`
+	DeviceID  model.ID `json:"device_id"`
 }
 
 // pendingDevice is device.json's pending member: {"device_id":id}.
@@ -142,6 +154,9 @@ type deviceRecordV1 struct {
 	SigSeed   []byte   `json:"sig_seed"`
 	SecretKey string   `json:"secret_key"`
 }
+
+// readKeyFile reads device.key. Tests replace it to make a read fail.
+var readKeyFile = os.ReadFile
 
 // localKeySize is the length of local_key (§11).
 const localKeySize = 32
@@ -307,7 +322,7 @@ func (s *Store) readDeviceConfig() (deviceConfig, error) {
 		return c, fmt.Errorf("%w: %v", ErrDeviceKey, err)
 	}
 	if err := json.Unmarshal(b, &c); err != nil || c.V != 1 || (c.Store != DeviceStoreKeychain && c.Store != DeviceStoreFile) ||
-		(c.Pending != nil && c.Pending.DeviceID.IsZero()) {
+		(c.Pending != nil && c.Pending.DeviceID.IsZero()) || (c.Next != nil && (c.Next.AccountID.IsZero() || c.Next.DeviceID.IsZero())) {
 		return c, fmt.Errorf("%w: %s is not a device key configuration", ErrDeviceKey, s.l.deviceConfig())
 	}
 	return c, nil
@@ -467,7 +482,7 @@ func (d *deviceStore) revokedSelf() error {
 		}
 		return unread
 	case DeviceStoreFile:
-		b, err := os.ReadFile(d.l.deviceKeyFile())
+		b, err := readKeyFile(d.l.deviceKeyFile())
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
@@ -532,7 +547,7 @@ func (d *deviceStore) loadSlot(id model.ID) (*deviceRecord, error) {
 
 func (d *deviceStore) loadFile() (*deviceRecord, error) {
 	path := d.l.deviceKeyFile()
-	b, err := os.ReadFile(path)
+	b, err := readKeyFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v (hop unlock --password restores it)", ErrDeviceKey, err)
 	}
@@ -729,7 +744,7 @@ func (t deviceTombstone) err() error {
 // fileDevice is the device device.key belongs to, a record or a tombstone,
 // from its public members. ok is false when there is no file.
 func (d *deviceStore) fileDevice() (id model.ID, ok bool, err error) {
-	b, err := os.ReadFile(d.l.deviceKeyFile())
+	b, err := readKeyFile(d.l.deviceKeyFile())
 	if errors.Is(err, os.ErrNotExist) {
 		return model.ID{}, false, nil
 	}
@@ -789,7 +804,7 @@ func (d *deviceStore) tombstone(id model.ID) error {
 		} else if ok && !d.ownsFile(cur, id) {
 			return errOtherDevice
 		}
-		if got, err := os.ReadFile(d.l.deviceKeyFile()); err == nil && bytes.Equal(got, b) {
+		if got, err := readKeyFile(d.l.deviceKeyFile()); err == nil && bytes.Equal(got, b) {
 			return nil
 		}
 		return writeFileAtomic(d.l.deviceKeyFile(), b)

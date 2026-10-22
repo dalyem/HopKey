@@ -97,6 +97,9 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err := s.checkRevoked(); err != nil {
 		return err
 	}
+	if err := s.refuseRetiring(); err != nil {
+		return err
+	}
 	if r != nil && s.state != nil {
 		return ErrAlreadyUnlocked
 	}
@@ -163,12 +166,22 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err := s.replayWAL(); err != nil {
 		return err
 	}
+	// The journal just replayed may be the one that started a logout.
+	if err := s.refuseRetiring(); err != nil {
+		return err
+	}
 	server, err := s.l.serverBacked()
 	if err != nil {
 		return err
 	}
 	if server && r == nil {
 		return fmt.Errorf("%w: use the server to unlock with the password", ErrServerBacked)
+	}
+	if !server {
+		// A local bootstrap is a local append.
+		if err := s.refuseLocalAppend(); err != nil {
+			return err
+		}
 	}
 	a, stored, raw, err := s.readAccountFile()
 	if err != nil {
@@ -502,6 +515,9 @@ func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, 
 		return Kit{}, err
 	}
 	defer unlock()
+	if err := s.refuseLocalAppend(); err != nil {
+		return Kit{}, err
+	}
 	if err := s.catchUp(); err != nil {
 		return Kit{}, err
 	}

@@ -28,18 +28,27 @@ func DefaultDataDir(home string, getenv func(string) string) string {
 // with safepath (0700, safe ancestors) before use, and every file is 0600.
 type layout struct {
 	data string
+	// keyName replaces device.key's name: device.next.key holds the
+	// destination record of a login merge (mergefile.go).
+	keyName string
 }
 
-func (l layout) deviceConfig() string  { return filepath.Join(l.data, "device.json") }
-func (l layout) deviceKeyFile() string { return filepath.Join(l.data, "device.key") }
-func (l layout) vault() string         { return filepath.Join(l.data, "vault") }
-func (l layout) lockFile() string      { return filepath.Join(l.vault(), "lock") }
-func (l layout) ownerLock() string     { return filepath.Join(l.vault(), "owner.lock") }
-func (l layout) entries() string       { return filepath.Join(l.vault(), "entries") }
-func (l layout) objects() string       { return filepath.Join(l.vault(), "objects") }
-func (l layout) journal() string       { return filepath.Join(l.vault(), "journal") }
-func (l layout) stateFile() string     { return filepath.Join(l.vault(), "state.json") }
-func (l layout) accountFile() string   { return filepath.Join(l.vault(), "account.json") }
+func (l layout) deviceConfig() string { return filepath.Join(l.data, "device.json") }
+
+func (l layout) deviceKeyFile() string {
+	if l.keyName != "" {
+		return filepath.Join(l.data, l.keyName)
+	}
+	return filepath.Join(l.data, "device.key")
+}
+func (l layout) vault() string       { return filepath.Join(l.data, "vault") }
+func (l layout) lockFile() string    { return filepath.Join(l.vault(), "lock") }
+func (l layout) ownerLock() string   { return filepath.Join(l.vault(), "owner.lock") }
+func (l layout) entries() string     { return filepath.Join(l.vault(), "entries") }
+func (l layout) objects() string     { return filepath.Join(l.vault(), "objects") }
+func (l layout) journal() string     { return filepath.Join(l.vault(), "journal") }
+func (l layout) stateFile() string   { return filepath.Join(l.vault(), "state.json") }
+func (l layout) accountFile() string { return filepath.Join(l.vault(), "account.json") }
 
 func (l layout) entryFile(seq uint64) string {
 	return filepath.Join(l.entries(), strconv.FormatUint(seq, 10)+".json")
@@ -65,11 +74,12 @@ func (l *layout) ensureDirs() error {
 	return nil
 }
 
-// exists reports whether a vault is here: any entry or a state file. An
-// init that stopped before writing its genesis entry left nothing a vault
-// needs, so init may run again over it.
+// exists reports whether a vault is here: any entry or a state file, or a
+// retirement journal whose logout has not finished its cleanup (retire.go).
+// An init that stopped before writing its genesis entry left nothing a
+// vault needs, so init may run again over it.
 func (l layout) exists() (bool, error) {
-	for _, p := range []string{l.stateFile()} {
+	for _, p := range []string{l.stateFile(), l.retireFile()} {
 		if _, err := os.Lstat(p); err == nil {
 			return true, nil
 		} else if !errors.Is(err, os.ErrNotExist) {
