@@ -9,10 +9,14 @@ export PATH
 case "${1:-}" in
 vet)
 	go vet ./...
+	# The dev store is compiled only with this tag; vet it too.
+	go vet -tags hopdev ./...
 	;;
 test)
 	# The ssh integration test must run on Kiln, not skip.
-	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" go test ./...
+	HOPKEY_REQUIRE_SSH=1 sh "$(dirname "$0")/with-passwd.sh" go test ./...
+	# The dev store and the hop binary's daemon autostart exist only with hopdev.
+	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" go test -tags hopdev ./internal/model/devstore/ ./cmd/hop/
 	;;
 race)
 	# Same as test, under the race detector, for the packages with goroutines.

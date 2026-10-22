@@ -785,3 +785,36 @@ func TestWriteInvalidLeavesFilesAlone(t *testing.T) {
 		t.Error("config changed after a failed Write")
 	}
 }
+
+func TestProxyJump(t *testing.T) {
+	pub := newPub(t)
+	mk := func(alias, jump string) Host {
+		return Host{Alias: alias, HostName: "10.0.0.1", PublicKey: pub, ProxyJump: jump}
+	}
+	opts := Options{Dir: "/home/a/.ssh/hop", AgentSocket: "/home/a/.ssh/hop/agent.sock"}
+
+	f, err := render(opts, []Host{mk("bastion", ""), mk("inner", "bastion")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(f.config), "Host inner\n  HostName 10.0.0.1\n  Port 22\n  ProxyJump bastion\n") {
+		t.Errorf("config does not carry the jump:\n%s", f.config)
+	}
+	if strings.Contains(strings.SplitN(string(f.config), "Host inner", 2)[0], "ProxyJump") {
+		t.Errorf("bastion got a ProxyJump:\n%s", f.config)
+	}
+
+	for name, hosts := range map[string][]Host{
+		"unknown jump": {mk("inner", "nowhere")},
+		"self":         {mk("a", "a")},
+		"two-loop":     {mk("a", "b"), mk("b", "a")},
+		"bad alias":    {mk("a", "x y"), mk("x", "")},
+	} {
+		if _, err := render(opts, hosts); err == nil {
+			t.Errorf("%s: render succeeded, want an error", name)
+		}
+	}
+	if !ValidAlias("web-1.prod") || ValidAlias("-x") || ValidAlias("a b") {
+		t.Error("ValidAlias disagrees with the alias rule")
+	}
+}

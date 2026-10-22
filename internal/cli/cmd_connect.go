@@ -1,0 +1,809 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+	"time"
+	"unicode"
+
+	"golang.org/x/crypto/ssh"
+
+	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/resolve"
+	"github.com/dalyem/hopkey/internal/sshconfig"
+	"github.com/dalyem/hopkey/internal/sshkeys"
+	"github.com/dalyem/hopkey/internal/tailscale"
+)
+
+// interactiveResolution is true when resolution may use DNS, fuzzy matching
+// and the picker: stdout is a terminal and the caller did not ask for JSON.
+func interactiveResolution(e *Env, json bool) bool { return e.StdoutTTY && !json }
+
+// connectable checks that rr names a host ssh can reach and returns what
+// building the ssh command line needs.
+type target struct {
+	rr    *daemon.ResolveResult
+	alias string // Host block in the generated config
+	user  string // explicit user@, or ""
+}
+
+func connectable(rr *daemon.ResolveResult) (*target, error) {
+	res := rr.Result
+	if res.Status != resolve.StatusMatched || rr.Host == nil {
+		return nil, failf("%s", describeUnresolved(res))
+	}
+	if rr.SSHAlias == "" {
+		return nil, failf("%s cannot be used with ssh: %s", res.HostName, orUnknown(rr.SSHProblem))
+	}
+	if rr.Route == nil {
+		return nil, failf("%s has no usable route: %s", res.HostName, orUnknown(rr.RouteError))
+	}
+	if res.User != "" && !sshconfig.ValidUser(res.User) {
+		return nil, failf("user %q is not usable in an ssh config", res.User)
+	}
+	return &target{rr: rr, alias: rr.SSHAlias, user: res.User}, nil
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "unknown reason"
+	}
+	return s
+}
+
+// chooseAddress returns the address to connect to. When the route is the
+// tailnet only because "auto" chose it, and nothing answers there, it uses the
+// direct fallback: "online" does not promise that ssh will answer.
+func chooseAddress(ctx context.Context, e *Env, t *target) (addr, note string) {
+	r := t.rr.Route
+	if t.rr.Host != nil && !t.rr.Host.JumpHostID.IsZero() {
+		return r.Address, "" // not reachable directly, so a direct probe says nothing
+	}
+	if r.Setting == resolve.RouteAuto && r.Chosen == resolve.RouteTailnet && r.Fallback != "" {
+		if err := tcpReachable(ctx, r.Address, r.Port, e.dialTimeout()/2); err != nil {
+			return r.Fallback, fmt.Sprintf("%s:%d (tailnet) did not answer, using %s (direct)", r.Address, r.Port, r.Fallback)
+		}
+	}
+	return r.Address, ""
+}
+
+// sshArgs builds the arguments up to and including the alias: options, then
+// "--" so nothing after it can be read as an option.
+func (e *Env) sshArgs(t *target, addr string, opts ...string) []string {
+	args := []string{"-F", e.sshConfigFile()}
+	args = append(args, opts...)
+	args = append(args, "-o", "HostName="+addr)
+	if t.user != "" {
+		args = append(args, "-o", "User="+t.user)
+	}
+	return append(args, "--", t.alias)
+}
+
+// runConnect is hop <target>: an interactive shell.
+func runConnect(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "connect", commands["connect"].usage)
+	pos, rest, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 || len(rest) > 0 {
+		fs.Usage()
+		return failf("expected exactly one target")
+	}
+	rr, err := resolveTarget(ctx, e, pos[0], interactiveResolution(e, false))
+	if err != nil {
+		return err
+	}
+	if rr.Result.Status == resolve.StatusPlainSSH {
+		return plainSSH(ctx, e, rr.Result)
+	}
+	t, err := connectable(rr)
+	if err != nil {
+		return err
+	}
+	addr, note := chooseAddress(ctx, e, t)
+	if note != "" {
+		fmt.Fprintf(e.Stderr, "hop: %s\n", note)
+	}
+	argv := append([]string{e.sshBinary()}, e.sshArgs(t, addr)...)
+	return e.execSSH(argv)
+}
+
+// execSSH replaces this process with ssh, falling back to a child process
+// where exec is not available.
+func (e *Env) execSSH(argv []string) error {
+	path, err := exec.LookPath(argv[0])
+	if err != nil {
+		return failf("cannot find %s: %v", argv[0], err)
+	}
+	run := e.ExecSSH
+	if run == nil {
+		run = execReplace
+	}
+	if err := run(path, argv, e.sshEnviron()); err != nil {
+		return failf("cannot run %s: %v", path, err)
+	}
+	return nil
+}
+
+// plainSSH connects to a target that is not in the vault with the user's own
+// ssh setup, then offers hop add.
+func plainSSH(ctx context.Context, e *Env, res *resolve.Result) error {
+	dest := res.Target
+	if res.User != "" {
+		dest = res.User + "@" + dest
+	}
+	fmt.Fprintf(e.Stderr, "hop: %q is not in the vault; connecting with plain ssh\n", res.Target)
+	cmd := exec.CommandContext(ctx, e.sshBinary(), "--", dest)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = e.Stdin, e.Stdout, e.Stderr
+	cmd.Env = e.environ()
+	err := cmd.Run()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		fmt.Fprintf(e.Stderr, "hop: to keep it, run: hop add %s --address %s\n", suggestName(res.Target), res.Target)
+		return nil
+	case errors.As(err, &ee):
+		return silent(exitCode(ee))
+	}
+	return failf("cannot run ssh: %v", err)
+}
+
+func exitCode(ee *exec.ExitError) int {
+	if c := ee.ExitCode(); c >= 0 {
+		return c
+	}
+	return ExitFailure // killed by a signal
+}
+
+// suggestName turns a target or a machine's own name into something usable
+// as a host name: lower case, letters, digits, '_' and '-', with runs of
+// separators folded into one '-'.
+func suggestName(t string) string {
+	var sb strings.Builder
+	lastDash := true // so the name never starts with '-'
+	for _, r := range strings.ToLower(t) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			sb.WriteRune(r)
+			lastDash = false
+		case r == '-' || r == '.' || r == ':' || r == '/' || unicode.IsSpace(r):
+			if !lastDash {
+				sb.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	name := strings.TrimRight(sb.String(), "-")
+	if len(name) > 64 {
+		name = strings.TrimRight(name[:64], "-")
+	}
+	if name == "" || name[0] == '_' {
+		return "host"
+	}
+	return name
+}
+
+// ---- hop exec ----
+
+// ExecResult is the --json shape of hop exec.
+type ExecResult struct {
+	Host       string `json:"host"`
+	ExitCode   int    `json:"exit_code"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	DurationMS int64  `json:"duration_ms"`
+	Truncated  bool   `json:"truncated"`
+	// Error is set when hop itself failed to run the command, e.g. a timeout.
+	Error string `json:"error,omitempty"`
+}
+
+// tailLimit is how much of each output stream --json keeps: the last 64 KB.
+const tailLimit = 64 << 10
+
+// tailBuffer keeps the last max bytes written to it.
+type tailBuffer struct {
+	max     int
+	buf     []byte
+	dropped bool
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > 2*t.max {
+		t.buf = append([]byte(nil), t.buf[len(t.buf)-t.max:]...)
+		t.dropped = true
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) Bytes() []byte {
+	if len(t.buf) > t.max {
+		t.dropped = true
+		return t.buf[len(t.buf)-t.max:]
+	}
+	return t.buf
+}
+
+// shellQuote quotes one word for a POSIX shell.
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_@%+=:,./-", r)) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// remoteCommand turns the words after -- into the string ssh sends. Several
+// words are quoted individually, so each stays one argument on the remote
+// side. A single word is a shell command line, as with ssh itself
+// (hop exec h -- 'cd /srv && make'). With sudo, it runs under sudo -n, which
+// fails at once instead of waiting for a password.
+func remoteCommand(words []string, sudo bool) string {
+	line := words[0]
+	if len(words) > 1 {
+		q := make([]string, len(words))
+		for i, w := range words {
+			q[i] = shellQuote(w)
+		}
+		line = strings.Join(q, " ")
+		if sudo {
+			return "sudo -n " + line
+		}
+		return line
+	}
+	if sudo {
+		return "sudo -n sh -c " + shellQuote(line)
+	}
+	return line
+}
+
+func runExec(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "exec", commands["exec"].usage)
+	asJSON := fs.Bool("json", false, "print the result as JSON")
+	timeout := fs.Duration("timeout", 0, "kill the command after this long (0 means no limit)")
+	sudo := fs.Bool("sudo", false, "run the command with sudo -n")
+	pos, rest, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) == 0 {
+		fs.Usage()
+		return failf("hop exec needs a target and a command")
+	}
+	tgt, words := pos[0], rest
+	if words == nil {
+		words = pos[1:] // no --: the rest is the command
+	}
+	if len(words) == 0 {
+		fs.Usage()
+		return failf("hop exec needs a command after the target")
+	}
+	if strings.ContainsRune(tgt, ',') || strings.HasPrefix(tgt, "tag:") {
+		return failf("hop exec runs on one host in this version; %q names several", tgt)
+	}
+
+	// Never fuzzy: a command must not run on a host that merely resembled the
+	// target.
+	rr, err := resolveTarget(ctx, e, tgt, false)
+	if err != nil {
+		return err
+	}
+	t, err := connectable(rr)
+	if err != nil {
+		return err
+	}
+	addr, note := chooseAddress(ctx, e, t)
+	if note != "" {
+		fmt.Fprintf(e.Stderr, "hop: %s\n", note)
+	}
+
+	connectTimeout := 10
+	if *timeout > 0 && *timeout < 10*time.Second {
+		connectTimeout = int((*timeout + time.Second - 1) / time.Second)
+	}
+	sshArgs := e.sshArgs(t, addr, "-T", "-o", "BatchMode=yes", "-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout))
+	sshArgs = append(sshArgs, remoteCommand(words, *sudo))
+
+	runCtx := ctx
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(runCtx, e.sshBinary(), sshArgs...)
+	cmd.Env = e.sshEnviron()
+	cmd.Stdin = e.Stdin
+	cmd.WaitDelay = time.Second
+	var outTail, errTail tailBuffer
+	outTail.max, errTail.max = tailLimit, tailLimit
+	if *asJSON {
+		cmd.Stdout, cmd.Stderr = &outTail, &errTail
+	} else {
+		cmd.Stdout, cmd.Stderr = e.Stdout, e.Stderr
+	}
+
+	start := time.Now()
+	runErr := cmd.Run()
+	res := ExecResult{Host: rr.Result.HostName, DurationMS: time.Since(start).Milliseconds()}
+	var ee *exec.ExitError
+	switch {
+	case runErr == nil:
+	case *timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded):
+		res.ExitCode = ExitFailure
+		res.Error = fmt.Sprintf("timed out after %s", *timeout)
+	case errors.As(runErr, &ee):
+		res.ExitCode = exitCode(ee)
+	default:
+		return failf("cannot run ssh: %v", runErr)
+	}
+	if *asJSON {
+		res.Stdout, res.Stderr = string(outTail.Bytes()), string(errTail.Bytes())
+		res.Truncated = outTail.dropped || errTail.dropped
+		if err := printJSON(e, res); err != nil {
+			return err
+		}
+	} else if res.Error != "" {
+		fmt.Fprintf(e.Stderr, "hop: %s\n", res.Error)
+	}
+	if res.ExitCode != 0 {
+		return silent(res.ExitCode)
+	}
+	return nil
+}
+
+// ---- hop which ----
+
+type hostRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// WhichResult is the --json shape of hop which.
+type WhichResult struct {
+	Target     string              `json:"target"`
+	User       string              `json:"user,omitempty"`
+	Status     resolve.Status      `json:"status"`
+	Rule       resolve.Rule        `json:"rule"`
+	Matched    string              `json:"matched,omitempty"`
+	Host       *hostRef            `json:"host,omitempty"`
+	Route      *resolve.Route      `json:"route,omitempty"`
+	RouteError string              `json:"route_error,omitempty"`
+	SSHAlias   string              `json:"ssh_alias,omitempty"`
+	SSHProblem string              `json:"ssh_problem,omitempty"`
+	Candidates []resolve.Candidate `json:"candidates,omitempty"`
+	Notes      []string            `json:"notes,omitempty"`
+	Tailscale  *tailscale.Node     `json:"tailscale,omitempty"`
+}
+
+func whichResult(rr *daemon.ResolveResult) WhichResult {
+	res := rr.Result
+	w := WhichResult{
+		Target: res.Target, User: res.User, Status: res.Status, Rule: res.Rule, Matched: res.Matched,
+		Route: rr.Route, RouteError: rr.RouteError, SSHAlias: rr.SSHAlias, SSHProblem: rr.SSHProblem,
+		Candidates: res.Candidates, Notes: res.Notes, Tailscale: res.Tailscale,
+	}
+	if res.HostID != "" {
+		w.Host = &hostRef{ID: res.HostID, Name: res.HostName}
+	}
+	return w
+}
+
+func runWhich(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "which", commands["which"].usage)
+	asJSON := fs.Bool("json", false, "print the result as JSON")
+	pos, _, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		fs.Usage()
+		return failf("expected exactly one target")
+	}
+	interactive := interactiveResolution(e, *asJSON)
+	// The picker would make which prompt; it only explains, so show the
+	// candidates instead.
+	var rr daemon.ResolveResult
+	if err := call(ctx, e, daemon.OpResolve, daemon.ResolveParams{Target: pos[0], Interactive: interactive}, &rr); err != nil {
+		return err
+	}
+	w := whichResult(&rr)
+	matched := rr.Result.Status == resolve.StatusMatched
+	if *asJSON {
+		if err := printJSON(e, w); err != nil {
+			return err
+		}
+	} else {
+		printWhich(e, &rr, &w)
+	}
+	if !matched {
+		return failf("%s", strings.SplitN(describeUnresolved(rr.Result), "\n", 2)[0])
+	}
+	return nil
+}
+
+func printWhich(e *Env, rr *daemon.ResolveResult, w *WhichResult) {
+	res := rr.Result
+	e.printf("target:   %s\n", res.Target)
+	switch res.Status {
+	case resolve.StatusMatched:
+		e.printf("host:     %s\n", res.HostName)
+		e.printf("rule:     %s (%s)\n", res.Rule, res.Matched)
+	case resolve.StatusAmbiguous:
+		e.printf("host:     ambiguous\n")
+		e.printf("rule:     %s (%s)\n", res.Rule, res.Matched)
+	case resolve.StatusPlainSSH:
+		e.printf("host:     none; hop would use plain ssh\n")
+	default:
+		e.printf("host:     no match\n")
+	}
+	if rr.Route != nil {
+		r := rr.Route
+		e.printf("address:  %s:%d via %s (%s)\n", r.Address, r.Port, r.Chosen, r.Reason)
+		if r.Fallback != "" {
+			e.printf("fallback: %s (direct) if the tailnet address does not answer\n", r.Fallback)
+		}
+	}
+	if rr.RouteError != "" {
+		e.printf("route:    %s\n", rr.RouteError)
+	}
+	if rr.Host != nil {
+		user := res.User
+		if user == "" {
+			user = rr.Host.User
+		}
+		if user != "" {
+			e.printf("user:     %s\n", user)
+		}
+		if rr.SSHAlias != "" {
+			e.printf("ssh:      ssh %s  (config %s)\n", rr.SSHAlias, e.sshConfigFile())
+		} else {
+			e.printf("ssh:      not available: %s\n", orUnknown(rr.SSHProblem))
+		}
+	}
+	for _, c := range res.Candidates {
+		e.printf("candidate: %s %s - %s\n", c.Name, strings.Join(c.Addresses, ","), c.Detail)
+	}
+	for _, n := range res.Notes {
+		e.printf("note:     %s\n", n)
+	}
+}
+
+// ---- hop check ----
+
+// Step statuses.
+const (
+	stepPass    = "pass"
+	stepFail    = "fail"
+	stepSkipped = "skipped"
+)
+
+// Step is one line of a hop check.
+type Step struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+// CheckResult is the --json shape of hop check.
+type CheckResult struct {
+	Target string `json:"target"`
+	Host   string `json:"host,omitempty"`
+	OK     bool   `json:"ok"`
+	Steps  []Step `json:"steps"`
+}
+
+// checker runs steps in order. A step names the steps it depends on; if any
+// of them did not pass it is skipped, with the reason. A step can also be
+// skipped by design (it does not apply to this host), which satisfies the
+// steps that depend on it.
+type checker struct {
+	steps     []Step
+	status    map[string]string
+	satisfied map[string]bool
+}
+
+func (c *checker) run(name string, deps []string, fn func() (string, string)) {
+	for _, d := range deps {
+		if c.status[d] != stepPass && !c.satisfied[d] {
+			c.add(Step{Name: name, Status: stepSkipped, Detail: fmt.Sprintf("skipped: %s did not pass", d)})
+			return
+		}
+	}
+	status, detail := fn()
+	c.add(Step{Name: name, Status: status, Detail: detail})
+}
+
+// skip records a step that does not apply, and does not count against ok.
+func (c *checker) skip(name, why string) {
+	c.add(Step{Name: name, Status: stepSkipped, Detail: why})
+	if c.satisfied == nil {
+		c.satisfied = map[string]bool{}
+	}
+	c.satisfied[name] = true
+}
+
+func (c *checker) add(s Step) {
+	if c.status == nil {
+		c.status = map[string]string{}
+	}
+	c.steps = append(c.steps, s)
+	c.status[s.Name] = s.Status
+}
+
+func (c *checker) ok() bool {
+	for _, s := range c.steps {
+		if s.Status != stepPass && !c.satisfied[s.Name] {
+			return false
+		}
+	}
+	return true
+}
+
+func parsePins(lines []string) (pins []ssh.PublicKey, bad int) {
+	for _, l := range lines {
+		p, err := sshkeys.ParsePublic(l)
+		if err != nil {
+			bad++
+			continue
+		}
+		pins = append(pins, p)
+	}
+	return
+}
+
+func fingerprints(pins []ssh.PublicKey) string {
+	var out []string
+	for _, p := range pins {
+		out = append(out, p.Type()+" "+sshkeys.Fingerprint(p))
+	}
+	return strings.Join(out, ", ")
+}
+
+func runCheck(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "check", commands["check"].usage)
+	asJSON := fs.Bool("json", false, "print the result as JSON")
+	pos, _, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		fs.Usage()
+		return failf("expected exactly one target")
+	}
+	out := CheckResult{Target: pos[0]}
+	var c checker
+
+	rr, err := resolveTarget(ctx, e, pos[0], interactiveResolution(e, *asJSON))
+	if err != nil {
+		return err
+	}
+	res := rr.Result
+	c.run("resolved", nil, func() (string, string) {
+		if res.Status != resolve.StatusMatched {
+			return stepFail, describeUnresolved(res)
+		}
+		return stepPass, fmt.Sprintf("host %q by rule %s (%s)", res.HostName, res.Rule, res.Matched)
+	})
+	out.Host = res.HostName
+
+	// A host behind a jump host is not expected to be reachable directly, so
+	// the direct probes (TCP, host key) cannot say anything about it. ssh
+	// itself goes through the jump host, which auth_ok exercises.
+	viaJump := rr.Host != nil && !rr.Host.JumpHostID.IsZero()
+	const jumpReason = "skipped: the host is reached through a jump host, so it is not probed directly"
+
+	var addr string
+	var port int
+	var route *resolve.Route
+	c.run("route", []string{"resolved"}, func() (string, string) {
+		if rr.Route == nil {
+			return stepFail, orUnknown(rr.RouteError)
+		}
+		route = rr.Route
+		addr, port = route.Address, route.Port
+		return stepPass, fmt.Sprintf("%s:%d via %s (%s)", addr, port, route.Chosen, route.Reason)
+	})
+
+	probe := func(name string, deps []string, fn func() (string, string)) {
+		if viaJump {
+			c.skip(name, jumpReason)
+			return
+		}
+		c.run(name, deps, fn)
+	}
+	probe("tcp_reachable", []string{"route"}, func() (string, string) {
+		err := tcpReachable(ctx, addr, port, e.dialTimeout())
+		if err == nil {
+			return stepPass, fmt.Sprintf("connected to %s:%d", addr, port)
+		}
+		if route.Fallback != "" {
+			if ferr := tcpReachable(ctx, route.Fallback, port, e.dialTimeout()); ferr == nil {
+				addr = route.Fallback
+				return stepPass, fmt.Sprintf("%s:%d (tailnet) did not answer (%v); %s:%d (direct) did", route.Address, port, err, addr, port)
+			}
+		}
+		return stepFail, fmt.Sprintf("cannot connect to %s:%d: %v", addr, port, err)
+	})
+
+	var pins []ssh.PublicKey
+	c.run("host_key_pinned", []string{"resolved"}, func() (string, string) {
+		var bad int
+		pins, bad = parsePins(rr.Host.HostKeys)
+		switch {
+		case len(pins) > 0 && bad > 0:
+			return stepPass, fmt.Sprintf("%d host key(s) pinned (%d unreadable ones are ignored): %s", len(pins), bad, fingerprints(pins))
+		case len(pins) > 0:
+			return stepPass, fmt.Sprintf("%d host key(s) pinned: %s", len(pins), fingerprints(pins))
+		}
+		return stepFail, fmt.Sprintf("no host key is pinned for %s, so ssh refuses it; pin the server's key with: hop trust %s", res.HostName, res.HostName)
+	})
+
+	probe("host_key_matches", []string{"tcp_reachable", "host_key_pinned"}, func() (string, string) {
+		key, err := fetchHostKey(ctx, addr, port, algorithmsFor(pins), e.dialTimeout())
+		if err != nil {
+			return stepFail, fmt.Sprintf("could not read the server's host key: %v", err)
+		}
+		for _, p := range pins {
+			if bytes.Equal(p.Marshal(), key.Marshal()) {
+				return stepPass, fmt.Sprintf("the server presents the pinned %s %s", key.Type(), sshkeys.Fingerprint(key))
+			}
+		}
+		return stepFail, fmt.Sprintf("the server presents %s %s, which is not pinned (pinned: %s); the machine may have been rebuilt, or something is intercepting the connection", key.Type(), sshkeys.Fingerprint(key), fingerprints(pins))
+	})
+
+	c.run("auth_ok", []string{"host_key_pinned", "host_key_matches"}, func() (string, string) {
+		t, err := connectable(rr)
+		if err != nil {
+			return stepFail, err.Error()
+		}
+		actx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		sshArgs := e.sshArgs(t, addr, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
+		cmd := exec.CommandContext(actx, e.sshBinary(), append(sshArgs, "true")...)
+		cmd.Env = e.sshEnviron()
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			msg := strings.TrimSpace(stderr.String())
+			if msg == "" {
+				msg = err.Error()
+			}
+			return stepFail, "ssh did not log in: " + lastLines(msg, 3)
+		}
+		return stepPass, fmt.Sprintf("logged in with ssh %s", t.alias)
+	})
+
+	out.Steps, out.OK = c.steps, c.ok()
+	if *asJSON {
+		if err := printJSON(e, out); err != nil {
+			return err
+		}
+	} else {
+		e.printf("check %s\n", pos[0])
+		for _, s := range out.Steps {
+			e.printf("  [%s] %-16s %s\n", s.Status, s.Name, strings.ReplaceAll(s.Detail, "\n", "\n"+strings.Repeat(" ", 28)))
+		}
+	}
+	if !out.OK {
+		return silent(ExitFailure)
+	}
+	return nil
+}
+
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "; ")
+}
+
+// ---- hop trust ----
+
+func runTrust(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "trust", commands["trust"].usage)
+	yes := fs.Bool("yes", false, "pin without asking")
+	fp := fs.String("fingerprint", "", "pin only if the server's key has this SHA256 fingerprint")
+	replace := fs.Bool("replace", false, "replace pinned keys of the same type")
+	asJSON := fs.Bool("json", false, "print the result as JSON")
+	pos, _, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		fs.Usage()
+		return failf("expected exactly one target")
+	}
+	rr, err := resolveTarget(ctx, e, pos[0], false)
+	if err != nil {
+		return err
+	}
+	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
+		return failf("%s", describeUnresolved(rr.Result))
+	}
+	if rr.Route == nil {
+		return failf("%s has no usable route: %s", rr.Result.HostName, orUnknown(rr.RouteError))
+	}
+	host := *rr.Host
+	if !host.JumpHostID.IsZero() {
+		return failf("%s is reached through a jump host, so hop cannot read its host key directly; pin it with: hop edit %s --host-key '<ssh-ed25519 AAAA...>'", host.Name, host.Name)
+	}
+	pins, _ := parsePins(host.HostKeys)
+	r := rr.Route
+	key, err := fetchHostKey(ctx, r.Address, r.Port, nil, e.dialTimeout())
+	if err != nil && r.Fallback != "" {
+		key, err = fetchHostKey(ctx, r.Fallback, r.Port, nil, e.dialTimeout())
+	}
+	if err != nil {
+		return failf("cannot read the host key of %s: %v", host.Name, err)
+	}
+	got := sshkeys.Fingerprint(key)
+	line := sshkeys.Line(key)
+
+	for _, p := range pins {
+		if bytes.Equal(p.Marshal(), key.Marshal()) {
+			return reportTrust(e, *asJSON, host.Name, key, got, false, "already pinned")
+		}
+	}
+	var sameType ssh.PublicKey // a pinned key of the same type, which this one would replace
+	for _, p := range pins {
+		if p.Type() == key.Type() {
+			sameType = p
+			break
+		}
+	}
+	if sameType != nil && !*replace {
+		return failf("%s already pins a different %s key (%s) and the server presents %s; a changed host key can mean the machine was rebuilt or the connection is intercepted. If you are sure, run again with --replace",
+			host.Name, key.Type(), sshkeys.Fingerprint(sameType), got)
+	}
+	switch {
+	case *fp != "":
+		if *fp != got {
+			return failf("the server presents %s, not the %s you gave; nothing was pinned", got, *fp)
+		}
+	default:
+		fmt.Fprintf(e.Stderr, "%s presents %s %s\n", host.Name, key.Type(), got)
+		ok, err := confirm(e, *yes, "Pin this host key?")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return failf("not pinned")
+		}
+	}
+
+	var keep []string
+	for _, l := range host.HostKeys {
+		if p, err := sshkeys.ParsePublic(l); err == nil && p.Type() == key.Type() {
+			continue // --replace: only reachable when sameType was allowed to go
+		}
+		keep = append(keep, l)
+	}
+	host.HostKeys = append(keep, line)
+	if err := call(ctx, e, daemon.OpPutHost, daemon.PutHostParams{Host: host}, nil); err != nil {
+		return err
+	}
+	return reportTrust(e, *asJSON, host.Name, key, got, true, "pinned")
+}
+
+func reportTrust(e *Env, asJSON bool, host string, key ssh.PublicKey, fp string, changed bool, what string) error {
+	if asJSON {
+		return printJSON(e, map[string]any{"host": host, "key_type": key.Type(), "fingerprint": fp, "pinned": true, "changed": changed})
+	}
+	e.printf("%s: %s %s %s\n", host, what, key.Type(), fp)
+	return nil
+}

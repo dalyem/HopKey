@@ -1,0 +1,229 @@
+package cli_test
+
+import (
+	"context"
+	"encoding/json"
+	"slices"
+	"strings"
+	"testing"
+
+	"golang.org/x/crypto/ssh"
+
+	"github.com/dalyem/hopkey/internal/cli"
+	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/tailscale"
+)
+
+type fixedTS struct{ st *tailscale.Status }
+
+func (f fixedTS) Status(context.Context) (*tailscale.Status, error) { return f.st, nil }
+
+func tailnet(t *testing.T) (*tailscale.Status, string) {
+	t.Helper()
+	signer := newSigner(t)
+	pubLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey())))
+	st := &tailscale.Status{
+		Available: true, MagicDNSSuffix: "tn.ts.net",
+		Self: tailscale.Node{ID: "nSELF", HostName: "laptop", DNSName: "laptop.tn.ts.net", Online: true, IPs: []string{"100.64.0.1"}, Self: true},
+		Peers: []tailscale.Node{
+			{ID: "nBUILD1", HostName: "build", DNSName: "build.tn.ts.net", Online: true, IPs: []string{"100.64.0.3", "fd7a:115c:a1e0::3"}},
+			{ID: "nBUILD2", HostName: "build", DNSName: "build-1.tn.ts.net", Online: false, IPs: []string{"100.64.0.4"}},
+			{ID: "nPHONE", HostName: "Daly's iPhone", DNSName: "dalys-iphone.tn.ts.net", IPs: []string{"100.64.0.5"}},
+			{ID: "nPRODDB", HostName: "prod-db", DNSName: "prod-db.tn.ts.net", Online: true, IPs: []string{"100.64.0.2"}, SSHHostKeys: []string{pubLine, "not a key"}},
+		},
+	}
+	return st, pubLine
+}
+
+func decodeTS(t *testing.T, stdout string) map[string]cli.TSEntry {
+	t.Helper()
+	var entries []cli.TSEntry
+	if err := json.Unmarshal([]byte(stdout), &entries); err != nil {
+		t.Fatalf("%v\n%s", err, stdout)
+	}
+	m := map[string]cli.TSEntry{}
+	for _, e := range entries {
+		m[e.NodeID] = e
+	}
+	return m
+}
+
+func TestTSImportCreatesAndLinksHosts(t *testing.T) {
+	st, _ := tailnet(t)
+	e := newE2EWith(t, fixedTS{st})
+	// An existing host that is evidently the prod-db node, not yet linked.
+	if _, err := e.store.PutHost(context.Background(), model.Host{
+		Name: "prod-db", Addresses: []string{"203.0.113.10"}, Port: 22, Route: "auto", AgentAccess: "allow",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := e.store.Writes()
+	code, stdout, stderr := e.hop(t, "ts", "import", "--dry-run", "--json")
+	if code != 0 {
+		t.Fatalf("dry run: %d %s", code, stderr)
+	}
+	if e.store.Writes() != before {
+		t.Error("--dry-run wrote to the vault")
+	}
+	if got := decodeTS(t, stdout); got["nPRODDB"].Status != "would_linked" || got["nBUILD1"].Status != "would_created" {
+		t.Errorf("dry run report = %+v", got)
+	}
+
+	code, stdout, stderr = e.hop(t, "ts", "import", "--json", "--user", "ops", "--key", "deploy-key", "--tag", "tailnet")
+	if code != 0 {
+		t.Fatalf("import: %d %s", code, stderr)
+	}
+	got := decodeTS(t, stdout)
+	want := map[string][2]string{ // node -> host, status
+		"nPRODDB": {"prod-db", "linked"},
+		"nBUILD1": {"build", "created"},
+		"nBUILD2": {"build-1", "created"}, // "build" is taken: use the MagicDNS label
+		"nPHONE":  {"dalys-iphone", "created"},
+	}
+	for id, w := range want {
+		if got[id].Host != w[0] || got[id].Status != w[1] {
+			t.Errorf("%s: %+v, want host %s status %s", id, got[id], w[0], w[1])
+		}
+	}
+	if _, ok := got["nSELF"]; ok {
+		t.Error("this machine was imported without --include-self")
+	}
+
+	_, stdout, _ = e.hop(t, "ls", "--json")
+	var views []cli.HostView
+	if err := json.Unmarshal([]byte(stdout), &views); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]cli.HostView{}
+	for _, v := range views {
+		byName[v.Name] = v
+	}
+	prod := byName["prod-db"]
+	if prod.Tailscale == nil || prod.Tailscale.StableNodeID != "nPRODDB" || prod.Tailscale.SSH != "yes" || prod.Tailscale.Online == nil || !*prod.Tailscale.Online {
+		t.Errorf("prod-db link = %+v", prod.Tailscale)
+	}
+	if len(prod.HostKeys) != 1 || !slices.Contains(prod.Addresses, "203.0.113.10") || !slices.Contains(prod.Addresses, "prod-db.tn.ts.net") {
+		t.Errorf("prod-db after linking: pins=%v addresses=%v (the unparseable key must be dropped; the old address kept)", prod.HostKeys, prod.Addresses)
+	}
+	build := byName["build"]
+	if build.User != "ops" || build.Key == nil || build.Key.Name != "deploy-key" || !slices.Equal(build.Tags, []string{"tailnet"}) ||
+		build.Tailscale == nil || build.Tailscale.SSH != "unknown" || len(build.HostKeys) != 0 || build.Addresses[0] != "100.64.0.3" {
+		t.Errorf("build = %+v", build)
+	}
+	if online := byName["build-1"].Tailscale.Online; online == nil || *online {
+		t.Error("build-1 should be offline")
+	}
+
+	// The import stored the tailnet address, so the address rule finds them,
+	// and the route follows the live status.
+	code, stdout, _ = e.hop(t, "which", "--json", "100.64.0.3")
+	var w cli.WhichResult
+	json.Unmarshal([]byte(stdout), &w)
+	if code != 0 || w.Rule != "address" || w.Host == nil || w.Host.Name != "build" || w.Route == nil || w.Route.Chosen != "tailnet" {
+		t.Errorf("which 100.64.0.3: code=%d %+v", code, w)
+	}
+	// The other node with the same host name is reachable by its own DNS name.
+	code, stdout, _ = e.hop(t, "which", "--json", "build-1.tn.ts.net")
+	json.Unmarshal([]byte(stdout), &w)
+	if code != 0 || w.Host == nil || w.Host.Name != "build-1" {
+		t.Errorf("which build-1.tn.ts.net: code=%d %+v", code, w)
+	}
+
+	// Running it again changes nothing.
+	before = e.store.Writes()
+	_, stdout, _ = e.hop(t, "ts", "import", "--json")
+	for id, en := range decodeTS(t, stdout) {
+		if en.Status != "already_linked" {
+			t.Errorf("second import: %s is %q", id, en.Status)
+		}
+	}
+	if e.store.Writes() != before {
+		t.Error("the second import wrote to the vault")
+	}
+
+	// Hosts that now have a key are in the generated config.
+	if cfg := e.configFile(t); !strings.Contains(cfg, "Host build\n") || !strings.Contains(cfg, "HostName 100.64.0.3") {
+		t.Errorf("imported host build is not in the config:\n%s", cfg)
+	}
+}
+
+func TestTSImportNamedPeersAndErrors(t *testing.T) {
+	st, _ := tailnet(t)
+	e := newE2EWith(t, fixedTS{st})
+
+	code, stdout, _ := e.hop(t, "ts", "import", "--json", "prod-db", "--no-pin")
+	got := decodeTS(t, stdout)
+	if code != 0 || len(got) != 1 || got["nPRODDB"].Status != "created" {
+		t.Errorf("named import: code=%d %+v", code, got)
+	}
+	_, stdout, _ = e.hop(t, "info", "--json", "prod-db")
+	var v cli.HostView
+	json.Unmarshal([]byte(stdout), &v)
+	if len(v.HostKeys) != 0 {
+		t.Errorf("--no-pin still pinned %v", v.HostKeys)
+	}
+
+	if code, _, stderr := e.hop(t, "ts", "import", "nonesuch"); code != 255 || !strings.Contains(stderr, "no tailscale node matches") {
+		t.Errorf("unknown peer: code=%d stderr=%q", code, stderr)
+	}
+	// Two nodes share the host name "build": naming it imports both.
+	_, stdout, _ = e.hop(t, "ts", "import", "--json", "build")
+	if got := decodeTS(t, stdout); len(got) != 2 {
+		t.Errorf("import of a duplicated host name: %+v", got)
+	}
+	_, stdout, _ = e.hop(t, "ts", "import", "--json", "--include-self")
+	if got := decodeTS(t, stdout); got["nSELF"].Status != "created" {
+		t.Errorf("--include-self: %+v", got["nSELF"])
+	}
+}
+
+func TestTSLink(t *testing.T) {
+	st, _ := tailnet(t)
+	e := newE2EWith(t, fixedTS{st})
+
+	code, stdout, stderr := e.hop(t, "ts", "link", "web-1", "prod-db.tn.ts.net", "--json")
+	got := decodeTS(t, stdout)
+	if code != 0 || got["nPRODDB"].Host != "web-1" || got["nPRODDB"].Status != "linked" {
+		t.Fatalf("link: code=%d %+v stderr=%q", code, got, stderr)
+	}
+	// web-1 already had a pin, so Tailscale's key was not added on top.
+	_, stdout, _ = e.hop(t, "info", "--json", "web-1")
+	var v cli.HostView
+	json.Unmarshal([]byte(stdout), &v)
+	if v.Tailscale == nil || v.Tailscale.StableNodeID != "nPRODDB" || len(v.HostKeys) != 1 {
+		t.Errorf("web-1 = %+v", v)
+	}
+	// And now the node resolves to web-1.
+	if code, out, _ := e.hop(t, "which", "100.64.0.2"); code != 0 || !strings.Contains(out, "host:     web-1") {
+		t.Errorf("which after link: code=%d\n%s", code, out)
+	}
+
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"ts", "link", "web-2", "prod-db"}, "already linked to host"},        // the node belongs to web-1
+		{[]string{"ts", "link", "web-1", "build-1.tn.ts.net"}, "pass --force"},        // web-1 is linked elsewhere
+		{[]string{"ts", "link", "web-2", "build"}, "matches several tailscale nodes"}, // duplicate host name
+		{[]string{"ts", "link", "web-2", "nothing"}, "no tailscale node matches"},
+		{[]string{"ts", "link", "nobody", "prod-db"}, "no host matches"},
+		{[]string{"ts", "link", "web-2"}, "expected a host and a tailscale name"},
+	} {
+		if code, _, stderr := e.hop(t, tc.args...); code != 255 || !strings.Contains(stderr, tc.want) {
+			t.Errorf("hop %v: code=%d stderr=%q, want %q", tc.args, code, stderr, tc.want)
+		}
+	}
+	if code, _, stderr := e.hop(t, "ts", "link", "web-1", "build-1.tn.ts.net", "--force"); code != 0 {
+		t.Errorf("--force: %d %s", code, stderr)
+	}
+}
+
+func TestTSCommandsWithoutTailscale(t *testing.T) {
+	e := newE2E(t) // noTailscale
+	for _, args := range [][]string{{"ts", "import"}, {"ts", "link", "web-1", "x"}} {
+		if code, _, stderr := e.hop(t, args...); code != 255 || !strings.Contains(stderr, "tailscale is not available") {
+			t.Errorf("hop %v: code=%d stderr=%q", args, code, stderr)
+		}
+	}
+}
