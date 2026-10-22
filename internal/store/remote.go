@@ -268,6 +268,9 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 		if err != nil {
 			return st, sec, err
 		}
+		// TODO(D2 review round 3, tracked follow-up): the secrets this
+		// entry supersedes are not zeroed (see supersede), nor are nsec's
+		// when commitVerified fails.
 		if err := s.commitVerified(c.Wire, h, next, rec); err != nil {
 			return st, sec, err
 		}

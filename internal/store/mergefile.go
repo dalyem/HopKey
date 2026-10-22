@@ -891,7 +891,7 @@ func fetchDestination(ctx context.Context, r SignInRemote, o *signInSecrets, sel
 // the state lists as active must be self, with self's keys.
 func (d *destination) checkSelf(st *vaultlog.State) error {
 	if slices.Contains(st.Retired.DeviceIDs, d.self.ID) {
-		return &vaultlog.RevokedError{DeviceID: d.self.ID, Head: st.Head}
+		return &retiredError{RevokedError: &vaultlog.RevokedError{DeviceID: d.self.ID, Head: st.Head}, anchor: true}
 	}
 	if da, ok := st.Devices[d.self.ID]; ok {
 		sigPK := d.self.Sig.Public().(ed25519.PublicKey)
@@ -936,9 +936,40 @@ func (d *destination) step(w *vaultlog.Wire) error {
 // after the checkpoint that revoked it.
 func (d *destination) departed() error {
 	if slices.Contains(d.st.Retired.DeviceIDs, d.self.ID) {
-		return &vaultlog.RevokedError{DeviceID: d.self.ID, Head: d.st.Head}
+		return &retiredError{RevokedError: &vaultlog.RevokedError{DeviceID: d.self.ID, Head: d.st.Head}}
 	}
 	return nil
+}
+
+// retiredError is a revocation a sign-in knows from a verified state's
+// list of retired devices, not one it met in the checkpoint that made it:
+// Head is that state's (the anchor's, if anchor), and the revoking
+// checkpoint may be older. It unwraps to the *vaultlog.RevokedError.
+type retiredError struct {
+	*vaultlog.RevokedError
+	anchor bool
+}
+
+func (e *retiredError) Error() string {
+	return fmt.Sprintf("store: device %v is %s", e.DeviceID, revokedAt(e))
+}
+
+func (e *retiredError) Unwrap() error { return e.RevokedError }
+
+// revokedAt says how a sign-in learnt of the revocation err wraps (a
+// *vaultlog.RevokedError): from the anchor's or a later state's retired
+// list (retiredError), or by meeting the revoking checkpoint.
+func revokedAt(err error) string {
+	if r := (*retiredError)(nil); errors.As(err, &r) {
+		if r.anchor {
+			return fmt.Sprintf("known retired at anchor seq %d", r.Head.Seq)
+		}
+		return fmt.Sprintf("known retired at seq %d", r.Head.Seq)
+	}
+	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+		return fmt.Sprintf("revoked by the checkpoint at seq %d", rev.Head.Seq)
+	}
+	return "revoked"
 }
 
 // add appends fetched entries, which must continue the log. An entry at a
@@ -1034,13 +1065,23 @@ func (d *destination) extend(ctx context.Context, r SignInRemote) error {
 	return d.departed()
 }
 
-// deviceInfo is rec's public device, for its bootstrap.
+// deviceInfo is rec's public device, for its bootstrap. The device keys
+// it decodes for it are zeroed before it returns.
 func deviceInfo(rec *deviceRecord, name string) (vaultlog.DeviceInfo, error) {
+	return deviceInfoWith(rec, name, nil)
+}
+
+// deviceInfoWith is deviceInfo with a test hook, which sees the decoded
+// device keys.
+func deviceInfoWith(rec *deviceRecord, name string, watch func(*vaultlog.LocalDevice)) (vaultlog.DeviceInfo, error) {
 	dev, err := rec.device()
 	if err != nil {
 		return vaultlog.DeviceInfo{}, err
 	}
 	defer zeroDevice(dev)
+	if watch != nil {
+		watch(dev)
+	}
 	return vaultlog.DeviceInfo{
 		ID: rec.DeviceID, Name: name, KEMPK: dev.KEM.PublicKey().Bytes(),
 		SigPK: append([]byte(nil), dev.Sig.Public().(ed25519.PublicKey)...),
@@ -1159,7 +1200,8 @@ func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams)
 		return signInDestination(ctx, r, o, self, info, s.now, s.hook)
 	})
 	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
-		return MergeStatus{}, s.revokeNext(next.AccountID, next.DeviceID, rev)
+		s.hook("signin:revoking")
+		return MergeStatus{}, s.revokeNext(next.AccountID, next.DeviceID, err)
 	}
 	if err != nil {
 		return MergeStatus{}, err
@@ -1303,26 +1345,46 @@ func (s *Store) mergeNextDevice(p SignInParams) (*deviceRecord, uint64, error) {
 // a tombstone that could not be written is tried again by every later
 // attempt and by MergeCancel. The source vault is not revoked: it stays
 // frozen until MergeCancel. It needs no unlocked store: a lock meanwhile
-// does not lose the revocation.
-func (s *Store) revokeNext(acct, id model.ID, rev *vaultlog.RevokedError) error {
+// does not lose the revocation. rev wraps the *vaultlog.RevokedError.
+//
+// device.json may name id as this directory's own device by now: a crash
+// or another owner installed the destination and promoted it before the
+// revocation was recorded. Its record is then the one tombstoned, and the
+// revocation is this store's (ErrDeviceRevoked). Open and every unlock
+// refuse it from the ledger alone too (checkRevoked).
+func (s *Store) revokeNext(acct, id model.ID, rev error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	revoked := fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrSignInRevoked, id, rev.Head.Seq)
+	revoked := fmt.Errorf("%w (device %v, %s)", ErrSignInRevoked, id, revokedAt(rev))
 	unlock, err := s.lockFile()
 	if err != nil {
 		return fmt.Errorf("%w; it could not be recorded: %v", revoked, err)
 	}
 	defer unlock()
-	return s.recordRevoked(acct, id, revoked, func() error {
-		cfg, err := s.readDeviceConfig()
-		if err == nil && (cfg.Next == nil || cfg.Next.DeviceID != id) {
-			err = errors.New("device.json no longer names it")
+	cfg, cerr := s.readDeviceConfig()
+	var ds *deviceStore
+	promoted := false
+	switch {
+	case cerr != nil:
+	case cfg.Next != nil && cfg.Next.AccountID == acct && cfg.Next.DeviceID == id:
+		ds = s.nextStore(cfg)
+	case cfg.AccountID == acct && slices.Contains(cfg.self(), id):
+		ds, promoted = s.deviceStore(cfg), true
+		revoked = fmt.Errorf("%w: %w", ErrDeviceRevoked, revoked)
+	default:
+		cerr = errors.New("device.json no longer names it")
+	}
+	err = s.recordRevoked(acct, id, revoked, func() error {
+		if cerr != nil {
+			return cerr
 		}
-		if err != nil {
-			return err
-		}
-		return s.nextStore(cfg).tombstone(id)
+		return ds.tombstone(id)
 	})
+	if promoted {
+		s.setRevoked(revoked)
+		s.dropLocked(revoked)
+	}
+	return err
 }
 
 // recordRevoked makes a sign-in's revocation of device id of account acct
@@ -1423,6 +1485,13 @@ func (s *Store) dropSource(gen uint64, o *signInSecrets, sf serverFile) (MergeSt
 	}
 	if cfg.Next == nil || cfg.Next.DeviceID != next.DeviceID {
 		return MergeStatus{}, fmt.Errorf("%w: device.json no longer names the destination device", ErrDeviceKey)
+	}
+	// A revocation the ledger recorded meanwhile is never installed.
+	if g, err := s.l.readLedger(); err != nil {
+		return MergeStatus{}, err
+	} else if g.isRevoked(cfg.Next.AccountID, next.DeviceID) {
+		return MergeStatus{}, s.stillRevoked(s.nextStore(cfg), next.DeviceID,
+			fmt.Errorf("%w (device %v, recorded in %s)", ErrSignInRevoked, next.DeviceID, s.l.ledgerFile()))
 	}
 	// The source's files, listed before the destination's objects are
 	// written next to them.
@@ -1582,6 +1651,19 @@ func (s *Store) promoteNextLocked(cfg deviceConfig) (deviceConfig, error) {
 	if err := s.hook("signin:promote"); err != nil {
 		return cfg, err
 	}
+	// The ledger must parse before anything changes. A destination device
+	// it records as revoked is promoted as one: its record becomes a
+	// tombstone first (at best effort: the ledger alone keeps it terminal,
+	// checkRevoked), and the store is revoked.
+	g, err := s.l.readLedger()
+	if err != nil {
+		return cfg, err
+	}
+	var revoked error
+	if g.isRevoked(cfg.Next.AccountID, cfg.Next.DeviceID) {
+		revoked = fmt.Errorf("%w: %w (device %v, recorded in %s)", ErrDeviceRevoked, ErrSignInRevoked, cfg.Next.DeviceID, s.l.ledgerFile())
+		s.nextStore(cfg).tombstone(cfg.Next.DeviceID)
+	}
 	ns := s.nextStore(cfg)
 	switch cfg.Store {
 	case DeviceStoreFile:
@@ -1618,8 +1700,12 @@ func (s *Store) promoteNextLocked(cfg deviceConfig) (deviceConfig, error) {
 	// are stale devices of it now (mergeNextDevice carried them into
 	// next.stale): the ledger forgets them, at best effort, since keeping
 	// them is harmless.
-	if g, err := s.l.readLedger(); err == nil && g.clearOrphaned(next.AccountID) {
+	if g.clearOrphaned(next.AccountID) {
 		s.l.writeLedger(g)
+	}
+	if revoked != nil {
+		s.setRevoked(revoked)
+		return next, revoked
 	}
 	return next, nil
 }

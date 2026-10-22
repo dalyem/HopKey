@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
@@ -22,7 +23,10 @@ import (
 //     from what the store holds for it (deviceStore.probeSlot): its record
 //     is used again, with this sign-in's Secret Key, its tombstone ends the
 //     sign-in, an inconclusive read changes nothing, and a confirmed
-//     absence makes it stale, since its bootstrap may have committed;
+//     absence makes it stale, since its bootstrap may have committed. The
+//     devices a cancelled merge into the account orphaned (ledger.go)
+//     become stale devices too, in device.json before the ledger forgets
+//     them;
 //  2. signInDestination: the log is read from genesis and verified from
 //     the anchor of the account keys, every head the server reports is
 //     checked against it, the bootstrap is posted unless an earlier
@@ -104,9 +108,12 @@ func signInWith(ctx context.Context, cfg Config, r SignInRemote, p SignInParams,
 		if err != nil {
 			return nil, SignInResult{}, err
 		}
-		if st.Info().Locked {
+		if info := st.Info(); info.Locked {
 			st.Close()
-			return nil, SignInResult{}, fmt.Errorf("store: an earlier sign-in installed the vault, but it does not unlock: %s", st.Info().LockReason)
+			if info.Revoked {
+				return nil, SignInResult{}, fmt.Errorf("%w: an earlier sign-in installed the vault, but its device is revoked: %s", ErrDeviceRevoked, info.LockReason)
+			}
+			return nil, SignInResult{}, fmt.Errorf("store: an earlier sign-in installed the vault, but it does not unlock: %s", info.LockReason)
 		}
 		info, err := st.ServerInfo()
 		if err != nil {
@@ -130,7 +137,7 @@ func signInWith(ctx context.Context, cfg Config, r SignInRemote, p SignInParams,
 	}
 	err = signInDestination(ctx, r, o, self, info, s.now, s.hook)
 	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
-		return nil, SignInResult{}, s.revokePending(dcfg, rec.DeviceID, rev)
+		return nil, SignInResult{}, s.revokePending(dcfg, rec.DeviceID, err)
 	}
 	if err != nil {
 		return nil, SignInResult{}, err
@@ -158,6 +165,13 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 		return nil, deviceConfig{}, false, err
 	}
 	acctID := p.Account.AccountID
+	// The sign-in ledger must parse before any device is chosen, the one
+	// an earlier attempt installed included.
+	ledger, err := s.l.readLedger()
+	if err != nil {
+		return nil, deviceConfig{}, false, err
+	}
+	orphans := ledger.orphaned(acctID)
 	var dcfg deviceConfig
 	present := false
 	if _, err := os.Lstat(s.l.deviceConfig()); err == nil {
@@ -188,9 +202,7 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 		if id := dcfg.pendingID(); !id.IsZero() {
 			// The ledger first: a revocation whose tombstone could not be
 			// written leaves the record readable.
-			if revoked, err := s.l.signInRevoked(acctID, id); err != nil {
-				return nil, deviceConfig{}, false, err
-			} else if revoked {
+			if ledger.isRevoked(acctID, id) {
 				return nil, deviceConfig{}, false, s.stillRevoked(s.deviceStore(dcfg), id,
 					fmt.Errorf("%w: %w (device %v, recorded in %s)", ErrDeviceRevoked, ErrSignInRevoked, id, s.l.ledgerFile()))
 			}
@@ -209,6 +221,10 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 					return nil, deviceConfig{}, false, err
 				}
 				if err := s.deviceStore(dcfg).refreshSecretKey(rec, p.SecretKey); err != nil {
+					rec.zero()
+					return nil, deviceConfig{}, false, err
+				}
+				if dcfg, err = s.adoptOrphans(dcfg, ledger, orphans); err != nil {
 					rec.zero()
 					return nil, deviceConfig{}, false, err
 				}
@@ -249,11 +265,15 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 	}
 	// The intent: device.json names the device before its record exists,
 	// so the store never holds a record that device.json does not track.
+	// The devices a cancelled merge into this account orphaned become
+	// stale in the same write.
 	dcfg.Pending = &pendingDevice{DeviceID: rec.DeviceID}
+	dcfg.StaleDevices = uniqueIDs(append(dcfg.StaleDevices, orphans...))
 	if err := s.writeDeviceConfig(dcfg); err != nil {
 		rec.zero()
 		return nil, deviceConfig{}, false, err
 	}
+	s.forgetOrphans(ledger, acctID)
 	if err := s.hook("signin:intent"); err != nil {
 		rec.zero()
 		return nil, deviceConfig{}, false, err
@@ -269,13 +289,41 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 	return rec, dcfg, false, nil
 }
 
+// adoptOrphans makes orphans, the devices a cancelled merge into dcfg's
+// account orphaned (MergeCancel with ForceOrphan), stale devices of dcfg,
+// durably in device.json, so hop passwd revokes the active ones once the
+// sign-in installs; then the ledger forgets them. It returns the
+// configuration written. The caller holds the file lock.
+func (s *Store) adoptOrphans(dcfg deviceConfig, ledger *signInLedger, orphans []model.ID) (deviceConfig, error) {
+	stale := uniqueIDs(append(slices.Clone(dcfg.StaleDevices), orphans...))
+	if len(stale) != len(dcfg.StaleDevices) {
+		dcfg.StaleDevices = stale
+		if err := s.writeDeviceConfig(dcfg); err != nil {
+			return deviceConfig{}, err
+		}
+	}
+	s.forgetOrphans(ledger, dcfg.AccountID)
+	return dcfg, nil
+}
+
+// forgetOrphans clears account acct's orphaned devices from the ledger,
+// once device.json lists them as stale. It is best effort: keeping them is
+// harmless, since the next sign-in into acct adopts them again without
+// duplicates. The caller holds the file lock.
+func (s *Store) forgetOrphans(ledger *signInLedger, acct model.ID) {
+	if ledger.clearOrphaned(acct) {
+		s.l.writeLedger(ledger)
+	}
+}
+
 // revokePending makes the revocation of id, the pending device of dcfg,
 // terminal for this data directory (§5.5): the sign-in ledger records it
 // durably, and then its record is replaced by its tombstone. Every later
 // attempt stops at either (signInDevice), whatever history the server
-// shows then, and tries a tombstone that could not be written again.
-func (s *Store) revokePending(dcfg deviceConfig, id model.ID, rev *vaultlog.RevokedError) error {
-	revoked := fmt.Errorf("%w: %w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, ErrSignInRevoked, id, rev.Head.Seq)
+// shows then, and tries a tombstone that could not be written again. rev
+// wraps the *vaultlog.RevokedError.
+func (s *Store) revokePending(dcfg deviceConfig, id model.ID, rev error) error {
+	revoked := fmt.Errorf("%w: %w (device %v, %s)", ErrDeviceRevoked, ErrSignInRevoked, id, revokedAt(rev))
 	unlock, err := s.lockFile()
 	if err != nil {
 		return fmt.Errorf("%w; it could not be recorded: %v", revoked, err)
@@ -301,6 +349,14 @@ func (s *Store) installSignIn(o *signInSecrets, dcfg deviceConfig, sf serverFile
 		return err
 	} else if exists {
 		return ErrVaultExists
+	}
+	// A revocation the ledger recorded meanwhile is never installed.
+	id := o.rec.DeviceID
+	if g, err := s.l.readLedger(); err != nil {
+		return err
+	} else if g.isRevoked(dcfg.AccountID, id) {
+		return s.stillRevoked(s.deviceStore(dcfg), id,
+			fmt.Errorf("%w: %w (device %v, recorded in %s)", ErrDeviceRevoked, ErrSignInRevoked, id, s.l.ledgerFile()))
 	}
 	t := &txn{}
 	if err := s.putDestination(t, o.d, sf); err != nil {

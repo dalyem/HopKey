@@ -28,15 +28,21 @@ import (
 //     tombstone is attempted, and it is terminal: a sign-in or merge whose
 //     device.json names one of them stops (ErrSignInRevoked) before it
 //     reads the device key store or asks the server, and retries the
-//     tombstone. It is never removed.
+//     tombstone. Nothing installs one (installSignIn, dropSource), a
+//     promotion revokes it (promoteNextLocked), and Open and every unlock
+//     refuse one that device.json names as this device or its pending
+//     replacement (checkRevoked). It is never removed.
 //   - orphaned: destination devices a MergeCancel with ForceOrphan dropped
 //     from device.json while a bootstrap may have committed for them. The
-//     next merge into account_id carries them into its next.stale, so hop
-//     passwd revokes the active ones once that destination is installed.
+//     next merge into account_id carries them into its next.stale, and the
+//     next SignIn into it into its stale devices, so hop passwd revokes
+//     the active ones once that destination is installed. The ledger
+//     forgets them once device.json lists them.
 //
 // It lives next to device.json, not in vault/, so a logout's cleanup of
 // the vault leaves it. Anything that does not parse is ErrCorrupt, and
-// every sign-in and merge then refuses: it never reads as empty.
+// every sign-in, merge, promotion, Open and unlock then refuses: it never
+// reads as empty.
 
 const (
 	ledgerRel     = "signins.json"
@@ -181,14 +187,4 @@ func (l layout) markRevoked(acct, dev model.ID) error {
 		return nil
 	}
 	return l.writeLedger(g)
-}
-
-// signInRevoked reports whether the ledger records device dev of account
-// acct as revoked. The caller holds the file lock.
-func (l layout) signInRevoked(acct, dev model.ID) (bool, error) {
-	g, err := l.readLedger()
-	if err != nil {
-		return false, err
-	}
-	return g.isRevoked(acct, dev), nil
 }

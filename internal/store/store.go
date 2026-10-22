@@ -323,7 +323,19 @@ func (s *Store) own() error {
 
 // Close drops every secret from memory and gives up the vault, so another
 // Open can take it. The Store cannot be unlocked again.
+//
+// It cancels the requests in flight first, and then waits for the
+// operations that made them (every one that waits on a server holds
+// syncMu) to return before it gives up vault/owner.lock: one that met a
+// revocation records it while this Store still owns the vault, so no other
+// owner can install or use the revoked device meanwhile.
 func (s *Store) Close() error {
+	s.mu.Lock()
+	s.dropLocked(nil)
+	s.mu.Unlock()
+	s.hook("close:drain")
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropLocked(nil)
@@ -706,39 +718,78 @@ func (s *Store) destroyDeviceRecord(id model.ID) []string {
 	return failed
 }
 
-// retryTombstone writes the tombstone of the device revoked.json names,
-// for a revocation whose tombstone failed. It is best effort: the marker
-// already makes the revocation terminal. The caller holds s.mu.
+// retryTombstone writes the tombstone of the device revoked.json names, or
+// of a device this data directory is that the sign-in ledger records as
+// revoked, for a revocation whose tombstone failed. It is best effort: the
+// marker or the ledger already makes the revocation terminal. The caller
+// holds s.mu.
 func (s *Store) retryTombstone() {
 	b, err := os.ReadFile(s.l.revokedFile())
 	var f revokedFile
-	if err != nil || canonjson.Unmarshal(b, &f) != nil || f.V != 1 || f.DeviceID.IsZero() {
+	if err == nil && canonjson.Unmarshal(b, &f) == nil && f.V == 1 && !f.DeviceID.IsZero() {
+		s.tombstoneRecord(f.DeviceID)
 		return
 	}
-	s.tombstoneRecord(f.DeviceID)
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return
+	}
+	if id, err := s.ledgerRevokedSelf(cfg); err == nil && !id.IsZero() {
+		s.tombstoneRecord(id)
+	}
+}
+
+// ledgerRevokedSelf returns the device this data directory is (cfg.self)
+// that the sign-in ledger records as revoked from cfg's account, or the
+// zero ID. A ledger that does not parse is ErrCorrupt.
+func (s *Store) ledgerRevokedSelf(cfg deviceConfig) (model.ID, error) {
+	g, err := s.l.readLedger()
+	if err != nil {
+		return model.ID{}, err
+	}
+	for _, id := range cfg.self() {
+		if g.isRevoked(cfg.AccountID, id) {
+			return id, nil
+		}
+	}
+	return model.ID{}, nil
 }
 
 // checkRevoked fails with ErrDeviceRevoked once this device is revoked: a
-// file at vault/revoked.json (any file counts: only hop writes it), or the
-// tombstone of a device this data directory is, DeviceID or the pending
-// replacement, in the device key store (deviceStore.revokedSelf). A device
-// key store it cannot read conclusively fails with ErrKeyStoreUnavailable,
-// which is not a revocation: nothing is recorded, and the next check reads
-// again. The caller holds s.mu.
+// file at vault/revoked.json (any file counts: only hop writes it), a
+// device this data directory is, DeviceID or the pending replacement, that
+// the sign-in ledger records as revoked from its account (ledger.go: a
+// sign-in's revocation whose tombstone was not written, or that a later
+// owner installed anyway), or the tombstone of one of them in the device
+// key store (deviceStore.revokedSelf). A ledger that does not parse fails
+// with ErrCorrupt, and a device key store it cannot read conclusively with
+// ErrKeyStoreUnavailable: neither is a revocation, so nothing is recorded
+// and the next check reads again, but neither lets a key be used. The
+// caller holds s.mu.
 func (s *Store) checkRevoked() error {
 	if s.revoked != nil {
 		return s.revoked
 	}
 	b, err := os.ReadFile(s.l.revokedFile())
 	if errors.Is(err, os.ErrNotExist) {
-		if cfg, err := s.readDeviceConfig(); err == nil {
-			err := s.deviceStore(cfg).revokedSelf()
-			if errors.Is(err, ErrDeviceRevoked) {
-				s.setRevoked(err)
-			}
+		cfg, err := s.readDeviceConfig()
+		if err != nil {
+			// Without device.json there is no self device; the ledger must
+			// still parse.
+			_, err := s.l.readLedger()
 			return err
 		}
-		return nil
+		if id, err := s.ledgerRevokedSelf(cfg); err != nil {
+			return err
+		} else if !id.IsZero() {
+			s.setRevoked(fmt.Errorf("%w: %w (device %v, recorded in %s)", ErrDeviceRevoked, ErrSignInRevoked, id, s.l.ledgerFile()))
+			return s.revoked
+		}
+		err = s.deviceStore(cfg).revokedSelf()
+		if errors.Is(err, ErrDeviceRevoked) {
+			s.setRevoked(err)
+		}
+		return err
 	}
 	var f revokedFile
 	if err != nil || canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
