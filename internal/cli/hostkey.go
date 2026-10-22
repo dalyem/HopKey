@@ -46,7 +46,7 @@ func fetchHostKey(ctx context.Context, host string, port int, algs []string, tim
 	if err == nil {
 		err = errors.New("no host key was presented")
 	}
-	return nil, fmt.Errorf("ssh handshake with %s: %w", addr, err)
+	return nil, fmt.Errorf("ssh handshake with %s: %w", oneLine(addr), cleanErr(err))
 }
 
 // algorithmsFor lists the host key algorithms that can present any of the

@@ -12,7 +12,7 @@ import (
 func openLog(path string, uid int) (*os.File, error) {
 	if fi, err := os.Lstat(path); err == nil {
 		if !fi.Mode().IsRegular() {
-			return nil, fmt.Errorf("the daemon log %s is not a regular file", path)
+			return nil, fmt.Errorf("the daemon log %s is not a regular file", oneLine(path))
 		}
 		if fi.Size() > maxLogSize {
 			if err := os.Rename(path, path+".1"); err != nil {

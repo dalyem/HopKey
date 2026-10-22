@@ -22,10 +22,10 @@ import (
 func openLog(path string, uid int) (*os.File, error) {
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("the daemon log %s is a symlink; remove it", path)
+			return nil, fmt.Errorf("the daemon log %s is a symlink; remove it", oneLine(path))
 		}
 		if !fi.Mode().IsRegular() {
-			return nil, fmt.Errorf("the daemon log %s is not a regular file", path)
+			return nil, fmt.Errorf("the daemon log %s is not a regular file", oneLine(path))
 		}
 		if fi.Size() > maxLogSize {
 			// Tighten the mode first: the previous generation keeps whatever
@@ -42,7 +42,7 @@ func openLog(path string, uid int) (*os.File, error) {
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("opening the daemon log: %w", err)
+		return nil, fmt.Errorf("opening the daemon log: %w", cleanErr(err))
 	}
 	fi, err := f.Stat()
 	if err != nil {
@@ -52,11 +52,11 @@ func openLog(path string, uid int) (*os.File, error) {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	switch {
 	case !fi.Mode().IsRegular():
-		err = fmt.Errorf("the daemon log %s is not a regular file", path)
+		err = fmt.Errorf("the daemon log %s is not a regular file", oneLine(path))
 	case !ok:
-		err = fmt.Errorf("cannot tell who owns the daemon log %s", path)
+		err = fmt.Errorf("cannot tell who owns the daemon log %s", oneLine(path))
 	case int(st.Uid) != uid:
-		err = fmt.Errorf("the daemon log %s belongs to uid %d, not %d", path, st.Uid, uid)
+		err = fmt.Errorf("the daemon log %s belongs to uid %d, not %d", oneLine(path), st.Uid, uid)
 	case fi.Mode().Perm() != 0o600:
 		err = f.Chmod(0o600)
 	}
@@ -72,11 +72,11 @@ func openLog(path string, uid int) (*os.File, error) {
 func tighten(path string) error {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("opening the daemon log: %w", err)
+		return fmt.Errorf("opening the daemon log: %w", cleanErr(err))
 	}
 	defer f.Close()
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
-		return fmt.Errorf("the daemon log %s is not a regular file", path)
+		return fmt.Errorf("the daemon log %s is not a regular file", oneLine(path))
 	}
 	return f.Chmod(0o600)
 }

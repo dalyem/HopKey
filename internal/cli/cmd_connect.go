@@ -34,7 +34,7 @@ type target struct {
 func connectable(rr *daemon.ResolveResult) (*target, error) {
 	res := rr.Result
 	if res.Status != resolve.StatusMatched || rr.Host == nil {
-		return nil, failf("%s", describeUnresolved(res))
+		return nil, failMsg(describeUnresolved(res))
 	}
 	if rr.SSHAlias == "" {
 		return nil, failf("%s cannot be used with ssh: %s", res.HostName, orUnknown(rr.SSHProblem))
@@ -68,7 +68,7 @@ func chooseAddress(ctx context.Context, e *Env, t *target) (addr, note string) {
 	}
 	if r.Setting == resolve.RouteAuto && r.Chosen == resolve.RouteTailnet && r.Fallback != "" {
 		if err := tcpReachable(ctx, r.Address, r.Port, e.dialTimeout()/2); err != nil {
-			return r.Fallback, fmt.Sprintf("%s:%d (tailnet) did not answer, using %s (direct)", r.Address, r.Port, r.Fallback)
+			return r.Fallback, safef("%s:%d (tailnet) did not answer, using %s (direct)", r.Address, r.Port, r.Fallback)
 		}
 	}
 	return r.Address, ""
@@ -113,6 +113,8 @@ func runConnect(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintf(e.Stderr, "hop: %s\n", note)
 	}
 	argv := append([]string{e.sshBinary()}, e.sshArgs(t, addr)...)
+	// ssh takes over this process's terminal (or runs as a child on the same
+	// streams). Its session is the user's own and is not sanitized, on purpose.
 	return e.execSSH(argv)
 }
 
@@ -142,13 +144,15 @@ func plainSSH(ctx context.Context, e *Env, res *resolve.Result) error {
 	}
 	fmt.Fprintf(e.Stderr, "hop: %q is not in the vault; connecting with plain ssh\n", res.Target)
 	cmd := exec.CommandContext(ctx, e.sshBinary(), "--", dest)
+	// The session's streams are not sanitized, on purpose: this is the user's
+	// own terminal session with ssh, not output hop composes.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = e.Stdin, e.Stdout, e.Stderr
 	cmd.Env = e.environ()
 	err := cmd.Run()
 	var ee *exec.ExitError
 	switch {
 	case err == nil:
-		fmt.Fprintf(e.Stderr, "hop: to keep it, run: hop add %s --address %s\n", suggestName(res.Target), res.Target)
+		fmt.Fprintf(e.Stderr, "hop: to keep it, run: hop add %s --address %s\n", oneLine(suggestName(res.Target)), oneLine(res.Target))
 		return nil
 	case errors.As(err, &ee):
 		return silent(exitCode(ee))
@@ -336,6 +340,9 @@ func runExec(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		cmd.Stdout, cmd.Stderr = &outTail, &errTail
 	} else {
+		// The remote command's output goes straight through, not sanitized, on
+		// purpose: it is the user's own terminal session. With --json it is
+		// captured above and JSON-encoded (escapeJSONControls in printJSON).
 		cmd.Stdout, cmd.Stderr = e.Stdout, e.Stderr
 	}
 
@@ -433,21 +440,22 @@ func runWhich(ctx context.Context, e *Env, args []string) error {
 		printWhich(e, &rr, &w)
 	}
 	if !matched {
-		return failf("%s", strings.SplitN(describeUnresolved(rr.Result), "\n", 2)[0])
+		return failMsg(strings.SplitN(describeUnresolved(rr.Result), "\n", 2)[0])
 	}
 	return nil
 }
 
 func printWhich(e *Env, rr *daemon.ResolveResult, w *WhichResult) {
+	// Everything below is vault, daemon or network text: oneLine as inserted.
 	res := rr.Result
-	e.printf("target:   %s\n", res.Target)
+	e.printf("target:   %s\n", oneLine(res.Target))
 	switch res.Status {
 	case resolve.StatusMatched:
-		e.printf("host:     %s\n", res.HostName)
-		e.printf("rule:     %s (%s)\n", res.Rule, res.Matched)
+		e.printf("host:     %s\n", oneLine(res.HostName))
+		e.printf("rule:     %s (%s)\n", oneLine(string(res.Rule)), oneLine(res.Matched))
 	case resolve.StatusAmbiguous:
 		e.printf("host:     ambiguous\n")
-		e.printf("rule:     %s (%s)\n", res.Rule, res.Matched)
+		e.printf("rule:     %s (%s)\n", oneLine(string(res.Rule)), oneLine(res.Matched))
 	case resolve.StatusPlainSSH:
 		e.printf("host:     none; hop would use plain ssh\n")
 	default:
@@ -455,16 +463,16 @@ func printWhich(e *Env, rr *daemon.ResolveResult, w *WhichResult) {
 	}
 	if rr.Route != nil {
 		r := rr.Route
-		e.printf("address:  %s:%d via %s\n", r.Address, r.Port, r.Label())
+		e.printf("address:  %s:%d via %s\n", oneLine(r.Address), r.Port, oneLine(r.Label()))
 		if r.Blocked != "" {
-			e.printf("blocked:  %s\n", r.Blocked)
+			e.printf("blocked:  %s\n", oneLine(r.Blocked))
 		}
 		if r.Fallback != "" {
-			e.printf("fallback: %s (direct) if the tailnet address does not answer\n", r.Fallback)
+			e.printf("fallback: %s (direct) if the tailnet address does not answer\n", oneLine(r.Fallback))
 		}
 	}
 	if rr.RouteError != "" {
-		e.printf("route:    %s\n", rr.RouteError)
+		e.printf("route:    %s\n", oneLine(rr.RouteError))
 	}
 	if rr.Host != nil {
 		user := res.User
@@ -472,19 +480,19 @@ func printWhich(e *Env, rr *daemon.ResolveResult, w *WhichResult) {
 			user = rr.Host.User
 		}
 		if user != "" {
-			e.printf("user:     %s\n", user)
+			e.printf("user:     %s\n", oneLine(user))
 		}
 		if rr.SSHAlias != "" {
-			e.printf("ssh:      ssh %s  (config %s)\n", rr.SSHAlias, e.sshConfigFile())
+			e.printf("ssh:      ssh %s  (config %s)\n", oneLine(rr.SSHAlias), oneLine(e.sshConfigFile()))
 		} else {
-			e.printf("ssh:      not available: %s\n", orUnknown(rr.SSHProblem))
+			e.printf("ssh:      not available: %s\n", oneLine(orUnknown(rr.SSHProblem)))
 		}
 	}
 	for _, c := range res.Candidates {
-		e.printf("candidate: %s %s - %s\n", c.Name, strings.Join(c.Addresses, ","), c.Detail)
+		e.printf("candidate: %s %s - %s\n", oneLine(c.Name), joinOne(c.Addresses, ","), oneLine(c.Detail))
 	}
 	for _, n := range res.Notes {
-		e.printf("note:     %s\n", n)
+		e.printf("note:     %s\n", oneLine(n))
 	}
 }
 
@@ -525,7 +533,7 @@ type checker struct {
 func (c *checker) run(name string, deps []string, fn func() (string, string)) {
 	for _, d := range deps {
 		if c.status[d] != stepPass && !c.satisfied[d] {
-			c.add(Step{Name: name, Status: stepSkipped, Detail: fmt.Sprintf("skipped: %s did not pass", d)})
+			c.add(Step{Name: name, Status: stepSkipped, Detail: safef("skipped: %s did not pass", d)})
 			return
 		}
 	}
@@ -602,7 +610,7 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		if res.Status != resolve.StatusMatched {
 			return stepFail, describeUnresolved(res)
 		}
-		return stepPass, fmt.Sprintf("host %q by rule %s (%s)", res.HostName, res.Rule, res.Matched)
+		return stepPass, safef("host %q by rule %s (%s)", res.HostName, res.Rule, res.Matched)
 	})
 	out.Host = res.HostName
 
@@ -621,14 +629,14 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 	var route *resolve.Route
 	c.run("route", []string{"resolved"}, func() (string, string) {
 		if rr.Route == nil {
-			return stepFail, orUnknown(rr.RouteError)
+			return stepFail, oneLine(orUnknown(rr.RouteError))
 		}
 		route = rr.Route
 		addr, port = route.Address, route.Port
 		if route.Blocked != "" {
-			return stepFail, route.Blocked
+			return stepFail, oneLine(route.Blocked)
 		}
-		return stepPass, fmt.Sprintf("%s:%d via %s", addr, port, route.Label())
+		return stepPass, safef("%s:%d via %s", addr, port, route.Label())
 	})
 
 	probe := func(name string, deps []string, fn func() (string, string)) {
@@ -644,15 +652,15 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 	probe("tcp_reachable", []string{"route"}, func() (string, string) {
 		err := tcpReachable(ctx, addr, port, e.dialTimeout())
 		if err == nil {
-			return stepPass, fmt.Sprintf("connected to %s:%d", addr, port)
+			return stepPass, safef("connected to %s:%d", addr, port)
 		}
 		if route.Fallback != "" {
 			if ferr := tcpReachable(ctx, route.Fallback, port, e.dialTimeout()); ferr == nil {
 				addr = route.Fallback
-				return stepPass, fmt.Sprintf("%s:%d (tailnet) did not answer (%v); %s:%d (direct) did", route.Address, port, err, addr, port)
+				return stepPass, safef("%s:%d (tailnet) did not answer (%v); %s:%d (direct) did", route.Address, port, err, addr, port)
 			}
 		}
-		return stepFail, fmt.Sprintf("cannot connect to %s:%d: %v", addr, port, err)
+		return stepFail, safef("cannot connect to %s:%d: %v", addr, port, err)
 	})
 
 	var pins []ssh.PublicKey
@@ -661,30 +669,30 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		pins, bad = parsePins(rr.Host.HostKeys)
 		switch {
 		case len(pins) > 0 && bad > 0:
-			return stepPass, fmt.Sprintf("%d host key(s) pinned (%d unreadable ones are ignored): %s", len(pins), bad, fingerprints(pins))
+			return stepPass, safef("%d host key(s) pinned (%d unreadable ones are ignored): %s", len(pins), bad, fingerprints(pins))
 		case len(pins) > 0:
-			return stepPass, fmt.Sprintf("%d host key(s) pinned: %s", len(pins), fingerprints(pins))
+			return stepPass, safef("%d host key(s) pinned: %s", len(pins), fingerprints(pins))
 		}
-		return stepFail, fmt.Sprintf("no host key is pinned for %s, so ssh refuses it; pin the server's key with: hop trust %s", res.HostName, res.HostName)
+		return stepFail, safef("no host key is pinned for %s, so ssh refuses it; pin the server's key with: hop trust %s", res.HostName, res.HostName)
 	})
 
 	probe("host_key_matches", []string{"tcp_reachable", "host_key_pinned"}, func() (string, string) {
 		key, err := fetchHostKey(ctx, addr, port, algorithmsFor(pins), e.dialTimeout())
 		if err != nil {
-			return stepFail, fmt.Sprintf("could not read the server's host key: %v", err)
+			return stepFail, safef("could not read the server's host key: %v", err)
 		}
 		for _, p := range pins {
 			if bytes.Equal(p.Marshal(), key.Marshal()) {
-				return stepPass, fmt.Sprintf("the server presents the pinned %s %s", key.Type(), sshkeys.Fingerprint(key))
+				return stepPass, safef("the server presents the pinned %s %s", key.Type(), sshkeys.Fingerprint(key))
 			}
 		}
-		return stepFail, fmt.Sprintf("the server presents %s %s, which is not pinned (pinned: %s); the machine may have been rebuilt, or something is intercepting the connection", key.Type(), sshkeys.Fingerprint(key), fingerprints(pins))
+		return stepFail, safef("the server presents %s %s, which is not pinned (pinned: %s); the machine may have been rebuilt, or something is intercepting the connection", key.Type(), sshkeys.Fingerprint(key), fingerprints(pins))
 	})
 
 	c.run("auth_ok", []string{"host_key_pinned", "host_key_matches"}, func() (string, string) {
 		t, err := connectable(rr)
 		if err != nil {
-			return stepFail, err.Error()
+			return stepFail, err.Error() // composed by failf/failMsg: already display-safe
 		}
 		actx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
@@ -694,13 +702,14 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
+			// ssh's stderr is remote text; lastLines makes each line safe.
 			msg := strings.TrimSpace(stderr.String())
 			if msg == "" {
 				msg = err.Error()
 			}
 			return stepFail, "ssh did not log in: " + lastLines(msg, 3)
 		}
-		return stepPass, fmt.Sprintf("logged in with ssh %s", t.alias)
+		return stepPass, safef("logged in with ssh %s", t.alias)
 	})
 
 	out.Steps, out.OK = c.steps, c.ok()
@@ -709,7 +718,7 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 			return err
 		}
 	} else {
-		e.printf("check %s\n", pos[0])
+		e.printf("check %s\n", oneLine(pos[0]))
 		for _, s := range out.Steps {
 			e.printf("  [%s] %-16s %s\n", s.Status, s.Name, strings.ReplaceAll(s.Detail, "\n", "\n"+strings.Repeat(" ", 28)))
 		}
@@ -725,7 +734,7 @@ func lastLines(s string, n int) string {
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}
-	return strings.Join(lines, "; ")
+	return joinOne(lines, "; ")
 }
 
 // ---- hop trust ----
@@ -749,7 +758,7 @@ func runTrust(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
-		return failf("%s", describeUnresolved(rr.Result))
+		return failMsg(describeUnresolved(rr.Result))
 	}
 	if rr.Route == nil {
 		return failf("%s has no usable route: %s", rr.Result.HostName, orUnknown(rr.RouteError))
@@ -795,7 +804,7 @@ func runTrust(ctx context.Context, e *Env, args []string) error {
 			return failf("the server presents %s, not the %s you gave; nothing was pinned", got, *fp)
 		}
 	default:
-		fmt.Fprintf(e.Stderr, "%s presents %s %s\n", host.Name, key.Type(), got)
+		fmt.Fprintf(e.Stderr, "%s presents %s %s\n", oneLine(host.Name), oneLine(key.Type()), oneLine(got))
 		ok, err := confirm(e, *yes, "Pin this host key?")
 		if err != nil {
 			return err
@@ -823,6 +832,6 @@ func reportTrust(e *Env, asJSON bool, host string, key ssh.PublicKey, fp string,
 	if asJSON {
 		return printJSON(e, map[string]any{"host": host, "key_type": key.Type(), "fingerprint": fp, "pinned": true, "changed": changed})
 	}
-	e.printf("%s: %s %s %s\n", host, what, key.Type(), fp)
+	e.printf("%s: %s %s %s\n", oneLine(host), what, oneLine(key.Type()), oneLine(fp))
 	return nil
 }
