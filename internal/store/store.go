@@ -54,6 +54,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
@@ -180,9 +181,11 @@ type Store struct {
 	// syncMu serializes Pull and PushHead. Neither holds mu while it waits
 	// on the server.
 	syncMu sync.Mutex
-	// gen counts locks. A pull or push started in an earlier generation
-	// discards its result (§11.2); cancels are its in-flight requests.
-	gen      uint64
+	// gen is the generation (Generation): it counts unlocks, locks,
+	// self-locks and revocations. A pull or push started in an earlier
+	// generation discards its result (§11.2); cancels are its in-flight
+	// requests. It is written under mu and read without it.
+	gen      atomic.Uint64
 	cancels  map[uint64]context.CancelFunc
 	cancelID uint64
 	// syncHalt is the error that stopped syncing (an equivocation or a
@@ -190,9 +193,10 @@ type Store struct {
 	syncHalt error
 	// revoked is set for good once a checkpoint revokes this device
 	// (§5.5, revoke): it wraps ErrDeviceRevoked. revokedC is closed then
-	// (Revoked).
-	revoked  error
-	revokedC chan struct{}
+	// (Revoked), and isRevoked set (IsRevoked).
+	revoked   error
+	revokedC  chan struct{}
+	isRevoked atomic.Bool
 
 	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
@@ -307,6 +311,9 @@ func (s *Store) Lock() {
 }
 
 func (s *Store) dropLocked(reason error) {
+	// The generation moves first, so the daemon's fence (Generation) stops
+	// signing before anything else happens.
+	s.gen.Add(1)
 	if s.sec != nil {
 		if s.sec.Account != nil {
 			s.sec.Account.Zero()
@@ -326,12 +333,23 @@ func (s *Store) dropLocked(reason error) {
 	s.lockErr = reason
 	// §11.2: locking stops pulls and pushes. In-flight requests are
 	// cancelled, and their responses are discarded by generation.
-	s.gen++
 	for id, cancel := range s.cancels {
 		cancel()
 		delete(s.cancels, id)
 	}
 }
+
+// Generation is the store's generation: it moves on every unlock, every
+// lock, every self-lock (an interrupted commit, a failed unlock) and every
+// revocation, before anything slow is written. It reads without the
+// store's mutex, which a lock or a revocation may hold for a while. The
+// daemon serves keys only while the generation they were loaded in is
+// current and IsRevoked is false (§5.5).
+func (s *Store) Generation() uint64 { return s.gen.Load() }
+
+// IsRevoked reports, without the store's mutex, whether this device is
+// known to be revoked (ErrDeviceRevoked).
+func (s *Store) IsRevoked() bool { return s.isRevoked.Load() }
 
 // Unlock reads the device key, verifies the log on disk and loads the
 // vault (§5.5). It finishes a write or a password change that a crash
@@ -358,8 +376,8 @@ func (s *Store) unlockLocked() error {
 		return errClosed
 	}
 	if err := s.checkRevoked(); err != nil {
-		// A revocation whose wipe of the device record failed retries it.
-		s.destroyDeviceRecord()
+		// A revocation whose tombstone failed retries it.
+		s.retryTombstone()
 		return err
 	}
 	cfg, err := s.readDeviceConfig()
@@ -368,6 +386,10 @@ func (s *Store) unlockLocked() error {
 	}
 	s.devCfg = cfg
 	rec, err := s.deviceStore(cfg).load()
+	if errors.Is(err, ErrDeviceRevoked) {
+		// The tombstone of a revocation whose revoked.json was lost.
+		s.setRevoked(err)
+	}
 	if err != nil {
 		return err
 	}
@@ -411,6 +433,7 @@ func (s *Store) unlockLocked() error {
 		return err
 	}
 	s.state, s.sec, s.dev, s.rec, s.repaired, s.server = st, sec, dev, rec, repaired, server
+	s.gen.Add(1)
 	return s.finishUnlock()
 }
 
@@ -443,21 +466,23 @@ type revokedFile struct {
 func (l layout) revokedFile() string { return filepath.Join(l.vault(), "revoked.json") }
 
 // revoke handles an authenticated checkpoint that revokes this device
-// (§5.5, "Revoked here?"): it records the revocation durably, deletes the
-// device record from the device key store, wipes every decrypted secret
-// and cancels in-flight requests, and from then on every use and every
-// unlock of this vault fails with ErrDeviceRevoked, after a restart too.
-// The revoking entry is never decrypted or written. The caller holds s.mu
-// and, when there is one, the file lock.
+// (§5.5, "Revoked here?"). It first marks the store revoked, which moves
+// the generation and fences the daemon's agent at once (Generation,
+// IsRevoked), and closes the Revoked channel. Then it records the
+// revocation durably in vault/revoked.json and overwrites the device
+// record with its tombstone, so the device key store keeps no key material
+// and, if the marker was lost, still says the device is revoked. Then it
+// wipes every decrypted secret and cancels in-flight requests. From then
+// on every use and every unlock of this vault fails with ErrDeviceRevoked,
+// after a restart too. The revoking entry is never decrypted or written.
+// The caller holds s.mu and, when there is one, the file lock.
 //
-// The device record goes whether or not revoked.json was written: a
-// revoked device's keys have no further use (§5.5 wipes them), and without
-// them an Open can't unlock even if the marker was lost. A password unlock
-// can't bring the vault back either: a server-backed vault refuses a local
-// one, and the server path meets the revocation again. If both the marker
-// and the deletion fail, the error says so, and a restart that still finds
-// the device record unlocks with it until the next pull meets the
-// revocation again.
+// Either the marker or the tombstone keeps the revocation terminal under a
+// server that withholds the revoking checkpoint: Open, Unlock and both
+// password unlocks refuse when they find either. If both fail, the device
+// record is deleted as a last resort, and the error says so: a password
+// unlock against a server that withholds the checkpoint could then enroll
+// this machine again (the total-failure limitation).
 func (s *Store) revoke(rev *vaultlog.RevokedError) error {
 	s.setRevoked(fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, rev.DeviceID, rev.Head.Seq))
 	var failed []string
@@ -468,11 +493,19 @@ func (s *Store) revoke(rev *vaultlog.RevokedError) error {
 	if err == nil {
 		err = writeFileAtomic(s.l.revokedFile(), b)
 	}
-	if err != nil {
+	markerOK := err == nil
+	if !markerOK {
 		failed = append(failed, fmt.Sprintf("recording it on disk failed: %v", err))
 	}
-	if err := s.destroyDeviceRecord(); err != nil {
-		failed = append(failed, fmt.Sprintf("deleting the device key failed: %v", err))
+	if err := s.tombstoneRecord(rev.DeviceID); err != nil {
+		failed = append(failed, fmt.Sprintf("replacing the device key with a tombstone failed: %v", err))
+		if !markerOK {
+			if err := s.destroyDeviceRecord(rev.DeviceID); err != nil {
+				failed = append(failed, fmt.Sprintf("deleting the device key failed: %v", err))
+			} else {
+				failed = append(failed, "the device key was deleted instead, so a server that withholds the revocation could enroll this machine again")
+			}
+		}
 	}
 	s.dropLocked(s.revoked)
 	if len(failed) > 0 {
@@ -481,9 +514,22 @@ func (s *Store) revoke(rev *vaultlog.RevokedError) error {
 	return s.revoked
 }
 
-// destroyDeviceRecord deletes this device's record from the device key
-// store (deviceStore.destroy). The caller holds s.mu.
-func (s *Store) destroyDeviceRecord() error {
+// tombstoneRecord overwrites device id's record with its tombstone
+// (deviceStore.tombstone). The caller holds s.mu.
+func (s *Store) tombstoneRecord(id model.ID) error {
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return err
+	}
+	if err := s.hook("revoke:tombstone"); err != nil {
+		return err
+	}
+	return s.deviceStore(cfg).tombstone(id)
+}
+
+// destroyDeviceRecord deletes device id's record (deviceStore.destroy).
+// The caller holds s.mu.
+func (s *Store) destroyDeviceRecord(id model.ID) error {
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
 		return err
@@ -491,7 +537,19 @@ func (s *Store) destroyDeviceRecord() error {
 	if err := s.hook("revoke:destroy"); err != nil {
 		return err
 	}
-	return s.deviceStore(cfg).destroy()
+	return s.deviceStore(cfg).destroy(id)
+}
+
+// retryTombstone writes the tombstone of the device revoked.json names,
+// for a revocation whose tombstone failed. It is best effort: the marker
+// already makes the revocation terminal. The caller holds s.mu.
+func (s *Store) retryTombstone() {
+	b, err := os.ReadFile(s.l.revokedFile())
+	var f revokedFile
+	if err != nil || canonjson.Unmarshal(b, &f) != nil || f.V != 1 || f.DeviceID.IsZero() {
+		return
+	}
+	s.tombstoneRecord(f.DeviceID)
 }
 
 // checkRevoked fails with ErrDeviceRevoked once this device is revoked. Any
@@ -518,6 +576,9 @@ func (s *Store) checkRevoked() error {
 // revocation and closes the Revoked channel. The caller holds s.mu.
 func (s *Store) setRevoked(err error) {
 	if s.revoked == nil {
+		// The fence first (Generation, IsRevoked), then the signal.
+		s.isRevoked.Store(true)
+		s.gen.Add(1)
 		close(s.revokedChan())
 	}
 	s.revoked = err

@@ -103,7 +103,7 @@ func (s *Store) trackRequest(ctx context.Context) (context.Context, uint64, func
 	s.cancelID++
 	id := s.cancelID
 	s.cancels[id] = cancel
-	return ctx, s.gen, func() {
+	return ctx, s.gen.Load(), func() {
 		delete(s.cancels, id)
 		cancel()
 	}
@@ -112,7 +112,7 @@ func (s *Store) trackRequest(ctx context.Context) (context.Context, uint64, func
 // current reports whether the store is still unlocked in generation gen.
 // The caller holds s.mu.
 func (s *Store) current(gen uint64) error {
-	if s.gen != gen || s.state == nil {
+	if s.gen.Load() != gen || s.state == nil {
 		return ErrSyncInterrupted
 	}
 	if s.syncHalt != nil {

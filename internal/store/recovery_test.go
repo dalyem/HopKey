@@ -40,20 +40,38 @@ func hasWarning(info Info, sub string) bool {
 	return slices.ContainsFunc(info.Warnings, func(w string) bool { return strings.Contains(w, sub) })
 }
 
-// storedRecord reads the device record from the keychain, as a restart
-// would.
+// storedRecord reads the device record from the device key store, as a
+// restart would. It must belong to accountID.
 func storedRecord(t *testing.T, cfg Config, accountID string) deviceRecord {
 	t.Helper()
-	raw, err := cfg.Keyring.Get(keychainService, "device:"+accountID)
+	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
+	dc, err := s.readDeviceConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec, err := parseDeviceRecord([]byte(raw))
+	rec, err := s.deviceStore(dc).load()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if rec.AccountID.String() != accountID {
+		t.Fatalf("the stored record belongs to account %v", rec.AccountID)
 	}
 	return *rec
 }
+
+// deviceSlot is the keychain entry of the device that device.json in cfg's
+// data directory names.
+func deviceSlot(t *testing.T, cfg Config) string {
+	t.Helper()
+	var c deviceConfig
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(cfg.DataDir, "device.json"))), &c); err != nil {
+		t.Fatal(err)
+	}
+	return slotOf(c.AccountID, c.DeviceID)
+}
+
+// slotOf is the keychain entry of device dev on account acct.
+func slotOf(acct, dev model.ID) string { return "device:" + acct.String() + ":" + dev.String() }
 
 // Item 1, key still readable: a password change committed, its kit not yet
 // confirmed, and then hop unlock --password replaces the device key. The
@@ -702,7 +720,7 @@ func TestNoPlaintextOnDiskSealedFile(t *testing.T) {
 func TestDeviceRecordSchema(t *testing.T) {
 	cfg := testConfig(t)
 	f := newVault(t, cfg)
-	user := "device:" + f.kit.AccountID
+	user := deviceSlot(t, cfg)
 	raw, err := cfg.Keyring.Get(keychainService, user)
 	if err != nil {
 		t.Fatal(err)

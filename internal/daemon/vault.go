@@ -136,7 +136,7 @@ func (d *Daemon) lockVault(v Vault) {
 // does. For a revoked device it also writes an ssh config with no hosts, so
 // nothing the vault decrypted stays behind (§5.5). The caller holds d.mu.
 func (d *Daemon) dropKeysLocked(revoked bool) {
-	old := d.live.swap(sshagent.NewKeyring())
+	old := d.live.swap(sshagent.NewKeyring(), d.live.generation())
 	old.RemoveAll()
 	st := lockedState()
 	st.revoked = revoked
@@ -149,12 +149,15 @@ func (d *Daemon) dropKeysLocked(revoked bool) {
 }
 
 // followStore takes the daemon to the locked state when err, from any use
-// of the store, says the vault is locked (an interrupted commit locks it)
-// or this device is revoked: the agent stops serving keys the vault no
-// longer has unlocked, as after hop lock. The store's own state decides,
-// so a vault unlocked again since err is left alone. The caller holds d.mu.
+// of the store, says the vault is locked or this device is revoked, or when
+// the store has left the generation the keyring was loaded in (an
+// interrupted commit locks the store whatever error it returns): the agent
+// stops serving keys the vault no longer has unlocked, as after hop lock.
+// The store's own state decides, so a vault unlocked again since err is
+// left alone; its keys stay fenced off until the next reload. The caller
+// holds d.mu.
 func (d *Daemon) followStore(err error) {
-	if !errors.Is(err, model.ErrLocked) && !errors.Is(err, store.ErrDeviceRevoked) {
+	if !errors.Is(err, model.ErrLocked) && !errors.Is(err, store.ErrDeviceRevoked) && !d.live.stale() {
 		return
 	}
 	v, ok := d.store.(Vault)

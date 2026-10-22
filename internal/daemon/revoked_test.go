@@ -140,7 +140,9 @@ func TestRevocationEmptiesTheAgent(t *testing.T) {
 
 			rs.revoke()
 			if signal {
-				for deadline := time.Now().Add(5 * time.Second); keys() != 0 && time.Now().Before(deadline); {
+				// The teardown empties the agent first and rewrites the ssh
+				// config after: wait for both.
+				for deadline := time.Now().Add(5 * time.Second); (keys() != 0 || strings.Contains(config(), "web")) && time.Now().Before(deadline); {
 					time.Sleep(10 * time.Millisecond)
 				}
 			} else {

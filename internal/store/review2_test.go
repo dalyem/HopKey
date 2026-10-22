@@ -2,15 +2,15 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
-
-	"github.com/zalando/go-keyring"
 
 	"github.com/dalyem/hopkey/internal/model"
 )
@@ -37,15 +37,32 @@ func serverVaultIn(t *testing.T, deviceStore string) (*fixture, *fakeRemote) {
 	return f, r
 }
 
-// recordGone reports whether the device key store of f holds no record.
-func recordGone(t *testing.T, f *fixture, deviceStore string) bool {
+// tombstoned reports whether the device key store of f holds the
+// tombstone of device dev where dev's record was, and so no key material.
+func tombstoned(t *testing.T, f *fixture, deviceStore string, dev model.ID) bool {
 	t.Helper()
-	if deviceStore == DeviceStoreFile {
-		_, err := os.Stat(filepath.Join(f.cfg.DataDir, "device.key"))
-		return errors.Is(err, os.ErrNotExist)
+	acct, err := model.ParseID(f.kit.AccountID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, err := f.cfg.Keyring.Get(keychainService, "device:"+f.kit.AccountID)
-	return errors.Is(err, keyring.ErrNotFound)
+	var raw string
+	if deviceStore == DeviceStoreFile {
+		b, err := os.ReadFile(filepath.Join(f.cfg.DataDir, "device.key"))
+		if err != nil {
+			return false
+		}
+		raw = string(b)
+	} else if raw, err = f.cfg.Keyring.Get(keychainService, slotOf(acct, dev)); err != nil {
+		return false
+	}
+	// Decoded here, not with parseTombstone, so the check does not lean on
+	// the code under test.
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return false
+	}
+	want := map[string]any{"v": float64(2), "revoked": true, "account_id": acct.String(), "device_id": dev.String()}
+	return maps.Equal(m, want)
 }
 
 func revokedFileExists(t *testing.T, cfg Config) bool {
@@ -102,7 +119,8 @@ func TestPasswordUnlockMeetsTheRevocationOfThisDevice(t *testing.T) {
 			p := newPair(t)
 			a := p.a.s
 			before := stateHead(t, p.a.cfg)
-			revokeOn(t, p.b.s, p.r, deviceOf(a))
+			dev := deviceOf(a)
+			revokeOn(t, p.b.s, p.r, dev)
 			rseq := p.r.head().Seq
 			a.Lock()
 			if keyLost {
@@ -128,8 +146,8 @@ func TestPasswordUnlockMeetsTheRevocationOfThisDevice(t *testing.T) {
 			if _, err := os.Stat(a.l.entryFile(rseq)); !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("the revoking checkpoint was written: %v", err)
 			}
-			if !recordGone(t, p.a, DeviceStoreKeychain) {
-				t.Error("the revoked device's record is still in the keychain")
+			if !tombstoned(t, p.a, DeviceStoreKeychain, dev) {
+				t.Error("the revoked device's keychain entry is not its tombstone")
 			}
 			s, err := tryOpen(t, p.a.cfg)
 			if err != nil {
@@ -176,10 +194,11 @@ func TestRemotePasswordUnlockNeedsALockedVault(t *testing.T) {
 	}
 }
 
-// Round 2, finding 4: a revocation deletes the device record whether or not
-// revoked.json could be written. Without the marker an Open stays locked,
-// and the server path meets the revocation again and records it.
-func TestRevocationDestroysTheDeviceRecord(t *testing.T) {
+// Round 2, finding 4, and round 3 (D1), finding 4: a revocation replaces
+// the device record with its tombstone whether or not revoked.json could
+// be written. Without the marker the tombstone alone keeps every unlock
+// refused, before the server is asked anything.
+func TestRevocationTombstonesTheDeviceRecord(t *testing.T) {
 	for _, deviceStore := range []string{DeviceStoreKeychain, DeviceStoreFile} {
 		for _, markerFails := range []bool{false, true} {
 			name := deviceStore + "/marker written"
@@ -192,7 +211,8 @@ func TestRevocationDestroysTheDeviceRecord(t *testing.T) {
 				addHost(t, f.s, "web")
 				pushAll(t, f.s, r)
 				b := secondDevice(t, f, r)
-				revokeOn(t, b.s, r, deviceOf(f.s))
+				dev := deviceOf(f.s)
+				revokeOn(t, b.s, r, dev)
 				if markerFails {
 					f.s.testHook = crashAt("revoke:marker")
 				}
@@ -207,8 +227,8 @@ func TestRevocationDestroysTheDeviceRecord(t *testing.T) {
 				if there := revokedFileExists(t, f.cfg); there == markerFails {
 					t.Errorf("revoked.json there: %v", there)
 				}
-				if !recordGone(t, f, deviceStore) {
-					t.Fatal("the device record survived the revocation")
+				if !tombstoned(t, f, deviceStore, dev) {
+					t.Fatal("the device record was not replaced with its tombstone")
 				}
 
 				s, err := tryOpen(t, f.cfg)
@@ -219,17 +239,21 @@ func TestRevocationDestroysTheDeviceRecord(t *testing.T) {
 					t.Fatal("the vault of a revoked device unlocked after a restart")
 				}
 				if markerFails {
-					if err := s.Unlock(ctx); !errors.Is(err, ErrDeviceKey) {
+					if err := s.Unlock(ctx); !errors.Is(err, ErrDeviceRevoked) {
 						t.Errorf("unlock without the marker: %v", err)
 					}
-					if err := s.UnlockWithPassword(ctx, []byte(testPassword), f.kit.SecretKey); !errors.Is(err, ErrServerBacked) {
+					if err := s.UnlockWithPassword(ctx, []byte(testPassword), f.kit.SecretKey); !errors.Is(err, ErrDeviceRevoked) {
 						t.Errorf("local password unlock: %v", err)
 					}
+					posts := r.postCount()
 					if err := s.UnlockWithPasswordRemote(ctx, r, []byte(testPassword), f.kit.SecretKey); !errors.Is(err, ErrDeviceRevoked) {
 						t.Errorf("password unlock through the server: %v", err)
 					}
-					if !revokedFileExists(t, f.cfg) {
-						t.Error("meeting the revocation again did not record it")
+					if r.postCount() != posts {
+						t.Error("the refused password unlock posted to the server")
+					}
+					if info := s.Info(); !info.Revoked {
+						t.Errorf("info without the marker %+v", info)
 					}
 				} else if err := s.Unlock(ctx); !errors.Is(err, ErrDeviceRevoked) {
 					t.Errorf("unlock: %v", err)

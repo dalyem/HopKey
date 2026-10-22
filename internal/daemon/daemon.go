@@ -134,7 +134,7 @@ func Start(opts Options) (*Daemon, error) {
 	}
 	opts.Paths.RunDir = runDir
 
-	live := newLiveAgent()
+	live := newLiveAgent(fenceOf(opts.Store))
 	agentSrv, err := sshagent.Listen(opts.Paths.AgentSocket(), live)
 	if errors.Is(err, sshagent.ErrInUse) {
 		return nil, ErrAlreadyRunning

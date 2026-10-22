@@ -188,6 +188,7 @@ func (p *PendingInit) Commit() (st *Store, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state, s.sec, s.dev, s.rec, s.devCfg = p.state, p.sec, p.dev, p.rec, p.devCfg
+	s.gen.Add(1)
 	if err := s.writeAccountFile(); err != nil {
 		return nil, err
 	}

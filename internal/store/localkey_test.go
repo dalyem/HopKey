@@ -64,7 +64,7 @@ func TestDeviceRecordV1Schema(t *testing.T) {
 func TestV1RecordIsUpgradedDurably(t *testing.T) {
 	cfg := testConfig(t)
 	f := newVault(t, cfg)
-	user := "device:" + f.kit.AccountID
+	user := deviceSlot(t, cfg)
 	v1 := string(v1Record(t, f.s.rec))
 	seed := bytes.Clone(f.s.rec.SigSeed)
 	if err := cfg.Keyring.Set(keychainService, user, v1); err != nil {

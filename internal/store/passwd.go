@@ -55,10 +55,11 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 // record is saved and installed, so no read or write sees a state or an
 // outbox in between, and every failure leaves it locked.
 //
-// A checkpoint on the server that revokes this device (the one device.json
-// names, or the one whose record is still readable) is met in the public
-// stage, before anything is decrypted: the device is revoked (§5.5) and it
-// returns ErrDeviceRevoked.
+// A checkpoint on the server that revokes this device (the one whose
+// record is still readable, or else the one device.json names) is met in
+// the public stage, before anything is decrypted: the device is revoked
+// (§5.5) and it returns ErrDeviceRevoked. So does a tombstone where the
+// device record was, without asking the server anything.
 //
 // It waits on the server without holding the store's mutex, so Lock is
 // never blocked behind it. A lock (§11.2), or an unlock with the device
@@ -95,27 +96,39 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err != nil {
 		return err
 	}
-	// The device key this device has now, if it can still be read.
+	// The device key this device has now, if it can still be read. A
+	// tombstone in its place is a revocation whose revoked.json was lost:
+	// it is as terminal as the marker (§5.5).
 	var old *deviceRecord
 	if s.rec != nil {
 		old = s.rec.clone()
 	} else if rec, err := s.deviceStore(cfg).load(); err == nil {
 		old = rec
+	} else if errors.Is(err, ErrDeviceRevoked) {
+		s.setRevoked(err)
+		return err
 	}
 	defer func() {
 		if old != nil {
 			old.zero()
 		}
 	}()
-	// The devices this machine is in the log as, public: the one
-	// device.json names and the one whose record can still be read. A
-	// checkpoint that revokes either revokes this device (transition).
+	// The one device this machine is in the log as, public: the one whose
+	// record can still be read, or else the one device.json names. A
+	// checkpoint that revokes it revokes this device (transition). Only
+	// one of them: after a replacement that stopped halfway, device.json
+	// can still name the device whose key was lost, and its revocation
+	// must not revoke the record that replaced it.
 	var self []model.ID
-	if !cfg.DeviceID.IsZero() {
-		self = append(self, cfg.DeviceID)
+	switch {
+	case old != nil:
+		self = []model.ID{old.DeviceID}
+	case !cfg.DeviceID.IsZero():
+		self = []model.ID{cfg.DeviceID}
 	}
-	if old != nil && old.DeviceID != cfg.DeviceID {
-		self = append(self, old.DeviceID)
+	var oldID model.ID
+	if old != nil {
+		oldID = old.DeviceID
 	}
 	var sk *crypto.SecretKey
 	switch {
@@ -234,7 +247,7 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 		if st, sec, err = s.bootstrapRemote(rctx, r, fl, gen, st, sec, info, rec, append(self, rec.DeviceID)); err != nil {
 			return err
 		}
-		if s.gen != gen || s.state != nil {
+		if s.gen.Load() != gen || s.state != nil {
 			return ErrSyncInterrupted
 		}
 	}
@@ -247,12 +260,24 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	}
 	s.dropLocked(nil)
 	s.state, s.sec, s.dev, s.rec, s.devCfg, s.repaired, s.server = st, sec, dev, rec, next, repaired, server
+	s.gen.Add(1)
 	// device.json still names the old device: reconciling moves it to the
 	// stale list and takes the new one off. A failure from here locks the
 	// store, as a failed Unlock does.
 	if err := s.finishUnlock(); err != nil {
 		s.dropLocked(err)
 		return err
+	}
+	// device.json names the new device now: the old keychain entries can
+	// go. This is best effort; an entry left behind belongs to a stale
+	// device, which the next hop passwd revokes.
+	if s.devCfg.DeviceID == rec.DeviceID {
+		ds := s.deviceStore(s.devCfg)
+		for _, id := range []model.ID{cfg.DeviceID, oldID} {
+			if !id.IsZero() && id != rec.DeviceID {
+				ds.deleteSlot(id)
+			}
+		}
 	}
 	return nil
 }
@@ -291,7 +316,7 @@ func (s *Store) outside(fl *fileHold, gen uint64, f func() error) error {
 	s.mu.Unlock()
 	err := f()
 	s.mu.Lock()
-	if s.gen != gen || s.state != nil {
+	if s.gen.Load() != gen || s.state != nil {
 		return ErrSyncInterrupted
 	}
 	if lerr := fl.lock(); lerr != nil {
@@ -601,7 +626,7 @@ func (s *Store) persistKitSK() error {
 		return fail(err)
 	}
 	defer clear(want)
-	if cur, err := ds.load(); err == nil {
+	if cur, err := ds.loadID(next.DeviceID); err == nil {
 		got, err := cur.jcs()
 		cur.zero()
 		done := err == nil && bytes.Equal(got, want)

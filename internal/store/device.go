@@ -28,7 +28,8 @@ const (
 // PassphraseEnv seals the device key file when it is set at hop init.
 const PassphraseEnv = "HOP_DEVICE_PASSPHRASE"
 
-// keychainService is the keychain service name. The account is the user.
+// keychainService is the keychain service name. Each device has its own
+// entry under it (deviceStore.slot).
 const keychainService = "hopkey-device"
 
 // Keyring is the OS keychain. OSKeyring is the real one; tests use
@@ -291,7 +292,32 @@ func (d *deviceStore) Describe() string {
 // keys and the Secret Key in plain form, protected only by its 0600 mode.
 func (d *deviceStore) Unsealed() bool { return d.cfg.Store == DeviceStoreFile && !d.cfg.Sealed }
 
-func (d *deviceStore) user() string { return "device:" + d.cfg.AccountID.String() }
+// slot is the keychain entry of one device: per account and per device, so
+// two vaults of the same account on one machine (two data directories)
+// never share an entry, and deleting or tombstoning one device's record
+// leaves the others alone.
+func (d *deviceStore) slot(id model.ID) string {
+	return "device:" + d.cfg.AccountID.String() + ":" + id.String()
+}
+
+// candidates are the keychain slots load tries, in order: the device
+// device.json names, then its stale devices, newest first. A password
+// unlock records the new device as stale before it saves the new record
+// and names it in device.json only after: if it stops in between, the new
+// record is found this way, and it decides which device this is
+// (reconcileDevice).
+func (d *deviceStore) candidates() []model.ID {
+	var ids []model.ID
+	if !d.cfg.DeviceID.IsZero() {
+		ids = append(ids, d.cfg.DeviceID)
+	}
+	for _, id := range slices.Backward(d.cfg.StaleDevices) {
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
 
 // probe checks that the store can hold a record before init commits to it.
 func (d *deviceStore) probe() error {
@@ -341,28 +367,80 @@ type deviceKeyFile struct {
 	Key        canonjson.Raw `json:"key"`
 }
 
+// load reads this device's record: the one whose device is the identity
+// of this data directory. It fails with ErrDeviceRevoked when it meets the
+// tombstone of a revoked device (§5.5, Store.revoke) instead.
 func (d *deviceStore) load() (*deviceRecord, error) {
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
-		raw, err := d.ring.Get(keychainService, d.user())
-		if err != nil {
-			return nil, fmt.Errorf("%w: keychain: %v (hop unlock --password restores it)", ErrDeviceKey, err)
+		ids := d.candidates()
+		if len(ids) == 0 {
+			return nil, fmt.Errorf("%w: %s names no device (hop unlock --password restores it)", ErrDeviceKey, d.l.deviceConfig())
 		}
-		// The decoder's error is not quoted: it can carry a character of
-		// the keys.
-		rec, err := parseDeviceRecord([]byte(raw))
-		if err != nil {
-			return nil, fmt.Errorf("%w: the keychain entry is not a valid device record", ErrDeviceKey)
+		var first error
+		for _, id := range ids {
+			rec, err := d.loadSlot(id)
+			if err == nil || errors.Is(err, ErrDeviceRevoked) {
+				return rec, err
+			}
+			if first == nil {
+				first = err
+			}
 		}
-		if rec.AccountID != d.cfg.AccountID {
-			rec.zero()
-			return nil, fmt.Errorf("%w: the stored device key does not belong to this vault", ErrDeviceKey)
-		}
-		return rec, nil
+		return nil, first
 	case DeviceStoreFile:
 		return d.loadFile()
 	}
 	return nil, fmt.Errorf("%w: unknown store %q", ErrDeviceKey, d.cfg.Store)
+}
+
+// loadID reads the record of device id, and fails unless that is what the
+// store holds.
+func (d *deviceStore) loadID(id model.ID) (*deviceRecord, error) {
+	switch d.cfg.Store {
+	case DeviceStoreKeychain:
+		return d.loadSlot(id)
+	case DeviceStoreFile:
+		rec, err := d.loadFile()
+		if err != nil {
+			return nil, err
+		}
+		if rec.DeviceID != id {
+			rec.zero()
+			return nil, fmt.Errorf("%w: %s holds the key of device %v, not %v", ErrDeviceKey, d.l.deviceKeyFile(), rec.DeviceID, id)
+		}
+		return rec, nil
+	}
+	return nil, fmt.Errorf("%w: unknown store %q", ErrDeviceKey, d.cfg.Store)
+}
+
+// loadSlot reads the keychain entry of device id.
+func (d *deviceStore) loadSlot(id model.ID) (*deviceRecord, error) {
+	raw, err := d.ring.Get(keychainService, d.slot(id))
+	if err != nil {
+		return nil, fmt.Errorf("%w: keychain: %v (hop unlock --password restores it)", ErrDeviceKey, err)
+	}
+	if t, ok := parseTombstone([]byte(raw)); ok {
+		if t.AccountID != d.cfg.AccountID || t.DeviceID != id {
+			return nil, fmt.Errorf("%w: the keychain entry of device %v holds another device's tombstone", ErrDeviceKey, id)
+		}
+		return nil, t.err()
+	}
+	// The decoder's error is not quoted: it can carry a character of the
+	// keys.
+	rec, err := parseDeviceRecord([]byte(raw))
+	if err != nil {
+		return nil, fmt.Errorf("%w: the keychain entry is not a valid device record", ErrDeviceKey)
+	}
+	if rec.AccountID != d.cfg.AccountID {
+		rec.zero()
+		return nil, fmt.Errorf("%w: the stored device key does not belong to this vault", ErrDeviceKey)
+	}
+	if rec.DeviceID != id {
+		rec.zero()
+		return nil, fmt.Errorf("%w: the keychain entry of device %v holds the key of %v", ErrDeviceKey, id, rec.DeviceID)
+	}
+	return rec, nil
 }
 
 func (d *deviceStore) loadFile() (*deviceRecord, error) {
@@ -370,6 +448,12 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v (hop unlock --password restores it)", ErrDeviceKey, err)
+	}
+	if t, ok := parseTombstone(b); ok {
+		if t.AccountID != d.cfg.AccountID {
+			return nil, fmt.Errorf("%w: %s holds another account's tombstone", ErrDeviceKey, path)
+		}
+		return nil, t.err()
 	}
 	var f deviceKeyFile
 	if err := canonjson.Unmarshal(b, &f); err != nil || f.V != 1 {
@@ -425,7 +509,7 @@ func (d *deviceStore) save(rec *deviceRecord) error {
 			return err
 		}
 		defer clear(b)
-		if err := d.ring.Set(keychainService, d.user(), string(b)); err != nil {
+		if err := d.ring.Set(keychainService, d.slot(rec.DeviceID), string(b)); err != nil {
 			return fmt.Errorf("saving the device key in the keychain: %w", err)
 		}
 		return nil
@@ -509,7 +593,7 @@ func (d *deviceStore) storeDurably(rec *deviceRecord) error {
 	if err := d.sync(); err != nil {
 		return err
 	}
-	got, err := d.load()
+	got, err := d.loadID(rec.DeviceID)
 	if err != nil {
 		return err
 	}
@@ -526,17 +610,114 @@ func (d *deviceStore) storeDurably(rec *deviceRecord) error {
 	return nil
 }
 
-// destroy deletes the device record for good: the keychain entry, or
-// device.key with its directory fsynced after. A record that is already
-// gone is no error. Only a revoked device does this (§5.5).
-func (d *deviceStore) destroy() error {
+// deviceTombstone is what a revoked device's record is overwritten with
+// (§5.5, Store.revoke), in its keychain entry or as device.key itself:
+//
+//	JCS({"v":2, "revoked":true, "account_id":id, "device_id":id})
+//
+// It holds no key material. Every unlock that meets one for this data
+// directory's device fails with ErrDeviceRevoked, even when
+// vault/revoked.json is missing.
+type deviceTombstone struct {
+	V         int      `json:"v"`
+	Revoked   bool     `json:"revoked"`
+	AccountID model.ID `json:"account_id"`
+	DeviceID  model.ID `json:"device_id"`
+}
+
+// parseTombstone strictly decodes a tombstone; ok is false for anything
+// else, a device record included.
+func parseTombstone(b []byte) (deviceTombstone, bool) {
+	var t deviceTombstone
+	if canonjson.Unmarshal(b, &t) != nil || t.V != 2 || !t.Revoked || t.AccountID.IsZero() || t.DeviceID.IsZero() {
+		return deviceTombstone{}, false
+	}
+	return t, true
+}
+
+func (t deviceTombstone) err() error {
+	return fmt.Errorf("%w (device %v; the device key store holds its tombstone)", ErrDeviceRevoked, t.DeviceID)
+}
+
+// fileDevice is the device device.key belongs to, a record or a tombstone,
+// from its public members. ok is false when there is no file.
+func (d *deviceStore) fileDevice() (id model.ID, ok bool, err error) {
+	b, err := os.ReadFile(d.l.deviceKeyFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return model.ID{}, false, nil
+	}
+	if err != nil {
+		return model.ID{}, false, err
+	}
+	if t, isTomb := parseTombstone(b); isTomb {
+		return t.DeviceID, true, nil
+	}
+	var f deviceKeyFile
+	if err := canonjson.Unmarshal(b, &f); err != nil || f.V != 1 {
+		return model.ID{}, false, fmt.Errorf("%s does not parse", d.l.deviceKeyFile())
+	}
+	return f.DeviceID, true, nil
+}
+
+// errOtherDevice means device.key belongs to another device than the one a
+// revocation names: it is left alone.
+var errOtherDevice = errors.New("device.key holds another device's key, which is left alone")
+
+// tombstone overwrites device id's record with its tombstone, durably. The
+// keychain entry is the device's own. device.key is shared by whatever
+// device this data directory is, so it is overwritten only when it is
+// missing or belongs to id.
+func (d *deviceStore) tombstone(id model.ID) error {
+	b, err := canonjson.Marshal(deviceTombstone{V: 2, Revoked: true, AccountID: d.cfg.AccountID, DeviceID: id})
+	if err != nil {
+		return err
+	}
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
-		if err := d.ring.Delete(keychainService, d.user()); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		if got, err := d.ring.Get(keychainService, d.slot(id)); err == nil && got == string(b) {
+			return nil
+		}
+		if err := d.ring.Set(keychainService, d.slot(id), string(b)); err != nil {
 			return err
+		}
+		got, err := d.ring.Get(keychainService, d.slot(id))
+		if err != nil {
+			return err
+		}
+		if got != string(b) {
+			return errors.New("the keychain gave back something other than the tombstone")
 		}
 		return nil
 	case DeviceStoreFile:
+		if cur, ok, err := d.fileDevice(); err != nil {
+			return err
+		} else if ok && cur != id {
+			return errOtherDevice
+		}
+		if got, err := os.ReadFile(d.l.deviceKeyFile()); err == nil && bytes.Equal(got, b) {
+			return nil
+		}
+		return writeFileAtomic(d.l.deviceKeyFile(), b)
+	}
+	return fmt.Errorf("unknown device key store %q", d.cfg.Store)
+}
+
+// destroy deletes device id's record: its keychain entry, or device.key
+// when that belongs to id, with its directory fsynced after. A record that
+// is already gone is no error. A revocation does this only when neither
+// revoked.json nor the tombstone could be written (Store.revoke).
+func (d *deviceStore) destroy(id model.ID) error {
+	switch d.cfg.Store {
+	case DeviceStoreKeychain:
+		return d.deleteSlot(id)
+	case DeviceStoreFile:
+		if cur, ok, err := d.fileDevice(); err != nil {
+			return err
+		} else if !ok {
+			return nil
+		} else if cur != id {
+			return errOtherDevice
+		}
 		path := d.l.deviceKeyFile()
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -544,6 +725,19 @@ func (d *deviceStore) destroy() error {
 		return syncDir(filepath.Dir(path))
 	}
 	return fmt.Errorf("unknown device key store %q", d.cfg.Store)
+}
+
+// deleteSlot deletes device id's keychain entry. One that is already gone
+// is no error. The file store has nothing to do: device.key is replaced in
+// place.
+func (d *deviceStore) deleteSlot(id model.ID) error {
+	if d.cfg.Store != DeviceStoreKeychain {
+		return nil
+	}
+	if err := d.ring.Delete(keychainService, d.slot(id)); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 // equal reports whether r and o are the same record.

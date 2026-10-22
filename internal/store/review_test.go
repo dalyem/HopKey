@@ -501,7 +501,7 @@ func TestInitReadsTheDeviceRecordBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ring.memRing.Set(keychainService, "device:"+p.Kit().AccountID, "not a device record"); err != nil {
+	if err := ring.memRing.Set(keychainService, slotOf(p.rec.AccountID, p.rec.DeviceID), "not a device record"); err != nil {
 		t.Fatal(err)
 	}
 	if s, err := p.Commit(); err == nil {
@@ -523,7 +523,7 @@ func TestAckKitKeepsTheJournalWhileTheWrongRecordIsStored(t *testing.T) {
 	ring := &staleRing{memRing: newMemRing()}
 	cfg.Keyring = ring
 	f := newVault(t, cfg)
-	user := "device:" + f.kit.AccountID
+	user := deviceSlot(t, cfg)
 	kit, err := f.s.ChangePassword(ctx, []byte(testPassword), []byte(newPassword))
 	if err != nil {
 		t.Fatal(err)
