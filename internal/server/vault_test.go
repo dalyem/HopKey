@@ -3,7 +3,11 @@ package server
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"math"
+	"net"
+	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -700,7 +704,7 @@ func TestArrayLens(t *testing.T) {
 		n    int
 	}
 	var out []got
-	arrayLens([]byte(` {"a":[1, [2,3], {"b":[]}, "x]\\\",[" ], "c":{"d":[ {} ,{"e":[1]}]}}`), func(path []string, n int) bool {
+	arrayLens([]byte(` {"a":[1, [2,3], {"b":[]}, "x]\\\",[" ], "c":{"d":[ {} ,{"e":[1]}]}}`), 32, []string{"a", "b", "c", "d", "e"}, func(path []string, n int) bool {
 		out = append(out, got{strings.Join(path, "."), n})
 		return true
 	})
@@ -740,4 +744,354 @@ func TestLargeCursorsAndWaits(t *testing.T) {
 	}
 	r, _ := e.readLog(v, tok, "?wait=0")
 	wantStatus(t, r, 200, "wait=0")
+}
+
+// The scan stops at MaxDepth: brackets past it are refused at once, and
+// nesting up to it is scanned.
+func TestArrayLensDepth(t *testing.T) {
+	nest := func(n int) []byte { return []byte(strings.Repeat("[", n) + strings.Repeat("]", n)) }
+	var arrays int
+	count := func([]string, int) bool { arrays++; return true }
+	if !arrayLens(nest(32), 32, nil, count) || arrays != 32 {
+		t.Errorf("32 nested arrays at depth 32: %d scanned", arrays)
+	}
+	arrays = 0
+	if arrayLens(nest(33), 32, nil, count) || arrays != 0 {
+		t.Errorf("33 nested arrays at depth 32 passed, or %d were scanned first", arrays)
+	}
+}
+
+// R14: an unauthenticated signup body of millions of brackets is refused
+// by the collection scan at MaxDepth, with a small fixed allocation that
+// does not grow with the body.
+func TestCollectionScanBoundsNesting(t *testing.T) {
+	s := &Server{lim: DefaultLimits()}
+	body := []byte(`{"wires":` + strings.Repeat("[", 4<<20))
+	if s.collectionsWithin(body, "wires") {
+		t.Fatal("4 Mi nested arrays passed the scan")
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	const runs = 10
+	allocs := testing.AllocsPerRun(runs, func() { s.collectionsWithin(body, "wires") })
+	runtime.ReadMemStats(&after)
+	// AllocsPerRun makes one warm-up call besides the runs.
+	perCall := (after.TotalAlloc - before.TotalAlloc) / (runs + 1)
+	if allocs > 4 || perCall > 16<<10 {
+		t.Errorf("refusing a %d-byte body of brackets allocated %v times, %d bytes per scan", len(body), allocs, perCall)
+	}
+
+	var prepares atomic.Int64
+	e := newEnv(t, withHooks(func(s *Server) { s.hooks.prepare = func() { prepares.Add(1) } }))
+	wantCode(t, e.do("POST", "/v1/signup", "", body), 413, "too_large", "a signup body of 4 Mi brackets")
+	if n := prepares.Load(); n != 0 {
+		t.Errorf("%d wires prepared", n)
+	}
+}
+
+// Member names are compared decoded, escapes included, as the strict
+// decoder compares them (R14).
+func TestArrayLensDecodesNames(t *testing.T) {
+	// %u stands for a backslash-u escape.
+	for body, want := range map[string]string{
+		`{"ops":[]}`:                             "ops",
+		`{"o%u0070s":[]}`:                        "ops",
+		`{"%u006F%u0070%u0073":[]}`:              "ops",
+		`{"%u006f%u0070%u0073":[]}`:              "ops",
+		`{"w%u0069re":[]}`:                       "wire",
+		`{"\/x\b\f\n\r\t\"\\":[]}`:               "/x\b\f\n\r\t\"\\",
+		`{"op":[]}`:                              "",
+		`{"opss":[]}`:                            "",
+		`{"ops%u0000":[]}`:                       "",
+		`{"%u00f6ps":[]}`:                        "",
+		`{"%ud83d%ude00ops":[]}`:                 "",
+		`{"OPS":[]}`:                             "",
+		`{"o\\ps":[]}`:                           "",
+		`{"o\qps":[]}`:                           "",
+		`{"o%u00":[]}`:                           "",
+		`{"o%u00zz":[]}`:                         "",
+		`{"\"ops":[]}`:                           "",
+		`{"` + strings.Repeat("x", 40) + `":[]}`: "",
+	} {
+		body = strings.ReplaceAll(body, "%u", `\u`)
+		names := []string{"ops", "wire", "/x\b\f\n\r\t\"\\"}
+		var got []string
+		arrayLens([]byte(body), 32, names, func(path []string, n int) bool {
+			got = append(got, strings.Join(path, "."))
+			return true
+		})
+		if len(got) != 1 || got[0] != want {
+			t.Errorf("%s: paths %q, want [%q]", body, got, want)
+		}
+	}
+}
+
+// R14: the early collection checks see a limited name however it is
+// escaped, so the bypass by escapes is closed; a near miss is not limited,
+// and a valid body with escaped names is never refused as too large.
+func TestCollectionLimitsDecodeNames(t *testing.T) {
+	var prepares atomic.Int64
+	e := newEnv(t, withHooks(func(s *Server) { s.hooks.prepare = func() { prepares.Add(1) } }))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	A := v.dev(0)
+	tok := e.session(v, A)
+	base := prepares.Load()
+	many := func(n int) string {
+		if n == 0 {
+			return "[]"
+		}
+		return "[" + strings.Repeat(`{"a":[1,"]"]},`, n-1) + `{}]`
+	}
+	// Spellings of a name: as written, each byte escaped in turn (in lower
+	// and upper case hex), and every byte escaped.
+	spell := func(name string) []string {
+		out := []string{name}
+		all := ""
+		for i := range len(name) {
+			out = append(out, name[:i]+fmt.Sprintf(`\u%04x`, name[i])+name[i+1:],
+				name[:i]+fmt.Sprintf(`\u%04X`, name[i])+name[i+1:])
+			all += fmt.Sprintf(`\u%04x`, name[i])
+		}
+		return append(out, all)
+	}
+	post := func(wire, entry, ops, objects string, nOps, nObjects int) string {
+		return `{"` + wire + `":{"` + entry + `":{"` + ops + `":` + many(nOps) + `},"sigs":[],"` + objects + `":` + many(nObjects) + `}}`
+	}
+	signup := func(wires, rest string) string {
+		return `{"email":"b@example.com","registration_code":"x","challenge":"","pop_sig":"","` + wires + `":` + rest + `}`
+	}
+	type tc struct{ name, body string }
+	var over, within []tc
+	for _, w := range spell("wire") {
+		over = append(over, tc{"wire " + w, post(w, "entry", "ops", "objects", 8193, 0)})
+		within = append(within, tc{"wire " + w, post(w, "entry", "ops", "objects", 8192, 16384)})
+	}
+	for _, en := range spell("entry") {
+		over = append(over, tc{"entry " + en, post("wire", en, "ops", "objects", 8193, 0)})
+		over = append(over, tc{"signup entry " + en, signup("wires", `[{},{"`+en+`":{"ops":`+many(8193)+`}}]`)})
+	}
+	for _, o := range spell("ops") {
+		over = append(over, tc{"ops " + o, post("wire", "entry", o, "objects", 8193, 0)})
+		over = append(over, tc{"signup ops " + o, signup("wires", `[{"entry":{"`+o+`":`+many(8193)+`}}]`)})
+		within = append(within, tc{"ops " + o, post("wire", "entry", o, "objects", 8192, 0)})
+	}
+	for _, o := range spell("objects") {
+		over = append(over, tc{"objects " + o, post("wire", "entry", "ops", o, 1, 16385)})
+		over = append(over, tc{"signup objects " + o, signup("wires", `[{"`+o+`":`+many(16385)+`}]`)})
+		within = append(within, tc{"objects " + o, post("wire", "entry", "ops", o, 1, 16384)})
+	}
+	for _, w := range spell("wires") {
+		over = append(over, tc{"wires " + w, signup(w, "["+strings.Repeat(`{},`, 16384)+`{}]`)})
+	}
+	// Near misses are other members, which the scan does not limit.
+	for _, o := range []string{"op", "opss", `ops%u0000`, `%u00f6ps`, "OPS", `o\\ps`} {
+		o = strings.ReplaceAll(o, "%u", `\u`)
+		within = append(within, tc{"near miss " + o, post("wire", "entry", o, "objects", 8193, 0)})
+	}
+	for _, c := range over {
+		path := logPath(v)
+		if strings.HasPrefix(c.name, "signup ") || strings.HasPrefix(c.name, "wires ") {
+			path = "/v1/signup"
+		}
+		wantCode(t, e.do("POST", path, tok, []byte(c.body)), 413, "too_large", c.name)
+	}
+	for _, c := range within {
+		if r := e.do("POST", logPath(v), tok, []byte(c.body)); r.status == 413 {
+			t.Errorf("%s: a body within the limits refused: %s", c.name, r)
+		}
+	}
+	if n := prepares.Load() - base; n != 0 {
+		t.Errorf("%d wires prepared", n)
+	}
+
+	// A valid wire whose limited names are all escaped is stored.
+	w := v.normal(A, 1, 10)
+	escaped := func(name string) string { sp := spell(name); return sp[len(sp)-1] }
+	raw := string(wireJSON(t, w))
+	for _, name := range []string{"entry", "ops", "objects"} {
+		raw = strings.Replace(raw, `"`+name+`":`, `"`+escaped(name)+`":`, 1)
+	}
+	body := []byte(`{"` + escaped("wire") + `":` + raw + `}`)
+	if !e.srv.collectionsWithin(body, "wire") {
+		t.Error("the scan refused a valid wire with escaped names")
+	}
+	var h vaultlog.Head
+	e.must(e.do("POST", logPath(v), tok, body), 200, &h)
+	if h.Seq != w.Entry.Seq {
+		t.Errorf("commit %+v, want seq %d", h, w.Entry.Seq)
+	}
+}
+
+// refsOf is how many requests hold or wait for the account's admission
+// lock.
+func (l *accountLocks) refsOf(id model.ID) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if a := l.m[id]; a != nil {
+		return a.refs
+	}
+	return 0
+}
+
+// R2: a log response that passed its admission check is written before an
+// invalidating commit can complete. The commit waits for the account's
+// admission lock, which the response holds until it is flushed; the
+// response is never written after the invalidation commits. (A commit
+// that lands before the admission check gets the 401 of
+// TestLogResponseAdmissionRechecksAuth.)
+func TestLogAdmissionOrdersWithInvalidation(t *testing.T) {
+	for _, mode := range []string{"read", "long-poll"} {
+		t.Run(mode, func(t *testing.T) {
+			p := newPauser()
+			var mu sync.Mutex
+			var events []string
+			record := func(ev string) func() {
+				return func() {
+					mu.Lock()
+					defer mu.Unlock()
+					events = append(events, ev)
+				}
+			}
+			e := newEnv(t, withHooks(func(s *Server) {
+				s.hooks.admitted = p.hook
+				s.hooks.sent = record("response sent")
+				s.hooks.invalidated = record("invalidation committed")
+			}))
+			v := newVault(t, "a@example.com")
+			e.publish(v)
+			A := v.dev(0)
+			reader, writer := e.session(v, A), e.session(v, A)
+			var got <-chan resp
+			if mode == "read" {
+				p.armed.Store(true)
+				ch := make(chan resp, 1)
+				go func() { ch <- e.do("GET", logPath(v), reader, nil) }()
+				got = ch
+			} else {
+				got = e.startPoll(v, reader, v.head().Seq)
+				p.armed.Store(true)
+				e.mustPost(v, writer, v.normal(A, 1, 10))
+			}
+			p.waitPaused(t)
+			// Released on every exit, so a failure does not leave the
+			// handler paused and the server's shutdown waiting for it.
+			resume := sync.OnceFunc(func() { close(p.resumed) })
+			defer resume()
+
+			// The response is admitted and unsent. A checkpoint revoking its
+			// session must wait for it.
+			acct, ckWire := v.accountID(), v.checkpoint(A)
+			ck := make(chan resp, 1)
+			go func() { ck <- e.post(v, writer, ckWire) }()
+			deadline := time.Now().Add(15 * time.Second)
+			for e.srv.accounts.refsOf(acct) < 2 {
+				select {
+				case r := <-ck:
+					t.Fatalf("the checkpoint completed (%s) while an admitted response was unsent", r)
+				case <-time.After(time.Millisecond):
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the checkpoint never waited for the account's admission lock")
+				}
+			}
+			select {
+			case r := <-ck:
+				t.Fatalf("the checkpoint completed (%s) while an admitted response was unsent", r)
+			case <-time.After(50 * time.Millisecond):
+			}
+			resume()
+
+			var page logPage
+			e.must(waitResp(t, got), 200, &page)
+			if len(page.Entries) == 0 {
+				t.Error("the admitted response carries no entries")
+			}
+			wantStatus(t, waitResp(t, ck), 200, "the checkpoint after the admitted response")
+			mu.Lock()
+			order := strings.Join(events, ", ")
+			mu.Unlock()
+			if order != "response sent, invalidation committed" {
+				t.Errorf("events: %s", order)
+			}
+			r, _ := e.readLog(v, reader, "")
+			wantCode(t, r, 401, "unauthorized", "the revoked session after the checkpoint")
+			if n := e.srv.accounts.refsOf(v.accountID()); n != 0 {
+				t.Errorf("%d references to the account lock left", n)
+			}
+		})
+	}
+}
+
+// smallSendBuffer gives each accepted connection a small kernel send
+// buffer, so a response the client does not read blocks its writer.
+type smallSendBuffer struct{ net.Listener }
+
+func (l smallSendBuffer) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetWriteBuffer(4096)
+	}
+	return c, err
+}
+
+// R2: an admitted response holds its account's admission lock only while
+// it is written, within AdmitWrite, so a client that never reads delays
+// its account's invalidating commit by at most that long. The commit is a
+// retirement, which ends the reading device's sessions; a checkpoint would
+// carry the whole large state.
+func TestAdmitWriteBoundsInvalidationWait(t *testing.T) {
+	admitted := make(chan struct{}, 1)
+	e := newEnv(t,
+		withLimits(func(l *Limits) { l.AdmitWrite, l.MaxPageBytes = time.Second, 16*MiB }),
+		withHooks(func(s *Server) {
+			s.hooks.admitted = func() {
+				select {
+				case admitted <- struct{}{}:
+				default:
+				}
+			}
+		}))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	A := v.dev(0)
+	writer := e.session(v, A)
+	// About 4 MB of log, far more than the socket buffers hold.
+	for range 4 {
+		e.mustPost(v, writer, v.normal(A, 100, 8192))
+	}
+	B, wb := v.bootstrap("dev-b")
+	e.mustPost(v, e.login(v), wb)
+	reader := e.session(v, B)
+
+	ts := httptest.NewUnstartedServer(e.srv.Handler())
+	ts.Listener = smallSendBuffer{ts.Listener}
+	ts.Start()
+	defer ts.Close()
+	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.(*net.TCPConn).SetReadBuffer(4096)
+	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: hop\r\nAuthorization: Bearer %s\r\n\r\n", logPath(v), reader); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-admitted:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the unread request was never admitted")
+	}
+
+	start := time.Now()
+	r := e.post(v, reader, v.retire(B))
+	took := time.Since(start)
+	wantStatus(t, r, 200, "a retirement behind an unread response")
+	if took < 500*time.Millisecond {
+		t.Errorf("the retirement took %v: it did not wait for the admitted response", took)
+	}
+	if took > 10*time.Second {
+		t.Errorf("an unread response delayed the retirement %v; AdmitWrite is 1s", took)
+	}
 }

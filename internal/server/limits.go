@@ -41,6 +41,11 @@ type Limits struct {
 
 	RequestDeadline time.Duration
 	PollDeadline    time.Duration
+	// AdmitWrite bounds how long an admitted log response may take to be
+	// written. The response holds its account's admission lock meanwhile,
+	// so this is the longest a slow reader can delay its own account's
+	// credential-invalidating commits (R2).
+	AdmitWrite time.Duration
 
 	// QuotaBytes is the default account storage quota (R13).
 	QuotaBytes int64
@@ -78,6 +83,7 @@ func DefaultLimits() Limits {
 
 		RequestDeadline: 30 * time.Second,
 		PollDeadline:    60 * time.Second,
+		AdmitWrite:      10 * time.Second,
 
 		QuotaBytes: 256 * MiB,
 	}
@@ -118,8 +124,12 @@ func DefaultRates() Rates {
 // that would hand the key a fresh bucket. When the store is full, buckets
 // that have refilled completely (and so carry no information) are dropped.
 // If none has, a new key shares its scope's overflow bucket, at the same
-// rate, until one has: the overflow is never more permissive than a bucket
-// of its own, and a full store cannot be used to escape a limit.
+// rate. The keys on the overflow bucket are not recorded, so any of them
+// may be the next new key: every key without a bucket of its own stays on
+// the overflow bucket until it has refilled completely, even when the
+// store has room again. The overflow is never more permissive than a
+// bucket of its own, and a full store cannot be used to escape a limit or
+// to shed debt.
 type rateLimiter struct {
 	mu       sync.Mutex
 	now      func() time.Time
@@ -168,16 +178,25 @@ func (l *rateLimiter) allow(scope, key string, r Rate) bool {
 	defer l.mu.Unlock()
 	now := l.now()
 	k := scope + "|" + key
-	b, ok := l.buckets[k]
-	if !ok {
+	b := l.buckets[k]
+	if b == nil {
+		if o := l.overflow[scope]; o != nil {
+			o.refill(now)
+			if o.tokens < float64(o.rate.N) {
+				b = o
+			} else {
+				delete(l.overflow, scope)
+			}
+		}
+	}
+	if b == nil {
 		if len(l.buckets) >= l.max {
 			l.evict(now)
 		}
+		b = &bucket{tokens: float64(r.N), last: now, rate: r}
 		if len(l.buckets) < l.max {
-			b = &bucket{tokens: float64(r.N), last: now, rate: r}
 			l.buckets[k] = b
-		} else if b = l.overflow[scope]; b == nil {
-			b = &bucket{tokens: float64(r.N), last: now, rate: r}
+		} else {
 			l.overflow[scope] = b
 		}
 	}

@@ -167,9 +167,10 @@ func (s *Server) accountBucket(c *call, p *principal) error {
 // {entries:[{seq,h,wire}], head:{seq,h}}. With nothing after after, it
 // waits up to wait seconds (at most 55) for a commit. Each wake-up
 // re-authenticates and reads in one snapshot, and every response is
-// admitted by a fresh authentication immediately before it is written, so
-// a credential invalidated while the page was built or while waiting gets
-// a 401 with no data (R2).
+// admitted by a fresh authentication under the account's admission lock,
+// held until the response is written, so a credential invalidated while
+// the page was built or while waiting gets a 401 with no data, and no
+// response is written after an invalidation commits (R2).
 func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 	tok, ok := bearer(r)
 	if !ok {
@@ -219,13 +220,17 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 	// send admits a response. The read that built body authenticated in
 	// its own snapshot, which may be older than a commit that invalidated
 	// the credential since; so authenticate again in a new read
-	// transaction. SQLite orders each read transaction wholly before or
-	// after each write transaction, so a credential whose invalidation has
-	// committed fails here, and nothing is written for it.
+	// transaction, under the account's admission lock. An invalidating
+	// commit holds the write lock until it has committed, so a credential
+	// whose invalidation has committed fails here and nothing is written
+	// for it; and one that passes is written, within AdmitWrite, before
+	// any invalidation can commit.
 	send := func(body []byte) error {
 		if h := s.hooks.beforeSend; h != nil {
 			h()
 		}
+		unlock := s.accounts.rlock(p.accountID)
+		defer unlock()
 		err := s.store.View(r.Context(), func(tx Tx) error {
 			_, err := s.vaultAuth(tx, tok, vaultID, okV)
 			return err
@@ -233,7 +238,21 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 		if err != nil {
 			return err
 		}
+		if h := s.hooks.admitted; h != nil {
+			h()
+		}
+		rc := http.NewResponseController(w)
+		writeBy := time.Now().Add(s.lim.AdmitWrite)
+		if c.writeBy.Before(writeBy) {
+			writeBy = c.writeBy
+		}
+		_ = rc.SetWriteDeadline(writeBy)
 		writeRaw(w, http.StatusOK, body)
+		// Hand the bytes to the connection before the lock is released.
+		_ = rc.Flush()
+		if h := s.hooks.sent; h != nil {
+			h()
+		}
 		return nil
 	}
 	body, n, beyond, err := read()
@@ -511,7 +530,11 @@ type postLogRequest struct {
 // check the quota, then write the entry and everything derived from it. A
 // login or recovery token's one bootstrap is consumed in the same
 // transaction (R6). The request holds a validation slot (R14) before any
-// of its body is decoded, so a full queue refuses it with no parsing.
+// of its body is decoded, so a full queue refuses it with no parsing. A
+// commit that invalidates credentials is made, and long-polls notified,
+// under the account's admission lock (accountLocks): the first attempt
+// runs without it, and one that finds it would invalidate rolls back and
+// runs again holding it.
 func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error {
 	tok, ok := bearer(r)
 	if !ok {
@@ -558,29 +581,24 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 
 	var result vaultlog.Head
 	committed := false
-	err = s.store.Update(r.Context(), func(tx Tx) error {
-		p, err := s.vaultAuth(tx, tok, vaultID, okV)
-		if err != nil {
+	write := func(locked bool) error {
+		return s.store.Update(r.Context(), func(tx Tx) (err error) {
+			result, committed, err = s.postTx(tx, tok, vaultID, okV, pw, locked)
 			return err
-		}
-		if err := mayWrite(p, &pw.w.Entry); err != nil {
-			return err
-		}
-		if p.kind != credSession && p.bootstrap != nil {
-			if p.bootstrap.H.Equal(pw.h) {
-				result = *p.bootstrap
-				return nil
+		})
+	}
+	err = write(false)
+	if errors.Is(err, errNeedsAccountLock) {
+		unlock := s.accounts.lock(p.accountID)
+		if err = write(true); err == nil && committed {
+			s.hub.notify(vaultID)
+			committed = false // notified
+			if h := s.hooks.invalidated; h != nil {
+				h()
 			}
-			return errUnauthorized
 		}
-		if result, committed, err = s.commit(tx, p.accountID, vaultID, pw); err != nil || !committed {
-			return err
-		}
-		if p.kind != credSession {
-			return tx.SetLoginTokenBootstrap(p.tokenHash, result)
-		}
-		return nil
-	})
+		unlock()
+	}
 	if err != nil {
 		return err
 	}
@@ -591,6 +609,33 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 	return nil
 }
 
+// errNeedsAccountLock rolls back a commit that would invalidate
+// credentials while its account's admission lock is not held.
+var errNeedsAccountLock = errors.New("server: the commit invalidates credentials")
+
+// postTx is postLog's write transaction. locked reports whether the
+// account's admission lock is held.
+func (s *Server) postTx(tx Tx, tok crypto.Hash, vaultID model.ID, okV bool, pw *prepared, locked bool) (vaultlog.Head, bool, error) {
+	p, err := s.vaultAuth(tx, tok, vaultID, okV)
+	if err != nil {
+		return vaultlog.Head{}, false, err
+	}
+	if err := mayWrite(p, &pw.w.Entry); err != nil {
+		return vaultlog.Head{}, false, err
+	}
+	if p.kind != credSession && p.bootstrap != nil {
+		if p.bootstrap.H.Equal(pw.h) {
+			return *p.bootstrap, false, nil
+		}
+		return vaultlog.Head{}, false, errUnauthorized
+	}
+	result, committed, err := s.commit(tx, p.accountID, vaultID, pw, locked)
+	if err == nil && committed && p.kind != credSession {
+		err = tx.SetLoginTokenBootstrap(p.tokenHash, result)
+	}
+	return result, committed, err
+}
+
 // commit is the commit path every entry write uses, inside the caller's
 // write transaction, after the caller authorized the write: an identical
 // committed H returns that commit (committed is false); otherwise prev must
@@ -598,8 +643,10 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 // the stored public state, and R13 must admit what the commit persists;
 // then the entry and everything derived from it are written, with the
 // charge and the account's reserve state. The caller notifies long-polls
-// after the transaction commits.
-func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared) (vaultlog.Head, bool, error) {
+// after the transaction commits. A commit that would invalidate
+// credentials fails with errNeedsAccountLock unless locked reports that
+// the caller holds the account's admission lock.
+func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared, locked bool) (vaultlog.Head, bool, error) {
 	old, err := tx.EntryByHash(vaultID, pw.h)
 	if err == nil {
 		return vaultlog.Head{Seq: old.Seq, H: old.H}, false, nil
@@ -635,6 +682,9 @@ func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared) (vault
 		return vaultlog.Head{}, false, err
 	}
 	deps := post.Departures()
+	if !locked && invalidates(a, e.Kind, post, len(deps)) {
+		return vaultlog.Head{}, false, errNeedsAccountLock
+	}
 	cost, err := entryCost(pw, len(deps), txStored{tx, vaultID, accountID})
 	if err != nil {
 		return vaultlog.Head{}, false, err
@@ -659,4 +709,13 @@ func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared) (vault
 		return vaultlog.Head{}, false, err
 	}
 	return v.Head, true, nil
+}
+
+// invalidates reports whether committing an entry of kind with post-state
+// post and deps departures invalidates credentials of a: a departure ends
+// the device's sessions, a checkpoint ends every session, and a change of
+// the credential generation ends every login and recovery token (R2, R6).
+func invalidates(a *Account, kind vaultlog.Kind, post *vaultlog.PublicState, deps int) bool {
+	creds, ok := post.Creds()
+	return deps > 0 || kind == vaultlog.KindCheckpoint || !ok || creds.Gen != a.CredGen
 }

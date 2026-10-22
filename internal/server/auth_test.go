@@ -378,6 +378,40 @@ func TestRateLimiterBoundsKeys(t *testing.T) {
 	}
 }
 
+// A key without a bucket of its own stays on its scope's overflow bucket
+// until that bucket has refilled completely: room appearing in the store
+// does not hand it a fresh bucket and so reset its debt (R14).
+func TestRateLimiterOverflowKeepsDebt(t *testing.T) {
+	c := &clock{t: time.Unix(0, 0)}
+	l := newRateLimiter(c.now, 1)
+	r := Rate{N: 1, Per: time.Hour}
+	if !l.allow("s", "A", r) {
+		t.Fatal("A on its own bucket at minute 0")
+	}
+	c.advance(59 * time.Minute)
+	if !l.allow("s", "B", r) {
+		t.Fatal("B on the overflow bucket at minute 59")
+	}
+	c.advance(time.Minute)
+	// A's bucket has refilled, so the store could take B now.
+	if a := l.buckets["s|A"]; a != nil {
+		a.refill(c.now())
+		if a.tokens < 1 {
+			t.Fatal("A's bucket has not refilled at minute 60")
+		}
+	}
+	if l.allow("s", "B", r) {
+		t.Error("B was admitted at minute 60, one minute after it emptied the overflow bucket")
+	}
+	c.advance(time.Hour)
+	if !l.allow("s", "B", r) {
+		t.Error("B was refused after the overflow bucket refilled")
+	}
+	if l.allow("s", "B", r) {
+		t.Error("B's bucket allowed two requests in an hour")
+	}
+}
+
 // A session request refused by the account bucket consumes nothing: the
 // challenge stays valid and no session is stored (R14).
 func TestSessionRateLimitChangesNothing(t *testing.T) {

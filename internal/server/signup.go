@@ -228,11 +228,12 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request, c *call) error {
 
 	// Validate the whole publication from empty state, keeping only what
 	// the commit needs: each entry's departures, the final state and the
-	// R13 charge, in which each object counts once.
+	// R13 charge, in which each object counts once, and which includes the
+	// rows the signup keeps for the life of the account.
 	deps := make([][]vaultlog.Departure, len(pws))
 	objs := vaultlog.ObjectMap{}
 	have := pubStored{objs, map[model.ID]bool{}}
-	var cost int64
+	cost := signupCharge(email, reg.CapHash)
 	var final *vaultlog.PublicState
 	for i, pw := range pws {
 		post, err := vaultlog.ApplyPublic(final, pw.w, objs)

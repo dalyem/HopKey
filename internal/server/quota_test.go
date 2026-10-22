@@ -64,6 +64,25 @@ func (e *env) persisted(v *tvault, seq uint64, stateBefore int64) int64 {
 	return wire + entryRowOverhead + bodies + rows*rowOverhead + e.stateLen(v) - stateBefore
 }
 
+// signupPersisted is what R13 must charge for v's signup: every wire's
+// rows, the final public state, and the rows kept for the life of the
+// account: the account and vault rows and the registration row holding
+// the acknowledgment, with their email and capability-hash bytes.
+func (e *env) signupPersisted(v *tvault) int64 {
+	e.t.Helper()
+	sum := e.stateLen(v)
+	for seq := range uint64(len(v.log)) {
+		sum += e.persisted(v, seq, e.stateLen(v))
+	}
+	aid := v.accountID()
+	email := e.count(`SELECT length(CAST(email AS BLOB)) FROM accounts WHERE account_id = ?`, aid[:])
+	capHash := e.count(`SELECT length(cap_hash) FROM registrations WHERE ack_account_id = ?`, aid[:])
+	if email == 0 || capHash != 32 {
+		e.t.Fatalf("signup rows: email %d bytes, capability hash %d bytes", email, capHash)
+	}
+	return sum + signupRowOverhead + 3*email + 2*capHash
+}
+
 // postCharged posts w and checks that the account was charged exactly what
 // the commit persisted. It returns the charge.
 func (e *env) postCharged(v *tvault, tok string, w *vaultlog.Wire) int64 {
@@ -106,11 +125,9 @@ func TestQuotaChargesPersistedBytes(t *testing.T) {
 	A := v.dev(0)
 	tok := e.session(v, A)
 
-	// The signup charge covers its rows and the public state too.
-	signup := e.stateLen(v)
-	for seq := range uint64(len(v.log)) {
-		signup += e.persisted(v, seq, e.stateLen(v))
-	}
+	// The signup charge covers its rows, the public state and the rows it
+	// keeps for the life of the account too.
+	signup := e.signupPersisted(v)
 	if e.account(v).UsedBytes != signup {
 		t.Errorf("signup charged %d, persisted %d", e.account(v).UsedBytes, signup)
 	}
@@ -167,6 +184,39 @@ func TestQuotaChargesPersistedBytes(t *testing.T) {
 	// A retirement writes a receipt and deactivates the device.
 	tok = e.session(v, devs[3])
 	e.postCharged(v, tok, v.retire(devs[3]))
+}
+
+// R13: a signup is admitted when its whole charge, the rows it keeps for
+// the life of the account included, leaves the recovery reserve free, and
+// refused one byte short.
+func TestSignupQuotaBoundary(t *testing.T) {
+	v := newVault(t, "a@example.com")
+	e := newEnv(t)
+	e.publish(v)
+	charge := e.signupPersisted(v)
+	if got := e.account(v).UsedBytes; got != charge {
+		t.Fatalf("signup charged %d, persisted %d", got, charge)
+	}
+	half := reserveHalf(DefaultLimits())
+	for _, c := range []struct {
+		quota  int64
+		status int
+	}{{charge + 2*half - 1, 507}, {charge + 2*half, 200}} {
+		f := newEnv(t, withLimits(func(l *Limits) { l.QuotaBytes = c.quota }))
+		code := f.invite(v.email)
+		r := f.do("POST", "/v1/signup", "", f.signupReq(v, code, f.signupChallenge(v.email, code), 0, nil, testOrigin))
+		if c.status == 507 {
+			wantCode(t, r, 507, "quota_exhausted", "a signup one byte over the quota")
+			if n := f.count(`SELECT COUNT(*) FROM accounts`); n != 0 {
+				t.Errorf("%d accounts after the refused signup", n)
+			}
+			continue
+		}
+		wantStatus(t, r, 200, "a signup exactly at the quota")
+		if got := f.account(v).UsedBytes; got != charge {
+			t.Errorf("signup at the boundary charged %d, want %d", got, charge)
+		}
+	}
 }
 
 // R13: ordinary writes leave the recovery reserve; one bootstrap and the

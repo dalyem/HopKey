@@ -18,9 +18,11 @@ import (
 //	+ len(public state after) − len(public state before)
 //
 // The public state is one column that each commit replaces, so its term
-// is the change in its size and can be negative. Sessions, login tokens
-// and challenges are not charged: they expire, the janitor deletes them,
-// and R8 and R14 bound how many can exist.
+// is the change in its size and can be negative. A signup is charged its
+// wires as above, its whole public state, and once the rows it keeps for
+// the life of the account (signupCharge). Sessions, login tokens and
+// challenges are not charged: they expire, the janitor deletes them, and
+// R8 and R14 bound how many can exist.
 const (
 	// entryRowOverhead is a log row apart from its wire: vault ID, seq, H
 	// and kind, the entries of its two indexes, and SQLite's record and
@@ -37,6 +39,28 @@ const (
 	// members of an item, grant, device or deploy record.
 	stateOpOverhead = 256
 )
+
+// signupRowOverhead is the fixed part of the rows a signup keeps for the
+// life of the account, apart from the email and the capability hash: the
+// account row (two 16-byte IDs, a 16-byte salt, two 32-byte verifiers and
+// six integers) with its primary-key, email and vault indexes; the vault
+// row (two 16-byte IDs, a 32-byte head hash and three integers; the public
+// state is charged on its own) with its two indexes; and the consumed
+// registration row holding the publication acknowledgment (two 16-byte
+// IDs, a 32-byte digest, a 32-byte head hash and four integers) with its
+// primary-key index; plus SQLite's record and page overhead for the
+// three rows and six index entries.
+const signupRowOverhead = 1024
+
+// signupCharge is what a signup is charged for the rows it keeps for the
+// life of the account (R13):
+//
+//	signupRowOverhead
+//	+ 3 × len(email)      the account row, its email index and the registration row
+//	+ 2 × len(cap_hash)   the registration row and its primary-key index
+func signupCharge(email string, capHash crypto.Hash) int64 {
+	return signupRowOverhead + 3*int64(len(email)) + 2*int64(len(capHash))
+}
 
 // reserveHalf is each half of the R13 recovery reserve: the most one
 // bootstrap or one checkpoint can be charged under the R9 and R14 limits.

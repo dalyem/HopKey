@@ -17,7 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
-	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +70,7 @@ type Server struct {
 	signups  *queue
 	polls    *pollLimiter
 	hub      *hub
+	accounts *accountLocks
 	mux      *http.ServeMux
 
 	stop     chan struct{}
@@ -79,9 +80,12 @@ type Server struct {
 	// hooks are nil outside tests, which set them before the first request
 	// to pause a request at a fixed point.
 	hooks struct {
-		beforeSend func() // getLog: a response is built, before its admission check
-		validating func() // postLog: a validation slot is held, before any decoding
-		prepare    func() // each call of prepare
+		beforeSend  func() // getLog: a response is built, before its admission check
+		admitted    func() // getLog: a response is admitted, before it is written
+		sent        func() // getLog: an admitted response is written and flushed
+		invalidated func() // postLog: an invalidating commit is committed and notified
+		validating  func() // postLog: a validation slot is held, before any decoding
+		prepare     func() // each call of prepare
 	}
 }
 
@@ -95,15 +99,16 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, errors.New("server: no store")
 	}
 	s := &Server{
-		origin:  origin,
-		store:   cfg.Store,
-		proxies: cfg.TrustedProxies,
-		log:     cfg.Logger,
-		now:     cfg.Now,
-		lim:     DefaultLimits(),
-		rates:   DefaultRates(),
-		hub:     newHub(),
-		stop:    make(chan struct{}),
+		origin:   origin,
+		store:    cfg.Store,
+		proxies:  cfg.TrustedProxies,
+		log:      cfg.Logger,
+		now:      cfg.Now,
+		lim:      DefaultLimits(),
+		rates:    DefaultRates(),
+		hub:      newHub(),
+		accounts: newAccountLocks(),
+		stop:     make(chan struct{}),
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -265,6 +270,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeRaw(w http.ResponseWriter, status int, b []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
 	w.WriteHeader(status)
 	w.Write(b)
 }
@@ -280,9 +286,10 @@ type route struct {
 
 // call is the per-request state the middleware hands a handler.
 type call struct {
-	route *route
-	ip    netip.Addr
-	body  []byte
+	route   *route
+	ip      netip.Addr
+	body    []byte
+	writeBy time.Time // the response's write deadline
 }
 
 func (s *Server) routes() {
@@ -337,8 +344,9 @@ func (s *Server) wrap(rt *route) http.Handler {
 			deadline = s.lim.PollDeadline
 		}
 		rc := http.NewResponseController(w)
+		writeBy := start.Add(deadline + 5*time.Second)
 		_ = rc.SetReadDeadline(start.Add(deadline))
-		_ = rc.SetWriteDeadline(start.Add(deadline + 5*time.Second))
+		_ = rc.SetWriteDeadline(writeBy)
 		ctx, cancel := context.WithTimeout(r.Context(), deadline)
 		defer cancel()
 		r = r.WithContext(ctx)
@@ -353,7 +361,7 @@ func (s *Server) wrap(rt *route) http.Handler {
 			s.log.Info("request", "route", rt.pattern, "status", w.status, "ms", time.Since(start).Milliseconds())
 		}()
 
-		c := &call{route: rt, ip: s.clientIP(r)}
+		c := &call{route: rt, ip: s.clientIP(r), writeBy: writeBy}
 		err := s.serve(w, r, c)
 		if err == nil {
 			return
@@ -447,41 +455,45 @@ func depthWithin(b []byte, max int) bool {
 }
 
 // collectionsWithin scans a request body for the R14 collection limits
-// before the strict decoder builds anything: the arrays at
-// prefix.entry.ops (MaxOps) and prefix.objects (MaxObjects) and, when the
-// member at prefix is itself an array of wires (signup), its length
-// (MaxSignupWires). Array elements leave no name in a path, so for signup
-// the ops of every wire are at wires.entry.ops.
+// and the nesting depth before the strict decoder builds anything: the
+// arrays at prefix.entry.ops (MaxOps) and prefix.objects (MaxObjects) and,
+// when the member at prefix is itself an array of wires (signup), its
+// length (MaxSignupWires). Array elements leave no name in a path, so for
+// signup the ops of every wire are at wires.entry.ops.
 //
-// It only refuses early. It does not validate, and member names are
-// compared as written, so a name spelled with escapes is missed here; the
-// strict decoder and prepare enforce the same limits on every request.
-func (s *Server) collectionsWithin(b []byte, prefix ...string) bool {
-	return arrayLens(b, func(path []string, n int) bool {
+// It only refuses early. It does not validate; the strict decoder and
+// prepare enforce the same limits on every request. Member names are
+// compared decoded, as the decoder compares them, so a limited name
+// spelled with escapes is caught here too.
+func (s *Server) collectionsWithin(b []byte, prefix string) bool {
+	names := [...]string{prefix, "entry", "ops", "objects"}
+	return arrayLens(b, s.lim.MaxDepth, names[:], func(path []string, n int) bool {
 		switch {
-		case slices.Equal(path, prefix):
+		case len(path) == 1 && path[0] == prefix:
 			return n <= s.lim.MaxSignupWires
-		case len(path) != len(prefix)+1 && len(path) != len(prefix)+2:
-			return true
-		case !slices.Equal(path[:len(prefix)], prefix):
-			return true
-		}
-		rest := path[len(prefix):]
-		switch {
-		case slices.Equal(rest, []string{"entry", "ops"}):
+		case len(path) == 3 && path[0] == prefix && path[1] == "entry" && path[2] == "ops":
 			return n <= s.lim.MaxOps
-		case slices.Equal(rest, []string{"objects"}):
+		case len(path) == 2 && path[0] == prefix && path[1] == "objects":
 			return n <= s.lim.MaxObjects
 		}
 		return true
 	})
 }
 
+// maxScanName is the longest member name arrayLens can match.
+const maxScanName = 32
+
 // arrayLens calls fn with the member-name path (array indexes left out)
 // and the element count of each array in b as the array closes, and stops
-// with false when fn returns false. It counts brackets and commas outside
-// strings; b need not be valid JSON.
-func arrayLens(b []byte, fn func(path []string, n int) bool) bool {
+// with false when fn returns false or the nesting depth exceeds maxDepth.
+// A path holds only the names it was given (ASCII, at most maxScanName
+// bytes): each member name is decoded, escapes included, and stands for
+// the element of names it equals, or "" for any other name. It counts
+// brackets and commas outside strings; b need not be valid JSON.
+//
+// It allocates its stack and path once, at maxDepth entries, so a body of
+// nothing but brackets costs no more than a valid one.
+func arrayLens(b []byte, maxDepth int, names []string, fn func(path []string, n int) bool) bool {
 	type frame struct {
 		array    bool
 		key      string // object: the current member's name
@@ -490,8 +502,8 @@ func arrayLens(b []byte, fn func(path []string, n int) bool) bool {
 		commas   int    // array
 		pathLen  int    // len(path) outside this container
 	}
-	var stack []frame
-	var path []string
+	stack := make([]frame, 0, maxDepth)
+	path := make([]string, 0, maxDepth)
 	for i := 0; i < len(b); i++ {
 		c := b[i]
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
@@ -506,19 +518,16 @@ func arrayLens(b []byte, fn func(path []string, n int) bool) bool {
 		}
 		switch c {
 		case '"':
-			j := i + 1
-			for j < len(b) && b[j] != '"' {
-				if b[j] == '\\' {
-					j++
-				}
-				j++
-			}
+			name, j := memberName(b, i, names)
 			if top != nil && !top.array && top.wantKey {
-				top.key = string(b[i+1 : min(j, len(b))])
+				top.key = name
 				top.wantKey = false
 			}
 			i = j
 		case '{', '[':
+			if len(stack) == maxDepth {
+				return false
+			}
 			n := len(path)
 			if top != nil && !top.array {
 				path = append(path, top.key)
@@ -550,6 +559,92 @@ func arrayLens(b []byte, fn func(path []string, n int) bool) bool {
 		}
 	}
 	return true
+}
+
+// memberName decodes the JSON string that opens at b[i] and returns the
+// element of names it equals ("" for none) and the index of its closing
+// quote (len(b) when there is none). A backslash always escapes the byte
+// after it, so the string ends where a skip over it would end; \uXXXX is
+// decoded, and a code point outside ASCII or an invalid escape matches no
+// name. It does not allocate.
+func memberName(b []byte, i int, names []string) (string, int) {
+	var buf [maxScanName]byte
+	n, ok := 0, true
+	j := i + 1
+	for j < len(b) && b[j] != '"' {
+		c := b[j]
+		j++
+		if c == '\\' {
+			if j >= len(b) {
+				break
+			}
+			c = b[j]
+			j++
+			switch c {
+			case '"', '\\', '/':
+			case 'b':
+				c = '\b'
+			case 'f':
+				c = '\f'
+			case 'n':
+				c = '\n'
+			case 'r':
+				c = '\r'
+			case 't':
+				c = '\t'
+			case 'u':
+				r, valid := hex4(b[j:])
+				if !valid || r >= 0x80 {
+					ok = false
+					continue
+				}
+				c = byte(r)
+				j += 4
+			default:
+				ok = false
+				continue
+			}
+		}
+		if n == len(buf) {
+			ok = false
+			continue
+		}
+		buf[n] = c
+		n++
+	}
+	if j > len(b) {
+		j = len(b)
+	}
+	if ok {
+		for _, name := range names {
+			if string(buf[:n]) == name {
+				return name, j
+			}
+		}
+	}
+	return "", j
+}
+
+// hex4 decodes the four hex digits that start b.
+func hex4(b []byte) (rune, bool) {
+	if len(b) < 4 {
+		return 0, false
+	}
+	var r rune
+	for _, c := range b[:4] {
+		switch {
+		case '0' <= c && c <= '9':
+			c -= '0'
+		case 'a' <= c && c <= 'f':
+			c -= 'a' - 10
+		case 'A' <= c && c <= 'F':
+			c -= 'A' - 10
+		default:
+			return 0, false
+		}
+		r = r<<4 | rune(c)
+	}
+	return r, true
 }
 
 // clientIP is the peer address, or for a trusted proxy the rightmost
@@ -659,5 +754,67 @@ func (h *hub) notify(v model.ID) {
 	if ch, ok := h.chans[v]; ok {
 		close(ch)
 		delete(h.chans, v)
+	}
+}
+
+// accountLocks orders log-response admission with the commits that
+// invalidate credentials (R2). A commit that ends sessions or changes the
+// credential generation holds its account's write lock across the
+// transaction and the long-poll notification; a log response holds the
+// read lock from its admission check until it has been written, within
+// AdmitWrite. So no response leaves after an invalidation of its
+// credential commits, and a slow reader can only delay its own account's
+// invalidating commits, and only for AdmitWrite. A lock exists only while
+// someone holds or waits for it, so the map is bounded by the requests in
+// flight.
+type accountLocks struct {
+	mu sync.Mutex
+	m  map[model.ID]*accountLock
+}
+
+type accountLock struct {
+	sync.RWMutex
+	refs int // holders and waiters
+}
+
+func newAccountLocks() *accountLocks { return &accountLocks{m: map[model.ID]*accountLock{}} }
+
+func (l *accountLocks) ref(id model.ID) *accountLock {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	a := l.m[id]
+	if a == nil {
+		a = &accountLock{}
+		l.m[id] = a
+	}
+	a.refs++
+	return a
+}
+
+func (l *accountLocks) unref(id model.ID, a *accountLock) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if a.refs--; a.refs == 0 {
+		delete(l.m, id)
+	}
+}
+
+// lock takes the account's write lock and returns its release.
+func (l *accountLocks) lock(id model.ID) func() {
+	a := l.ref(id)
+	a.Lock()
+	return func() {
+		a.Unlock()
+		l.unref(id, a)
+	}
+}
+
+// rlock takes the account's read lock and returns its release.
+func (l *accountLocks) rlock(id model.ID) func() {
+	a := l.ref(id)
+	a.RLock()
+	return func() {
+		a.RUnlock()
+		l.unref(id, a)
 	}
 }
