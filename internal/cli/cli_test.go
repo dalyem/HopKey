@@ -239,6 +239,26 @@ func TestConsentNoticeAndPrintable(t *testing.T) {
 	if strings.ContainsRune(notice, 0x1b) {
 		t.Errorf("a control character reached the terminal: %q", notice)
 	}
+	// The notice names what is being authorized and does not claim to be
+	// equivalent to connecting.
+	for _, want := range []string{"with your permissions", "even with --dry-run", "Only continue if you trust this config"} {
+		if !strings.Contains(notice, want) {
+			t.Errorf("notice lacks %q:\n%s", want, notice)
+		}
+	}
+	if strings.Contains(notice, "exactly as connecting") {
+		t.Errorf("notice still claims equivalence with connecting:\n%s", notice)
+	}
+	// A hostile file name cannot redraw the prompt: escapes, newlines and
+	// bidi overrides in the path are neutralized.
+	evil := "/tmp/x\x1b[2J\nOK to continue\u202e.conf"
+	notice = consentNotice(evil, &configScan{})
+	if strings.ContainsAny(notice, "\x1b\u202e") || strings.Contains(notice, "\nOK to continue") {
+		t.Errorf("the path reached the terminal unneutralized: %q", notice)
+	}
+	if got := printable("a\u202eb\u2066c\u200bd"); got != "a?b?c?d" {
+		t.Errorf("printable left format characters: %q", got)
+	}
 	if got := printable(strings.Repeat("x", 500)); len(got) != maxShown+3 {
 		t.Errorf("a long line is cut to %d bytes, got %d", maxShown+3, len(got))
 	}

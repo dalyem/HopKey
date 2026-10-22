@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
@@ -91,9 +92,9 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	if !*yes {
 		switch {
 		case *asJSON:
-			return failf("import ssh-config reads %s with ssh -G, which runs any `Match exec` commands in it; confirmation needed but --json cannot ask; pass --yes", path)
+			return failf("import ssh-config reads %s with ssh -G, which runs any `Match exec` commands in it; confirmation needed but --json cannot ask; pass --yes", printable(path))
 		case !e.StdinTTY:
-			return failf("import ssh-config reads %s with ssh -G, which runs any `Match exec` commands in it; confirmation needed but stdin is not a terminal; pass --yes", path)
+			return failf("import ssh-config reads %s with ssh -G, which runs any `Match exec` commands in it; confirmation needed but stdin is not a terminal; pass --yes", printable(path))
 		}
 		ok, err := confirm(e, false, "Read this config with ssh -G?")
 		if err != nil {
@@ -146,8 +147,10 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 // promise.
 func consentNotice(path string, s *configScan) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "hop import ssh-config reads %s with OpenSSH (ssh -G), exactly as connecting would.\n", path)
-	sb.WriteString("That runs any `Match exec` commands in the config and may do DNS lookups (CanonicalizeHostname).\n")
+	fmt.Fprintf(&sb, "hop import ssh-config evaluates %s and the files it Includes with OpenSSH (ssh -G).\n", printable(path))
+	sb.WriteString("That runs any `Match exec` commands in them as you, with your permissions, possibly several\n" +
+		"times (once per host), even with --dry-run, and may do DNS lookups (CanonicalizeHostname).\n" +
+		"Only continue if you trust this config, especially one you have not used with ssh yourself.\n")
 	if len(s.matchExec) == 0 && len(s.unscanned) == 0 {
 		sb.WriteString("hop's scan found no `Match exec` lines and no Include it could not inspect; hop's scan is best effort.\n")
 		return sb.String()
@@ -197,7 +200,10 @@ func printable(s string) string {
 		r = r[:maxShown]
 	}
 	for i, c := range r {
-		if c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0) {
+		// C0, DEL, C1 (which covers the ANSI CSI introducer), and Unicode
+		// format characters such as bidi overrides, which reorder what the
+		// prompt shows.
+		if c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0) || unicode.Is(unicode.Cf, c) {
 			r[i] = '?'
 		}
 	}

@@ -105,7 +105,8 @@ func (p *sshProber) run(ctx context.Context, config, name string, trace bool) (s
 	cmd.Stdin = nil // /dev/null
 	var stdout, stderr bytes.Buffer
 	errBuf := &limitedBuffer{buf: &stderr, max: maxProbeStderr}
-	cmd.Stdout, cmd.Stderr = &stdout, errBuf
+	outBuf := &limitedBuffer{buf: &stdout, max: maxProbeStdout}
+	cmd.Stdout, cmd.Stderr = outBuf, errBuf
 	cmd.WaitDelay = time.Second
 	err := cmd.Run()
 	// Output that did not fit was dropped, and with it possibly the line that
@@ -113,6 +114,11 @@ func (p *sshProber) run(ctx context.Context, config, name string, trace bool) (s
 	// trusted, whether or not ssh succeeded.
 	if errBuf.overflow {
 		return sshSettings{}, &errTraceUnverified{fmt.Sprintf("ssh wrote more than %d bytes to stderr, which hop does not keep", maxProbeStderr)}
+	}
+	// Partial settings would be parsed as if complete, so a cut-off stdout
+	// fails the probe rather than importing guesses.
+	if outBuf.overflow {
+		return sshSettings{}, &errTraceUnverified{fmt.Sprintf("ssh -G wrote more than %d bytes of settings, which hop does not keep", maxProbeStdout)}
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -157,6 +163,9 @@ func (p *sshProber) verifyTrace(ctx context.Context) error {
 
 // maxProbeStderr is how much of one probe's stderr hop keeps.
 const maxProbeStderr = 1 << 20
+
+// maxProbeStdout bounds one probe's settings output; ssh -G prints a few KB.
+const maxProbeStdout = 1 << 20
 
 // limitedBuffer drops what exceeds max, so a noisy ssh cannot fill memory, and
 // records that it did.

@@ -2288,6 +2288,12 @@ esac`,
 /dev/null) ` + noise + ` ;;
 *) ` + applied("a") + ` ;;
 esac`,
+		// Settings output that does not fit cannot be parsed as complete.
+		"the real probe's stdout": `case "$cfg" in
+*hop-trace*) ` + applied("hop-trace-probe") + ` ;;
+/dev/null) ;;
+*) ` + applied("a") + `; head -c 1100000 /dev/zero | tr '\0' x ;;
+esac`,
 		"the trace check": `case "$cfg" in
 *hop-trace*) ` + applied("hop-trace-probe") + `; ` + noise + ` ;;
 *) ` + applied("a") + ` ;;
