@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -47,11 +48,11 @@ func storedRecord(t *testing.T, cfg Config, accountID string) deviceRecord {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rec deviceRecord
-	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+	rec, err := parseDeviceRecord([]byte(raw))
+	if err != nil {
 		t.Fatal(err)
 	}
-	return rec
+	return *rec
 }
 
 // Item 1, key still readable: a password change committed, its kit not yet
@@ -496,7 +497,7 @@ func TestDeviceKeyFileFormat(t *testing.T) {
 				t.Fatal(err)
 			}
 			track(t, cfg, s)
-			want := "file (unsealed)"
+			want := "file (unsealed: private keys on disk)"
 			if sealed {
 				want = "file (sealed)"
 			}
@@ -686,4 +687,259 @@ func TestNoPlaintextOnDiskSealedFile(t *testing.T) {
 	needles = append(needles, pemSecretLines(k.PrivateKey)...)
 	needles = append(needles, keyNeedles(t, s)...)
 	scanForPlaintext(t, cfg.DataDir, needles)
+}
+
+// Rev 15 §11: the device record is exactly
+// JCS({"v":1, "account_id":id, "device_id":id, "kem_sk":b64, "sig_seed":b64(32), "secret_key":str≤64}),
+// in the keychain and as the device key file's key, and is read strictly.
+func TestDeviceRecordSchema(t *testing.T) {
+	cfg := testConfig(t)
+	f := newVault(t, cfg)
+	user := "device:" + f.kit.AccountID
+	raw, err := cfg.Keyring.Get(keychainService, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err := canonjson.Canonicalize([]byte(raw)); err != nil || string(c) != raw {
+		t.Errorf("the keychain entry is not JCS: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(slices.Sorted(maps.Keys(m)), ","); got != "account_id,device_id,kem_sk,secret_key,sig_seed,v" {
+		t.Errorf("members %s", got)
+	}
+	if m["secret_key"] != f.kit.SecretKey || m["device_id"] != f.s.dev.ID.String() || m["v"] != float64(1) {
+		t.Errorf("record %v %v %v", m["v"], m["device_id"], m["secret_key"] == f.kit.SecretKey)
+	}
+	if _, err := parseDeviceRecord([]byte(raw)); err != nil {
+		t.Fatalf("the stored record does not parse: %v", err)
+	}
+
+	b64 := base64.RawURLEncoding.EncodeToString
+	with := func(change func(m map[string]any)) string {
+		c := maps.Clone(m)
+		change(c)
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	bad := map[string]string{
+		"unknown member":          with(func(m map[string]any) { m["name"] = "x" }),
+		"v 2":                     with(func(m map[string]any) { m["v"] = 2 }),
+		"v as a string":           with(func(m map[string]any) { m["v"] = "1" }),
+		"account_id not an ID":    with(func(m map[string]any) { m["account_id"] = "nope" }),
+		"device_id a number":      with(func(m map[string]any) { m["device_id"] = 7 }),
+		"kem_sk null":             with(func(m map[string]any) { m["kem_sk"] = nil }),
+		"kem_sk empty":            with(func(m map[string]any) { m["kem_sk"] = "" }),
+		"kem_sk padded base64":    with(func(m map[string]any) { m["kem_sk"] = base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}) }),
+		"sig_seed 31 bytes":       with(func(m map[string]any) { m["sig_seed"] = b64(make([]byte, 31)) }),
+		"sig_seed 33 bytes":       with(func(m map[string]any) { m["sig_seed"] = b64(make([]byte, 33)) }),
+		"sig_seed an array":       with(func(m map[string]any) { m["sig_seed"] = []int{1, 2} }),
+		"secret_key 65 bytes":     with(func(m map[string]any) { m["secret_key"] = strings.Repeat("A", 65) }),
+		"secret_key with a LF":    with(func(m map[string]any) { m["secret_key"] = "H1-\nX" }),
+		"secret_key a number":     with(func(m map[string]any) { m["secret_key"] = 1 }),
+		"a duplicate member":      strings.Replace(raw, "{", `{"v":1,`, 1),
+		"trailing data":           raw + "{}",
+		"the pre-rev-15 encoding": preRev15(t, f.s.rec),
+		"an array, not an object": "[" + raw + "]",
+		"secret_key not a string": with(func(m map[string]any) { m["secret_key"] = []string{"a"} }),
+		"account_id empty":        with(func(m map[string]any) { m["account_id"] = "" }),
+		"device_id empty":         with(func(m map[string]any) { m["device_id"] = "" }),
+	}
+	for name := range m {
+		bad["missing "+name] = with(func(m map[string]any) { delete(m, name) })
+	}
+	for name, b := range bad {
+		if rec, err := parseDeviceRecord([]byte(b)); err == nil {
+			t.Errorf("%s: accepted %+v", name, rec.DeviceID)
+		}
+	}
+
+	// Read through the keychain, a refused record leaves the vault locked
+	// and says why, without quoting the record.
+	for _, name := range []string{"unknown member", "missing kem_sk", "sig_seed 31 bytes", "the pre-rev-15 encoding"} {
+		if err := cfg.Keyring.Set(keychainService, user, bad[name]); err != nil {
+			t.Fatal(err)
+		}
+		info := open(t, cfg).Info()
+		if !info.Locked || !strings.Contains(info.LockReason, "not a valid device record") {
+			t.Errorf("%s in the keychain: locked=%v reason %q", name, info.Locked, info.LockReason)
+		}
+	}
+
+	// The device key file's key carries the same record and is read the
+	// same way.
+	fcfg := testConfig(t)
+	p, err := PrepareInit(fcfg, InitOptions{Password: []byte(testPassword), DeviceStore: DeviceStoreFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := p.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	track(t, fcfg, s)
+	path := filepath.Join(fcfg.DataDir, "device.key")
+	file, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fm map[string]json.RawMessage
+	if err := json.Unmarshal(file, &fm); err != nil {
+		t.Fatal(err)
+	}
+	var km map[string]any
+	if err := json.Unmarshal(fm["key"], &km); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(slices.Sorted(maps.Keys(km)), ","); got != "account_id,device_id,kem_sk,secret_key,sig_seed,v" {
+		t.Errorf("device.key key members %s", got)
+	}
+	km["extra"] = true
+	key, err := json.Marshal(km)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm["key"] = key
+	out, err := json.Marshal(fm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if info := open(t, fcfg).Info(); !info.Locked || !strings.Contains(info.LockReason, "does not hold a valid device record") {
+		t.Errorf("device.key with an extra record member: locked=%v reason %q", info.Locked, info.LockReason)
+	}
+}
+
+// preRev15 is a keychain entry as written before rev 15: encoding/json,
+// so standard padded base64 and no JCS.
+func preRev15(t *testing.T, rec *deviceRecord) string {
+	t.Helper()
+	b, err := json.Marshal(struct {
+		V         int      `json:"v"`
+		AccountID model.ID `json:"account_id"`
+		DeviceID  model.ID `json:"device_id"`
+		KEMSK     []byte   `json:"kem_sk"`
+		SigSeed   []byte   `json:"sig_seed"`
+		SecretKey string   `json:"secret_key"`
+	}{rec.V, rec.AccountID, rec.DeviceID, rec.KEMSK, rec.SigSeed, rec.SecretKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// Round 2, finding A: a file save that renamed device.key into place but
+// then failed to fsync its directory has a record that reads back but may
+// not survive a crash. AckKit refuses, and keeps the journal, until the
+// fsyncs succeed.
+func TestAckKitWaitsForADurableSecretKey(t *testing.T) {
+	cfg := testConfig(t)
+	p, err := PrepareInit(cfg, InitOptions{Password: []byte(testPassword), DeviceStore: DeviceStoreFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := p.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	track(t, cfg, s)
+	addHost(t, s, "web-1")
+	ctx := context.Background()
+
+	dataDir := s.l.data
+	errFsync := errors.New("injected directory fsync failure")
+	failing := false
+	syncDir = func(dir string) error {
+		if failing && dir == dataDir {
+			return errFsync
+		}
+		return fsyncDir(dir)
+	}
+	t.Cleanup(func() { syncDir = fsyncDir })
+
+	failing = true
+	kit, err := s.ChangePassword(ctx, []byte(testPassword), []byte(newPassword))
+	if err != nil {
+		t.Fatalf("a committed change hides its kit: %v", err)
+	}
+	// The save renamed the file into place: the record reads back.
+	if rec, err := s.deviceStore(s.devCfg).load(); err != nil || rec.SecretKey != kit.SecretKey {
+		t.Fatalf("setup: device.key does not hold the new Secret Key: %v", err)
+	}
+	if !hasWarning(s.Info(), "not saved on this device") {
+		t.Errorf("warnings = %q", s.Info().Warnings)
+	}
+	if err := s.AckKit(); !errors.Is(err, errFsync) || !strings.Contains(err.Error(), "stays pending") {
+		t.Errorf("ack while device.key is not durable: %v", err)
+	}
+	if s.PendingKit() == nil || len(journalFiles(t, cfg)) != 1 {
+		t.Fatal("the journal was deleted before the Secret Key was durable")
+	}
+
+	// The fsyncs succeed now: the retry finishes them and the ack goes on.
+	failing = false
+	if err := s.AckKit(); err != nil {
+		t.Fatalf("ack once the fsyncs succeed: %v", err)
+	}
+	if len(journalFiles(t, cfg)) != 0 || s.PendingKit() != nil || len(s.Info().Warnings) != 0 {
+		t.Errorf("after the ack: journal %v, warnings %q", journalFiles(t, cfg), s.Info().Warnings)
+	}
+	if err := open(t, cfg).UnlockWithPassword(ctx, []byte(newPassword), ""); err != nil {
+		t.Errorf("password unlock with the stored Secret Key: %v", err)
+	}
+}
+
+// Round 2, finding C: in one process, an unlocked store's password unlock
+// commits its bootstrap and then fails to save the new device key. The
+// store stays unlocked with the old key, and the next hop passwd revokes
+// the device that bootstrap enrolled.
+func TestPasswdAfterAFailedPasswordUnlockRevokesTheAbandonedDevice(t *testing.T) {
+	cfg := testConfig(t)
+	ring := &failRing{memRing: newMemRing()}
+	cfg.Keyring = ring
+	f := newVault(t, cfg)
+	addHost(t, f.s, "web-1")
+	ctx := context.Background()
+	s := f.s
+	cur := s.dev.ID
+
+	ring.fail = true
+	if err := s.UnlockWithPassword(ctx, []byte(testPassword), ""); err == nil || !strings.Contains(err.Error(), "not saved") {
+		t.Fatalf("password unlock with the keychain refusing writes: %v", err)
+	}
+	ring.fail = false
+	disk, err := s.readDeviceConfig()
+	if err != nil || len(disk.StaleDevices) != 1 {
+		t.Fatalf("setup: device.json %+v, %v; want the new device recorded as stale", disk, err)
+	}
+	abandoned := disk.StaleDevices[0]
+	if s.dev == nil || s.dev.ID != cur {
+		t.Fatal("setup: the store is not unlocked with the old key")
+	}
+	if seqs, err := s.l.entrySeqs(); err != nil || seqs[len(seqs)-1] <= s.state.Head.Seq {
+		t.Fatalf("setup: the bootstrap is not on disk past the in-memory head: %v %v", seqs, err)
+	}
+
+	if _, err := s.ChangePassword(ctx, []byte(testPassword), []byte(newPassword)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.state.Devices[abandoned]; ok || !slices.Contains(s.state.Retired.DeviceIDs, abandoned) {
+		t.Error("the abandoned device was not revoked")
+	}
+	if _, ok := s.state.Devices[cur]; !ok {
+		t.Error("this device was revoked")
+	}
+	if info := s.Info(); info.StaleDevices != 0 || hasWarning(info, "stale") {
+		t.Errorf("after passwd: %+v", info)
+	}
+	if s := open(t, cfg); len(s.state.Devices) != 1 {
+		t.Errorf("%d devices after a restart, want 1", len(s.state.Devices))
+	}
 }

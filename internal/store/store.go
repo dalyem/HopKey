@@ -74,7 +74,7 @@ var (
 	ErrKitPending = errors.New("store: a new Emergency Kit is waiting to be confirmed; run hop passwd to see it")
 	// ErrVaultBusy means another Store (another process, normally the hop
 	// daemon) has the vault open.
-	ErrVaultBusy = errors.New("store: the hop daemon owns this vault")
+	ErrVaultBusy = errors.New("store: the vault is busy (another hop process owns it)")
 
 	errClosed = errors.New("store: the vault store is closed")
 
@@ -147,6 +147,10 @@ type Store struct {
 	// skErr is why the pending kit's Secret Key is not in the device key
 	// store yet. AckKit refuses until it is.
 	skErr error
+	// kitSKDurable means a save of the pending kit's Secret Key, or the
+	// fsyncs that make a stored one durable, fully succeeded. Until then a
+	// record that merely reads back is not trusted (see persistKitSK).
+	kitSKDurable bool
 	// repaired says what the last unlock finished after a crash.
 	repaired string
 
@@ -277,7 +281,7 @@ func (s *Store) dropLocked(reason error) {
 		s.rec.zero()
 	}
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
-	s.kitOrphaned, s.skErr, s.repaired = false, nil, ""
+	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
 	s.lockErr = reason
 }
 

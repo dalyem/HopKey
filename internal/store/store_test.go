@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -456,8 +455,8 @@ func TestSecondOpenIsRefused(t *testing.T) {
 	}
 	addHost(t, f.s, "web-1")
 	s := open(t, cfg) // closes f.s first
-	if _, err := Open(context.Background(), cfg); !errors.Is(err, ErrVaultBusy) || !strings.Contains(err.Error(), "daemon") {
-		t.Fatalf("second open: %v, want ErrVaultBusy naming the daemon", err)
+	if _, err := Open(context.Background(), cfg); !errors.Is(err, ErrVaultBusy) || !strings.Contains(err.Error(), "another hop process owns it") {
+		t.Fatalf("second open: %v, want ErrVaultBusy saying another process owns the vault", err)
 	}
 	if got := names(snapshot(t, s)); len(got) != 1 {
 		t.Errorf("hosts = %v", got)
@@ -513,9 +512,8 @@ func TestKeychainBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no device key in the keychain: %v", err)
 	}
-	var rec deviceRecord
-	if err := json.Unmarshal([]byte(raw), &rec); err != nil || rec.SecretKey != f.kit.SecretKey {
-		t.Errorf("keychain record: %v, secret key %q", err, rec.SecretKey)
+	if rec, err := parseDeviceRecord([]byte(raw)); err != nil || rec.SecretKey != f.kit.SecretKey {
+		t.Errorf("keychain record: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(cfg.DataDir, "device.key")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("device.key exists with the keychain store: %v", err)

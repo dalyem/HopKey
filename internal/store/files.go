@@ -249,7 +249,10 @@ func writeTemp(path string, data []byte) (string, error) {
 	return name, nil
 }
 
-func syncDir(dir string) error {
+// syncDir fsyncs a directory. It is a variable so tests can make it fail.
+var syncDir = fsyncDir
+
+func fsyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

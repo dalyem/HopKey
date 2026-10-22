@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 
 	"github.com/zalando/go-keyring"
@@ -65,7 +66,12 @@ type deviceConfig struct {
 
 // deviceRecord is what the device key store keeps: this device's private
 // keys and the account Secret Key, so the SK never has to be typed again on
-// this device (§11).
+// this device (§11, rev 15). It is the keychain entry and the device key
+// file's key (sealed, or raw when unsealed):
+//
+//	JCS({"v":1, "account_id":id, "device_id":id, "kem_sk":b64, "sig_seed":b64(32), "secret_key":str≤64})
+//
+// and is read with parseDeviceRecord, which refuses anything else.
 type deviceRecord struct {
 	V         int      `json:"v"`
 	AccountID model.ID `json:"account_id"`
@@ -73,6 +79,36 @@ type deviceRecord struct {
 	KEMSK     []byte   `json:"kem_sk"`
 	SigSeed   []byte   `json:"sig_seed"`
 	SecretKey string   `json:"secret_key"`
+}
+
+// parseDeviceRecord strictly decodes a device record: unknown, missing,
+// duplicate and wrongly typed members are refused, and so is a record with
+// another version, an empty ID or kem_sk, a signing seed that is not 32
+// bytes, or a secret_key that is not a str≤64.
+func parseDeviceRecord(b []byte) (*deviceRecord, error) {
+	var rec deviceRecord
+	if err := canonjson.Unmarshal(b, &rec); err != nil {
+		rec.zero()
+		return nil, err
+	}
+	var err error
+	switch {
+	case rec.V != 1:
+		err = fmt.Errorf("device record version %d", rec.V)
+	case rec.AccountID.IsZero() || rec.DeviceID.IsZero():
+		err = errors.New("device record: empty account_id or device_id")
+	case len(rec.KEMSK) == 0:
+		err = errors.New("device record: empty kem_sk")
+	case len(rec.SigSeed) != ed25519.SeedSize:
+		err = errors.New("device record: sig_seed is not 32 bytes")
+	default:
+		err = crypto.CheckStr("secret_key", rec.SecretKey, 64)
+	}
+	if err != nil {
+		rec.zero()
+		return nil, err
+	}
+	return &rec, nil
 }
 
 func (r *deviceRecord) zero() {
@@ -172,9 +208,13 @@ func (d *deviceStore) Describe() string {
 	case d.cfg.Sealed:
 		return "file (sealed)"
 	default:
-		return "file (unsealed)"
+		return "file (unsealed: private keys on disk)"
 	}
 }
+
+// Unsealed reports whether the device key file holds the device private
+// keys and the Secret Key in plain form, protected only by its 0600 mode.
+func (d *deviceStore) Unsealed() bool { return d.cfg.Store == DeviceStoreFile && !d.cfg.Sealed }
 
 func (d *deviceStore) user() string { return "device:" + d.cfg.AccountID.String() }
 
@@ -233,11 +273,17 @@ func (d *deviceStore) load() (*deviceRecord, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%w: keychain: %v (hop unlock --password restores it)", ErrDeviceKey, err)
 		}
-		var rec deviceRecord
-		if err := json.Unmarshal([]byte(raw), &rec); err != nil || rec.V != 1 || rec.AccountID != d.cfg.AccountID {
+		// The decoder's error is not quoted: it can carry a character of
+		// the keys.
+		rec, err := parseDeviceRecord([]byte(raw))
+		if err != nil {
+			return nil, fmt.Errorf("%w: the keychain entry is not a valid device record", ErrDeviceKey)
+		}
+		if rec.AccountID != d.cfg.AccountID {
+			rec.zero()
 			return nil, fmt.Errorf("%w: the stored device key does not belong to this vault", ErrDeviceKey)
 		}
-		return &rec, nil
+		return rec, nil
 	case DeviceStoreFile:
 		return d.loadFile()
 	}
@@ -281,9 +327,9 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 	default:
 		return nil, fmt.Errorf("%w: %s is sealed, but this device is set up for an unsealed file", ErrDeviceKey, path)
 	}
-	var rec deviceRecord
-	if err := canonjson.Unmarshal(pt, &rec); err != nil || rec.V != 1 {
-		return nil, fmt.Errorf("%w: %s does not hold a device key", ErrDeviceKey, path)
+	rec, err := parseDeviceRecord(pt)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s does not hold a valid device record", ErrDeviceKey, path)
 	}
 	if rec.DeviceID != f.DeviceID {
 		rec.zero()
@@ -293,13 +339,13 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 		rec.zero()
 		return nil, fmt.Errorf("%w: the stored device key does not belong to this vault", ErrDeviceKey)
 	}
-	return &rec, nil
+	return rec, nil
 }
 
 func (d *deviceStore) save(rec *deviceRecord) error {
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
-		b, err := json.Marshal(rec)
+		b, err := canonjson.Marshal(rec)
 		if err != nil {
 			return err
 		}
@@ -348,6 +394,29 @@ func (d *deviceStore) save(rec *deviceRecord) error {
 	return fmt.Errorf("unknown device key store %q", d.cfg.Store)
 }
 
+// sync makes a saved record durable. A file save can rename device.key
+// into place and then fail to fsync the directory: the record then reads
+// back but may not survive a crash. sync fsyncs the file and its directory
+// again; the keychain has nothing to do.
+func (d *deviceStore) sync() error {
+	if d.cfg.Store != DeviceStoreFile {
+		return nil
+	}
+	path := d.l.deviceKeyFile()
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
 // clone returns a copy of the record that shares no memory with it.
 func (r *deviceRecord) clone() *deviceRecord {
 	c := *r
@@ -380,6 +449,21 @@ func (s *Store) reconcileDevice() error {
 	}
 	s.devCfg = cfg
 	return nil
+}
+
+// reloadDeviceConfig reads device.json again and reconciles it with the
+// device key in use and the verified state. The caller holds the file lock
+// and the store is unlocked.
+func (s *Store) reloadDeviceConfig() error {
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.AccountID != s.state.Account.AccountID {
+		return fmt.Errorf("%w: %s belongs to another account", ErrDeviceKey, s.l.deviceConfig())
+	}
+	s.devCfg = cfg
+	return s.reconcileDevice()
 }
 
 // staleActive returns cfg's stale devices that are active in the verified
