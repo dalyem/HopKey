@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -598,5 +600,139 @@ func TestRetireStatusIssuesNoSession(t *testing.T) {
 	count(&after)
 	if after != before {
 		t.Errorf("sessions went from %d to %d", before, after)
+	}
+}
+
+// faultStore wraps the env's store for tests of failing transactions. Each
+// armed fault applies once, to the next transaction of its kind: failView
+// and failUpdate fail it after its function succeeds, as a failed commit
+// would (it rolls back, and the caller gets errFault), and watchUpdate
+// sends the error the next Update returns on updated.
+type faultStore struct {
+	Store
+	failView, failUpdate, watchUpdate atomic.Bool
+	updated                           chan error
+}
+
+var errFault = errors.New("injected fault")
+
+func withFaults(f *faultStore) envOpt {
+	return func(c *envConfig) { f.Store, c.Store = c.Store, f }
+}
+
+func (f *faultStore) View(ctx context.Context, fn func(Tx) error) error {
+	return f.Store.View(ctx, failAfter(fn, f.failView.Swap(false)))
+}
+
+func (f *faultStore) Update(ctx context.Context, fn func(Tx) error) error {
+	watch := f.watchUpdate.Swap(false)
+	err := f.Store.Update(ctx, failAfter(fn, f.failUpdate.Swap(false)))
+	if watch {
+		f.updated <- err
+	}
+	return err
+}
+
+func failAfter(fn func(Tx) error, fail bool) func(Tx) error {
+	if !fail {
+		return fn
+	}
+	return func(tx Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return errFault
+	}
+}
+
+// A post whose challenge authenticated, and whose request runs out of time
+// waiting for the database's one writer before its write transaction
+// begins, spends the challenge once the writer is free (R5).
+func TestRetirePostWriterWaitConsumes(t *testing.T) {
+	rs := crypto.OperationRetireStatus
+	f := &faultStore{updated: make(chan error, 1)}
+	var once sync.Once
+	e := newEnv(t, withLimits(func(l *Limits) { l.RequestDeadline = time.Second }), withFaults(f),
+		withHooks(func(s *Server) {
+			s.hooks.retireRead = func() { once.Do(func() { f.watchUpdate.Store(true) }) }
+		}))
+	v, _, B := twoDevices(t, e)
+	w := v.unrecordedRetire(B)
+	chal := e.newChallenge(v, B, rs)
+	sig := e.signAuth(v, B, rs, testOrigin, chal)
+
+	// Hold the writer in a transaction of its own; the post's read
+	// transaction runs on a reader and is not held up.
+	held, free := make(chan struct{}), make(chan struct{})
+	holder := make(chan error, 1)
+	go func() {
+		holder <- e.st.Update(context.Background(), func(Tx) error {
+			close(held)
+			<-free
+			return nil
+		})
+	}()
+	release := sync.OnceFunc(func() { close(free) })
+	defer release()
+	<-held
+	post := make(chan resp, 1)
+	go func() { post <- e.retirePostWith(v, B, chal, sig, w) }()
+	select {
+	case err := <-f.updated:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("the post's write transaction: %v, want the request's deadline", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the post did not give up waiting for the writer")
+	}
+	release()
+	if err := <-holder; err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, waitResp(t, post), 429, "busy", "the post out of time")
+	wantSpent(t, e, v, B, chal, sig)
+}
+
+// A request whose challenge authenticated spends it when a transaction
+// fails after the signature verified: a post's read transaction, or its
+// commit, whose retirement then rolls back with the consumption in it, or
+// a status's transaction. The challenge is spent in a transaction of its
+// own, and nothing else is written (R5).
+func TestRetireFailedTransactionConsumes(t *testing.T) {
+	rs := crypto.OperationRetireStatus
+	for _, c := range []struct {
+		name   string
+		status bool // the request is a status, not a post
+		arm    func(f *faultStore)
+	}{
+		{"post read", false, func(f *faultStore) { f.failView.Store(true) }},
+		{"post commit", false, func(f *faultStore) { f.failUpdate.Store(true) }},
+		{"status commit", true, func(f *faultStore) { f.failUpdate.Store(true) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &faultStore{}
+			e := newEnv(t, withFaults(f))
+			v, _, B := twoDevices(t, e)
+			e.session(v, B)
+			w := v.unrecordedRetire(B)
+			chal := e.newChallenge(v, B, rs)
+			sig := e.signAuth(v, B, rs, testOrigin, chal)
+			before := e.written(v)
+			c.arm(f)
+			var r resp
+			if c.status {
+				r = e.retireStatusWith(v, B, chal, sig, hashOf(t, v.log[0]))
+			} else {
+				r = e.retirePostWith(v, B, chal, sig, w)
+			}
+			wantCode(t, r, 500, "internal", "the failed request")
+			if f.failView.Load() || f.failUpdate.Load() {
+				t.Fatal("the fault was not reached")
+			}
+			if after := e.written(v); after != before {
+				t.Errorf("the failed request wrote: %s, before %s", after, before)
+			}
+			wantSpent(t, e, v, B, chal, sig)
+		})
 	}
 }

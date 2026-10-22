@@ -20,8 +20,8 @@
 # reach :8080: the network is internal, so nothing routes to it from
 # outside, and inhibit_ipv4 leaves the host without an address on its
 # bridge (Docker otherwise gives the host 172.30.0.1 there, and any process
-# on the host could reach the server directly). --trusted-proxy names the
-# proxy alone.
+# on the host could reach the server directly; tested with Docker 29.1.3).
+# --trusted-proxy names the proxy alone.
 # (For a proxy on the host instead, publish to loopback only, -p
 # 127.0.0.1:8080:8080, and trust the address the container sees for it:
 # the gateway of the network the container runs on, which docker network

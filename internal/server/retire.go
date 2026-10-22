@@ -211,10 +211,11 @@ func onlyRetireOf(e *vaultlog.Entry, dev model.ID) bool {
 // challenge. A challenge whose signature verified is consumed whatever
 // the answer: an inactive device (401), a wire for another vault (400),
 // the account's bucket (429), a full lock or validation queue or a request
-// out of time (429 busy), or a refused or failed commit (head_conflict,
-// invalid entry, quota); a retry needs a fresh one (R5). Refusals of the
-// challenge or the signature consume nothing, nor do the checks of the
-// wire alone, before authentication.
+// out of time (429 busy), a refused commit (head_conflict, invalid entry,
+// quota), or a failure of either transaction after the signature verified,
+// including a write transaction that never began; a retry needs a fresh one
+// (R5). Refusals of the challenge or the signature consume nothing, nor do
+// the checks of the wire alone, before authentication.
 func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) error {
 	release, ok := s.validate.acquire(r.Context())
 	if !ok {
@@ -239,14 +240,19 @@ func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) err
 	if err != nil {
 		return err
 	}
-	// authorize checks everything but the commit inside tx. err refuses
-	// before the challenge authenticated. refused is a refusal after it
-	// did, with the challenge ch, which the caller must consume.
+	// authorize checks everything but the commit inside tx. refused is a
+	// refusal after the challenge authenticated, with the challenge ch,
+	// which the caller must consume. It sets authenticated once the
+	// challenge and the signature verify, in either transaction: from then
+	// on every exit but a commit spends the challenge, a failed transaction
+	// included.
+	authenticated := false
 	authorize := func(tx Tx) (ch *Challenge, a *Account, refused, err error) {
 		ch, d, err := s.retireAuth(tx, req.AccountID, req.DeviceID, req.Challenge, req.Sig)
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		authenticated = true
 		if !d.Active {
 			return ch, nil, errUnauthorized, nil
 		}
@@ -263,14 +269,19 @@ func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) err
 		_, _, refused, err = authorize(tx)
 		return err
 	})
-	if err != nil {
-		return err
-	}
-	// The challenge authenticated: every exit from here but a commit
-	// spends it. No account lock is needed for that, since nothing but the
-	// challenge changes.
+	// Once the challenge authenticated, every exit but a commit spends it.
+	// No account lock is needed for that, since nothing but the challenge
+	// changes.
 	spend := func(refused error) error {
 		return s.spendChallenge(r, c, req.AccountID, req.DeviceID, req.Challenge, req.Sig, refused)
+	}
+	if err != nil {
+		if authenticated {
+			// A lookup after the signature verified, or the read
+			// transaction's end, failed.
+			return spend(err)
+		}
+		return err
 	}
 	if h := s.hooks.retireRead; h != nil {
 		h()
@@ -296,13 +307,11 @@ func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) err
 	var result vaultlog.Head
 	var vaultID model.ID
 	committed := false
-	authenticated := false
 	err = s.store.Update(r.Context(), func(tx Tx) error {
 		ch, a, refusedAuth, err := authorize(tx)
 		if err != nil {
 			return err
 		}
-		authenticated = true
 		if err := tx.DeleteChallenge(ch.Hash); err != nil {
 			return err
 		}
@@ -322,11 +331,12 @@ func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) err
 		return err
 	})
 	if err != nil {
-		if authenticated {
-			// The transaction, and the consumption in it, rolled back.
-			return spend(err)
-		}
-		return err
+		// The transaction, and the consumption in it, rolled back, or it
+		// never began (the request ran out of time waiting for the
+		// writer). The challenge authenticated in the read transaction, so
+		// spend it; if a concurrent request spent it meanwhile, the answer
+		// is that 401.
+		return spend(err)
 	}
 	if refused != nil {
 		return refused
