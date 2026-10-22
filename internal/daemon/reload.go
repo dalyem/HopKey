@@ -16,6 +16,7 @@ import (
 	"github.com/dalyem/hopkey/internal/sshagent"
 	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/sshkeys"
+	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
@@ -28,6 +29,11 @@ type state struct {
 	sshHosts    int
 	warnings    []string
 	lastError   string // set on a copy of the state when a later reload failed
+
+	locked  bool           // the vault is locked: nothing is loaded
+	snap    model.Snapshot // what it was built from, when head is set
+	head    store.Head     // the store's head at the time, if it has one
+	hasHead bool
 }
 
 // fingerprint identifies a snapshot by the IDs and versions of its items.
@@ -65,6 +71,7 @@ func (d *Daemon) reload(ctx context.Context) error {
 // returns it. On failure the previous keyring and config stay in place and
 // the failure is recorded in the state.
 func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
+	head, hasHead := d.storeHead()
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
 		d.noteError(err)
@@ -75,6 +82,7 @@ func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
 		d.noteError(err)
 		return model.Snapshot{}, err
 	}
+	next.snap, next.head, next.hasHead = snap, head, hasHead
 	d.state.Store(next)
 	return snap, nil
 }
@@ -89,8 +97,14 @@ func (d *Daemon) noteError(err error) {
 }
 
 // fresh returns the current snapshot, reloading first if the store has
-// changed since the last reload (another device synced, say).
+// changed since the last reload (another device synced, say). A store that
+// reports its log head is asked only for that while it is unchanged.
 func (d *Daemon) fresh(ctx context.Context) (model.Snapshot, *state, error) {
+	if h, ok := d.storeHead(); ok {
+		if cur := d.state.Load(); cur != nil && cur.hasHead && cur.head == h {
+			return cur.snap, cur, nil
+		}
+	}
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
 		return model.Snapshot{}, nil, err

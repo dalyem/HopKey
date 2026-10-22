@@ -129,6 +129,7 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 	e.printf("keys:         %d in the vault, %d in the agent\n", st.Keys, st.KeysInAgent)
 	e.printf("agent socket: %s\n", st.AgentSocket)
 	e.printf("ssh config:   %s\n", st.ConfigDir)
+	printVaultStatus(e, st.Vault)
 	if st.Tailscale.Available {
 		e.printf("tailscale:    available\n")
 	} else {

@@ -110,6 +110,9 @@ func rejectOversize(c net.Conn, enc *json.Encoder) {
 func errorResponse(err error) Response {
 	var e *Error
 	if !errors.As(err, &e) {
+		e = vaultError(err)
+	}
+	if e == nil {
 		switch {
 		case errors.Is(err, model.ErrNotFound):
 			e = &Error{Code: CodeNotFound, Message: err.Error()}
@@ -183,11 +186,17 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 	case OpShutdown:
 		return nil, nil
 	}
+	if result, ok, err := d.dispatchVault(ctx, req, decode); ok {
+		return result, err
+	}
 	return nil, invalidf("unknown op %q", req.Op)
 }
 
 func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 	snap, st, err := d.fresh(ctx)
+	if errors.Is(err, model.ErrLocked) {
+		snap, st, err = model.Snapshot{}, lockedState(), nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -197,6 +206,7 @@ func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 		ConfigDir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path(), ControlSocket: d.control.path,
 		Hosts: len(snap.Hosts), Keys: len(snap.Keys), KeysInAgent: st.keysInAgent, SSHHosts: st.sshHosts,
 		Warnings: slices.Clone(st.warnings), LoadedAt: st.loadedAt, LastError: st.lastError,
+		Vault: d.vaultStatus(),
 	}
 	out.Tailscale.Available, out.Tailscale.Reason = ts.Available, ts.Reason
 	return out, nil

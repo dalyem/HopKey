@@ -8,6 +8,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/resolve"
+	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
@@ -149,7 +150,10 @@ type StatusResult struct {
 	Warnings      []string  `json:"warnings,omitempty"`
 	LoadedAt      time.Time `json:"loaded_at"`
 	LastError     string    `json:"last_error,omitempty"` // the last reload that failed, if any
-	Tailscale     struct {
+	// Vault describes the encrypted store: locked or not, the device key
+	// store in use and the log head. Nil for other stores.
+	Vault     *store.Info `json:"vault,omitempty"`
+	Tailscale struct {
 		Available bool   `json:"available"`
 		Reason    string `json:"reason,omitempty"`
 	} `json:"tailscale"`
