@@ -63,6 +63,9 @@ type Env struct {
 	// the ssh -G runs of `hop import ssh-config`. Tests use it for the passwd
 	// shim that ssh needs under a uid with no passwd entry.
 	SSHProbeEnv []string
+	// PasswdHome is the home directory in the passwd database, which OpenSSH
+	// expands ~ from whatever $HOME says. Nil asks os/user. Tests replace it.
+	PasswdHome func() (string, error)
 
 	// DialTimeout bounds TCP and handshake probes. Zero means 5 seconds.
 	DialTimeout time.Duration
@@ -115,7 +118,7 @@ func init() {
 		"edit":    {runEdit, "hop edit <target> [--name N] [--address A]... [other flags as hop add]"},
 		"rm":      {runRm, "hop rm <target> [--yes]"},
 		"key":     {runKey, "hop key add <path> [--name N] | hop key ls | hop key rm <name> [--yes]"},
-		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run] [--allow-match-exec] [--json]"},
+		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run] [--allow-match-exec] [--allow-unscanned-includes] [--json]"},
 		"ts":      {runTS, "hop ts import [name...] [--user U] [--key K] [--tag T] [--no-pin] [--dry-run] | hop ts link <host> <node-id-or-dns-name>"},
 		"setup":   {runSetup, "hop setup [--yes]"},
 		"daemon":  {runDaemon, "hop daemon [stop]"},

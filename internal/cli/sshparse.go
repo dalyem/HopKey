@@ -2,17 +2,27 @@ package cli
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 )
 
 // configAlias is one concrete name from a Host line.
 type configAlias struct {
 	Name   string
 	Source string // file:line of the Host line that first named it
+}
+
+// hostLoc is where a Host line sits: the file as ssh prints it, and the line.
+type hostLoc struct {
+	file string
+	line int
 }
 
 // configScan lists what an ssh_config file names, and nothing about what
@@ -22,18 +32,21 @@ type configAlias struct {
 //
 //   - the aliases: the whitespace-separated words of Host lines that hold no
 //     wildcard and no leading "!", each once, in file order;
-//   - the lines that use "Match exec", which make ssh -G run a command;
-//   - the User and IdentityFile values the files set, so that a value ssh -G
-//     prints as a default can be told from one the user wrote.
+//   - the words of every Host line, by file and line, so that a Host line ssh
+//     reports as applied can be checked for the alias it applied to;
+//   - the lines that use a Match criterion which runs a command (exec), which
+//     make ssh -G run that command;
+//   - the Include lines it could not resolve or read. ssh -G reads those
+//     files all the same, so nothing the scan says about the config is
+//     complete while that list is not empty.
 type configScan struct {
-	home    string
-	skipDir string // Include of anything under here is skipped: hop's own output
+	home    string // the passwd home: what OpenSSH expands ~ to
+	skipDir string // Include of anything under here is skipped for aliases: hop's own output
 
 	aliases   []configAlias
-	matchExec []string // file:line
-	users     map[string]bool
-	identity  map[string]bool // normalized by normIdentity
-	warnings  []string
+	hostLines map[hostLoc][]string // positive literal words of each Host line
+	matchExec []string             // file:line
+	unscanned []string             // file:line: Include "x": why it is not scanned
 
 	seen      map[string]bool
 	readFile  func(string) (io.ReadCloser, error)
@@ -46,21 +59,29 @@ const maxIncludeDepth = 16
 func newConfigScan(home, skipDir string) *configScan {
 	return &configScan{
 		home: home, skipDir: skipDir,
-		users: map[string]bool{}, identity: map[string]bool{}, seen: map[string]bool{},
+		hostLines: map[hostLoc][]string{}, seen: map[string]bool{},
 		readFile:  func(p string) (io.ReadCloser, error) { return os.Open(p) },
 		globFiles: filepath.Glob,
 	}
 }
 
-func (s *configScan) warnf(format string, args ...any) {
-	s.warnings = append(s.warnings, fmt.Sprintf(format, args...))
-}
-
 // scan reads path. A missing top-level file is an error; a missing included
 // file is skipped, as ssh does.
-func (s *configScan) scan(path string) error { return s.file(path, 0) }
+func (s *configScan) scan(path string) error { return s.file(path, 0, true) }
 
-func (s *configScan) file(path string, depth int) error {
+// declares reports whether the Host line at file:line names alias literally,
+// as a word that is not negated or a pattern. file is compared as ssh prints
+// it, so ./a and a are the same file.
+func (s *configScan) declares(file string, line int, alias string) bool {
+	return slices.ContainsFunc(s.hostLines[hostLoc{filepath.Clean(file), line}], func(w string) bool {
+		return strings.EqualFold(w, alias)
+	})
+}
+
+// file scans one file. With aliases false (hop's own generated config) the
+// file is still read for what it makes ssh do, but its Host lines name nothing
+// to import.
+func (s *configScan) file(path string, depth int, aliases bool) error {
 	rc, err := s.readFile(path)
 	if err != nil {
 		return err
@@ -69,85 +90,156 @@ func (s *configScan) file(path string, depth int) error {
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for line := 1; sc.Scan(); line++ {
-		key, args := splitDirective(sc.Text())
+		text := sc.Text()
+		key, args := splitDirective(text)
 		source := fmt.Sprintf("%s:%d", path, line)
 		switch key {
 		case "host":
+			var words []string
 			for _, a := range args {
-				if strings.ContainsAny(a, "*?") || strings.HasPrefix(a, "!") || s.seen[strings.ToLower(a)] {
+				if strings.ContainsAny(a, "*?") || strings.HasPrefix(a, "!") {
 					continue
 				}
-				s.seen[strings.ToLower(a)] = true
-				s.aliases = append(s.aliases, configAlias{Name: a, Source: source})
-			}
-		case "match":
-			for _, a := range args {
-				if strings.EqualFold(a, "exec") {
-					s.matchExec = append(s.matchExec, source)
-					break
+				words = append(words, a)
+				if aliases && !s.seen[strings.ToLower(a)] {
+					s.seen[strings.ToLower(a)] = true
+					s.aliases = append(s.aliases, configAlias{Name: a, Source: source})
 				}
 			}
-		case "user":
-			if len(args) > 0 {
-				s.users[args[0]] = true
+			if aliases {
+				s.hostLines[hostLoc{filepath.Clean(path), line}] = words
 			}
-		case "identityfile":
-			if len(args) > 0 {
-				s.identity[normIdentity(s.home, args[0])] = true
+		case "match":
+			if matchRunsCommand(args) {
+				s.matchExec = append(s.matchExec, source)
 			}
 		case "include":
 			for _, pat := range args {
-				s.include(pat, depth)
+				s.include(source, pat, depth, aliases)
 			}
 		}
 	}
 	return sc.Err()
 }
 
-func (s *configScan) include(pattern string, depth int) {
+// include scans the files one Include argument names. Anything it cannot
+// resolve or read goes to s.unscanned, because ssh -G will still read it.
+func (s *configScan) include(source, raw string, depth int, aliases bool) {
+	fail := func(why string) {
+		s.unscanned = append(s.unscanned, fmt.Sprintf("%s: Include %q %s", source, raw, why))
+	}
 	if depth >= maxIncludeDepth {
-		s.warnf("Include %q is nested too deeply and is skipped", pattern)
+		fail("is nested too deeply")
 		return
 	}
-	pattern = s.expand(pattern)
-	if strings.Contains(pattern, "%") || strings.Contains(pattern, "${") {
-		s.warnf("Include %q uses a token or variable hop does not expand; the hosts in it may be missing", pattern)
+	pattern, why := s.resolveInclude(raw)
+	if why != "" {
+		fail(why)
 		return
-	}
-	if !filepath.IsAbs(pattern) {
-		pattern = filepath.Join(s.home, ".ssh", pattern) // relative paths are relative to ~/.ssh
 	}
 	matches, err := s.globFiles(pattern)
 	if err != nil {
-		s.warnf("Include %q: %v", pattern, err)
+		fail(fmt.Sprintf("is not a usable pattern (%v)", err))
 		return
 	}
 	for _, m := range matches {
-		if s.skipDir != "" && (m == s.skipDir || strings.HasPrefix(m, s.skipDir+string(filepath.Separator))) {
-			continue // hop's own generated config: importing it would copy the vault into itself
+		sub := aliases
+		if s.skipDir != "" && underDir(m, s.skipDir) {
+			sub = false // hop's own generated config: importing it would copy the vault into itself
 		}
-		if err := s.file(m, depth+1); err != nil {
-			s.warnf("Include %s: %v", m, err)
+		err := s.file(m, depth+1, sub)
+		// ssh skips a file that is gone and reads nothing from a directory.
+		if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.EISDIR) {
+			fail(fmt.Sprintf("names %s, which cannot be read (%v)", m, err))
 		}
 	}
 }
 
-// expand resolves a leading ~ and the %d token (the home directory).
-func (s *configScan) expand(path string) string { return expandHome(s.home, path) }
+func underDir(path, dir string) bool {
+	path, dir = filepath.Clean(path), filepath.Clean(dir)
+	return path == dir || strings.HasPrefix(path, dir+string(filepath.Separator))
+}
 
-func expandHome(home, path string) string {
-	path = strings.ReplaceAll(path, "%d", home)
-	if path == "~" {
-		return home
+// resolveInclude expands an Include argument the way OpenSSH does for a user
+// config: %d and %% tokens, a leading ~ (the passwd home), and a path that is
+// not absolute is relative to ~/.ssh. why says what it cannot expand: another
+// token, ${VAR} or ~user depend on things hop does not know.
+func (s *configScan) resolveInclude(raw string) (pattern, why string) {
+	if strings.Contains(raw, "${") {
+		return "", "uses an environment variable, which hop does not expand"
 	}
-	if strings.HasPrefix(path, "~/") {
-		return filepath.Join(home, path[2:])
+	var sb strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '%' {
+			sb.WriteByte(raw[i])
+			continue
+		}
+		i++
+		switch {
+		case i < len(raw) && raw[i] == '%':
+			sb.WriteByte('%')
+		case i < len(raw) && raw[i] == 'd':
+			sb.WriteString(s.home)
+		default:
+			return "", "uses a token hop does not expand"
+		}
 	}
-	return path
+	p := sb.String()
+	switch {
+	case p == "~":
+		p = s.home
+	case strings.HasPrefix(p, "~/"):
+		p = filepath.Join(s.home, p[2:])
+	case strings.HasPrefix(p, "~"):
+		return "", "names another user's home (~user), which hop does not expand"
+	case !filepath.IsAbs(p):
+		p = filepath.Join(s.home, ".ssh", p)
+	}
+	return p, ""
+}
+
+// matchCriteriaWithArg are the Match criteria that take an argument. All,
+// canonical and final stand alone.
+var matchCriteriaWithArg = map[string]bool{
+	"host": true, "originalhost": true, "user": true, "localuser": true,
+	"localnetwork": true, "tagged": true, "command": true, "sessiontype": true, "version": true,
+}
+
+// matchRunsCommand reports whether a Match line makes ssh run a command: it
+// has an exec criterion, negated or not, in any position. Criteria are read
+// the way OpenSSH reads them (a word, an optional leading "!", then the
+// argument of the criteria that take one), so `Match host exec` is a host
+// named exec, not a command. A word hop does not know could take an argument
+// or not, so a line with one counts as exec if any word is: this is a consent
+// check, and it errs toward asking.
+func matchRunsCommand(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		name := strings.ToLower(strings.TrimPrefix(args[i], "!"))
+		switch {
+		case name == "exec":
+			return true
+		case name == "all" || name == "canonical" || name == "final":
+		case matchCriteriaWithArg[name]:
+			i++ // its argument is not a criterion
+		default:
+			return slices.ContainsFunc(args, func(a string) bool {
+				return strings.EqualFold(strings.TrimLeft(a, "!"), "exec")
+			})
+		}
+	}
+	return false
 }
 
 // normIdentity makes the ways of writing one IdentityFile path comparable.
-func normIdentity(home, path string) string { return filepath.Clean(expandHome(home, path)) }
+func normIdentity(home, path string) string {
+	switch {
+	case path == "~":
+		path = home
+	case strings.HasPrefix(path, "~/"):
+		path = filepath.Join(home, path[2:])
+	}
+	return filepath.Clean(path)
+}
 
 // argSpan is one word of a config line: its text with quotes removed, and the
 // byte range it occupies in the line (quotes included).
@@ -157,8 +249,8 @@ type argSpan struct {
 }
 
 // splitDirective splits a config line into a lower-cased keyword and its
-// arguments. It understands "Key Value", "Key=Value", "Key = Value", double
-// quotes and # comments. A blank or comment line returns "".
+// arguments. It understands "Key Value", "Key=Value", "Key = Value", quotes
+// and # comments. A blank or comment line returns "".
 func splitDirective(line string) (key string, args []string) {
 	spans := directiveSpans(line)
 	if len(spans) == 0 {
@@ -171,11 +263,14 @@ func splitDirective(line string) (key string, args []string) {
 }
 
 // directiveSpans is splitDirective with positions: the keyword first, then
-// the arguments, each with the byte range it covers in line.
+// the arguments, each with the byte range it covers in line. Words split as
+// OpenSSH's argv_split does: single or double quotes group, and a backslash
+// escapes a quote, a backslash, or (outside quotes) a space.
 func directiveSpans(line string) []argSpan {
 	var tokens []argSpan
 	var cur strings.Builder
-	inQuote, have := false, false
+	var quote byte
+	have := false
 	start := 0
 	push := func(end int) {
 		if have {
@@ -193,15 +288,19 @@ func directiveSpans(line string) []argSpan {
 	for i := 0; i < len(line); i++ {
 		c := line[i]
 		switch {
-		case inQuote:
-			if c == '"' {
-				inQuote = false
+		case c == '\\' && i+1 < len(line) && (line[i+1] == '"' || line[i+1] == '\'' || line[i+1] == '\\' || (quote == 0 && line[i+1] == ' ')):
+			begin(i)
+			i++
+			cur.WriteByte(line[i])
+		case quote != 0:
+			if c == quote {
+				quote = 0
 			} else {
 				cur.WriteByte(c)
 			}
-		case c == '"':
+		case c == '"' || c == '\'':
 			begin(i)
-			inQuote = true
+			quote = c
 		case c == '#' && !have:
 			push(i)
 			i = len(line)
