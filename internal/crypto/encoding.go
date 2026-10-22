@@ -1,5 +1,5 @@
 // Package crypto implements HopKey's cryptographic layer, suite 1, as
-// defined by the crypto and protocol spec rev 7
+// defined by the crypto and protocol spec rev 8
 // (https://plan.23d.dev/p/xuu5z9q2). The spec is normative; section
 // numbers in comments refer to it. Nothing here goes beyond the spec, and
 // places where the spec is silent or contradictory are marked SPEC GAP.
@@ -100,31 +100,43 @@ func (h *Hash) UnmarshalText(b []byte) error {
 // Equal compares in constant time.
 func (h Hash) Equal(o Hash) bool { return subtle.ConstantTimeCompare(h[:], o[:]) == 1 }
 
-// OptHash is an "h | \"\"" value: the zero value is written as "".
-type OptHash [32]byte
-
-func (h OptHash) IsZero() bool { return h == OptHash{} }
-
-func (h OptHash) MarshalText() ([]byte, error) {
-	if h.IsZero() {
-		return []byte{}, nil
-	}
-	return []byte(hex.EncodeToString(h[:])), nil
+// OptHash is an "h | \"\"" value. Presence is kept separately from the
+// digest, so "" means absent and any 64-hex value, including all zeros,
+// means present. The zero value is absent.
+type OptHash struct {
+	h   Hash
+	set bool
 }
 
-func (h *OptHash) UnmarshalText(b []byte) error {
+// SomeHash returns a present OptHash holding h.
+func SomeHash(h Hash) OptHash { return OptHash{h: h, set: true} }
+
+// Get returns the digest and whether it is present.
+func (o OptHash) Get() (Hash, bool) { return o.h, o.set }
+
+// IsZero reports whether the value is absent ("").
+func (o OptHash) IsZero() bool { return !o.set }
+
+// Equal reports, in constant time, whether o is present and equals h.
+func (o OptHash) Equal(h Hash) bool { return o.set && o.h.Equal(h) }
+
+func (o OptHash) MarshalText() ([]byte, error) {
+	if !o.set {
+		return []byte{}, nil
+	}
+	return []byte(o.h.String()), nil
+}
+
+func (o *OptHash) UnmarshalText(b []byte) error {
 	if len(b) == 0 {
-		*h = OptHash{}
+		*o = OptHash{}
 		return nil
 	}
 	var x Hash
 	if err := parseHex(b, x[:]); err != nil {
 		return err
 	}
-	if x == (Hash{}) {
-		return errors.New("crypto: the all-zero digest is reserved for \"\"")
-	}
-	*h = OptHash(x)
+	*o = SomeHash(x)
 	return nil
 }
 

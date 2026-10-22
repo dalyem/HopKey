@@ -43,15 +43,114 @@ func TestHKDFRFC5869(t *testing.T) {
 	}
 }
 
-// Argon2id v0x13 from the reference implementation's test suite
-// (phc-winner-argon2 src/test.c: t=2, m=2^16 KiB, p=1, "password",
-// "somesalt"). RFC 9106 §5.3's Argon2id vector needs a secret and
-// associated data, which x/crypto's IDKey does not take, so it cannot be
-// replayed here. The pinned kdf_version 1 tuple is covered by the KAT.
+// Argon2id v0x13 known answers.
+//
+// The x/crypto rows are copied from golang.org/x/crypto@v0.58.0
+// argon2/argon2_test.go, var testVectors (lines 140-242): every
+// mode: argon2id row, run there through deriveKey(argon2id, "password",
+// "somesalt", nil, nil, ...), which is what IDKey calls. The first row is
+// the entry at lines 155-156.
+//
+// The t=2, m=2^16, p=1 row is the Argon2id v0x13 case in phc-winner-argon2
+// src/test.c. It is not in x/crypto's tests and its source could not be
+// checked offline; it is kept because it is the only row at the 64 MiB
+// memory size kdf_version 1 uses. RFC 9106 §5.3's vector needs a secret and
+// associated data, which IDKey does not take (x/crypto checks it as
+// testArgon2id, through the unexported deriveKey).
 func TestArgon2idReferenceVector(t *testing.T) {
-	got := argon2.IDKey([]byte("password"), []byte("somesalt"), 2, 1<<16, 1, 32)
-	if hex.EncodeToString(got) != "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7" {
-		t.Fatalf("Argon2id = %x", got)
+	for _, tc := range []struct {
+		time, memory uint32
+		threads      uint8
+		hash         string
+	}{
+		{1, 64, 1, "655ad15eac652dc59f7170a7332bf49b8469be1fdb9c28bb"},
+		{2, 64, 1, "068d62b26455936aa6ebe60060b0a65870dbfa3ddf8d41f7"},
+		{2, 64, 2, "350ac37222f436ccb5c0972f1ebd3bf6b958bf2071841362"},
+		{3, 256, 2, "4668d30ac4187e6878eedeacf0fd83c5a0a30db2cc16ef0b"},
+		{4, 4096, 4, "145db9733a9f4ee43edf33c509be96b934d505a4efb33c5a"},
+		{4, 1024, 8, "8dafa8e004f8ea96bf7c0f93eecf67a6047476143d15577f"},
+		{2, 64, 3, "4a15b31aec7c2590b87d1f520be7d96f56658172deaa3079"},
+		{3, 1024, 6, "1640b932f4b60e272f5d2207b9a9c626ffa1bd88d2349016"},
+		{2, 1 << 16, 1, "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7"}, // phc-winner-argon2
+	} {
+		got := argon2.IDKey([]byte("password"), []byte("somesalt"), tc.time, tc.memory, tc.threads, uint32(len(tc.hash)/2))
+		if hex.EncodeToString(got) != tc.hash {
+			t.Errorf("Argon2id t=%d m=%d p=%d = %x", tc.time, tc.memory, tc.threads, got)
+		}
+	}
+}
+
+// Buffer ownership in Go 1.27.3's crypto/hpke, as documented above
+// DeriveKEMKey. NewPrivateKey and DeriveKeyPair do not retain their input,
+// and Bytes() returns the stored seed itself. If this test starts failing,
+// a Go release changed the behavior; the copies in DeriveKEMKey,
+// ParseKEMPrivateKey and kemPrivateBytes keep our zeroing safe either way.
+func TestHPKEBufferOwnership(t *testing.T) {
+	kem := hpkeKEM()
+	seed := fixedBytes("ownership", 32)
+	in := bytes.Clone(seed)
+	k, err := kem.NewPrivateKey(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := k.PublicKey().Bytes()
+	clear(in)
+	if b, _ := k.Bytes(); !bytes.Equal(b, seed) || !bytes.Equal(k.PublicKey().Bytes(), pub) {
+		t.Fatal("crypto/hpke NewPrivateKey retains its input slice")
+	}
+	ikm := bytes.Clone(seed)
+	dk, err := kem.DeriveKeyPair(ikm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dpub := dk.PublicKey().Bytes()
+	clear(ikm)
+	if !bytes.Equal(dk.PublicKey().Bytes(), dpub) {
+		t.Fatal("crypto/hpke DeriveKeyPair retains its input slice")
+	}
+	b1, _ := k.Bytes()
+	b2, _ := k.Bytes()
+	if &b1[0] != &b2[0] {
+		t.Log("crypto/hpke Bytes() now returns a copy; kemPrivateBytes still copies")
+	}
+
+	// Our wrappers: clearing what we passed in or got back never touches
+	// the key.
+	in = bytes.Clone(seed)
+	pk, err := ParseKEMPrivateKey(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(in)
+	out, err := kemPrivateBytes(pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(out)
+	if b, _ := pk.Bytes(); !bytes.Equal(b, seed) {
+		t.Fatal("clearing our buffers destroyed the key")
+	}
+	ikm = bytes.Clone(seed)
+	dk2, err := DeriveKEMKey(ikm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(ikm)
+	if !bytes.Equal(dk2.PublicKey().Bytes(), dpub) {
+		t.Fatal("clearing ikm changed the derived key")
+	}
+	// MarshalAcctPriv clears its copy of the KEM seed; the account key is
+	// unaffected.
+	acct := fixedAccount(t, 1)
+	before, _ := acct.KEM.Bytes()
+	before = bytes.Clone(before)
+	ap, err := acct.MarshalAcctPriv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(ap)
+	if after, _ := acct.KEM.Bytes(); !bytes.Equal(after, before) {
+		t.Fatal("MarshalAcctPriv cleared the account KEM seed")
 	}
 }
 

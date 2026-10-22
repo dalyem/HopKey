@@ -44,6 +44,19 @@ import (
 // unused trailing bits required to be zero.
 var b64 = base64.RawURLEncoding.Strict()
 
+// decodeB64 decodes a b64 value. encoding/base64 skips CR and LF even in
+// strict mode, so every character is first checked against the base64url
+// alphabet; anything else, including line breaks, is rejected.
+func decodeB64(s string) ([]byte, error) {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-' || c == '_') {
+			return nil, fmt.Errorf("character %q at offset %d is not in the base64url alphabet", c, i)
+		}
+	}
+	return b64.DecodeString(s)
+}
+
 // Raw holds one JSON value in canonical form. Marshal re-canonicalizes it;
 // Unmarshal stores the canonical form of whatever value it finds there. It
 // is for members whose schema depends on context, such as an item plaintext
@@ -494,7 +507,7 @@ func decode(n *node, v reflect.Value, path string, asString bool) error {
 			if n.kind != kindString {
 				return typeErr(path, "b64 string", n)
 			}
-			b, err := b64.DecodeString(n.str)
+			b, err := decodeB64(n.str)
 			if err != nil {
 				return fmt.Errorf("canonjson: %s: invalid base64url: %w", path, err)
 			}

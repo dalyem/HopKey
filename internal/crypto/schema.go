@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -25,13 +26,19 @@ func schemaErr(field, format string, args ...any) error {
 }
 
 // CheckStr enforces str≤n (§3): valid UTF-8, at most n bytes, and no
-// control characters.
-//
-// SPEC GAP (§3): "control characters" is not defined further. This code
-// rejects Unicode general category Cc (C0, DEL and C1), which includes
-// newline. That makes every multi-line value invalid, including the
-// OpenSSH PEM that §6.5 requires in key.private_key; see that field.
+// control characters (Unicode general category Cc: C0, DEL and C1).
 func CheckStr(field, s string, n int) error {
+	return checkString(field, s, n, false)
+}
+
+// CheckText enforces text≤n (§3): like str≤n, except that LF (U+000A) and
+// TAB (U+0009) are allowed. CR and every other Cc character are rejected;
+// clients convert CRLF to LF on input (CRLFToLF).
+func CheckText(field, s string, n int) error {
+	return checkString(field, s, n, true)
+}
+
+func checkString(field, s string, n int, text bool) error {
 	if !utf8.ValidString(s) {
 		return schemaErr(field, "not valid UTF-8")
 	}
@@ -39,12 +46,20 @@ func CheckStr(field, s string, n int) error {
 		return schemaErr(field, "longer than %d bytes", n)
 	}
 	for _, r := range s {
+		if text && (r == '\n' || r == '\t') {
+			continue
+		}
 		if unicode.IsControl(r) {
 			return schemaErr(field, "contains a control character")
 		}
 	}
 	return nil
 }
+
+// CRLFToLF converts every CRLF in s to LF, the input conversion §3 asks of
+// clients for text≤n fields. A CR that is not followed by LF is left in
+// place, so CheckText still rejects it.
+func CRLFToLF(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
 
 func checkStrs(field string, ss []string, n int) error {
 	for i, s := range ss {
@@ -106,7 +121,7 @@ func ValidateHost(h *model.Host) error {
 	if err := checkStrs("tags", h.Tags, 32); err != nil {
 		return err
 	}
-	if err := CheckStr("description", h.Description, 1024); err != nil {
+	if err := CheckText("description", h.Description, 1024); err != nil {
 		return err
 	}
 	if ts := h.Tailscale; ts != nil {
@@ -129,13 +144,8 @@ func ValidateHost(h *model.Host) error {
 	return checkEnum("agent_access", h.AgentAccess, "allow", "deny")
 }
 
-// ValidateKey checks a key plaintext against §6.5.
-//
-// SPEC GAP (§6.5 vs §3): private_key is "str≤16384 (unencrypted OpenSSH
-// PEM)", but str≤n forbids control characters and PEM is multi-line, so a
-// real OpenSSH private key can never pass. This code applies str≤n as
-// written (rejecting real keys) until the spec says which characters
-// private_key may contain.
+// ValidateKey checks a key plaintext against §6.5. private_key is
+// text≤16384, so a multi-line OpenSSH PEM passes.
 func ValidateKey(k *model.Key) error {
 	if err := checkHeader(k.Header, model.TypeKey); err != nil {
 		return err
@@ -146,7 +156,7 @@ func ValidateKey(k *model.Key) error {
 	if err := checkEnum("key_type", k.KeyType, "ed25519", "ecdsa-p256", "rsa"); err != nil {
 		return err
 	}
-	if err := CheckStr("private_key", k.PrivateKey, 16384); err != nil {
+	if err := CheckText("private_key", k.PrivateKey, 16384); err != nil {
 		return err
 	}
 	return CheckStr("public_key", k.PublicKey, 8192)
@@ -174,13 +184,13 @@ func ValidateSnippet(s *model.Snippet) error {
 	if err := CheckStr("name", s.Name, 64); err != nil {
 		return err
 	}
-	if err := CheckStr("command", s.Command, 8192); err != nil {
+	if err := CheckText("command", s.Command, 8192); err != nil {
 		return err
 	}
 	if err := checkStrs("params", s.Params, 32); err != nil {
 		return err
 	}
-	return CheckStr("description", s.Description, 1024)
+	return CheckText("description", s.Description, 1024)
 }
 
 // ValidateGrant checks a grant record plaintext against §6.5. Rules that

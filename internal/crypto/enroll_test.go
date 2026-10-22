@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/model"
 )
 
@@ -153,11 +154,30 @@ func TestEnrollMessageSchemas(t *testing.T) {
 		"commit duplicate":      {`{"c":"` + strings.Repeat("a", 64) + `","c":"` + strings.Repeat("b", 64) + `","v":1}`, &EnrollCommit{}},
 		"commit v=2":            {`{"c":"` + strings.Repeat("a", 64) + `","v":2}`, &EnrollCommit{}},
 		"commit missing c":      {`{"v":1}`, &EnrollCommit{}},
-		"open short nD":         {`{"kem_pk":"AA","name":"n","nD":"AA","sig_pk":"AA","v":1}`, &EnrollOpen{}},
 		"chal missing akv":      {`{"account_id":"` + strings.Repeat("1", 32) + `","acct_sig_fp":"` + strings.Repeat("a", 64) + `","approver_device_id":"` + strings.Repeat("2", 32) + `","enroll_id":"` + strings.Repeat("3", 32) + `","nA":"` + strings.Repeat("A", 43) + `","v":1}`, &EnrollChal{}},
 	} {
 		if err := ParseEnrollMessage([]byte(tc.in), tc.v); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+	// open with valid keys and only nD the wrong length: the rejection must
+	// come from nD, not from an earlier field.
+	o := testOpen(t)
+	if j, err := canonjson.Marshal(o); err != nil {
+		t.Fatal(err)
+	} else if err := ParseEnrollMessage(j, &EnrollOpen{}); err != nil {
+		t.Fatalf("valid open rejected: %v", err)
+	}
+	for _, n := range []int{0, 31, 33} {
+		short := *o
+		short.ND = fixedBytes("nD", n)
+		j, err := canonjson.Marshal(&short)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var se *SchemaError
+		if err := ParseEnrollMessage(j, &EnrollOpen{}); !errors.As(err, &se) || se.Field != "nD" {
+			t.Errorf("open with %d-byte nD: %v", n, err)
 		}
 	}
 	good := `{"c":"` + strings.Repeat("a", 64) + `","v":1}`
@@ -200,7 +220,7 @@ func newEnrollRig(t *testing.T) *enrollRig {
 // both SAS values.
 func (r *enrollRig) runToOpen(t *testing.T, enrollID model.ID) (dSAS, aSAS string) {
 	t.Helper()
-	d, commit, err := NewDeviceEnrollment(r.dp, "new-laptop")
+	d, commit, err := NewDeviceEnrollmentWithClock(r.dp, r.clock.now, "new-laptop")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +294,7 @@ func TestEnrollmentHappyPath(t *testing.T) {
 		t.Fatal("D not done")
 	}
 	// The delivered certificate binds SHA-256(T).
-	if [32]byte(v.Cert.EnrollTranscript) != [32]byte(TranscriptHash(r.d.transcript())) {
+	if !v.Cert.EnrollTranscript.Equal(TranscriptHash(r.d.transcript())) {
 		t.Fatal("enroll_transcript is not SHA-256(T)")
 	}
 }
@@ -292,7 +312,7 @@ func TestSecondChalAfterReveal(t *testing.T) {
 		t.Fatalf("different second chal: %v", err)
 	}
 	// Also after a restart.
-	d, err := RestoreDeviceEnrollment(r.dp, r.dp.state)
+	d, err := RestoreDeviceEnrollmentWithClock(r.dp, r.clock.now, r.dp.state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +468,7 @@ func TestSubstitutedDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	cert := Cert{V: 1, AccountID: evil.AccountID, AKV: 1, DeviceID: fixedID(0x41), Name: open.Name,
-		KEMFp: FpKEM(open.KEMPK), SigFp: FpSig(open.SigPK), EnrollTranscript: OptHash(th), IssuedAt: 0}
+		KEMFp: FpKEM(open.KEMPK), SigFp: FpSig(open.SigPK), EnrollTranscript: SomeHash(th), IssuedAt: 0}
 	sig, _ := SignCert(evil, &cert)
 	unlock, _ := SealUnlock(open.KEMPK, &cert, evil)
 	env, _ := SealDelivery(open.KEMPK, th, &EnrollDelivery{V: 1, Cert: cert, CertSig: sig, Unlock: unlock})
@@ -481,7 +501,7 @@ func TestSubstitutedDelivery(t *testing.T) {
 	// Right keys, wrong transcript.
 	cert3 := cert
 	cert3.AccountID = r.acct.AccountID
-	cert3.EnrollTranscript = OptHash(sha256.Sum256([]byte("other T")))
+	cert3.EnrollTranscript = SomeHash(sha256.Sum256([]byte("other T")))
 	sig3, _ := SignCert(r.acct, &cert3)
 	unlock4, _ := SealUnlock(open.KEMPK, &cert3, r.acct)
 	env3, _ := SealDelivery(open.KEMPK, th, &EnrollDelivery{V: 1, Cert: cert3, CertSig: sig3, Unlock: unlock4})
@@ -632,7 +652,7 @@ func TestApprovalRestartMidway(t *testing.T) {
 	if err != nil || !bytes.Equal(env.CT, env2.CT) {
 		t.Fatal("delivery not stable across restart")
 	}
-	d2, err := RestoreDeviceEnrollment(r.dp, r.dp.state)
+	d2, err := RestoreDeviceEnrollmentWithClock(r.dp, r.clock.now, r.dp.state)
 	if err != nil {
 		t.Fatal(err)
 	}

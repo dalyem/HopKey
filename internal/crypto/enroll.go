@@ -1,10 +1,10 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/hpke"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -214,14 +214,76 @@ type VerifiedDelivery struct {
 	AnchorH   Hash
 }
 
+// ErrCertName means the delivered certificate names the device differently
+// from the open message (§7 step 6 requires Cert.name = open.name).
+var ErrCertName = errors.New("crypto: certificate name differs from the enrolled device name")
+
 // VerifyDelivery runs D's delivery checks (§7 step 6): it opens the
 // delivery and the unlock blob, derives the account public keys from
 // acct_priv and requires fp_sig = chal.acct_sig_fp, akv = chal.akv and
-// account_id = chal.account_id, the certificate to bind D's own keys and
-// SHA-256(T), and cert_sig to verify under the derived signing key. The
+// account_id = chal.account_id, the certificate to bind D's own keys,
+// SHA-256(T) and open.name, and cert_sig to verify under the derived
+// signing key. open.name is read back from T, which ends in lp(name). The
 // anchor checks that follow belong to the vault log.
 func VerifyDelivery(devKEM hpke.PrivateKey, devSigPK []byte, ch *EnrollChal, t []byte, e HPKEEnvelope) (*VerifiedDelivery, error) {
-	th := TranscriptHash(t)
+	name, err := transcriptName(t)
+	if err != nil {
+		return nil, err
+	}
+	return verifyDelivery(devKEM, devSigPK, ch, name, TranscriptHash(t), e)
+}
+
+// transcriptName returns the name field of T: every field before it has a
+// fixed layout (§7), and lp(name) is the last.
+func transcriptName(t []byte) (string, error) {
+	errT := errors.New("crypto: malformed enrollment transcript")
+	r := t
+	lp := func() ([]byte, bool) {
+		if len(r) < 4 {
+			return nil, false
+		}
+		n := binary.BigEndian.Uint32(r)
+		if uint64(len(r)-4) < uint64(n) {
+			return nil, false
+		}
+		f := r[4 : 4+n]
+		r = r[4+n:]
+		return f, true
+	}
+	u32 := func() bool {
+		if len(r) < 4 {
+			return false
+		}
+		r = r[4:]
+		return true
+	}
+	// label, u32(1), enroll_id, c, nA, account_id, approver_device_id,
+	// acct_sig_fp, u32(akv), kem_pk, sig_pk, nD, name.
+	label, ok := lp()
+	if !ok || string(label) != LabelEnrollTranscript || !u32() {
+		return "", errT
+	}
+	for range 6 {
+		if _, ok := lp(); !ok {
+			return "", errT
+		}
+	}
+	if !u32() {
+		return "", errT
+	}
+	for range 3 {
+		if _, ok := lp(); !ok {
+			return "", errT
+		}
+	}
+	name, ok := lp()
+	if !ok || len(r) != 0 {
+		return "", errT
+	}
+	return string(name), nil
+}
+
+func verifyDelivery(devKEM hpke.PrivateKey, devSigPK []byte, ch *EnrollChal, name string, th Hash, e HPKEEnvelope) (*VerifiedDelivery, error) {
 	d, err := OpenDelivery(devKEM, th, e)
 	if err != nil {
 		return nil, err
@@ -239,9 +301,13 @@ func VerifyDelivery(devKEM hpke.PrivateKey, devSigPK []byte, ch *EnrollChal, t [
 		acct.Zero()
 		return nil, err
 	}
-	if d.Cert.EnrollTranscript.IsZero() || subtle.ConstantTimeCompare(d.Cert.EnrollTranscript[:], th[:]) != 1 {
+	if !d.Cert.EnrollTranscript.Equal(th) {
 		acct.Zero()
 		return nil, errors.New("crypto: certificate does not bind this enrollment transcript")
+	}
+	if d.Cert.Name != name {
+		acct.Zero()
+		return nil, ErrCertName
 	}
 	if err := VerifyCert(acct.Public().SigPK, &d.Cert, d.CertSig); err != nil {
 		acct.Zero()
@@ -251,4 +317,20 @@ func VerifyDelivery(devKEM hpke.PrivateKey, devSigPK []byte, ch *EnrollChal, t [
 		Cert: d.Cert, CertSig: d.CertSig, Unlock: d.Unlock, Account: acct,
 		AnchorSeq: d.AnchorSeq, AnchorH: d.AnchorH,
 	}, nil
+}
+
+// clone returns a deep copy.
+func (m *EnrollChal) clone() *EnrollChal {
+	c := *m
+	c.NA = bytes.Clone(m.NA)
+	return &c
+}
+
+// clone returns a deep copy.
+func (m *EnrollOpen) clone() *EnrollOpen {
+	c := *m
+	c.KEMPK = bytes.Clone(m.KEMPK)
+	c.SigPK = bytes.Clone(m.SigPK)
+	c.ND = bytes.Clone(m.ND)
+	return &c
 }

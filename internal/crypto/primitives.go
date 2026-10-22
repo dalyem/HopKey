@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/hkdf"
 	"crypto/hpke"
 	"crypto/rand"
@@ -56,6 +57,13 @@ type HPKEEnvelope struct {
 	Suite int    `json:"suite"`
 	Enc   []byte `json:"enc"`
 	CT    []byte `json:"ct"`
+}
+
+// clone returns a deep copy.
+func (e HPKEEnvelope) clone() HPKEEnvelope {
+	e.Enc = bytes.Clone(e.Enc)
+	e.CT = bytes.Clone(e.CT)
+	return e
 }
 
 // ErrUnsupported means an object names a format version or suite other
@@ -171,11 +179,43 @@ func HPKESuiteIDs() (kem, kdf, aead uint16) {
 // GenerateKEMKey returns a new X-Wing key pair.
 func GenerateKEMKey() (hpke.PrivateKey, error) { return hpkeKEM().GenerateKey() }
 
-// DeriveKEMKey is KEM.DeriveKeyPair(ikm) (RFC 9180 §7.1.3).
-func DeriveKEMKey(ikm []byte) (hpke.PrivateKey, error) { return hpkeKEM().DeriveKeyPair(ikm) }
+// Buffer ownership with crypto/hpke (Go 1.27.3, src/crypto/hpke/pq.go):
+//
+//   - hybridKEM.NewPrivateKey(priv) absorbs priv into SHAKE256 and keeps
+//     bytes.Clone(priv) as the seed (newHybridPrivateKey); the ML-KEM and
+//     X25519 halves are built from fresh buffers, which crypto/mlkem copies
+//     into arrays and crypto/ecdh clones. The input is not retained.
+//   - hybridKEM.DeriveKeyPair(ikm) only absorbs ikm into SHAKE256
+//     (labeledDerive) and passes the fresh output to NewPrivateKey.
+//   - hybridPrivateKey.Bytes() returns the stored seed itself, not a copy.
+//
+// So that clearing our own buffers stays safe even if a later release
+// retains its input, both constructors get a private copy that we never
+// clear, and Bytes() output is copied before we use it (kemPrivateBytes).
+// TestHPKEBufferOwnership pins the behavior above.
 
-// ParseKEMPrivateKey reads PrivateKey.Bytes() output.
-func ParseKEMPrivateKey(b []byte) (hpke.PrivateKey, error) { return hpkeKEM().NewPrivateKey(b) }
+// DeriveKEMKey is KEM.DeriveKeyPair(ikm) (RFC 9180 §7.1.3). The caller may
+// clear ikm afterwards.
+func DeriveKEMKey(ikm []byte) (hpke.PrivateKey, error) {
+	return hpkeKEM().DeriveKeyPair(bytes.Clone(ikm))
+}
+
+// ParseKEMPrivateKey reads PrivateKey.Bytes() output. The caller may clear
+// b afterwards.
+func ParseKEMPrivateKey(b []byte) (hpke.PrivateKey, error) {
+	return hpkeKEM().NewPrivateKey(bytes.Clone(b))
+}
+
+// kemPrivateBytes returns a copy of k.Bytes(), which the caller owns and
+// may clear. crypto/hpke returns its internal seed, so clearing the
+// uncopied value would destroy the key.
+func kemPrivateBytes(k hpke.PrivateKey) ([]byte, error) {
+	b, err := k.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	return bytes.Clone(b), nil
+}
 
 // ParseKEMPublicKey reads PublicKey.Bytes() output.
 func ParseKEMPublicKey(b []byte) (hpke.PublicKey, error) { return hpkeKEM().NewPublicKey(b) }

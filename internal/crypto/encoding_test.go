@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"maps"
+	"math/big"
+	"slices"
 	"strings"
 	"testing"
 
@@ -110,6 +114,139 @@ func TestSignVerify(t *testing.T) {
 	}
 }
 
+// Malformed and non-canonical Ed25519 signatures are rejected. S + L is
+// the classic malleated signature: it satisfies the verification equation,
+// so only the canonical-S check (RFC 8032 §5.1.7) refuses it.
+func TestVerifyRejectsMalformedSignatures(t *testing.T) {
+	key := fixedSig("signer")
+	pub := key.Public().(ed25519.PublicKey)
+	obj := map[string]any{"v": 1}
+	sig, err := Sign(key, LabelDeviceCert, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// L = 2^252 + 27742317777372353535851937790883648493, little-endian.
+	l := new(big.Int).Add(new(big.Int).Lsh(big.NewInt(1), 252), mustBig("27742317777372353535851937790883648493"))
+	le := func(b []byte) *big.Int {
+		r := bytes.Clone(b)
+		slices.Reverse(r)
+		return new(big.Int).SetBytes(r)
+	}
+	toLE := func(n *big.Int) []byte {
+		b := n.FillBytes(make([]byte, 32))
+		slices.Reverse(b)
+		return b
+	}
+	sPlusL := bytes.Clone(sig)
+	copy(sPlusL[32:], toLE(new(big.Int).Add(le(sig[32:]), l)))
+	highS := bytes.Clone(sig)
+	highS[63] |= 0xe0
+	// R replaced by a non-canonical encoding: y = p + 1 is the identity
+	// written with y >= p.
+	p := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 255), big.NewInt(19))
+	nonCanonR := bytes.Clone(sig)
+	copy(nonCanonR[:32], toLE(new(big.Int).Add(p, big.NewInt(1))))
+	identityR := bytes.Clone(sig)
+	copy(identityR[:32], toLE(big.NewInt(1)))
+	for name, bad := range map[string][]byte{
+		"S + L":           sPlusL,
+		"S top bits set":  highS,
+		"non-canonical R": nonCanonR,
+		"identity R":      identityR,
+		"all zero":        make([]byte, 64),
+		"all 0xff":        bytes.Repeat([]byte{0xff}, 64),
+		"long":            append(bytes.Clone(sig), 0),
+		"short":           sig[:63],
+		"empty":           nil,
+		"flipped bit":     func() []byte { b := bytes.Clone(sig); b[10] ^= 1; return b }(),
+	} {
+		if err := Verify(pub, LabelDeviceCert, obj, bad); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := Verify(pub, LabelDeviceCert, obj, sig); err != nil {
+		t.Fatalf("the original no longer verifies: %v", err)
+	}
+	// A malformed public key fails as well.
+	for name, k := range map[string][]byte{"short key": pub[:31], "long key": append(bytes.Clone(pub), 0)} {
+		if err := Verify(k, LabelDeviceCert, obj, sig); !errors.Is(err, ErrBadSignature) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func mustBig(s string) *big.Int {
+	n, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		panic(s)
+	}
+	return n
+}
+
+// §3: input need not be canonical (whitespace, escapes and member order
+// may vary), but every digest and signature is over the JCS re-encoding of
+// the decoded value. A certificate received in non-canonical form has the
+// same digest and verifies under the same signature.
+func TestNonCanonicalInputSameDigestAndSignature(t *testing.T) {
+	acct := fixedAccount(t, 1)
+	c := Cert{V: 1, AccountID: acct.AccountID, AKV: 1, DeviceID: fixedID(0x40), Name: "laptop é",
+		KEMFp: Hash{1, 2, 3}, SigFp: Hash{4, 5, 6}, EnrollTranscript: SomeHash(Hash{}), IssuedAt: 1792670400}
+	sig, err := SignCert(acct, &c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canon, err := canonjson.Marshal(&c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := c.Digest()
+
+	// The same value: members reversed, whitespace everywhere, and
+	// characters written as escapes (\u0061 for "a", \u00e9 for "é",
+	// \/ for "/").
+	var members []string
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(canon, &obj); err != nil {
+		t.Fatal(err)
+	}
+	keys := slices.Sorted(maps.Keys(obj))
+	slices.Reverse(keys)
+	esc := func(s string) string {
+		return strings.ReplaceAll(strings.ReplaceAll(s, "a", `\u0061`), "é", `\u00e9`)
+	}
+	for _, k := range keys {
+		members = append(members, "\n\t\""+esc(k)+"\" :\r\n "+esc(string(obj[k])))
+	}
+	noncanon := []byte("{ " + strings.Join(members, " ,") + "\n}\n")
+	if bytes.Equal(noncanon, canon) {
+		t.Fatal("test input is canonical")
+	}
+	var got Cert
+	if err := canonjson.Unmarshal(noncanon, &got); err != nil {
+		t.Fatalf("non-canonical certificate rejected: %v\n%s", err, noncanon)
+	}
+	if got != c {
+		t.Fatal("non-canonical input decoded to a different value")
+	}
+	if d, _ := got.Digest(); !d.Equal(want) {
+		t.Fatal("digest depends on the received bytes")
+	}
+	if err := VerifyCert(acct.Public().SigPK, &got, sig); err != nil {
+		t.Fatalf("signature does not verify over the decoded value: %v", err)
+	}
+	if again, _ := SignCert(acct, &got); !bytes.Equal(again, sig) {
+		t.Fatal("re-signing the decoded value gives another signature")
+	}
+	if re, _ := canonjson.Canonicalize(noncanon); !bytes.Equal(re, canon) {
+		t.Fatalf("Canonicalize = %s", re)
+	}
+	// The digest is never over the received bytes.
+	raw := sha256.Sum256(cat(lps(LabelDeviceCert), LP(noncanon)))
+	if Hash(raw).Equal(want) {
+		t.Fatal("digest computed over received bytes")
+	}
+}
+
 func TestHashText(t *testing.T) {
 	var h Hash
 	good := strings.Repeat("ab", 32)
@@ -128,8 +265,43 @@ func TestHashText(t *testing.T) {
 	if b, _ := o.MarshalText(); len(b) != 0 {
 		t.Errorf("zero OptHash marshals as %q", b)
 	}
-	if err := o.UnmarshalText([]byte(strings.Repeat("00", 32))); err == nil {
-		t.Error("OptHash accepted the reserved all-zero digest")
+	// Presence is separate from the digest: an all-zero digest is a present
+	// h value (§3 allows it) and round-trips as 64 zeros, not as "".
+	zeros := strings.Repeat("00", 32)
+	if err := o.UnmarshalText([]byte(zeros)); err != nil || o.IsZero() {
+		t.Fatalf("OptHash rejected the all-zero digest: %v", err)
+	}
+	if got, ok := o.Get(); !ok || got != (Hash{}) || !o.Equal(Hash{}) {
+		t.Error("all-zero OptHash is not present with a zero digest")
+	}
+	if b, _ := o.MarshalText(); string(b) != zeros {
+		t.Errorf("all-zero OptHash marshals as %q", b)
+	}
+	if (OptHash{}).Equal(Hash{}) {
+		t.Error("absent OptHash equals the zero digest")
+	}
+	if b, _ := SomeHash(Hash{1}).MarshalText(); string(b) != "01"+strings.Repeat("00", 31) {
+		t.Errorf("SomeHash marshals as %q", b)
+	}
+	for _, bad := range []string{strings.Repeat("AB", 32), strings.Repeat("ab", 31), " "} {
+		if err := o.UnmarshalText([]byte(bad)); err == nil {
+			t.Errorf("OptHash accepted %q", bad)
+		}
+	}
+	// Through canonjson, inside a certificate.
+	c := Cert{V: 1, AccountID: fixedID(1), DeviceID: fixedID(2), Name: "n", EnrollTranscript: SomeHash(Hash{})}
+	j, err := canonjson.Marshal(&c)
+	if err != nil || !strings.Contains(string(j), `"enroll_transcript":"`+zeros+`"`) {
+		t.Fatalf("cert with all-zero enroll_transcript: %s, %v", j, err)
+	}
+	var back Cert
+	if err := canonjson.Unmarshal(j, &back); err != nil || back != c {
+		t.Fatalf("round trip: %v", err)
+	}
+	c.EnrollTranscript = OptHash{}
+	j, _ = canonjson.Marshal(&c)
+	if !strings.Contains(string(j), `"enroll_transcript":""`) {
+		t.Fatalf("absent enroll_transcript: %s", j)
 	}
 	if b, _ := (Hash{}).MarshalText(); len(b) != 64 {
 		t.Error("zero Hash does not marshal as 64 hex characters")

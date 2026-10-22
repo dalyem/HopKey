@@ -122,8 +122,18 @@ func TestRecoveryKeys(t *testing.T) {
 	if k2 == rkKey {
 		t.Fatal("account ID does not salt the recovery keys")
 	}
-	if _, _, err := RecoveryKeys(nil, acct); err == nil {
-		t.Fatal("empty RK accepted")
+	// RK is exactly 32 bytes (§12).
+	for _, n := range []int{0, 1, 16, 31, 33, 64} {
+		if _, _, err := RecoveryKeys(fixedBytes("RK", n), acct); err == nil {
+			t.Errorf("%d-byte RK accepted", n)
+		}
+	}
+	gen, err := NewRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RecoveryKeys(gen[:], acct); err != nil {
+		t.Fatalf("generated RK rejected: %v", err)
 	}
 }
 
