@@ -180,10 +180,11 @@ func TestRevocationLeavesAnotherVaultOfTheAccountAlone(t *testing.T) {
 }
 
 // Round 3 (D1), finding 3: a replacement that stopped after saving the new
-// record (B) and before device.json named it leaves device.json naming the
-// lost device (A). Another device then revokes A, which is stale, and
-// keeps B. A retried password unlock is this machine as B, the readable
-// record: the revocation of A does not revoke it.
+// record (B) and before installing it leaves device.json naming the lost
+// device (A), with B pending. Another device then revokes A and keeps B.
+// The retried password unlock finds B's bootstrap in the verified log and
+// its record readable, and installs B before it asks the server anything:
+// the revocation of A, which B replaced, does not revoke it.
 func TestAStaleConfigIDDoesNotRevokeTheReplacement(t *testing.T) {
 	ctx := context.Background()
 	f, r := serverVaultIn(t, DeviceStoreKeychain)
@@ -207,14 +208,13 @@ func TestAStaleConfigIDDoesNotRevokeTheReplacement(t *testing.T) {
 	b := deviceOf(f.s)
 	f.s.Lock()
 	// What a replacement that stopped between saving B's record and
-	// updating device.json leaves on disk: device.json names A and lists B
-	// as stale.
+	// installing it leaves on disk: device.json names A, with B pending.
 	path := filepath.Join(f.cfg.DataDir, "device.json")
 	var dc deviceConfig
 	if err := json.Unmarshal([]byte(readFile(t, path)), &dc); err != nil {
 		t.Fatal(err)
 	}
-	dc.DeviceID, dc.StaleDevices = a, []model.ID{b}
+	dc.DeviceID, dc.Pending, dc.StaleDevices = a, &pendingDevice{DeviceID: b}, nil
 	raw, err := json.Marshal(dc)
 	if err != nil {
 		t.Fatal(err)
@@ -232,12 +232,13 @@ func TestAStaleConfigIDDoesNotRevokeTheReplacement(t *testing.T) {
 	if got := storedRecord(t, f.cfg, f.kit.AccountID); got.DeviceID != b {
 		t.Fatalf("setup: the readable record is %v, want B (%v)", got.DeviceID, b)
 	}
-	// Without B's device key the password unlock cannot open the
-	// checkpoint's new keys, so it may fail; it must not revoke.
+	posts := r.postCount()
 	err = s.UnlockWithPasswordRemote(ctx, r, []byte(testPassword), f.kit.SecretKey)
-	t.Logf("the retried password unlock: %v", err)
 	if errors.Is(err, ErrDeviceRevoked) || s.IsRevoked() || revokedFileExists(t, f.cfg) || s.Info().Revoked {
-		t.Fatalf("the revocation of the stale device A revoked this machine: %v", err)
+		t.Fatalf("the revocation of the replaced device A revoked this machine: %v", err)
+	}
+	if err != nil || deviceOf(s) != b || r.postCount() != posts {
+		t.Fatalf("the retried password unlock: %v; want B (%v) installed with nothing posted", err, b)
 	}
 	if tombstoned(t, f, DeviceStoreKeychain, b) || tombstoned(t, f, DeviceStoreKeychain, a) {
 		t.Error("a device record was tombstoned")

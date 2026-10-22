@@ -52,17 +52,61 @@ func (OSKeyring) Delete(service, user string) error        { return keyring.Dele
 // deviceConfig is device.json: which store holds the device key, and the
 // local device bookkeeping. It holds no secrets.
 //
-// DeviceID is the device whose key the store holds. StaleDevices are
-// devices this machine enrolled and then lost the key of (a password unlock
-// replaces the device key): they are still active in the log, and the next
-// hop passwd revokes them (§10.1).
+// DeviceID is this data directory's device. Pending is at most one
+// replacement that a password unlock is enrolling and has not installed
+// yet: it is set durably before the bootstrap entry is built, and cleared
+// in the same write that makes it DeviceID, or once the attempt is
+// abandoned and its record deleted. Only these two are this machine (self):
+// the device key is read from DeviceID's record, else from Pending's, and a
+// revocation of either is terminal for this directory.
+//
+// StaleDevices are devices this machine enrolled and then lost the key of
+// (a password unlock replaced them, or was abandoned): they are still
+// active in the log, and the next hop passwd revokes them (§10.1). They are
+// a cleanup list only: never a source of the device key, never self.
 type deviceConfig struct {
-	V            int        `json:"v"`
-	Store        string     `json:"store"`
-	Sealed       bool       `json:"sealed,omitempty"` // file store only
-	AccountID    model.ID   `json:"account_id"`
-	DeviceID     model.ID   `json:"device_id,omitzero"`
-	StaleDevices []model.ID `json:"stale_devices,omitempty"`
+	V            int            `json:"v"`
+	Store        string         `json:"store"`
+	Sealed       bool           `json:"sealed,omitempty"` // file store only
+	AccountID    model.ID       `json:"account_id"`
+	DeviceID     model.ID       `json:"device_id,omitzero"`
+	Pending      *pendingDevice `json:"pending,omitempty"`
+	StaleDevices []model.ID     `json:"stale_devices,omitempty"`
+}
+
+// pendingDevice is device.json's pending member: {"device_id":id}.
+type pendingDevice struct {
+	DeviceID model.ID `json:"device_id"`
+}
+
+// pendingID is the pending replacement, or the zero ID.
+func (c deviceConfig) pendingID() model.ID {
+	if c.Pending == nil {
+		return model.ID{}
+	}
+	return c.Pending.DeviceID
+}
+
+// self is the devices this data directory is: DeviceID, then Pending.
+func (c deviceConfig) self() []model.ID {
+	var ids []model.ID
+	for _, id := range []model.ID{c.DeviceID, c.pendingID()} {
+		if !id.IsZero() && !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// withPending returns c with the pending replacement set to id, or cleared
+// for the zero ID, and its own copy of the stale list.
+func (c deviceConfig) withPending(id model.ID) deviceConfig {
+	c.Pending = nil
+	if !id.IsZero() {
+		c.Pending = &pendingDevice{DeviceID: id}
+	}
+	c.StaleDevices = slices.Clone(c.StaleDevices)
+	return c
 }
 
 // deviceRecord is what the device key store keeps: this device's private
@@ -262,7 +306,8 @@ func (s *Store) readDeviceConfig() (deviceConfig, error) {
 	if err != nil {
 		return c, fmt.Errorf("%w: %v", ErrDeviceKey, err)
 	}
-	if err := json.Unmarshal(b, &c); err != nil || c.V != 1 || (c.Store != DeviceStoreKeychain && c.Store != DeviceStoreFile) {
+	if err := json.Unmarshal(b, &c); err != nil || c.V != 1 || (c.Store != DeviceStoreKeychain && c.Store != DeviceStoreFile) ||
+		(c.Pending != nil && c.Pending.DeviceID.IsZero()) {
 		return c, fmt.Errorf("%w: %s is not a device key configuration", ErrDeviceKey, s.l.deviceConfig())
 	}
 	return c, nil
@@ -298,25 +343,6 @@ func (d *deviceStore) Unsealed() bool { return d.cfg.Store == DeviceStoreFile &&
 // leaves the others alone.
 func (d *deviceStore) slot(id model.ID) string {
 	return "device:" + d.cfg.AccountID.String() + ":" + id.String()
-}
-
-// candidates are the keychain slots load tries, in order: the device
-// device.json names, then its stale devices, newest first. A password
-// unlock records the new device as stale before it saves the new record
-// and names it in device.json only after: if it stops in between, the new
-// record is found this way, and it decides which device this is
-// (reconcileDevice).
-func (d *deviceStore) candidates() []model.ID {
-	var ids []model.ID
-	if !d.cfg.DeviceID.IsZero() {
-		ids = append(ids, d.cfg.DeviceID)
-	}
-	for _, id := range slices.Backward(d.cfg.StaleDevices) {
-		if !slices.Contains(ids, id) {
-			ids = append(ids, id)
-		}
-	}
-	return ids
 }
 
 // probe checks that the store can hold a record before init commits to it.
@@ -367,21 +393,27 @@ type deviceKeyFile struct {
 	Key        canonjson.Raw `json:"key"`
 }
 
-// load reads this device's record: the one whose device is the identity
-// of this data directory. It fails with ErrDeviceRevoked when it meets the
-// tombstone of a revoked device (§5.5, Store.revoke) instead.
+// load reads this data directory's device record: DeviceID's, or, if that
+// cannot be read, Pending's (deviceConfig). No other record is ever a
+// candidate: without either there is no device key, which a password
+// unlock replaces. It fails with ErrDeviceRevoked instead, before it
+// returns any record, when the store holds the tombstone of either device
+// (revokedSelf); the caller checks vault/revoked.json (Store.checkRevoked).
 func (d *deviceStore) load() (*deviceRecord, error) {
+	if err := d.revokedSelf(); err != nil {
+		return nil, err
+	}
+	ids := d.cfg.self()
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%w: %s names no device (hop unlock --password restores it)", ErrDeviceKey, d.l.deviceConfig())
+	}
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
-		ids := d.candidates()
-		if len(ids) == 0 {
-			return nil, fmt.Errorf("%w: %s names no device (hop unlock --password restores it)", ErrDeviceKey, d.l.deviceConfig())
-		}
 		var first error
 		for _, id := range ids {
 			rec, err := d.loadSlot(id)
-			if err == nil || errors.Is(err, ErrDeviceRevoked) {
-				return rec, err
+			if err == nil {
+				return rec, nil
 			}
 			if first == nil {
 				first = err
@@ -389,9 +421,48 @@ func (d *deviceStore) load() (*deviceRecord, error) {
 		}
 		return nil, first
 	case DeviceStoreFile:
-		return d.loadFile()
+		rec, err := d.loadFile()
+		if err != nil {
+			return nil, err
+		}
+		if !slices.Contains(ids, rec.DeviceID) {
+			rec.zero()
+			return nil, fmt.Errorf("%w: %s holds the key of device %v, which %s names neither as this device nor as its pending replacement (hop unlock --password restores it)",
+				ErrDeviceKey, d.l.deviceKeyFile(), rec.DeviceID, d.l.deviceConfig())
+		}
+		return rec, nil
 	}
 	return nil, fmt.Errorf("%w: unknown store %q", ErrDeviceKey, d.cfg.Store)
+}
+
+// revokedSelf fails with ErrDeviceRevoked when the device key store holds
+// the tombstone of a device this data directory is (DeviceID or Pending): a
+// revocation whose revoked.json was lost (§5.5, Store.revoke). device.key
+// is this directory's alone, so a tombstone of this account there counts
+// whichever device it names. A record that cannot be read is no
+// tombstone: that is for load to report.
+func (d *deviceStore) revokedSelf() error {
+	switch d.cfg.Store {
+	case DeviceStoreKeychain:
+		for _, id := range d.cfg.self() {
+			raw, err := d.ring.Get(keychainService, d.slot(id))
+			if err != nil {
+				continue
+			}
+			if t, ok := parseTombstone([]byte(raw)); ok && t.AccountID == d.cfg.AccountID && t.DeviceID == id {
+				return t.err()
+			}
+		}
+	case DeviceStoreFile:
+		b, err := os.ReadFile(d.l.deviceKeyFile())
+		if err != nil {
+			return nil
+		}
+		if t, ok := parseTombstone(b); ok && t.AccountID == d.cfg.AccountID {
+			return t.err()
+		}
+	}
+	return nil
 }
 
 // loadID reads the record of device id, and fails unless that is what the
@@ -659,14 +730,22 @@ func (d *deviceStore) fileDevice() (id model.ID, ok bool, err error) {
 	return f.DeviceID, true, nil
 }
 
-// errOtherDevice means device.key belongs to another device than the one a
-// revocation names: it is left alone.
+// errOtherDevice means device.key belongs to a device that this data
+// directory is not: it is left alone.
 var errOtherDevice = errors.New("device.key holds another device's key, which is left alone")
+
+// ownsFile reports whether device.key, holding device cur's record or
+// tombstone, may be replaced on behalf of device id: it belongs to id, or
+// to a device this data directory is (self). A revocation of either self
+// device is terminal for the directory, whichever record device.key holds.
+func (d *deviceStore) ownsFile(cur, id model.ID) bool {
+	return cur == id || slices.Contains(d.cfg.self(), cur)
+}
 
 // tombstone overwrites device id's record with its tombstone, durably. The
 // keychain entry is the device's own. device.key is shared by whatever
 // device this data directory is, so it is overwritten only when it is
-// missing or belongs to id.
+// missing or the directory owns it for id (ownsFile).
 func (d *deviceStore) tombstone(id model.ID) error {
 	b, err := canonjson.Marshal(deviceTombstone{V: 2, Revoked: true, AccountID: d.cfg.AccountID, DeviceID: id})
 	if err != nil {
@@ -691,7 +770,7 @@ func (d *deviceStore) tombstone(id model.ID) error {
 	case DeviceStoreFile:
 		if cur, ok, err := d.fileDevice(); err != nil {
 			return err
-		} else if ok && cur != id {
+		} else if ok && !d.ownsFile(cur, id) {
 			return errOtherDevice
 		}
 		if got, err := os.ReadFile(d.l.deviceKeyFile()); err == nil && bytes.Equal(got, b) {
@@ -703,9 +782,10 @@ func (d *deviceStore) tombstone(id model.ID) error {
 }
 
 // destroy deletes device id's record: its keychain entry, or device.key
-// when that belongs to id, with its directory fsynced after. A record that
-// is already gone is no error. A revocation does this only when neither
-// revoked.json nor the tombstone could be written (Store.revoke).
+// when the directory owns it for id (ownsFile), with its directory fsynced
+// after. A record that is already gone is no error. A revocation does this
+// only when neither revoked.json nor the tombstone could be written
+// (Store.revoke).
 func (d *deviceStore) destroy(id model.ID) error {
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
@@ -715,7 +795,7 @@ func (d *deviceStore) destroy(id model.ID) error {
 			return err
 		} else if !ok {
 			return nil
-		} else if cur != id {
+		} else if !d.ownsFile(cur, id) {
 			return errOtherDevice
 		}
 		path := d.l.deviceKeyFile()
@@ -738,6 +818,29 @@ func (d *deviceStore) deleteSlot(id model.ID) error {
 		return err
 	}
 	return nil
+}
+
+// discard removes the record of id, an abandoned pending replacement, so
+// that clearing it from device.json leaves no key of it behind: its
+// keychain entry is deleted, and device.key, if it holds id, is replaced
+// with keep (the record in use) or else deleted. A tombstone is never
+// removed: if either self device has one, it fails with ErrDeviceRevoked
+// (revokedSelf) and changes nothing.
+func (d *deviceStore) discard(id model.ID, keep *deviceRecord) error {
+	if err := d.revokedSelf(); err != nil {
+		return err
+	}
+	if d.cfg.Store != DeviceStoreFile {
+		return d.deleteSlot(id)
+	}
+	cur, ok, err := d.fileDevice()
+	if err != nil || !ok || cur != id {
+		return err
+	}
+	if keep != nil {
+		return d.storeDurably(keep)
+	}
+	return d.destroy(id)
 }
 
 // equal reports whether r and o are the same record.
@@ -788,22 +891,34 @@ func (d *deviceStore) upgradeRecord(rec *deviceRecord) error {
 }
 
 // reconcileDevice brings device.json up to date with the device key in use
-// and the verified state. The record in the device key store decides which
-// device this is: a device.json that names another one (a password unlock
-// stopped between saving the new key and updating device.json, or an older
-// device.json) has that device moved to the stale list. Stale devices that
-// are no longer active in the log are dropped, and this device is never
-// stale. The caller holds the file lock and the store is unlocked.
+// and the verified state. The device in use is always one device.json
+// names (load): DeviceID, or the pending replacement. If it is the pending
+// one, this installs it: in one atomic write of device.json it becomes
+// DeviceID, the device it replaces becomes stale, and Pending is cleared.
+// If it is DeviceID, a pending replacement is an abandoned attempt: its
+// record is discarded first, then it becomes stale and Pending is cleared.
+// Stale devices that are no longer active in the log are dropped, and this
+// device is never stale. The caller holds the file lock and the store is
+// unlocked.
 func (s *Store) reconcileDevice() error {
-	cfg := s.devCfg
-	if cfg.DeviceID != s.rec.DeviceID {
-		if !cfg.DeviceID.IsZero() {
+	cfg := s.devCfg.withPending(model.ID{})
+	id, pending := s.rec.DeviceID, s.devCfg.pendingID()
+	switch {
+	case !pending.IsZero() && pending == id:
+		if !cfg.DeviceID.IsZero() && cfg.DeviceID != id {
 			cfg.StaleDevices = append(cfg.StaleDevices, cfg.DeviceID)
 		}
-		cfg.DeviceID = s.rec.DeviceID
+		cfg.DeviceID = id
+	case cfg.DeviceID != id:
+		return fmt.Errorf("%w: %s names device %v, whose key is in use, neither as this device nor as its pending replacement", ErrDeviceKey, s.l.deviceConfig(), id)
+	case !pending.IsZero():
+		if err := s.deviceStore(s.devCfg).discard(pending, s.rec); err != nil {
+			return fmt.Errorf("discarding the device key of an abandoned password unlock: %w", err)
+		}
+		cfg.StaleDevices = append(cfg.StaleDevices, pending)
 	}
 	cfg.StaleDevices = s.staleActive(cfg)
-	if cfg.DeviceID == s.devCfg.DeviceID && slices.Equal(cfg.StaleDevices, s.devCfg.StaleDevices) {
+	if cfg.DeviceID == s.devCfg.DeviceID && pending.IsZero() && slices.Equal(cfg.StaleDevices, s.devCfg.StaleDevices) {
 		return nil
 	}
 	if err := s.writeDeviceConfig(cfg); err != nil {

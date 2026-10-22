@@ -24,6 +24,14 @@ import (
 // bootstrap entry and stores it. The old device stays in the log, recorded
 // in device.json as stale, and the next hop passwd revokes it.
 //
+// The new device is recorded in device.json as the pending replacement
+// before its bootstrap is built, and installed (named as this device, with
+// pending cleared, in one write) once its record is saved. An attempt that
+// stops in between leaves it pending; the next one resolves it first: a
+// replacement whose bootstrap is in the verified log and whose record can
+// be read is installed instead of enrolling another device, and any other
+// is abandoned, its record discarded and the device recorded as stale.
+//
 // A kit from a committed password change that is still waiting to be
 // confirmed is sealed to the old device key. If that key can still be read,
 // the kit is sealed to the new one too before the old one is replaced. If it
@@ -47,19 +55,19 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 // it catches up with the server through verified transitions, posts the
 // bootstrap entry there, and uses it only once it is verified from the
 // server's log. If the post fails or its outcome is unknown, nothing is
-// saved and the new device stays listed as stale, so the next hop passwd
-// revokes it if it committed.
+// saved and the new device stays pending, so the next attempt abandons it
+// and the hop passwd after revokes it if it committed.
 //
 // It runs only on a locked vault, and returns ErrAlreadyUnlocked otherwise:
 // it is for a lost device key. The vault stays locked until the new device
 // record is saved and installed, so no read or write sees a state or an
 // outbox in between, and every failure leaves it locked.
 //
-// A checkpoint on the server that revokes this device (the one whose
-// record is still readable, or else the one device.json names) is met in
-// the public stage, before anything is decrypted: the device is revoked
-// (§5.5) and it returns ErrDeviceRevoked. So does a tombstone where the
-// device record was, without asking the server anything.
+// A checkpoint on the server that revokes this machine (the device
+// device.json names, or the pending replacement, this attempt's included)
+// is met in the public stage, before anything is decrypted: the data
+// directory is revoked (§5.5) and it returns ErrDeviceRevoked. So does a
+// tombstone in either device's record, without asking the server anything.
 //
 // It waits on the server without holding the store's mutex, so Lock is
 // never blocked behind it. A lock (§11.2), or an unlock with the device
@@ -96,9 +104,10 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err != nil {
 		return err
 	}
-	// The device key this device has now, if it can still be read. A
-	// tombstone in its place is a revocation whose revoked.json was lost:
-	// it is as terminal as the marker (§5.5).
+	// The device key this device has now, if it can still be read: the
+	// record of the device device.json names, or of its pending
+	// replacement (load). A tombstone of either is a revocation whose
+	// revoked.json was lost: it is as terminal as the marker (§5.5).
 	var old *deviceRecord
 	if s.rec != nil {
 		old = s.rec.clone()
@@ -113,19 +122,11 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 			old.zero()
 		}
 	}()
-	// The one device this machine is in the log as, public: the one whose
-	// record can still be read, or else the one device.json names. A
-	// checkpoint that revokes it revokes this device (transition). Only
-	// one of them: after a replacement that stopped halfway, device.json
-	// can still name the device whose key was lost, and its revocation
-	// must not revoke the record that replaced it.
-	var self []model.ID
-	switch {
-	case old != nil:
-		self = []model.ID{old.DeviceID}
-	case !cfg.DeviceID.IsZero():
-		self = []model.ID{cfg.DeviceID}
-	}
+	// The devices this machine is in the log as, public: the one device.json
+	// names and the pending replacement an earlier attempt left, if any
+	// (deviceConfig.self). A checkpoint that revokes either revokes this
+	// machine (transition). Stale devices never count.
+	self := cfg.self()
 	var oldID model.ID
 	if old != nil {
 		oldID = old.DeviceID
@@ -181,6 +182,28 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err != nil {
 		return err
 	}
+	// An earlier attempt left a pending replacement. Resolve it first: if
+	// its bootstrap is in the verified log and its record can be read, it
+	// is installed and nothing new is enrolled. Otherwise it is abandoned:
+	// its record is discarded, and it is recorded as stale, so the next hop
+	// passwd revokes it if its bootstrap committed. Pending is cleared in
+	// the same write that names this attempt's device (next).
+	next := cfg.withPending(model.ID{})
+	if p := cfg.pendingID(); !p.IsZero() {
+		if _, active := st.Devices[p]; active {
+			if prec, err := s.deviceStore(cfg).loadID(p); err == nil {
+				return s.installPending(cfg, prec, oldID, st, sec, repaired, server)
+			}
+		}
+		var keep *deviceRecord
+		if s.rec != nil && s.rec.DeviceID != p {
+			keep = s.rec
+		}
+		if err := s.deviceStore(cfg).discard(p, keep); err != nil {
+			return fmt.Errorf("store: discarding the device key of an abandoned password unlock: %w", err)
+		}
+		next.StaleDevices = append(next.StaleDevices, p)
+	}
 	rec, info, err := newDeviceRecord(acct.AccountID, sk.String())
 	if err != nil {
 		return err
@@ -210,16 +233,15 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 			}
 		}
 	}
-	// The new device counts as stale until its key is saved: if this stops
-	// after the bootstrap commits, the next hop passwd revokes it.
-	next := cfg
-	if next.DeviceID.IsZero() && old != nil {
-		next.DeviceID = old.DeviceID
-	}
-	next.StaleDevices = append(slices.Clone(cfg.StaleDevices), rec.DeviceID)
+	// The new device is the pending replacement, durably, before its
+	// bootstrap is built: from then on it is self, and if this stops, the
+	// next attempt or unlock resolves it. It is installed (reconcileDevice)
+	// only once its record is saved.
+	next.Pending = &pendingDevice{DeviceID: rec.DeviceID}
+	self = next.self()
 	// From here device.json may be ahead of memory. If the replacement
 	// fails and the store stays unlocked with the old key, memory takes the
-	// file's bookkeeping, so the next hop passwd revokes the new device.
+	// file's bookkeeping, so the next hop passwd resolves the pending device.
 	defer func() {
 		if err != nil && s.state != nil {
 			if c, rerr := s.readDeviceConfig(); rerr == nil {
@@ -244,7 +266,7 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 		// stays locked throughout.
 		rctx, gen, untrack := s.trackRequest(ctx)
 		defer untrack()
-		if st, sec, err = s.bootstrapRemote(rctx, r, fl, gen, st, sec, info, rec, append(self, rec.DeviceID)); err != nil {
+		if st, sec, err = s.bootstrapRemote(rctx, r, fl, gen, st, sec, info, rec, self); err != nil {
 			return err
 		}
 		if s.gen.Load() != gen || s.state != nil {
@@ -258,19 +280,27 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err := s.deviceStore(cfg).storeDurably(rec); err != nil {
 		return fmt.Errorf("store: the new device key was not saved: %w", err)
 	}
+	return s.install(next, rec, dev, oldID, st, sec, repaired, server)
+}
+
+// install unlocks the store with rec, the pending replacement in cfg, and
+// the verified (st, sec), and installs it: device.json names it and no
+// longer a pending device (reconcileDevice). A failure locks the store, as
+// a failed Unlock does. The keychain entries of the device it replaced
+// (cfg's DeviceID, and oldID, the record read before) go after, best
+// effort: an entry left behind belongs to a stale device, which the next
+// hop passwd revokes. The caller holds s.mu and the file lock.
+func (s *Store) install(cfg deviceConfig, rec *deviceRecord, dev *vaultlog.LocalDevice, oldID model.ID, st *vaultlog.State, sec *vaultlog.Secrets, repaired string, server bool) error {
+	if err := s.hook("passwd:install"); err != nil {
+		return err
+	}
 	s.dropLocked(nil)
-	s.state, s.sec, s.dev, s.rec, s.devCfg, s.repaired, s.server = st, sec, dev, rec, next, repaired, server
+	s.state, s.sec, s.dev, s.rec, s.devCfg, s.repaired, s.server = st, sec, dev, rec, cfg, repaired, server
 	s.gen.Add(1)
-	// device.json still names the old device: reconciling moves it to the
-	// stale list and takes the new one off. A failure from here locks the
-	// store, as a failed Unlock does.
 	if err := s.finishUnlock(); err != nil {
 		s.dropLocked(err)
 		return err
 	}
-	// device.json names the new device now: the old keychain entries can
-	// go. This is best effort; an entry left behind belongs to a stale
-	// device, which the next hop passwd revokes.
 	if s.devCfg.DeviceID == rec.DeviceID {
 		ds := s.deviceStore(s.devCfg)
 		for _, id := range []model.ID{cfg.DeviceID, oldID} {
@@ -280,6 +310,23 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 		}
 	}
 	return nil
+}
+
+// installPending finishes the attempt that left rec, cfg's pending
+// replacement, readable with its bootstrap in the verified log (st): rec is
+// made durable again, as a record found on disk must be before it is used
+// (upgradeRecord), and installed. The caller holds s.mu and the file lock.
+func (s *Store) installPending(cfg deviceConfig, rec *deviceRecord, oldID model.ID, st *vaultlog.State, sec *vaultlog.Secrets, repaired string, server bool) error {
+	if err := s.deviceStore(cfg).upgradeRecord(rec); err != nil {
+		rec.zero()
+		return err
+	}
+	dev, err := rec.device()
+	if err != nil {
+		rec.zero()
+		return err
+	}
+	return s.install(cfg, rec, dev, oldID, st, sec, repaired, server)
 }
 
 // fileHold is the file lock as one operation holds it, given up and taken
@@ -456,9 +503,10 @@ func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, 
 		return Kit{}, err
 	}
 	// The stale devices to revoke come from device.json, not memory: a
-	// failed password unlock in this process may have recorded one there.
+	// failed password unlock in this process may have left a pending
+	// replacement there, which reconciling abandons and makes stale.
 	if err := s.reloadDeviceConfig(); err != nil {
-		return Kit{}, err
+		return Kit{}, fmt.Errorf("store: the password was not changed: %w", err)
 	}
 	sk, err := s.rec.secretKey()
 	if err != nil {

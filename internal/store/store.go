@@ -311,8 +311,9 @@ func (s *Store) Lock() {
 }
 
 func (s *Store) dropLocked(reason error) {
-	// The generation moves first, so the daemon's fence (Generation) stops
-	// signing before anything else happens.
+	// The generation moves first, so the daemon's fence (Generation) admits
+	// no new signature before anything else happens. A signature admitted
+	// before it moved may still complete.
 	s.gen.Add(1)
 	if s.sec != nil {
 		if s.sec.Account != nil {
@@ -343,8 +344,10 @@ func (s *Store) dropLocked(reason error) {
 // lock, every self-lock (an interrupted commit, a failed unlock) and every
 // revocation, before anything slow is written. It reads without the
 // store's mutex, which a lock or a revocation may hold for a while. The
-// daemon serves keys only while the generation they were loaded in is
-// current and IsRevoked is false (§5.5).
+// daemon admits a list or a signature only while the generation its keys
+// were loaded in is current and IsRevoked is false (§5.5). That is an
+// admission cutoff: a call admitted before the generation moved may still
+// complete; every call that starts after is refused.
 func (s *Store) Generation() uint64 { return s.gen.Load() }
 
 // IsRevoked reports, without the store's mutex, whether this device is
@@ -387,7 +390,8 @@ func (s *Store) unlockLocked() error {
 	s.devCfg = cfg
 	rec, err := s.deviceStore(cfg).load()
 	if errors.Is(err, ErrDeviceRevoked) {
-		// The tombstone of a revocation whose revoked.json was lost.
+		// The tombstone of a revocation whose revoked.json was lost, of
+		// this device or of its pending replacement.
 		s.setRevoked(err)
 	}
 	if err != nil {
@@ -477,9 +481,14 @@ func (l layout) revokedFile() string { return filepath.Join(l.vault(), "revoked.
 // after a restart too. The revoking entry is never decrypted or written.
 // The caller holds s.mu and, when there is one, the file lock.
 //
+// rev.DeviceID is a device this data directory is: DeviceID, or the
+// pending replacement of a password unlock (deviceConfig.self). Either
+// one's revocation is terminal for the directory.
+//
 // Either the marker or the tombstone keeps the revocation terminal under a
 // server that withholds the revoking checkpoint: Open, Unlock and both
-// password unlocks refuse when they find either. If both fail, the device
+// password unlocks refuse when they find either, the tombstone of the
+// pending replacement included (checkRevoked, load). If both fail, the device
 // record is deleted as a last resort, and the error says so: a password
 // unlock against a server that withholds the checkpoint could then enroll
 // this machine again (the total-failure limitation).
@@ -515,7 +524,10 @@ func (s *Store) revoke(rev *vaultlog.RevokedError) error {
 }
 
 // tombstoneRecord overwrites device id's record with its tombstone
-// (deviceStore.tombstone). The caller holds s.mu.
+// (deviceStore.tombstone). The revocation is the whole data directory's,
+// so the keychain entry of the other device it is (DeviceID or the pending
+// replacement) gets its own tombstone too, best effort: id's already keeps
+// the revocation terminal. The caller holds s.mu.
 func (s *Store) tombstoneRecord(id model.ID) error {
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
@@ -524,7 +536,18 @@ func (s *Store) tombstoneRecord(id model.ID) error {
 	if err := s.hook("revoke:tombstone"); err != nil {
 		return err
 	}
-	return s.deviceStore(cfg).tombstone(id)
+	ds := s.deviceStore(cfg)
+	if err := ds.tombstone(id); err != nil {
+		return err
+	}
+	if cfg.Store == DeviceStoreKeychain {
+		for _, other := range cfg.self() {
+			if other != id {
+				ds.tombstone(other)
+			}
+		}
+	}
+	return nil
 }
 
 // destroyDeviceRecord deletes device id's record (deviceStore.destroy).
@@ -552,15 +575,23 @@ func (s *Store) retryTombstone() {
 	s.tombstoneRecord(f.DeviceID)
 }
 
-// checkRevoked fails with ErrDeviceRevoked once this device is revoked. Any
-// file at vault/revoked.json counts: only hop writes it. The caller holds
-// s.mu.
+// checkRevoked fails with ErrDeviceRevoked once this device is revoked: a
+// file at vault/revoked.json (any file counts: only hop writes it), or the
+// tombstone of a device this data directory is, DeviceID or the pending
+// replacement, in the device key store (deviceStore.revokedSelf). The
+// caller holds s.mu.
 func (s *Store) checkRevoked() error {
 	if s.revoked != nil {
 		return s.revoked
 	}
 	b, err := os.ReadFile(s.l.revokedFile())
 	if errors.Is(err, os.ErrNotExist) {
+		if cfg, err := s.readDeviceConfig(); err == nil {
+			if err := s.deviceStore(cfg).revokedSelf(); err != nil {
+				s.setRevoked(err)
+				return err
+			}
+		}
 		return nil
 	}
 	var f revokedFile

@@ -41,11 +41,12 @@ type loaded struct {
 //
 // With a fenced store it serves the keyring only while the store is in the
 // generation the keyring was loaded in and the device is not revoked (§5.5).
-// That check reads two atomics, right before each list or signature, so a
-// lock or a revocation stops signing at once, even while the store is still
-// writing and the daemon's teardown is waiting for it. A signature that was
-// already being computed when the fence moved may finish: that is the
-// cutoff.
+// That check reads two atomics when each list or signature call is
+// admitted: it is an admission cutoff. Once a lock or a revocation moves
+// the fence, every call admitted after is refused, even while the store is
+// still writing and the daemon's teardown is waiting for it. A call that
+// passed the check before the fence moved may still complete, whether or
+// not its signature was already being computed.
 type liveAgent struct {
 	fence fence // nil: the store has no generation, and nothing is fenced
 	cur   atomic.Pointer[loaded]

@@ -953,10 +953,10 @@ func TestPasswdAfterAFailedPasswordUnlockRevokesTheAbandonedDevice(t *testing.T)
 	}
 	ring.fail = false
 	disk, err := s.readDeviceConfig()
-	if err != nil || len(disk.StaleDevices) != 1 {
-		t.Fatalf("setup: device.json %+v, %v; want the new device recorded as stale", disk, err)
+	if err != nil || disk.pendingID().IsZero() || disk.DeviceID != cur {
+		t.Fatalf("setup: device.json %+v, %v; want the new device recorded as pending", disk, err)
 	}
-	abandoned := disk.StaleDevices[0]
+	abandoned := disk.pendingID()
 	if s.dev == nil || s.dev.ID != cur {
 		t.Fatal("setup: the store is not unlocked with the old key")
 	}
