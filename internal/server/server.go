@@ -88,6 +88,8 @@ type Server struct {
 		invalidated func() // postLog: an invalidating commit is committed and notified
 		validating  func() // postLog: a validation slot is held, before any decoding
 		prepare     func() // each call of prepare
+		enrollSend  func() // enrollGet: A's response is built, before its admission check
+		retireRead  func() // retirePost: the read transaction authorized, before any write
 	}
 }
 
@@ -319,9 +321,9 @@ func (s *Server) routes() {
 		{pattern: "POST /v1/vaults/{vault}/log", ipRate: s.rates.IP, body: lim.MaxBody, h: s.postLog},
 		{pattern: "POST /v1/enroll", ipRate: s.rates.EnrollIP, body: lim.MaxBody, h: s.enrollCreate},
 		{pattern: "POST /v1/enroll/claim", ipRate: s.rates.IP, body: lim.MaxBody, h: s.enrollClaim},
-		// A message body is at most the mailbox's byte limit, so the
-		// request is too, apart from its wrapper.
-		{pattern: "POST /v1/enroll/{enroll}/msg", ipRate: s.rates.IP, body: int64(lim.MailboxBytes) + 1024, h: s.enrollPost},
+		// The mailbox's byte limit applies to the canonical body, after
+		// decoding (enrollPost), not to the request.
+		{pattern: "POST /v1/enroll/{enroll}/msg", ipRate: s.rates.IP, body: lim.MaxBody, h: s.enrollPost},
 		{pattern: "GET /v1/enroll/{enroll}/msg", ipRate: s.rates.IP, poll: true, h: s.enrollGet},
 		{pattern: "POST /v1/retire-status", ipRate: s.rates.IP, body: lim.MaxBody, h: s.retireStatus},
 		{pattern: "POST /v1/retire-status/post", ipRate: s.rates.IP, body: lim.MaxBody, h: s.retirePost},

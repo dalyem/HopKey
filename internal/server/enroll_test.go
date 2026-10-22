@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -471,6 +472,12 @@ func TestEnrollMessageLimitsAndSchemas(t *testing.T) {
 		}
 		huge := deliverFor(t, d, bytes.Repeat([]byte("x"), 12<<10))
 		r = e.postMsg(id, tokA, msgDeliver, huge)
+		wantCode(t, r, 413, "too_large", "a delivery past the mailbox bytes on its own")
+		if !strings.Contains(string(r.body), errMailboxFull.msg) {
+			t.Errorf("refused by %s, want the mailbox limit", r.body)
+		}
+		// The request itself meets only the general body limit.
+		r = e.do("POST", msgPath(id), tokA, bytes.Repeat([]byte(" "), int(e.srv.lim.MaxBody)+1))
 		wantCode(t, r, 413, "too_large", "a request past the route's body limit")
 		if !strings.Contains(string(r.body), errTooLarge.msg) {
 			t.Errorf("refused by %s, want the body limit", r.body)
@@ -612,5 +619,260 @@ func TestEnrollRateLimits(t *testing.T) {
 		wantCode(t, e.claim(tokA, "0000000000"), 404, "not_found", "a wrong guess")
 		wantCode(t, e.claim("", "0000000000"), 401, "unauthorized", "an unauthenticated guess")
 		wantCode(t, e.claim(tokB, d.mb.RoutingCode), 429, "rate_limited", "a third claim from the IP")
+	})
+}
+
+// The mailbox's byte limit counts canonical bodies, not request bytes: a
+// valid chal padded with 70 KiB of whitespace, past the whole 64 KiB
+// budget, is stored, and an identical retransmission padded differently
+// gets its n (R8, R12).
+func TestEnrollBudgetCountsCanonicalBodies(t *testing.T) {
+	e := newEnv(t)
+	v, tokA, d := enrollSetup(t, e)
+	id := d.mb.EnrollID
+	chal := string(rawJSON(t, chalFor(t, id, v, v.dev(0))))
+	padded := func(outer, inner int) []byte {
+		ws := func(n int) string { return strings.Repeat(" \n\t\r", n/4) }
+		return []byte(`{"type":"chal",` + ws(outer) + `"body":{` + ws(inner) + chal[1:] + ws(outer) + `}`)
+	}
+	first := padded(20<<10, 30<<10) // 70 KiB of whitespace
+	if len(first)-len(chal) < 70<<10 || e.srv.lim.MailboxBytes != 64<<10 {
+		t.Fatalf("a %d-byte request for a %d-byte budget", len(first), e.srv.lim.MailboxBytes)
+	}
+	var r enrollMsgResponse
+	e.must(e.do("POST", msgPath(id), tokA, first), 200, &r)
+	if r.N != 1 {
+		t.Errorf("padded chal got n %d", r.N)
+	}
+	e.must(e.do("POST", msgPath(id), tokA, padded(40<<10, 10<<10)), 200, &r)
+	if r.N != 1 {
+		t.Errorf("padded retransmission got n %d", r.N)
+	}
+	_, all := e.getMsgs(id, tokA, "")
+	if len(all.Messages) != 1 || string(all.Messages[0].Body) != chal {
+		t.Errorf("stored %+v, want the canonical chal once", all)
+	}
+	e.mustMsg(id, d.mb.MailboxToken, msgOpen, d.open, 2)
+}
+
+// Once a mailbox is claimed, D's requests are charged to the claim's
+// account: its long-polls count toward the account's cap together with
+// A's, and its requests spend the account's buckets. A poll D started
+// before the claim keeps counting under the mailbox (R8, R14).
+func TestEnrollClaimedMailboxChargesAccount(t *testing.T) {
+	t.Run("long-polls", func(t *testing.T) {
+		if n := DefaultLimits().PollsPerAccount; n != 16 {
+			t.Fatalf("default polls per account %d", n)
+		}
+		e := newEnv(t, withLimits(func(l *Limits) { l.PollsPerCredential, l.PollsPerIP = 64, 64 }))
+		v := newVault(t, "a@example.com")
+		e.publish(v)
+		A := v.dev(0)
+		tokA := e.session(v, A)
+		d := makeD(t, "laptop")
+		e.mailbox(d)
+		id, tokD := d.mb.EnrollID, d.mb.MailboxToken
+		path := msgPath(id) + "?wait=30"
+		counts := func() (acct, mailbox int) {
+			e.srv.polls.mu.Lock()
+			defer e.srv.polls.mu.Unlock()
+			return e.srv.polls.acct[v.accountID().String()], e.srv.polls.acct["enroll:"+id.String()]
+		}
+
+		polls := []<-chan resp{e.startGet(path, tokD)}
+		e.must(e.claim(tokA, d.mb.RoutingCode), 200, nil)
+		for range 8 {
+			polls = append(polls, e.startGet(path, tokA), e.startGet(path, tokD))
+		}
+		if acct, mailbox := counts(); acct != 16 || mailbox != 1 {
+			t.Errorf("%d polls under the account and %d under the mailbox, want 16 and 1", acct, mailbox)
+		}
+		wantCode(t, e.do("GET", path, tokD, nil), 429, "busy", "D's poll past the account's cap")
+		wantCode(t, e.do("GET", path, tokA, nil), 429, "busy", "A's poll past the account's cap")
+		r, _ := e.readLog(v, tokA, "?after="+itoa(v.head().Seq)+"&wait=30")
+		wantCode(t, r, 429, "busy", "a log poll past the account's cap")
+
+		// The chal wakes them all.
+		e.mustMsg(id, tokA, msgChal, chalFor(t, id, v, A), 1)
+		for _, p := range polls {
+			wantStatus(t, waitResp(t, p), 200, "a woken poll")
+		}
+	})
+	t.Run("buckets", func(t *testing.T) {
+		rates := *unlimitedRates()
+		rates.Account = Rate{3, time.Minute}
+		e := newEnv(t, withRates(rates))
+		v := newVault(t, "a@example.com")
+		e.publish(v)
+		A := v.dev(0)
+		tokA := e.session(v, A)
+		d := makeD(t, "laptop")
+		e.mailbox(d)
+		id, tokD := d.mb.EnrollID, d.mb.MailboxToken
+		// Unclaimed, the mailbox has no account to charge.
+		for range 5 {
+			r, _ := e.getMsgs(id, tokD, "")
+			wantStatus(t, r, 200, "D reads its unclaimed mailbox")
+		}
+		e.must(e.claim(tokA, d.mb.RoutingCode), 200, nil)
+
+		// Each route's account bucket is shared by A and D.
+		deliver := deliverFor(t, d, []byte("x"))
+		e.mustMsg(id, tokA, msgChal, chalFor(t, id, v, A), 1)
+		e.mustMsg(id, tokD, msgOpen, d.open, 2)
+		e.mustMsg(id, tokA, msgDeliver, deliver, 3)
+		wantCode(t, e.postMsg(id, tokA, msgDeliver, deliver), 429, "rate_limited", "A's post after three on the account")
+		wantCode(t, e.postMsg(id, tokD, msgOpen, d.open), 429, "rate_limited", "D's post after three on the account")
+		for range 3 {
+			r, _ := e.getMsgs(id, tokD, "")
+			wantStatus(t, r, 200, "D reads the claimed mailbox")
+		}
+		r, _ := e.getMsgs(id, tokA, "")
+		wantCode(t, r, 429, "rate_limited", "A's read after D's three")
+		r, _ = e.getMsgs(id, tokD, "")
+		wantCode(t, r, 429, "rate_limited", "D's fourth read")
+	})
+}
+
+// A's response is admitted by a fresh authentication under the account's
+// admission lock: a session that a checkpoint ends after the messages were
+// read gets a 401 with nothing (R2).
+func TestEnrollGetAdmissionRechecksAuth(t *testing.T) {
+	for _, mode := range []string{"read", "long-poll"} {
+		t.Run(mode, func(t *testing.T) {
+			p := newPauser()
+			e := newEnv(t, withHooks(func(s *Server) { s.hooks.enrollSend = p.hook }))
+			v, tokA, d := enrollSetup(t, e)
+			A := v.dev(0)
+			id := d.mb.EnrollID
+			e.mustMsg(id, tokA, msgChal, chalFor(t, id, v, A), 1)
+			writer := e.session(v, A)
+			var got <-chan resp
+			if mode == "read" {
+				p.armed.Store(true)
+				ch := make(chan resp, 1)
+				go func() { ch <- e.do("GET", msgPath(id), tokA, nil) }()
+				got = ch
+			} else {
+				got = e.startGet(msgPath(id)+"?after=1&wait=30", tokA)
+				p.armed.Store(true)
+				// The open wakes the poll, which reads it.
+				e.mustMsg(id, d.mb.MailboxToken, msgOpen, d.open, 2)
+			}
+			p.waitPaused(t)
+			e.mustPost(v, writer, v.checkpoint(A))
+			close(p.resumed)
+			r := waitResp(t, got)
+			wantCode(t, r, 401, "unauthorized", "messages read before the checkpoint")
+			if strings.Contains(string(r.body), "messages") {
+				t.Errorf("the 401 carries data: %s", r.body)
+			}
+		})
+	}
+}
+
+// Concurrent claims of one code bind it to exactly one device; every other
+// claimant gets already_claimed, and the binding is the winner's (R7).
+func TestEnrollCompetingClaims(t *testing.T) {
+	e := newEnv(t, withLimits(func(l *Limits) { l.MailboxesPerIP = 100 }))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	B, wb := v.bootstrap("dev-b")
+	e.mustPost(v, e.login(v), wb)
+	other := newVault(t, "b@example.com")
+	e.publish(other)
+	type claimant struct {
+		acct, dev model.ID
+		tok       string
+	}
+	cs := []claimant{
+		{v.accountID(), v.dev(0), e.session(v, v.dev(0))},
+		{v.accountID(), B, e.session(v, B)},
+		{other.accountID(), other.dev(0), e.session(other, other.dev(0))},
+	}
+	for round := range 8 {
+		d := makeD(t, "x")
+		e.mailbox(d)
+		start := make(chan struct{})
+		rs := make([]resp, len(cs))
+		var wg sync.WaitGroup
+		for i, c := range cs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				rs[i] = e.claim(c.tok, d.mb.RoutingCode)
+			}()
+		}
+		close(start)
+		wg.Wait()
+		winner := -1
+		for i, r := range rs {
+			if r.status != 200 {
+				wantCode(t, r, 409, "already_claimed", "a losing claim")
+				continue
+			}
+			if winner >= 0 {
+				t.Errorf("round %d: claimants %d and %d both won", round, winner, i)
+			}
+			winner = i
+		}
+		if winner < 0 {
+			t.Fatalf("round %d: no claim won: %v", round, rs)
+		}
+		e.view(func(tx Tx) error {
+			m, err := tx.Mailbox(d.mb.EnrollID)
+			if err != nil || m.AccountID == nil || *m.AccountID != cs[winner].acct || *m.DeviceID != cs[winner].dev {
+				t.Errorf("round %d: binding %+v (%v), want claimant %d", round, m, err, winner)
+			}
+			return nil
+		})
+		wantStatus(t, e.claim(cs[winner].tok, d.mb.RoutingCode), 200, "the winner's repeat")
+	}
+}
+
+// A long-poll ends when its mailbox expires, or for A when its session
+// does, instead of waiting out its wait; the read then refuses: D gets
+// 401, since its token died with the mailbox, and A 404 for the mailbox or
+// 401 for its session (R12).
+func TestEnrollPollEndsAtExpiry(t *testing.T) {
+	// within checks that a poll of wait=55 ended long before its wait.
+	within := func(t *testing.T, poll <-chan resp) resp {
+		t.Helper()
+		start := time.Now()
+		r := waitResp(t, poll)
+		if d := time.Since(start); d > 10*time.Second {
+			t.Errorf("the poll ended after %v", d)
+		}
+		return r
+	}
+	t.Run("mailbox", func(t *testing.T) {
+		e := newEnv(t)
+		_, tokA, d := enrollSetup(t, e)
+		id := d.mb.EnrollID
+		e.clock.advance(MailboxTTL - time.Second) // the session outlives the mailbox
+		pollD := e.startGet(msgPath(id)+"?wait=55", d.mb.MailboxToken)
+		pollA := e.startGet(msgPath(id)+"?wait=55", tokA)
+		e.clock.advance(time.Second)
+		wantCode(t, within(t, pollD), 401, "unauthorized", "D's poll when the mailbox expires")
+		wantCode(t, within(t, pollA), 404, "not_found", "A's poll when the mailbox expires")
+	})
+	t.Run("session", func(t *testing.T) {
+		e := newEnv(t)
+		v := newVault(t, "a@example.com")
+		e.publish(v)
+		tokA := e.session(v, v.dev(0))
+		// The mailbox outlives the session by a minute.
+		e.clock.advance(SessionTTL - MailboxTTL + time.Minute)
+		d := makeD(t, "laptop")
+		e.mailbox(d)
+		e.must(e.claim(tokA, d.mb.RoutingCode), 200, nil)
+		e.clock.advance(MailboxTTL - time.Minute - time.Second)
+		id := d.mb.EnrollID
+		poll := e.startGet(msgPath(id)+"?wait=55", tokA)
+		e.clock.advance(time.Second)
+		wantCode(t, within(t, poll), 401, "unauthorized", "A's poll when its session expires")
+		r, _ := e.getMsgs(id, d.mb.MailboxToken, "")
+		wantStatus(t, r, 200, "D reads the live mailbox")
 	})
 }

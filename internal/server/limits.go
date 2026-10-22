@@ -36,7 +36,8 @@ type Limits struct {
 
 	// Enrollment relay mailboxes (R7, R8): live mailboxes per creating IP
 	// and per process, and per mailbox the messages and the bytes of
-	// their canonical bodies.
+	// their canonical bodies. MailboxBytes leaves out D's commit, which is
+	// the mailbox's metadata and bounded by its schema.
 	MailboxesPerIP      int
 	MailboxesPerProcess int
 	MailboxMessages     int
@@ -307,6 +308,11 @@ type pollLimiter struct {
 	acct  map[string]int
 	ip    map[string]int
 	total int
+
+	// acquired counts every slot ever granted. Unlike total it never
+	// falls, so a test can wait for a new poll even while an answered one
+	// is still releasing its slot.
+	acquired uint64
 }
 
 func newPollLimiter(lim Limits) *pollLimiter {
@@ -321,6 +327,7 @@ func (p *pollLimiter) acquire(cred, acct, ip string) (func(), bool) {
 		return nil, false
 	}
 	p.total++
+	p.acquired++
 	p.cred[cred]++
 	p.acct[acct]++
 	p.ip[ip]++

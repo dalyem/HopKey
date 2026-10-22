@@ -1,7 +1,9 @@
 package server
 
 import (
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -210,7 +212,9 @@ func TestRetirePost(t *testing.T) {
 }
 
 // Only an active device may post, and only its own retirement as the
-// wire's only op. These refusals consume nothing.
+// wire's only op. Refusals of the wire or the challenge consume nothing;
+// an inactive device's, which comes after its challenge authenticated,
+// consumes it.
 func TestRetirePostRefusals(t *testing.T) {
 	e := newEnv(t)
 	v, A, B := twoDevices(t, e)
@@ -245,7 +249,187 @@ func TestRetirePostRefusals(t *testing.T) {
 	chal = e.newChallenge(v, B, rs)
 	sig = e.signAuth(v, B, rs, testOrigin, chal)
 	wantCode(t, e.retirePostWith(v, B, chal, sig, ret), 401, "unauthorized", "a retired device")
-	wantStatus(t, e.retireStatusWith(v, B, chal, sig, hashOf(t, ret)), 200, "the challenge after the inactive refusal")
+	wantCode(t, e.retireStatusWith(v, B, chal, sig, hashOf(t, ret)), 401, "unauthorized", "the challenge the inactive refusal consumed")
+	wantStatus(t, e.retireStatus(v, B, hashOf(t, ret)), 200, "a fresh challenge")
+}
+
+// resign signs w again as dev, after a test changed its entry.
+func resign(t *testing.T, v *tvault, dev model.ID, w *vaultlog.Wire) {
+	t.Helper()
+	sig, err := v.devs[dev].SignEntry(&w.Entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Sigs = []vaultlog.Sig{{Role: vaultlog.RoleDevice, Sig: sig}}
+}
+
+// otherVaultRetire is dev's retirement on v's head, but for vault other.
+func otherVaultRetire(t *testing.T, v, other *tvault, dev model.ID) *vaultlog.Wire {
+	t.Helper()
+	w := v.unrecordedRetire(dev)
+	w.Entry.VaultID = other.vaultID()
+	resign(t, v, dev, w)
+	return w
+}
+
+// written summarizes what a retirement commit writes for v's account: the
+// head and public state, the log, receipts, active devices and sessions,
+// and the account's usage and reserve.
+func (e *env) written(v *tvault) string {
+	e.t.Helper()
+	vid, aid := v.vaultID(), v.accountID()
+	a := e.account(v)
+	return fmt.Sprint(
+		e.count(`SELECT head_seq FROM vaults WHERE vault_id = ?`, vid[:]),
+		e.count(`SELECT length(public_state) FROM vaults WHERE vault_id = ?`, vid[:]),
+		e.count(`SELECT COUNT(*) FROM log WHERE vault_id = ?`, vid[:]),
+		e.count(`SELECT COUNT(*) FROM receipts WHERE account_id = ?`, aid[:]),
+		e.count(`SELECT COUNT(*) FROM devices WHERE account_id = ? AND active = 1`, aid[:]),
+		e.count(`SELECT COUNT(*) FROM sessions WHERE account_id = ?`, aid[:]),
+		a.UsedBytes, a.Reserve,
+	)
+}
+
+// Every refusal after the challenge and the signature verified consumes
+// the challenge: a wire for another vault, an entry the log rules reject,
+// and a commit past the quota. None writes anything else (R5, R13).
+func TestRetirePostAuthenticatedRefusalsConsume(t *testing.T) {
+	rs := crypto.OperationRetireStatus
+	for _, c := range []struct {
+		name, code string
+		status     int
+		wire       func(t *testing.T, e *env, v *tvault, B model.ID) *vaultlog.Wire
+	}{
+		{"another vault", "bad_request", 400, func(t *testing.T, e *env, v *tvault, B model.ID) *vaultlog.Wire {
+			other := newVault(t, "b@example.com")
+			e.publish(other)
+			return otherVaultRetire(t, v, other, B)
+		}},
+		{"invalid entry", "invalid_entry", 400, func(t *testing.T, e *env, v *tvault, B model.ID) *vaultlog.Wire {
+			w := v.unrecordedRetire(B)
+			w.Sigs[0].Sig = append([]byte(nil), w.Sigs[0].Sig...)
+			w.Sigs[0].Sig[0] ^= 1
+			return w
+		}},
+		{"quota", "quota_exhausted", 507, func(t *testing.T, e *env, v *tvault, B model.ID) *vaultlog.Wire {
+			e.setQuota(v, 1)
+			return v.unrecordedRetire(B)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEnv(t)
+			v, _, B := twoDevices(t, e)
+			e.session(v, B)
+			w := c.wire(t, e, v, B)
+			chal := e.newChallenge(v, B, rs)
+			sig := e.signAuth(v, B, rs, testOrigin, chal)
+			before := e.written(v)
+			wantCode(t, e.retirePostWith(v, B, chal, sig, w), c.status, c.code, "the refused post")
+			if after := e.written(v); after != before {
+				t.Errorf("the refusal wrote: %s, before %s", after, before)
+			}
+			wantCode(t, e.retireStatusWith(v, B, chal, sig, hashOf(t, v.log[0])), 401, "unauthorized", "the consumed challenge")
+			e.view(func(tx Tx) error {
+				if _, err := tx.Challenge(crypto.SHA256(chal)); err == nil {
+					t.Error("the challenge is still stored")
+				}
+				return nil
+			})
+		})
+	}
+}
+
+// Of requests on both retirement endpoints with one challenge, exactly one
+// consumes it, whether the post commits or is refused after its challenge
+// authenticated (R5).
+func TestRetireChallengeConsumedOnce(t *testing.T) {
+	rs := crypto.OperationRetireStatus
+	// consumers counts the responses that consumed the challenge: a
+	// status 200, and a post 200, or 400 for a wire of another vault. Every
+	// other response must be the 401 of a spent challenge.
+	consumers := func(t *testing.T, post resp, statuses []resp) int {
+		t.Helper()
+		n := 0
+		if post.status == 200 || post.status == 400 {
+			n++
+		} else {
+			wantCode(t, post, 401, "unauthorized", "a post that lost")
+		}
+		for _, r := range statuses {
+			if r.status == 200 {
+				n++
+			} else {
+				wantCode(t, r, 401, "unauthorized", "a status that lost")
+			}
+		}
+		return n
+	}
+	for _, mode := range []string{"commit", "another vault"} {
+		// The post reads the challenge first, and statuses consume it
+		// before the post writes.
+		t.Run(mode+", interleaved", func(t *testing.T) {
+			p := newPauser()
+			e := newEnv(t, withHooks(func(s *Server) { s.hooks.retireRead = p.hook }))
+			v, _, B := twoDevices(t, e)
+			other := newVault(t, "b@example.com")
+			e.publish(other)
+			w := v.unrecordedRetire(B)
+			if mode == "another vault" {
+				w = otherVaultRetire(t, v, other, B)
+			}
+			chal := e.newChallenge(v, B, rs)
+			sig := e.signAuth(v, B, rs, testOrigin, chal)
+			p.armed.Store(true)
+			post := make(chan resp, 1)
+			go func() { post <- e.retirePostWith(v, B, chal, sig, w) }()
+			p.waitPaused(t)
+			status := e.retireStatusWith(v, B, chal, sig, hashOf(t, v.log[0]))
+			close(p.resumed)
+			if n := consumers(t, waitResp(t, post), []resp{status}); n != 1 {
+				t.Errorf("%d requests consumed the challenge", n)
+			}
+		})
+		t.Run(mode+", simultaneous", func(t *testing.T) {
+			e := newEnv(t)
+			v, _, B := twoDevices(t, e)
+			other := newVault(t, "b@example.com")
+			e.publish(other)
+			h := hashOf(t, v.log[0])
+			for round := range 10 {
+				w := v.unrecordedRetire(B)
+				if mode == "another vault" {
+					w = otherVaultRetire(t, v, other, B)
+				}
+				chal := e.newChallenge(v, B, rs)
+				sig := e.signAuth(v, B, rs, testOrigin, chal)
+				start := make(chan struct{})
+				var post resp
+				statuses := make([]resp, 4)
+				var wg sync.WaitGroup
+				wg.Add(1 + len(statuses))
+				go func() {
+					defer wg.Done()
+					<-start
+					post = e.retirePostWith(v, B, chal, sig, w)
+				}()
+				for i := range statuses {
+					go func() {
+						defer wg.Done()
+						<-start
+						statuses[i] = e.retireStatusWith(v, B, chal, sig, h)
+					}()
+				}
+				close(start)
+				wg.Wait()
+				if n := consumers(t, post, statuses); n != 1 {
+					t.Fatalf("round %d: %d requests consumed the challenge", round, n)
+				}
+				if post.status == 200 {
+					break // B is retired; it has nothing more to post
+				}
+			}
+		})
+	}
 }
 
 // A retirement whose prev is no longer the head gets the standard

@@ -87,10 +87,13 @@ func (e *env) startPoll(v *tvault, tok string, after uint64) <-chan resp {
 	return ch
 }
 
-func (e *env) polls() int {
+// polls is the number of long-polls the server has ever admitted. A count
+// of live polls would miss a new poll that takes the slot an answered one
+// is releasing.
+func (e *env) polls() uint64 {
 	e.srv.polls.mu.Lock()
 	defer e.srv.polls.mu.Unlock()
-	return e.srv.polls.total
+	return e.srv.polls.acquired
 }
 
 func itoa(n uint64) string { return strconv.FormatUint(n, 10) }

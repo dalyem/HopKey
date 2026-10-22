@@ -276,6 +276,9 @@ const (
 // session (401 if not), and it acts as A only for the device the mailbox
 // is bound to; any other session, and a mailbox that is absent, expired or
 // unclaimed, gets 404. p is set for A.
+//
+// D's permissions stay its own, but what it spends is not: see
+// mailboxAccount.
 func (s *Server) mailboxAuth(tx Tx, tok crypto.Hash, id model.ID, okID bool) (m *Mailbox, role enrollRole, p *principal, err error) {
 	if okID {
 		m, err = tx.Mailbox(id)
@@ -298,6 +301,29 @@ func (s *Server) mailboxAuth(tx Tx, tok crypto.Hash, id model.ID, okID bool) (m 
 		return nil, 0, nil, errNotFound
 	}
 	return m, roleA, p, nil
+}
+
+// mailboxAccount is the account a request on m is charged to: once m is
+// claimed, its claim's account, whichever party sends the request, so D's
+// traffic shares the account's rate buckets and long-poll budget with A's
+// and every other device's (R8, R14). An unclaimed mailbox has no account
+// yet; D's requests then meet only the per-IP and per-credential limits,
+// and a long-poll counts under the mailbox (enrollGet).
+func mailboxAccount(m *Mailbox) (model.ID, bool) {
+	if m.AccountID == nil {
+		return model.ID{}, false
+	}
+	return *m.AccountID, true
+}
+
+// mailboxBucket applies the account bucket of c's route to a request on m,
+// when m is claimed.
+func (s *Server) mailboxBucket(c *call, m *Mailbox) error {
+	acct, ok := mailboxAccount(m)
+	if ok && !s.limiter.allow(c.route.pattern+"|account", acct.String(), s.rates.Account) {
+		return errRateLimited
+	}
+	return nil
 }
 
 type enrollMsgRequest struct {
@@ -344,7 +370,15 @@ func checkMsgBody(typ string, body []byte) ([]byte, error) {
 // (R12). An identical canonical retransmission returns its original n; a
 // different message for a filled slot, or a message out of order, gets 409
 // and changes nothing. A chal must name this mailbox and its claim. The
-// count and byte limits apply to what is stored (R8).
+// count and byte limits apply to what is stored (R8): the byte limit
+// counts the canonical bodies of the messages, never the request bytes, so
+// a client's whitespace or member order neither spends the budget nor gets
+// a valid message refused. The request itself meets only the general body
+// limit, and the strict decoder bounds what it builds.
+//
+// D's commit is not a message: it is the mailbox's own metadata, fixed
+// and bounded by its schema when the mailbox is created, and the byte
+// limit leaves it out.
 func (s *Server) enrollPost(w http.ResponseWriter, r *http.Request, c *call) error {
 	tok, ok := bearer(r)
 	if !ok {
@@ -359,17 +393,20 @@ func (s *Server) enrollPost(w http.ResponseWriter, r *http.Request, c *call) err
 	if err != nil {
 		return err
 	}
+	// A body past the limit on its own can never have been stored, so it
+	// is no retransmission either.
+	if len(body) > s.lim.MailboxBytes {
+		return errMailboxFull
+	}
 	var n uint64
 	added := false
 	err = s.store.Update(r.Context(), func(tx Tx) error {
-		m, role, p, err := s.mailboxAuth(tx, tok, id, okID)
+		m, role, _, err := s.mailboxAuth(tx, tok, id, okID)
 		if err != nil {
 			return err
 		}
-		if p != nil {
-			if err := s.accountBucket(c, p); err != nil {
-				return err
-			}
+		if err := s.mailboxBucket(c, m); err != nil {
+			return err
 		}
 		want := roleA
 		if req.Type == msgOpen {
@@ -402,6 +439,7 @@ func (s *Server) enrollPost(w http.ResponseWriter, r *http.Request, c *call) err
 		if n != uint64(len(msgs))+1 {
 			return errEnrollOrder
 		}
+		// The canonical bodies only; the commit is not counted.
 		size := len(body)
 		for _, old := range msgs {
 			size += len(old.Body)
@@ -492,6 +530,9 @@ func (s *Server) enrollGet(w http.ResponseWriter, r *http.Request, c *call) erro
 			writeRaw(w, http.StatusOK, body)
 			return nil
 		}
+		if h := s.hooks.enrollSend; h != nil {
+			h()
+		}
 		unlock, err := s.accounts.rlock(r.Context(), p.accountID)
 		if err != nil {
 			return err
@@ -519,17 +560,19 @@ func (s *Server) enrollGet(w http.ResponseWriter, r *http.Request, c *call) erro
 	if err != nil {
 		return err
 	}
-	if p != nil {
-		if err := s.accountBucket(c, p); err != nil {
-			return err
-		}
+	if err := s.mailboxBucket(c, m); err != nil {
+		return err
 	}
 	if n > 0 || wait == 0 {
 		return send(body)
 	}
+	// The poll is counted under the account the mailbox is charged to as
+	// of this read, and keeps that slot until it ends: a poll D started
+	// before the claim stays under the mailbox, and every request after
+	// the claim counts under the account (R8).
 	cred, acct := hex.EncodeToString(tok[:]), "enroll:"+id.String()
-	if p != nil {
-		acct = p.accountID.String()
+	if a, ok := mailboxAccount(m); ok {
+		acct = a.String()
 	}
 	release, ok := s.polls.acquire(cred, acct, ipKey(c.ip))
 	if !ok {
