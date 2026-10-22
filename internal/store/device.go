@@ -1,15 +1,18 @@
 package store
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/zalando/go-keyring"
 
+	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
@@ -44,13 +47,20 @@ func (OSKeyring) Get(service, user string) (string, error) { return keyring.Get(
 func (OSKeyring) Set(service, user, secret string) error   { return keyring.Set(service, user, secret) }
 func (OSKeyring) Delete(service, user string) error        { return keyring.Delete(service, user) }
 
-// deviceConfig is device.json: which store holds the device key. It holds
-// no secrets.
+// deviceConfig is device.json: which store holds the device key, and the
+// local device bookkeeping. It holds no secrets.
+//
+// DeviceID is the device whose key the store holds. StaleDevices are
+// devices this machine enrolled and then lost the key of (a password unlock
+// replaces the device key): they are still active in the log, and the next
+// hop passwd revokes them (§10.1).
 type deviceConfig struct {
-	V         int      `json:"v"`
-	Store     string   `json:"store"`
-	Sealed    bool     `json:"sealed,omitempty"` // file store only
-	AccountID model.ID `json:"account_id"`
+	V            int        `json:"v"`
+	Store        string     `json:"store"`
+	Sealed       bool       `json:"sealed,omitempty"` // file store only
+	AccountID    model.ID   `json:"account_id"`
+	DeviceID     model.ID   `json:"device_id,omitzero"`
+	StaleDevices []model.ID `json:"stale_devices,omitempty"`
 }
 
 // deviceRecord is what the device key store keeps: this device's private
@@ -146,15 +156,23 @@ func (s *Store) readDeviceConfig() (deviceConfig, error) {
 	return c, nil
 }
 
-// Describe says which store is in use, for hop status.
+func (s *Store) writeDeviceConfig(c deviceConfig) error {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(s.l.deviceConfig(), b)
+}
+
+// Describe says which store is in use, for hop status (§11).
 func (d *deviceStore) Describe() string {
 	switch {
 	case d.cfg.Store == DeviceStoreKeychain:
 		return "keychain"
 	case d.cfg.Sealed:
-		return "file " + d.l.deviceKeyFile() + " (sealed with " + PassphraseEnv + ")"
+		return "file (sealed)"
 	default:
-		return "file " + d.l.deviceKeyFile()
+		return "file (unsealed)"
 	}
 }
 
@@ -178,139 +196,201 @@ func (d *deviceStore) probe() error {
 		}
 		return nil
 	case DeviceStoreFile:
-		if d.cfg.Sealed && d.getenv(PassphraseEnv) == "" {
-			return fmt.Errorf("%s is empty", PassphraseEnv)
+		if !d.cfg.Sealed {
+			return nil
 		}
+		pw, err := crypto.NormalizePassword([]byte(d.getenv(PassphraseEnv)))
+		if err != nil {
+			return fmt.Errorf("%s: %w", PassphraseEnv, err)
+		}
+		clear(pw)
 		return nil
 	}
 	return fmt.Errorf("unknown device key store %q", d.cfg.Store)
 }
 
-// fileForm is device.key: the record in the clear (0600) or sealed with a
-// key derived from HOP_DEVICE_PASSPHRASE.
-type fileForm struct {
-	V        int                  `json:"v"`
-	Record   *deviceRecord        `json:"record,omitempty"`
-	Salt     []byte               `json:"salt,omitempty"`
-	Envelope *crypto.AEADEnvelope `json:"envelope,omitempty"`
-}
-
-// passphraseKey derives the file key from the passphrase with the §4.1
-// Argon2id derivation (crypto.DeriveLoginKeys). internal/crypto has no
-// stand-alone passphrase KDF, so this reuses that one, with an all-zero
-// Secret Key and the account ID as its context, rather than invent another.
-func passphraseKey(pass string, salt []byte, accountID model.ID) (*crypto.SymKey, error) {
-	var zeroSK crypto.SecretKey
-	lk, err := crypto.DeriveLoginKeys([]byte(pass), salt, &zeroSK, accountID, crypto.KDFv1)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", PassphraseEnv, err)
-	}
-	k := lk.EncKey
-	lk.Zero()
-	return &k, nil
-}
-
-const labelDeviceKeyFile = "hopkey/v1/local-device-key"
-
-func fileAAD(accountID model.ID) []byte {
-	return append(crypto.LP([]byte(labelDeviceKeyFile)), crypto.LP(accountID[:])...)
+// deviceKeyFile is device.key (§11, rev 14):
+//
+//	{"v":1, "kdf_version":1, "device_id":id, "salt":b64(16),
+//	 "key":AEAD(pk, device_private_keys, aad=lp("hopkey/v1/device-key-file") || lp(device_id_bytes))}
+//
+// with pk from crypto.DevicePassphraseKey. Unsealed, kdf_version is 0, the
+// salt is empty and key is the device private keys' JCS itself. The device
+// private keys are the record: this device's KEM and signing keys and the
+// account Secret Key. The file is JCS and is read with the strict decoder.
+type deviceKeyFile struct {
+	V          int           `json:"v"`
+	KDFVersion uint32        `json:"kdf_version"`
+	DeviceID   model.ID      `json:"device_id"`
+	Salt       []byte        `json:"salt"`
+	Key        canonjson.Raw `json:"key"`
 }
 
 func (d *deviceStore) load() (*deviceRecord, error) {
-	var raw string
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
-		s, err := d.ring.Get(keychainService, d.user())
+		raw, err := d.ring.Get(keychainService, d.user())
 		if err != nil {
 			return nil, fmt.Errorf("%w: keychain: %v (hop unlock --password restores it)", ErrDeviceKey, err)
 		}
-		raw = s
+		var rec deviceRecord
+		if err := json.Unmarshal([]byte(raw), &rec); err != nil || rec.V != 1 || rec.AccountID != d.cfg.AccountID {
+			return nil, fmt.Errorf("%w: the stored device key does not belong to this vault", ErrDeviceKey)
+		}
+		return &rec, nil
 	case DeviceStoreFile:
-		b, err := os.ReadFile(d.l.deviceKeyFile())
+		return d.loadFile()
+	}
+	return nil, fmt.Errorf("%w: unknown store %q", ErrDeviceKey, d.cfg.Store)
+}
+
+func (d *deviceStore) loadFile() (*deviceRecord, error) {
+	path := d.l.deviceKeyFile()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v (hop unlock --password restores it)", ErrDeviceKey, err)
+	}
+	var f deviceKeyFile
+	if err := canonjson.Unmarshal(b, &f); err != nil || f.V != 1 {
+		return nil, fmt.Errorf("%w: %s does not parse", ErrDeviceKey, path)
+	}
+	pt := []byte(f.Key)
+	switch {
+	case d.cfg.Sealed && f.KDFVersion == crypto.KDFv1.Version && len(f.Salt) == crypto.SaltSize:
+		pass := d.getenv(PassphraseEnv)
+		if pass == "" {
+			return nil, fmt.Errorf("%w: %s is sealed; set %s", ErrDeviceKey, path, PassphraseEnv)
+		}
+		env, err := crypto.ParseAEADEnvelope(f.Key)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v (hop unlock --password restores it)", ErrDeviceKey, err)
+			return nil, fmt.Errorf("%w: %s: %v", ErrDeviceKey, path, err)
 		}
-		var f fileForm
-		if err := json.Unmarshal(b, &f); err != nil || f.V != 1 {
-			return nil, fmt.Errorf("%w: %s does not parse", ErrDeviceKey, d.l.deviceKeyFile())
+		key, err := crypto.DevicePassphraseKey([]byte(pass), f.Salt, f.DeviceID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %v", ErrDeviceKey, PassphraseEnv, err)
 		}
-		switch {
-		case f.Envelope != nil:
-			pass := d.getenv(PassphraseEnv)
-			if pass == "" {
-				return nil, fmt.Errorf("%w: %s is sealed; set %s", ErrDeviceKey, d.l.deviceKeyFile(), PassphraseEnv)
-			}
-			key, err := passphraseKey(pass, f.Salt, d.cfg.AccountID)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrDeviceKey, err)
-			}
-			pt, err := crypto.OpenAEAD(key, *f.Envelope, fileAAD(d.cfg.AccountID))
-			key.Zero()
-			if err != nil {
-				return nil, fmt.Errorf("%w: %s does not open with %s", ErrDeviceKey, d.l.deviceKeyFile(), PassphraseEnv)
-			}
-			raw = string(pt)
-			clear(pt)
-		case f.Record != nil:
-			if d.cfg.Sealed {
-				return nil, fmt.Errorf("%w: %s should be sealed but is not", ErrDeviceKey, d.l.deviceKeyFile())
-			}
-			b, _ := json.Marshal(f.Record)
-			raw = string(b)
-		default:
-			return nil, fmt.Errorf("%w: %s is empty", ErrDeviceKey, d.l.deviceKeyFile())
+		pt, err = crypto.OpenAEAD(key, env, crypto.DeviceKeyFileAAD(f.DeviceID))
+		key.Zero()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s does not open with %s (wrong passphrase, or the file was changed)", ErrDeviceKey, path, PassphraseEnv)
 		}
+		defer clear(pt)
+	case !d.cfg.Sealed && f.KDFVersion == 0 && len(f.Salt) == 0:
+	case d.cfg.Sealed:
+		return nil, fmt.Errorf("%w: %s should be sealed but is not", ErrDeviceKey, path)
 	default:
-		return nil, fmt.Errorf("%w: unknown store %q", ErrDeviceKey, d.cfg.Store)
+		return nil, fmt.Errorf("%w: %s is sealed, but this device is set up for an unsealed file", ErrDeviceKey, path)
 	}
 	var rec deviceRecord
-	if err := json.Unmarshal([]byte(raw), &rec); err != nil || rec.V != 1 || rec.AccountID != d.cfg.AccountID {
+	if err := canonjson.Unmarshal(pt, &rec); err != nil || rec.V != 1 {
+		return nil, fmt.Errorf("%w: %s does not hold a device key", ErrDeviceKey, path)
+	}
+	if rec.DeviceID != f.DeviceID {
+		rec.zero()
+		return nil, fmt.Errorf("%w: %s names device %v but holds the key of %v", ErrDeviceKey, path, f.DeviceID, rec.DeviceID)
+	}
+	if rec.AccountID != d.cfg.AccountID {
+		rec.zero()
 		return nil, fmt.Errorf("%w: the stored device key does not belong to this vault", ErrDeviceKey)
 	}
 	return &rec, nil
 }
 
 func (d *deviceStore) save(rec *deviceRecord) error {
-	b, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	defer clear(b)
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		defer clear(b)
 		if err := d.ring.Set(keychainService, d.user(), string(b)); err != nil {
 			return fmt.Errorf("saving the device key in the keychain: %w", err)
 		}
 		return nil
 	case DeviceStoreFile:
-		f := fileForm{V: 1}
+		pt, err := canonjson.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		defer clear(pt)
+		f := deviceKeyFile{V: 1, DeviceID: rec.DeviceID, Salt: []byte{}, Key: pt}
 		if d.cfg.Sealed {
 			pass := d.getenv(PassphraseEnv)
 			if pass == "" {
 				return fmt.Errorf("the device key file is sealed; set %s", PassphraseEnv)
 			}
+			f.KDFVersion = crypto.KDFv1.Version
 			f.Salt = make([]byte, crypto.SaltSize)
 			if _, err := rand.Read(f.Salt); err != nil {
 				return err
 			}
-			key, err := passphraseKey(pass, f.Salt, d.cfg.AccountID)
+			key, err := crypto.DevicePassphraseKey([]byte(pass), f.Salt, rec.DeviceID)
 			if err != nil {
-				return err
+				return fmt.Errorf("%s: %w", PassphraseEnv, err)
 			}
-			env, err := crypto.SealAEAD(key, b, fileAAD(d.cfg.AccountID))
+			env, err := crypto.SealAEAD(key, pt, crypto.DeviceKeyFileAAD(rec.DeviceID))
 			key.Zero()
 			if err != nil {
 				return err
 			}
-			f.Envelope = &env
-		} else {
-			f.Record = rec
+			if f.Key, err = env.JCS(); err != nil {
+				return err
+			}
 		}
-		out, err := json.Marshal(f)
+		out, err := canonjson.Marshal(f)
 		if err != nil {
 			return err
 		}
+		defer clear(out)
 		return writeFileAtomic(d.l.deviceKeyFile(), out)
 	}
 	return fmt.Errorf("unknown device key store %q", d.cfg.Store)
+}
+
+// clone returns a copy of the record that shares no memory with it.
+func (r *deviceRecord) clone() *deviceRecord {
+	c := *r
+	c.KEMSK = append([]byte(nil), r.KEMSK...)
+	c.SigSeed = append([]byte(nil), r.SigSeed...)
+	return &c
+}
+
+// reconcileDevice brings device.json up to date with the device key in use
+// and the verified state. The record in the device key store decides which
+// device this is: a device.json that names another one (a password unlock
+// stopped between saving the new key and updating device.json, or an older
+// device.json) has that device moved to the stale list. Stale devices that
+// are no longer active in the log are dropped, and this device is never
+// stale. The caller holds the file lock and the store is unlocked.
+func (s *Store) reconcileDevice() error {
+	cfg := s.devCfg
+	if cfg.DeviceID != s.rec.DeviceID {
+		if !cfg.DeviceID.IsZero() {
+			cfg.StaleDevices = append(cfg.StaleDevices, cfg.DeviceID)
+		}
+		cfg.DeviceID = s.rec.DeviceID
+	}
+	cfg.StaleDevices = s.staleActive(cfg)
+	if cfg.DeviceID == s.devCfg.DeviceID && slices.Equal(cfg.StaleDevices, s.devCfg.StaleDevices) {
+		return nil
+	}
+	if err := s.writeDeviceConfig(cfg); err != nil {
+		return err
+	}
+	s.devCfg = cfg
+	return nil
+}
+
+// staleActive returns cfg's stale devices that are active in the verified
+// state, sorted, without duplicates and without this device.
+func (s *Store) staleActive(cfg deviceConfig) []model.ID {
+	var out []model.ID
+	for _, id := range cfg.StaleDevices {
+		if _, ok := s.state.Devices[id]; ok && id != s.dev.ID && !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	slices.SortFunc(out, func(a, b model.ID) int { return bytes.Compare(a[:], b[:]) })
+	return out
 }

@@ -2,7 +2,6 @@ package store
 
 import (
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -107,6 +106,7 @@ func PrepareInit(cfg Config, opts InitOptions) (*PendingInit, error) {
 		return nil, err
 	}
 	info.Name = s.deviceName()
+	devCfg.DeviceID = rec.DeviceID
 	dev, err := rec.device()
 	if err != nil {
 		return nil, err
@@ -139,8 +139,9 @@ func (p *PendingInit) DeviceStore() string { return p.s.deviceStore(p.devCfg).De
 
 // Commit writes the vault: the device key first (so a vault never exists
 // that this device cannot open), then device.json, the genesis objects and
-// entry, state.json and account.json. It returns the unlocked store.
-func (p *PendingInit) Commit() (*Store, error) {
+// entry, state.json and account.json. It returns the unlocked store, which
+// owns the vault (see Open) until Close.
+func (p *PendingInit) Commit() (st *Store, err error) {
 	if p.created {
 		return nil, errors.New("store: init already committed")
 	}
@@ -148,6 +149,16 @@ func (p *PendingInit) Commit() (*Store, error) {
 	if err := s.l.ensureDirs(); err != nil {
 		return nil, err
 	}
+	if s.owner == nil {
+		if err := s.own(); err != nil {
+			return nil, err
+		}
+	}
+	defer func() {
+		if err != nil {
+			s.Close()
+		}
+	}()
 	unlock, err := s.lockFile()
 	if err != nil {
 		return nil, err
@@ -161,11 +172,7 @@ func (p *PendingInit) Commit() (*Store, error) {
 	if err := s.deviceStore(p.devCfg).save(p.rec); err != nil {
 		return nil, err
 	}
-	b, err := json.Marshal(p.devCfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := writeFileAtomic(s.l.deviceConfig(), b); err != nil {
+	if err := s.writeDeviceConfig(p.devCfg); err != nil {
 		return nil, err
 	}
 	if err := s.commit(p.wire, p.state); err != nil {

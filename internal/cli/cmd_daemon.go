@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/version"
 )
 
@@ -26,16 +28,26 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	if e.OpenStore == nil {
 		return failf("this build has no vault store")
 	}
-	store, err := e.OpenStore()
+	vault, err := e.OpenStore()
+	if errors.Is(err, store.ErrVaultBusy) {
+		// Another daemon got there first and owns the vault.
+		fmt.Fprintln(e.Stderr, "hop daemon is already running")
+		return nil
+	}
 	if err != nil {
 		return failf("opening the vault: %v", err)
 	}
 	d, err := daemon.Start(daemon.Options{
-		Paths: e.Paths, Store: store, Version: version.Version,
+		Paths: e.Paths, Store: vault, Version: version.Version,
 		Logf: func(format string, args ...any) {
 			fmt.Fprintf(e.Stderr, "%s %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
 		},
 	})
+	if err != nil {
+		if c, ok := vault.(io.Closer); ok {
+			c.Close()
+		}
+	}
 	if errors.Is(err, daemon.ErrAlreadyRunning) {
 		fmt.Fprintln(e.Stderr, "hop daemon is already running")
 		return nil

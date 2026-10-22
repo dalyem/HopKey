@@ -8,8 +8,10 @@
 // Layout, under the data directory ($XDG_DATA_HOME/hop, else
 // ~/.local/share/hop), every directory 0700 and every file 0600:
 //
-//	device.json                which device key store is in use (no secrets)
-//	device.key                 the device key, when the file store is used
+//	device.json                which device key store is in use, this device's ID and
+//	                           stale devices to revoke (no secrets)
+//	device.key                 the device key, when the file store is used (§11)
+//	vault/owner.lock           held by the one process that has the vault open
 //	vault/lock                 the writer lock
 //	vault/entries/<seq>.json   signed entries (the wire without its objects), append-only
 //	vault/objects/<sha256>     envelopes, content-addressed and immutable
@@ -17,14 +19,22 @@
 //	vault/account.json         account_id, salt, kdf_version, pw_blob, rk_blob, verifier hashes
 //	vault/journal/<seq>.json   checkpoint candidates, sealed to the device key (§10.1)
 //
+// One process owns the vault at a time: Open takes vault/owner.lock for the
+// life of the Store, and a second Open fails with ErrVaultBusy. That process
+// is the hop daemon; the CLI goes through it.
+//
 // A write stores its objects, then its entry, then state.json, each fsynced,
 // under an exclusive lock. The entry file is the commit point: on unlock,
 // every entry is verified again from the latest anchor (genesis or
 // checkpoint), and an entry past state.json's head (a crash between the two)
-// is applied only after it passes the transition algorithm.
+// is applied only after it passes the transition algorithm. Otherwise
+// state.json must be, byte for byte, the state the replay computes at its
+// head (rev 12 makes that state the same on every client); any other
+// state.json fails closed.
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -62,6 +72,11 @@ var (
 	// ErrKitPending means a password change committed but its Emergency Kit
 	// has not been confirmed yet.
 	ErrKitPending = errors.New("store: a new Emergency Kit is waiting to be confirmed; run hop passwd to see it")
+	// ErrVaultBusy means another Store (another process, normally the hop
+	// daemon) has the vault open.
+	ErrVaultBusy = errors.New("store: the hop daemon owns this vault")
+
+	errClosed = errors.New("store: the vault store is closed")
 
 	errLocked = fmt.Errorf("%w; run hop unlock", model.ErrLocked)
 )
@@ -104,6 +119,11 @@ type Info struct {
 	AccountID   string `json:"account_id,omitempty"`
 	Head        *Head  `json:"head,omitempty"`
 	KitPending  bool   `json:"kit_pending,omitempty"`
+	// StaleDevices counts devices this machine enrolled and lost the key
+	// of (password unlocks), still active in the log until hop passwd.
+	StaleDevices int `json:"stale_devices,omitempty"`
+	// Warnings are for the user, one sentence each.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Store is the encrypted vault. It implements model.Store; Head, Lock,
@@ -119,7 +139,18 @@ type Store struct {
 	rec     *deviceRecord
 	devCfg  deviceConfig
 	lockErr error
-	kit     *Kit // a committed password change whose kit is not confirmed
+	kit     *Kit   // a committed password change whose kit is not confirmed
+	kitSeq  uint64 // the seq of kit's journal
+	// kitOrphaned means the current checkpoint's journal is sealed only to
+	// a device key this device no longer has: its kit cannot be shown.
+	kitOrphaned bool
+	// skErr is why the pending kit's Secret Key is not in the device key
+	// store yet. AckKit refuses until it is.
+	skErr error
+	// repaired says what the last unlock finished after a crash.
+	repaired string
+
+	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
 	testHook func(stage string) error // simulates crashes in tests
 }
@@ -162,6 +193,9 @@ func (s *Store) deviceName() string {
 // If the device key cannot be read, the store is returned locked (Info says
 // why) so that hop unlock --password can still reach it. A vault that fails
 // verification is an error.
+//
+// The returned Store owns the vault until Close: a second Open, in this
+// process or another, fails with ErrVaultBusy.
 func Open(ctx context.Context, cfg Config) (*Store, error) {
 	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
 	if ok, err := s.l.exists(); err != nil {
@@ -172,10 +206,41 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := s.l.ensureDirs(); err != nil {
 		return nil, err
 	}
+	if err := s.own(); err != nil {
+		return nil, err
+	}
 	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) {
+		s.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// own takes vault/owner.lock without waiting.
+func (s *Store) own() error {
+	f, err := filelock.TryLock(s.l.ownerLock())
+	if errors.Is(err, filelock.ErrLocked) {
+		return ErrVaultBusy
+	}
+	if err != nil {
+		return err
+	}
+	s.owner = f
+	return nil
+}
+
+// Close drops every secret from memory and gives up the vault, so another
+// Open can take it. The Store cannot be unlocked again.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropLocked(nil)
+	if s.owner == nil {
+		return nil
+	}
+	err := s.owner.Close()
+	s.owner = nil
+	return err
 }
 
 // lockFile takes the vault's writer lock. Every write, and every unlock
@@ -212,6 +277,7 @@ func (s *Store) dropLocked(reason error) {
 		s.rec.zero()
 	}
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
+	s.kitOrphaned, s.skErr, s.repaired = false, nil, ""
 	s.lockErr = reason
 }
 
@@ -233,6 +299,9 @@ func (s *Store) Unlock(ctx context.Context) error {
 }
 
 func (s *Store) unlockLocked() error {
+	if s.owner == nil {
+		return errClosed
+	}
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
 		return err
@@ -252,7 +321,7 @@ func (s *Store) unlockLocked() error {
 	}
 	defer unlock()
 
-	stored, err := s.readStoredState()
+	stored, raw, err := s.readStoredState()
 	if err != nil {
 		return err
 	}
@@ -260,11 +329,14 @@ func (s *Store) unlockLocked() error {
 	if err != nil {
 		return err
 	}
-	st, sec, err := s.replay(stored, acct, dev)
+	st, sec, repaired, err := s.replay(stored, raw, acct, dev)
 	if err != nil {
 		return err
 	}
-	s.state, s.sec, s.dev, s.rec = st, sec, dev, rec
+	s.state, s.sec, s.dev, s.rec, s.repaired = st, sec, dev, rec, repaired
+	if err := s.reconcileDevice(); err != nil {
+		return err
+	}
 	if err := s.writeAccountFile(); err != nil {
 		return err
 	}
@@ -320,49 +392,51 @@ func openUnlock(l layout, cert *crypto.Cert, h crypto.Hash, dev *vaultlog.LocalD
 	return acct, nil
 }
 
-// readStoredState reads state.json, or returns nil if it is missing and
-// only the genesis entry exists (a crash during init).
-func (s *Store) readStoredState() (*vaultlog.State, error) {
+// readStoredState reads state.json, parsed and as the bytes on disk, or
+// returns nil if it is missing and only the genesis entry exists (a crash
+// during init).
+func (s *Store) readStoredState() (*vaultlog.State, []byte, error) {
 	b, err := os.ReadFile(s.l.stateFile())
 	if errors.Is(err, os.ErrNotExist) {
 		seqs, err := s.l.entrySeqs()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(seqs) == 1 && seqs[0] == 0 {
-			return nil, nil
+			return nil, nil, nil
 		}
 		if len(seqs) == 0 {
-			return nil, ErrNoVault
+			return nil, nil, ErrNoVault
 		}
-		return nil, fmt.Errorf("%w: state.json is missing", ErrCorrupt)
+		return nil, nil, fmt.Errorf("%w: state.json is missing", ErrCorrupt)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	st, err := vaultlog.ParseState(b)
 	if err != nil {
-		return nil, fmt.Errorf("%w: state.json: %v", ErrCorrupt, err)
+		return nil, nil, fmt.Errorf("%w: state.json: %v", ErrCorrupt, err)
 	}
-	return st, nil
+	return st, b, nil
 }
 
 // replay verifies the log on disk (§5.5): it anchors at the newest genesis
 // or checkpoint entry at or before the stored head with acct, applies the
 // transition algorithm to every later entry, and requires the stored head
-// to be one it passes. Entries past the stored head are the tail of a write
-// that crashed before state.json was updated: each is verified by the
-// transition algorithm before it is applied, and state.json is then
-// rewritten. dev crosses a checkpoint in that tail; with no dev (a password
-// unlock) such a tail is an error.
-func (s *Store) replay(stored *vaultlog.State, acct *crypto.AccountKeys, dev vaultlog.DeviceKey) (*vaultlog.State, *vaultlog.Secrets, error) {
+// to be one it passes and state.json (raw) to be exactly the state it
+// computes there. Entries past the stored head are the tail of a write that
+// crashed before state.json was updated: each is verified by the transition
+// algorithm before it is applied, and state.json is then rewritten; the
+// returned note says so. dev crosses a checkpoint in that tail; with no dev
+// (a password unlock) such a tail is an error.
+func (s *Store) replay(stored *vaultlog.State, raw []byte, acct *crypto.AccountKeys, dev vaultlog.DeviceKey) (*vaultlog.State, *vaultlog.Secrets, string, error) {
 	seqs, err := s.l.entrySeqs()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 	for i, seq := range seqs {
 		if seq != uint64(i) {
-			return nil, nil, fmt.Errorf("%w: entry %d is missing", ErrCorrupt, i)
+			return nil, nil, "", fmt.Errorf("%w: entry %d is missing", ErrCorrupt, i)
 		}
 	}
 	var storedHead *vaultlog.Head
@@ -370,7 +444,7 @@ func (s *Store) replay(stored *vaultlog.State, acct *crypto.AccountKeys, dev vau
 		storedHead = &stored.Head
 	}
 	if storedHead != nil && storedHead.Seq >= uint64(len(seqs)) {
-		return nil, nil, fmt.Errorf("%w: the state head (seq %d) is not among the entries (%d on disk)", ErrCorrupt, storedHead.Seq, len(seqs))
+		return nil, nil, "", fmt.Errorf("%w: the state head (seq %d) is not among the entries (%d on disk)", ErrCorrupt, storedHead.Seq, len(seqs))
 	}
 	last := uint64(0)
 	if storedHead != nil {
@@ -382,7 +456,7 @@ func (s *Store) replay(stored *vaultlog.State, acct *crypto.AccountKeys, dev vau
 	for i := range seqs {
 		w, err := s.l.readEntry(uint64(i))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		wires[i] = w
 		if k := w.Entry.Kind; uint64(i) <= last && (k == vaultlog.KindGenesis || k == vaultlog.KindCheckpoint) {
@@ -390,45 +464,52 @@ func (s *Store) replay(stored *vaultlog.State, acct *crypto.AccountKeys, dev vau
 		}
 	}
 	if anchor < 0 {
-		return nil, nil, fmt.Errorf("%w: no genesis or checkpoint entry at or before seq %d", ErrCorrupt, last)
+		return nil, nil, "", fmt.Errorf("%w: no genesis or checkpoint entry at or before seq %d", ErrCorrupt, last)
 	}
 
 	objs := objectDir(s.l.objects())
 	st, sec, _, err := vaultlog.Anchor(acct.Pin(), acct, wires[anchor], objs, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: anchor entry %d: %w", ErrCorrupt, anchor, err)
+		return nil, nil, "", fmt.Errorf("%w: anchor entry %d: %w", ErrCorrupt, anchor, err)
 	}
 	for i := anchor + 1; i <= int(last); i++ {
 		if st, sec, err = vaultlog.Transition(st, sec, dev, wires[i], objs); err != nil {
-			return nil, nil, fmt.Errorf("%w: entry %d: %w", ErrCorrupt, i, err)
+			return nil, nil, "", fmt.Errorf("%w: entry %d: %w", ErrCorrupt, i, err)
 		}
 	}
 	if storedHead != nil && (st.Head.Seq != storedHead.Seq || !st.Head.H.Equal(storedHead.H)) {
-		return nil, nil, fmt.Errorf("%w: the state head (seq %d) is not the entry on disk at that seq", ErrCorrupt, storedHead.Seq)
+		return nil, nil, "", fmt.Errorf("%w: the state head (seq %d) is not the entry on disk at that seq", ErrCorrupt, storedHead.Seq)
 	}
-	// state.json is a cache of what was just verified. A copy that differs
-	// at the same head is not trusted; it is rewritten below.
-	rewrite := stored == nil || !sameState(st, stored)
+	// Every client computes the same state at the same head (rev 12), so
+	// state.json must be exactly that state. Anything else was changed
+	// outside hop: fail closed rather than trust it or quietly repair it.
+	if stored != nil {
+		want, err := st.Marshal()
+		if err != nil {
+			return nil, nil, "", err
+		}
+		if !bytes.Equal(want, raw) {
+			return nil, nil, "", fmt.Errorf("%w: state.json differs from the verified log at seq %d", ErrCorrupt, last)
+		}
+	}
 
-	// Crash recovery: entries past the stored head.
+	// Crash recovery: entries past the stored head. With no state.json at
+	// all, only genesis exists (a crash during init).
+	note := ""
+	if stored != nil && len(wires)-1 > int(last) {
+		note = fmt.Sprintf("finished a write that a crash interrupted: state.json moved from seq %d to %d", last, len(wires)-1)
+	}
 	for i := int(last) + 1; i < len(wires); i++ {
 		if st, sec, err = vaultlog.Transition(st, sec, dev, wires[i], objs); err != nil {
-			return nil, nil, fmt.Errorf("%w: entry %d past the state head: %w", ErrCorrupt, i, err)
-		}
-		rewrite = true
-	}
-	if rewrite {
-		if err := s.l.writeState(st); err != nil {
-			return nil, nil, err
+			return nil, nil, "", fmt.Errorf("%w: entry %d past the state head: %w", ErrCorrupt, i, err)
 		}
 	}
-	return st, sec, nil
-}
-
-func sameState(a, b *vaultlog.State) bool {
-	x, err1 := a.Marshal()
-	y, err2 := b.Marshal()
-	return err1 == nil && err2 == nil && string(x) == string(y)
+	if stored == nil || note != "" {
+		if err := s.writeState(st); err != nil {
+			return nil, nil, "", err
+		}
+	}
+	return st, sec, note, nil
 }
 
 // Head returns the verified head. It fails with model.ErrLocked while the
@@ -451,6 +532,10 @@ func (s *Store) Info() Info {
 	if cfg, err := s.readDeviceConfig(); err == nil {
 		info.DeviceStore = s.deviceStore(cfg).Describe()
 		info.AccountID = cfg.AccountID.String()
+		info.StaleDevices = len(cfg.StaleDevices)
+		if s.state != nil {
+			info.StaleDevices = len(s.staleActive(cfg))
+		}
 	}
 	if s.lockErr != nil {
 		info.LockReason = s.lockErr.Error()
@@ -459,27 +544,59 @@ func (s *Store) Info() Info {
 		info.Head = &Head{Seq: s.state.Head.Seq, H: s.state.Head.H.String()}
 		info.DeviceID = s.dev.ID.String()
 	}
+	if s.kitOrphaned {
+		info.Warnings = append(info.Warnings, "the Emergency Kit from the last hop passwd was never confirmed, "+
+			"and this device can no longer read it: hop unlock --password replaced the device key it was sealed to. "+
+			"Its Recovery Key cannot be recovered; run hop passwd to make a new Emergency Kit")
+	}
+	if s.skErr != nil {
+		info.Warnings = append(info.Warnings, fmt.Sprintf("the new Secret Key from the last hop passwd is not saved on this device yet (%v); run hop passwd to retry", s.skErr))
+	}
+	if info.StaleDevices > 0 {
+		info.Warnings = append(info.Warnings, fmt.Sprintf("%d stale device(s) from earlier password unlocks; run hop passwd to revoke", info.StaleDevices))
+	}
+	if s.repaired != "" {
+		info.Warnings = append(info.Warnings, s.repaired)
+	}
 	return info
 }
 
-// catchUp applies, after verifying them, entries another writer appended
-// since this store last looked. The caller holds the file lock.
+// catchUp applies, after verifying them, entries past the in-memory head:
+// a write whose entry committed but whose state.json write failed. The
+// verified result goes to state.json before it replaces the state in
+// memory, so memory never runs ahead of the disk. The caller holds the file
+// lock.
 func (s *Store) catchUp() error {
 	objs := objectDir(s.l.objects())
+	st, sec := s.state, s.sec
 	for {
-		w, err := s.l.readEntry(s.state.Head.Seq + 1)
+		w, err := s.l.readEntry(st.Head.Seq + 1)
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			break
 		}
 		if err != nil {
 			return err
 		}
-		st, sec, err := vaultlog.Transition(s.state, s.sec, s.dev, w, objs)
-		if err != nil {
+		if st, sec, err = vaultlog.Transition(st, sec, s.dev, w, objs); err != nil {
 			return fmt.Errorf("%w: entry %d: %w", ErrCorrupt, w.Entry.Seq, err)
 		}
-		s.state, s.sec = st, sec
 	}
+	if st == s.state {
+		return nil
+	}
+	if err := s.writeState(st); err != nil {
+		return err
+	}
+	s.state, s.sec = st, sec
+	return nil
+}
+
+// writeState writes state.json.
+func (s *Store) writeState(st *vaultlog.State) error {
+	if err := s.hook("state"); err != nil {
+		return err
+	}
+	return s.l.writeState(st)
 }
 
 // commit writes a built entry: its objects, then the entry, then state.json.
@@ -491,7 +608,7 @@ func (s *Store) commit(w *vaultlog.Wire, st *vaultlog.State) error {
 	if err := s.l.writeEntry(w); err != nil {
 		return err
 	}
-	return s.l.writeState(st)
+	return s.writeState(st)
 }
 
 // write builds a normal entry for ch against the current head and commits

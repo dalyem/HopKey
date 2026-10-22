@@ -223,3 +223,42 @@ func TestForeignOwnedFinalFails(t *testing.T) {
 	}
 	mustFail(t, d, "not owned")
 }
+
+// Every directory EnsurePrivateDir creates has its parent fsynced, from the
+// first ancestor that existed down; a directory that exists already costs
+// no sync.
+func TestNewDirsAreSynced(t *testing.T) {
+	var synced []string
+	syncDir = func(dir string) error {
+		synced = append(synced, dir)
+		return syncDirOS(dir)
+	}
+	t.Cleanup(func() { syncDir = syncDirOS })
+
+	root := base(t)
+	dir := filepath.Join(root, "a", "b", "c")
+	if _, err := EnsurePrivateDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{root, filepath.Join(root, "a"), filepath.Join(root, "a", "b")}
+	if strings.Join(synced, "|") != strings.Join(want, "|") {
+		t.Errorf("synced %q, want %q", synced, want)
+	}
+
+	synced = nil
+	if _, err := EnsurePrivateDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsurePrivateDir(filepath.Join(root, "a", "d")); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{filepath.Join(root, "a")}; strings.Join(synced, "|") != strings.Join(want, "|") {
+		t.Errorf("second round synced %q, want %q", synced, want)
+	}
+
+	// A failing sync fails the call.
+	syncDir = func(string) error { return os.ErrPermission }
+	if _, err := EnsurePrivateDir(filepath.Join(root, "e")); err == nil {
+		t.Error("a failed directory sync was ignored")
+	}
+}

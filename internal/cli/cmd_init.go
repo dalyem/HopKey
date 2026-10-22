@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/dalyem/hopkey/internal/store"
 )
@@ -77,10 +78,15 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 		}
 		return failf("%v; nothing was created", err)
 	}
-	if _, err := p.Commit(); err != nil {
+	s, err := p.Commit()
+	if err != nil {
 		return failf("creating the vault: %v", err)
 	}
 	committed = true
+	// The daemon opens the vault on its own; this process lets go of it.
+	if err := s.Close(); err != nil {
+		return failf("closing the vault: %v", err)
+	}
 	e.printf("\nVault created in %s.\nDevice key: %s.\n", cfg.DataDir, p.DeviceStore())
 	return nil
 }
@@ -108,25 +114,66 @@ func readNewPassword(e *Env, prompt string) ([]byte, error) {
 }
 
 // showKit prints the Emergency Kit and writes it to kitFile, if one is
-// given, as a new 0600 file.
+// given, as a new 0600 file. The file is on disk, fsynced, before it is
+// reported saved and before the kit can be typed back.
 func showKit(e *Env, kit store.Kit, kitFile string) error {
 	e.printf("\n%s\n", kit.Text())
 	if kitFile == "" {
 		return nil
 	}
-	f, err := os.OpenFile(kitFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return failf("writing the kit: %v", err)
-	}
-	if _, err := f.WriteString(kit.Text()); err != nil {
-		f.Close()
-		return failf("writing the kit: %v", err)
-	}
-	if err := f.Close(); err != nil {
+	if err := writeKitFile(kitFile, []byte(kit.Text())); err != nil {
 		return failf("writing the kit: %v", err)
 	}
 	e.printf("The kit was also written to %s.\n", kitFile)
 	return nil
+}
+
+// kitSync fsyncs an open file or directory. Tests replace it.
+var kitSync = func(f *os.File) error { return f.Sync() }
+
+// writeKitFile creates path holding data, mode 0600, atomically: a temp
+// file in the same directory is written and fsynced, then linked into
+// place, which fails if path exists, and the directory is fsynced. Where
+// hard links are not supported (FAT, say), the temp file is renamed into
+// place after checking that path does not exist.
+func writeKitFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".hop-kit-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	err = f.Chmod(0o600)
+	if err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = kitSync(f)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Link(tmp, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%s already exists", path)
+		}
+		if _, lerr := os.Lstat(path); !errors.Is(lerr, os.ErrNotExist) {
+			return fmt.Errorf("%s already exists", path)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			return err
+		}
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return kitSync(d)
 }
 
 // typeBack makes the user type the last group of the Secret Key and of the

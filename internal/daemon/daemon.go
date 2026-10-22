@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -64,7 +65,10 @@ type TailscaleSource interface {
 
 // Options configures Start.
 type Options struct {
-	Paths   Paths
+	Paths Paths
+	// Store is the vault. The daemon closes it when it shuts down, if it
+	// is an io.Closer, which for the encrypted store gives up the vault's
+	// owner lock. When Start fails, the caller still has to close it.
 	Store   model.Store
 	Version string
 
@@ -201,6 +205,11 @@ func (d *Daemon) shutdown() {
 			err = aerr
 		}
 		d.wg.Wait()
+		if c, ok := d.store.(io.Closer); ok {
+			if cerr := c.Close(); err == nil {
+				err = cerr
+			}
+		}
 		d.closeErr = err
 		close(d.done)
 	})
