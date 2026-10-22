@@ -58,8 +58,9 @@ var (
 	// verified head: the server lost or withheld entries.
 	ErrServerBehind = errors.New("store: the server's head is behind this device's verified head")
 	// ErrSyncHalted wraps the error that stopped syncing: an equivocation
-	// (§5.6), a rule violation in a server entry (§5.3) or a revocation.
-	// Sync stays stopped until the store is opened again.
+	// (§5.6) or a rule violation in a server entry (§5.3). Sync stays
+	// stopped until the store is opened again. A revocation is terminal
+	// instead (ErrDeviceRevoked).
 	ErrSyncHalted = errors.New("store: sync is stopped")
 )
 
@@ -73,7 +74,7 @@ func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == nil {
-		return nil, 0, nil, errLocked
+		return nil, 0, nil, s.lockedErr()
 	}
 	if !s.server {
 		return nil, 0, nil, ErrNotServerBacked
@@ -81,6 +82,20 @@ func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(
 	if s.syncHalt != nil {
 		return nil, 0, nil, s.syncHalt
 	}
+	ctx, gen, untrack := s.trackRequest(ctx)
+	done := func() {
+		s.mu.Lock()
+		untrack()
+		s.mu.Unlock()
+	}
+	return ctx, gen, done, nil
+}
+
+// trackRequest derives a context for requests to the server that Lock
+// cancels (§11.2). It returns the lock generation it started in, and a func
+// that stops tracking the context and cancels it. The caller holds s.mu,
+// and holds it when it calls that func.
+func (s *Store) trackRequest(ctx context.Context) (context.Context, uint64, func()) {
 	ctx, cancel := context.WithCancel(ctx)
 	if s.cancels == nil {
 		s.cancels = map[uint64]context.CancelFunc{}
@@ -88,13 +103,10 @@ func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(
 	s.cancelID++
 	id := s.cancelID
 	s.cancels[id] = cancel
-	done := func() {
-		s.mu.Lock()
+	return ctx, s.gen, func() {
 		delete(s.cancels, id)
-		s.mu.Unlock()
 		cancel()
 	}
-	return ctx, s.gen, done, nil
 }
 
 // current reports whether the store is still unlocked in generation gen.
@@ -121,7 +133,9 @@ func (s *Store) halt(err error) error {
 // server's head. An entry at a seq this device already holds with a
 // different H is an equivocation (§5.6): Pull returns a
 // *vaultlog.EquivocationError and sync stops. So does any rule violation.
-// A lock while Pull waits discards the response (§11.2).
+// A checkpoint that revokes this device locks the vault for good (revoke):
+// Pull returns ErrDeviceRevoked. A lock while Pull waits discards the
+// response (§11.2).
 func (s *Store) Pull(ctx context.Context, r Remote) error {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
@@ -174,7 +188,10 @@ func (s *Store) applyPulled(gen uint64, entries []Committed, head vaultlog.Head)
 	}
 	defer unlock()
 	before := s.state.Head.Seq
-	st, sec, err := s.applyEntries(s.state, s.sec, s.dev, entries, true)
+	st, sec, err := s.applyEntries(s.state, s.sec, s.dev, entries, s.rec)
+	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+		return false, s.revoke(rev)
+	}
 	// An interrupted commit locks the store (commitTxn): then nothing is
 	// installed, and the next unlock replays the journal.
 	if s.current(gen) == nil && st != s.state {
@@ -202,22 +219,20 @@ func (s *Store) applyPulled(gen uint64, entries []Committed, head vaultlog.Head)
 // passes every other error through.
 func (s *Store) haltOn(err error) error {
 	var eq *vaultlog.EquivocationError
-	var rev *vaultlog.RevokedError
-	if errors.As(err, &eq) || errors.As(err, &rev) || vaultlog.RuleOf(err) != "" {
+	if errors.As(err, &eq) || vaultlog.RuleOf(err) != "" {
 		return s.halt(err)
 	}
 	return err
 }
 
-// applyEntries verifies entries on top of (st, sec) and commits each one.
-// It returns the last committed state, even with an error. Entries this
-// device already holds are compared with what it holds (§5.6). The caller
-// holds s.mu and the file lock.
-//
-// With settle false the outbox is left alone: a password unlock commits
-// before the device record it would open the outbox with is saved, and
-// settleAtUnlock settles it afterwards.
-func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaultlog.DeviceKey, entries []Committed, settle bool) (*vaultlog.State, *vaultlog.Secrets, error) {
+// applyEntries verifies entries on top of (st, sec) and commits each one,
+// with the outbox records it settles. It returns the last committed state,
+// even with an error. Entries this device already holds are compared with
+// what it holds (§5.6). rec is the device record whose local_key opens the
+// outbox: a password unlock passes the new record, which carries the old
+// one's local_key, before it is saved. The caller holds s.mu and the file
+// lock.
+func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaultlog.DeviceKey, entries []Committed, rec *deviceRecord) (*vaultlog.State, *vaultlog.Secrets, error) {
 	objs := objectDir(s.l.objects())
 	for _, c := range entries {
 		if c.Wire == nil {
@@ -252,7 +267,7 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 		if err != nil {
 			return st, sec, err
 		}
-		if err := s.commitVerified(c.Wire, h, next, settle); err != nil {
+		if err := s.commitVerified(c.Wire, h, next, rec); err != nil {
 			return st, sec, err
 		}
 		st, sec = next, nsec
@@ -264,9 +279,9 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 // harmless if a crash leaves them unreferenced), then, in one transaction,
 // the entry, state.json and every outbox record it settles (§11.1). A
 // record whose candidate is this entry is deleted; a record whose live
-// candidate was at this seq with another H has it marked dead. The caller
-// holds s.mu and the file lock.
-func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.State, settle bool) error {
+// candidate was at this seq with another H has it marked dead. rec opens
+// the outbox. The caller holds s.mu and the file lock.
+func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.State, rec *deviceRecord) error {
 	if err := s.l.writeObjects(w); err != nil {
 		return err
 	}
@@ -283,15 +298,12 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 	t := &txn{}
 	t.create(entryRel(w.Entry.Seq), eb)
 	t.put(stateRel, sb)
-	if !settle {
-		return s.commitTxn(t)
-	}
 	if err := s.settle(t, w.Entry.Seq, func(seq uint64) (crypto.Hash, error) {
 		if seq == w.Entry.Seq {
 			return h, nil
 		}
 		return s.entryHash(seq)
-	}); err != nil {
+	}, rec, st.VaultID); err != nil {
 		return err
 	}
 	return s.commitTxn(t)
@@ -309,12 +321,13 @@ func (s *Store) entryHash(seq uint64) (crypto.Hash, error) {
 // decides: every live candidate at a seq ≤ head is committed if the
 // verified entry there has its H, and dead otherwise. A record with a
 // committed candidate is deleted. Nothing else ever settles a candidate.
-// The caller holds the file lock.
-func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, error)) error {
+// rec's local_key opens the outbox of vault vaultID. The caller holds the
+// file lock.
+func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, error), rec *deviceRecord, vaultID model.ID) error {
 	if ns, err := s.l.outboxNumbers(); err != nil || len(ns) == 0 {
 		return err
 	}
-	recs, err := s.readOutbox()
+	recs, err := s.readOutboxAs(rec, vaultID)
 	if err != nil {
 		return err
 	}
@@ -333,20 +346,20 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 		}
 		c.Status = statusDead
 		delete(r.Wires, c.H)
-		if err := s.putRecord(t, r); err != nil {
+		if err := s.putRecordAs(t, r, rec, vaultID); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// settleAtUnlock settles candidates that verified history already decides,
-// for a vault opened after a commit that could not settle them (a password
-// unlock that replaced the device record). The caller holds s.mu and the
-// file lock.
+// settleAtUnlock settles candidates that verified history already decides.
+// Every verified commit settles its own, so this finds work only in a vault
+// whose commits did not (a crash in an older build). The caller holds s.mu
+// and the file lock.
 func (s *Store) settleAtUnlock() error {
 	t := &txn{}
-	if err := s.settle(t, s.state.Head.Seq, s.entryHash); err != nil {
+	if err := s.settle(t, s.state.Head.Seq, s.entryHash, s.rec, s.state.VaultID); err != nil {
 		return err
 	}
 	return s.commitTxn(t)
@@ -549,7 +562,7 @@ func (s *Store) Status() (SyncStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == nil {
-		return SyncStatus{}, errLocked
+		return SyncStatus{}, s.lockedErr()
 	}
 	st := SyncStatus{ServerBacked: s.server, Head: Head{Seq: s.state.Head.Seq, H: s.state.Head.H.String()}}
 	if s.syncHalt != nil {
@@ -578,7 +591,7 @@ func (s *Store) Status() (SyncStatus, error) {
 // s.mu.
 func (s *Store) needServer() error {
 	if s.state == nil {
-		return errLocked
+		return s.lockedErr()
 	}
 	if !s.server {
 		return ErrNotServerBacked

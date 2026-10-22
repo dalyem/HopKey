@@ -393,6 +393,14 @@ func newCredential(t *testing.T, s *Store, name string) model.Credential {
 // grantChanges is a grant whose record lists items, with host_key_map.
 func grantChanges(t *testing.T, s *Store, items []model.ID, hostKeys map[model.ID]model.ID) vaultlog.Changes {
 	t.Helper()
+	ch, _ := grantWithToken(t, s, items, hostKeys)
+	return ch
+}
+
+// grantWithToken is grantChanges with the grant's token, which opens its
+// bundles.
+func grantWithToken(t *testing.T, s *Store, items []model.ID, hostKeys map[model.ID]model.ID) (vaultlog.Changes, *crypto.Token) {
+	t.Helper()
 	grantID, err := vaultlog.NewID()
 	if err != nil {
 		t.Fatal(err)
@@ -423,7 +431,7 @@ func grantChanges(t *testing.T, s *Store, items []model.ID, hostKeys map[model.I
 		GrantID: grantID, Name: "ci", ExpiresAt: model.TimestampOf(time.Now().Add(24 * time.Hour)),
 		TokenKEMPK: kem.PublicKey().Bytes(), Items: ids, HostKeyMap: hostKeys, KeyPolicy: "shared",
 	}
-	return vaultlog.Changes{Grants: []vaultlog.NewGrant{{Record: rec, TAuthSHA256: crypto.SHA256(tauth)}}}
+	return vaultlog.Changes{Grants: []vaultlog.NewGrant{{Record: rec, TAuthSHA256: crypto.SHA256(tauth)}}}, tok
 }
 
 // mergeItem encodes a model item for comparisons.

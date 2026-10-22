@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -480,7 +481,8 @@ func TestCompanionGrantOpsOnHostDelete(t *testing.T) {
 	// listing it; drop it first.
 	editHost(t, a, p.host.ItemID, func(h *model.Host) { h.CredentialID = model.ID{} })
 	pushAll(t, a, p.r)
-	direct(t, a, p.r, grantChanges(t, a, []model.ID{p.key.ItemID, p.host.ItemID}, map[model.ID]model.ID{p.host.ItemID: p.key.ItemID}))
+	grant, tok := grantWithToken(t, a, []model.ID{p.key.ItemID, p.host.ItemID}, map[model.ID]model.ID{p.host.ItemID: p.key.ItemID})
+	direct(t, a, p.r, grant)
 	a.mu.Lock()
 	var grantID, recordID model.ID
 	for g, gs := range a.state.Grants {
@@ -535,6 +537,46 @@ func TestCompanionGrantOpsOnHostDelete(t *testing.T) {
 	a.mu.Unlock()
 	if slices.Contains(rec.Items, p.host.ItemID) || len(rec.HostKeyMap) != 0 || !slices.Contains(rec.Items, p.key.ItemID) {
 		t.Errorf("grant record after the delete: items %v, map %v", rec.Items, rec.HostKeyMap)
+	}
+
+	// Open the new bundle as the token client would: it carries the key as
+	// verified state has it, without the overlay's later rename, and no
+	// longer the host.
+	var opened *crypto.OpenedBundle
+	for _, o := range posted.Entry.Ops {
+		bp, ok := o.(*vaultlog.BundlePutOp)
+		if !ok || bp.GrantID != grantID {
+			continue
+		}
+		for _, obj := range posted.Objects {
+			if !obj.SHA256.Equal(bp.EnvelopeSHA256) {
+				continue
+			}
+			env, err := crypto.ParseHPKEEnvelope(obj.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if opened, err = crypto.OpenBundle(tok, env, bp.BundleVersion, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if opened == nil {
+		t.Fatal("the delete's entry carries no bundle for the grant")
+	}
+	key, ok := opened.Items[p.key.ItemID].(*model.Key)
+	if !ok || key.Name != p.key.Name || key.ItemVersion != p.key.ItemVersion {
+		t.Errorf("the bundle's key: %+v", opened.Items[p.key.ItemID])
+	}
+	if _, ok := opened.Items[p.host.ItemID]; ok || len(opened.Items) != 1 {
+		t.Errorf("the bundle still carries the host, or %d items", len(opened.Items))
+	}
+	b, err := canonjson.Marshal(opened.Bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte("renamed in the overlay")) {
+		t.Error("the bundle carries an overlay value")
 	}
 }
 

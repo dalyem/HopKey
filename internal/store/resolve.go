@@ -31,6 +31,11 @@ var (
 	// replacement against current state: S changed, so the user must
 	// approve again (§5.4).
 	ErrStaleConfirm = errors.New("store: the confirmation does not match the current proposal")
+	// ErrReplacementRefused means a keep mine or edit replacement would not
+	// apply to verified state: a reference names no verified item (one that
+	// only a later queued record creates included), or a §5.3 rule such as
+	// a deploy-op blocker fails (§11.1).
+	ErrReplacementRefused = errors.New("store: the replacement does not apply to verified state")
 )
 
 // Resolution is the user's choice for the held outbox head.
@@ -282,16 +287,51 @@ func (s *Store) replacement(rec *record, ev evaluation, r *Resolution) (merge.In
 			return merge.Intent{}, model.ID{}, err
 		}
 	}
+	if err := s.checkReplacement(repl); err != nil {
+		return merge.Intent{}, model.ID{}, err
+	}
+	return repl, newID, nil
+}
+
+// checkReplacement requires a replacement to apply to verified state as it
+// is now (§11.1): nothing comes before the head, so every reference must
+// name a verified item of the right type, never one that only a later
+// queued record creates, and the candidate the push would build from it
+// must pass the §5.3 rules, deploy-op blockers included. Propose and
+// Resolve both run it, so a held flag is never cleared on a replacement
+// that would only hold again on a rule. The caller holds s.mu and the file
+// lock.
+func (s *Store) checkReplacement(repl merge.Intent) error {
 	if repl.Want != nil {
 		p, err := plainOf(repl.Want)
 		if err != nil {
-			return merge.Intent{}, model.ID{}, err
+			return err
 		}
 		if err := crypto.ValidateItem(p); err != nil {
-			return merge.Intent{}, model.ID{}, err
+			return err
+		}
+		verified := map[model.ID]*merge.Item{}
+		for id := range s.sec.Items {
+			it, err := s.verifiedItem(id)
+			if err != nil {
+				return err
+			}
+			if it != nil {
+				verified[id] = it
+			}
+		}
+		if err := checkRefs(p, verified); err != nil {
+			return fmt.Errorf("%w: %w", ErrReplacementRefused, err)
 		}
 	}
-	return repl, newID, nil
+	ev, err := s.evaluate(repl)
+	if err != nil {
+		return err
+	}
+	if ev.res.Kind == merge.KindHold && ev.res.Cause == merge.CauseRuleFailure {
+		return fmt.Errorf("%w: %v", ErrReplacementRefused, ev.res.Err)
+	}
+	return nil
 }
 
 // checkFreshID requires id to be unused: not live or retired in verified

@@ -302,11 +302,23 @@ func (l layout) outboxNumbers() ([]uint64, error) {
 // readOutbox opens every record, in n order. The caller holds the file
 // lock.
 func (s *Store) readOutbox() ([]*record, error) {
+	if s.state == nil || s.rec == nil {
+		return nil, s.lockedErr()
+	}
+	return s.readOutboxAs(s.rec, s.state.VaultID)
+}
+
+// readOutboxAs is readOutbox with rec's local_key, for vault vaultID. The
+// caller holds the file lock.
+func (s *Store) readOutboxAs(rec *deviceRecord, vaultID model.ID) ([]*record, error) {
 	ns, err := s.l.outboxNumbers()
 	if err != nil || len(ns) == 0 {
 		return nil, err
 	}
-	key, err := s.outboxKey()
+	if rec == nil {
+		return nil, s.lockedErr()
+	}
+	key, err := rec.localKey()
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +329,7 @@ func (s *Store) readOutbox() ([]*record, error) {
 		if err != nil {
 			return nil, err
 		}
-		r, err := openRecord(key, s.state.VaultID, n, b)
+		r, err := openRecord(key, vaultID, n, b)
 		if err != nil {
 			return nil, err
 		}
@@ -330,19 +342,27 @@ func (s *Store) readOutbox() ([]*record, error) {
 // unlock (upgradeRecord), so it may be used.
 func (s *Store) outboxKey() (*crypto.SymKey, error) {
 	if s.rec == nil {
-		return nil, errLocked
+		return nil, s.lockedErr()
 	}
 	return s.rec.localKey()
 }
 
 // putRecord adds r's file to t.
 func (s *Store) putRecord(t *txn, r *record) error {
-	key, err := s.outboxKey()
+	if s.state == nil || s.rec == nil {
+		return s.lockedErr()
+	}
+	return s.putRecordAs(t, r, s.rec, s.state.VaultID)
+}
+
+// putRecordAs is putRecord with rec's local_key, for vault vaultID.
+func (s *Store) putRecordAs(t *txn, r *record, rec *deviceRecord, vaultID model.ID) error {
+	key, err := rec.localKey()
 	if err != nil {
 		return err
 	}
 	defer key.Zero()
-	b, err := sealRecord(key, s.state.VaultID, r)
+	b, err := sealRecord(key, vaultID, r)
 	if err != nil {
 		return err
 	}
@@ -441,7 +461,7 @@ func (s *Store) EnableServerMode() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == nil {
-		return errLocked
+		return s.lockedErr()
 	}
 	if s.server {
 		return nil

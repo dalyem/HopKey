@@ -29,12 +29,18 @@ func walExists(t *testing.T, cfg Config) bool {
 	return err == nil
 }
 
+// notJournaled reports whether a crash at stage comes before wal.json is
+// renamed into place: the commit then did not happen, and the store stays
+// unlocked.
+func notJournaled(stage string) bool { return stage == "wal:before" || stage == "wal:install" }
+
 // §13: write-ahead journal replay after a crash in each multi-file commit.
 // A pull that verifies an entry commits the entry, state.json and the
 // deletion of the outbox record it settles together: a crash at any
-// durable step leaves all of them or none.
+// durable step, or a failed fsync after it, leaves all of them or none.
 func TestWALReplayVerifiedCommit(t *testing.T) {
-	for _, stage := range []string{"wal:before", "wal:written", "wal:op:0", "wal:op:1", "wal:op:2", "wal:applied"} {
+	for _, stage := range []string{"wal:before", "wal:install", "wal:install:sync", "wal:written",
+		"wal:op:0", "wal:op:0:sync", "wal:op:1", "wal:op:1:sync", "wal:op:2", "wal:op:2:sync", "wal:applied", "wal:removed"} {
 		t.Run(stage, func(t *testing.T) {
 			ctx := context.Background()
 			f, r := serverVault(t)
@@ -58,15 +64,15 @@ func TestWALReplayVerifiedCommit(t *testing.T) {
 			if err := s.Pull(ctx, r); !errors.Is(err, errCrash) {
 				t.Fatalf("pull with a crash at %s: %v", stage, err)
 			}
-			if stage != "wal:before" {
-				if _, err := s.Snapshot(ctx); !errors.Is(err, model.ErrLocked) {
-					t.Errorf("an interrupted commit left the store unlocked: %v", err)
-				}
+			if _, err := s.Snapshot(ctx); notJournaled(stage) != (err == nil) {
+				t.Errorf("after a crash at %s: snapshot %v", stage, err)
+			} else if err != nil && !errors.Is(err, model.ErrLocked) {
+				t.Errorf("an interrupted commit left the store unlocked: %v", err)
 			}
 			s = open(t, f.cfg)
 			recs := records(t, s)
 			switch got := headOf(t, s); {
-			case stage == "wal:before":
+			case notJournaled(stage):
 				if got != before || len(recs) != 1 || recs[0].live() == nil {
 					t.Errorf("nothing journaled, yet head %d and %d records", got.Seq, len(recs))
 				}
@@ -90,7 +96,8 @@ func TestWALReplayVerifiedCommit(t *testing.T) {
 
 // Appending a record writes it together with the outbox counter.
 func TestWALReplayAppend(t *testing.T) {
-	for _, stage := range []string{"wal:before", "wal:written", "wal:op:0", "wal:op:1", "wal:applied"} {
+	for _, stage := range []string{"wal:before", "wal:install", "wal:install:sync", "wal:written",
+		"wal:op:0", "wal:op:0:sync", "wal:op:1", "wal:op:1:sync", "wal:applied", "wal:removed"} {
 		t.Run(stage, func(t *testing.T) {
 			f, _ := serverVault(t)
 			s := f.s
@@ -104,7 +111,7 @@ func TestWALReplayAppend(t *testing.T) {
 				t.Fatal(err)
 			}
 			recs := records(t, s)
-			if stage == "wal:before" {
+			if notJournaled(stage) {
 				if len(recs) != 0 || m.Next != 1 {
 					t.Errorf("nothing journaled, yet %d records, next %d", len(recs), m.Next)
 				}

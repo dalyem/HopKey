@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -48,6 +49,12 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 // server's log. If the post fails or its outcome is unknown, nothing is
 // saved and the new device stays listed as stale, so the next hop passwd
 // revokes it if it committed.
+//
+// It waits on the server without holding the store's mutex, so Lock is
+// never blocked behind it. A lock (§11.2) cancels its in-flight request and
+// discards whatever arrives afterwards: it then returns ErrSyncInterrupted,
+// having saved no device record and installed nothing. Verified entries it
+// committed before the lock stay committed.
 func (s *Store) UnlockWithPasswordRemote(ctx context.Context, r Remote, password []byte, secretKey string) error {
 	if r == nil {
 		return errors.New("store: no server")
@@ -56,10 +63,19 @@ func (s *Store) UnlockWithPasswordRemote(ctx context.Context, r Remote, password
 }
 
 func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byte, secretKey string) (err error) {
+	if r != nil {
+		// The bootstrap waits on the server without s.mu or the file lock;
+		// syncMu keeps Pull and PushHead out meanwhile.
+		s.syncMu.Lock()
+		defer s.syncMu.Unlock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owner == nil {
 		return errClosed
+	}
+	if err := s.checkRevoked(); err != nil {
+		return err
 	}
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
@@ -93,11 +109,11 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 		return ErrNeedSecretKey
 	}
 
-	unlock, err := s.lockFile()
-	if err != nil {
+	fl := &fileHold{s: s}
+	if err := fl.lock(); err != nil {
 		return err
 	}
-	defer unlock()
+	defer fl.unlock()
 	if err := s.replayWAL(); err != nil {
 		return err
 	}
@@ -180,7 +196,28 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 		if err := s.commit(w, st); err != nil {
 			return err
 		}
-	} else if st, sec, err = s.bootstrapRemote(ctx, r, st, sec, info); err != nil {
+	} else {
+		// From here every request to the server runs outside s.mu, and a
+		// lock in the meantime discards its result.
+		rctx, gen, untrack := s.trackRequest(ctx)
+		defer untrack()
+		st0 := s.state
+		// If this fails after committing verified entries, a store that is
+		// still unlocked in the same session moves to them: memory never
+		// runs behind the files, whose outbox records they may have settled.
+		defer func() {
+			if err != nil && st0 != nil && s.gen == gen && s.state == st0 && st.Head.Seq > st0.Head.Seq {
+				s.state, s.sec = st, sec
+			}
+		}()
+		if st, sec, err = s.bootstrapRemote(rctx, r, fl, gen, st0, st, sec, info, rec); err != nil {
+			return err
+		}
+		if s.gen != gen || s.state != st0 {
+			return ErrSyncInterrupted
+		}
+	}
+	if err := s.hook("passwd:save"); err != nil {
 		return err
 	}
 	// The new record is used only once it is durable (§11).
@@ -190,17 +227,55 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	s.dropLocked(nil)
 	s.state, s.sec, s.dev, s.rec, s.devCfg, s.repaired, s.server = st, sec, dev, rec, next, repaired, server
 	// device.json still names the old device: reconciling moves it to the
-	// stale list and takes the new one off.
-	if err := s.reconcileDevice(); err != nil {
+	// stale list and takes the new one off. A failure from here locks the
+	// store, as a failed Unlock does.
+	if err := s.finishUnlock(); err != nil {
+		s.dropLocked(err)
 		return err
 	}
-	if err := s.writeAccountFile(); err != nil {
+	return nil
+}
+
+// fileHold is the file lock as one operation holds it, given up and taken
+// again around requests to the server (outside).
+type fileHold struct {
+	s       *Store
+	release func()
+}
+
+func (h *fileHold) lock() error {
+	release, err := h.s.lockFile()
+	if err != nil {
 		return err
 	}
-	if err := s.settleAtUnlock(); err != nil {
-		return err
+	h.release = release
+	return nil
+}
+
+func (h *fileHold) unlock() {
+	if h.release != nil {
+		h.release()
+		h.release = nil
 	}
-	return s.recoverJournal()
+}
+
+// outside runs f, a request to the server, without s.mu or the file lock,
+// and then takes both back (§11.2). The caller holds both, and holds s.mu
+// again when outside returns; it holds the file lock again unless outside
+// fails. A lock or an unlock while f ran (the generation gen or the state
+// st0 changed) discards f's result: outside returns ErrSyncInterrupted.
+func (s *Store) outside(fl *fileHold, gen uint64, st0 *vaultlog.State, f func() error) error {
+	fl.unlock()
+	s.mu.Unlock()
+	err := f()
+	s.mu.Lock()
+	if s.gen != gen || s.state != st0 {
+		return ErrSyncInterrupted
+	}
+	if lerr := fl.lock(); lerr != nil {
+		return lerr
+	}
+	return err
 }
 
 // dropLostRecords deletes every queued outbox record, which no readable
@@ -229,17 +304,30 @@ func (s *Store) dropLostRecords() error {
 
 // bootstrapRemote catches (st, sec) up with the server through verified
 // transitions, posts a bootstrap entry for info, and returns the state once
-// the server's log shows it, verified. Outbox records are settled later, by
-// settleAtUnlock. The caller holds s.mu and the file lock.
-func (s *Store) bootstrapRemote(ctx context.Context, r Remote, st *vaultlog.State, sec *vaultlog.Secrets, info vaultlog.DeviceInfo) (*vaultlog.State, *vaultlog.Secrets, error) {
+// the server's log shows it, verified. With an error it returns the last
+// state it committed, (st, sec) if none. Each verified entry is committed
+// with the outbox records it settles, opened with rec's local_key (carried
+// over from the old record). Every request runs outside s.mu (see outside),
+// and nothing is committed once the store has left generation gen or the
+// state st0. The caller holds s.mu and the file lock (fl).
+func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen uint64, st0 *vaultlog.State, st *vaultlog.State, sec *vaultlog.Secrets, info vaultlog.DeviceInfo, rec *deviceRecord) (*vaultlog.State, *vaultlog.Secrets, error) {
 	catchUp := func() error {
 		for {
-			entries, head, err := r.Since(ctx, st.Head.Seq)
-			if err != nil {
+			var entries []Committed
+			var head vaultlog.Head
+			after := st.Head.Seq
+			if err := s.outside(fl, gen, st0, func() (err error) {
+				if err := s.hook("passwd:since"); err != nil {
+					return err
+				}
+				entries, head, err = r.Since(ctx, after)
+				return err
+			}); err != nil {
 				return err
 			}
 			before := st.Head.Seq
-			st, sec, err = s.applyEntries(st, sec, nil, entries, false)
+			var err error
+			st, sec, err = s.applyEntries(st, sec, nil, entries, rec)
 			if err != nil {
 				return err
 			}
@@ -253,33 +341,38 @@ func (s *Store) bootstrapRemote(ctx context.Context, r Remote, st *vaultlog.Stat
 	}
 	for attempt := 0; attempt < maxPushAttempts; attempt++ {
 		if err := catchUp(); err != nil {
-			return nil, nil, err
+			return st, sec, err
 		}
 		w, _, _, err := vaultlog.BuildBootstrap(st, sec, info, s.now())
 		if err != nil {
-			return nil, nil, err
+			return st, sec, err
 		}
 		h, err := w.Entry.Hash()
 		if err != nil {
-			return nil, nil, err
+			return st, sec, err
 		}
-		if _, err := r.Post(ctx, w); err != nil && !errors.Is(err, ErrHeadConflict) {
-			return nil, nil, err
+		if err := s.outside(fl, gen, st0, func() error {
+			if _, err := r.Post(ctx, w); err != nil && !errors.Is(err, ErrHeadConflict) {
+				return err
+			}
+			return nil
+		}); err != nil {
+			return st, sec, err
 		}
 		if err := catchUp(); err != nil {
-			return nil, nil, err
+			return st, sec, err
 		}
 		if st.Head.Seq >= w.Entry.Seq {
 			got, err := s.entryHash(w.Entry.Seq)
 			if err != nil {
-				return nil, nil, err
+				return st, sec, err
 			}
 			if got.Equal(h) {
 				return st, sec, nil
 			}
 		}
 	}
-	return nil, nil, errors.New("store: the bootstrap entry did not commit; another device keeps writing first")
+	return st, sec, errors.New("store: the bootstrap entry did not commit; another device keeps writing first")
 }
 
 // ChangePassword changes the master password (§10.1). It is a full
@@ -296,7 +389,7 @@ func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
-		return Kit{}, errLocked
+		return Kit{}, s.lockedErr()
 	}
 	if s.kit != nil {
 		return Kit{}, ErrKitPending
@@ -433,7 +526,7 @@ func (s *Store) AckKit() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == nil {
-		return errLocked
+		return s.lockedErr()
 	}
 	if s.kit == nil {
 		return nil
@@ -457,13 +550,15 @@ func (s *Store) AckKit() error {
 }
 
 // persistKitSK makes the device key store hold the pending kit's Secret
-// Key, durably. It reads the stored record first, so a retry after a
+// Key, durably: the record in memory with that Secret Key, byte for byte,
+// local_key included. It reads the stored record first, so a retry after a
 // failure, or after a crash, does only what is still missing. A record that
 // reads back is not yet durable: a file save can rename device.key into
 // place and then fail to fsync the directory. So unless a save of this kit
 // fully succeeded (kitSKDurable), the record found is made durable again
-// before it is relied on. The record in memory changes only after that.
-// The caller holds the file lock.
+// before it is relied on. Anything else is stored with storeDurably, which
+// rereads it. The record in memory changes only after that. The caller
+// holds the file lock.
 func (s *Store) persistKitSK() error {
 	k := s.kit
 	if _, err := crypto.ParseSecretKey(k.SecretKey); err != nil {
@@ -471,27 +566,37 @@ func (s *Store) persistKitSK() error {
 		return s.skErr
 	}
 	ds := s.deviceStore(s.devCfg)
+	next := s.rec.clone()
+	next.SecretKey = k.SecretKey
+	fail := func(err error) error {
+		next.zero()
+		s.skErr = err
+		return err
+	}
+	want, err := next.jcs()
+	if err != nil {
+		return fail(err)
+	}
+	defer clear(want)
 	if cur, err := ds.load(); err == nil {
-		done := cur.DeviceID == s.rec.DeviceID && cur.SecretKey == k.SecretKey
+		got, err := cur.jcs()
 		cur.zero()
+		done := err == nil && bytes.Equal(got, want)
+		clear(got)
 		if done {
 			if !s.kitSKDurable {
 				if err := ds.sync(); err != nil {
-					s.skErr = err
-					return err
+					return fail(err)
 				}
 			}
-			s.rec.SecretKey, s.skErr, s.kitSKDurable = k.SecretKey, nil, true
+			s.rec.zero()
+			s.rec, s.skErr, s.kitSKDurable = next, nil, true
 			return nil
 		}
 	}
 	s.kitSKDurable = false
-	next := s.rec.clone()
-	next.SecretKey = k.SecretKey
-	if err := ds.save(next); err != nil {
-		next.zero()
-		s.skErr = err
-		return err
+	if err := ds.storeDurably(next); err != nil {
+		return fail(err)
 	}
 	s.rec.zero()
 	s.rec, s.skErr, s.kitSKDurable = next, nil, true

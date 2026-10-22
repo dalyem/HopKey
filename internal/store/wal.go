@@ -29,6 +29,16 @@ import (
 // vault and at most one transaction in it: the writer lock serializes
 // commits, and a commit does not return until its journal is gone.
 //
+// A failure from the rename in step 1 on leaves the commit uncertain: the
+// journal may or may not survive a crash. The store then locks, so memory
+// never runs ahead of or behind the files, and the next unlock replays
+// whatever journal is there. A journal that is still there when a commit
+// starts is never overwritten: the commit fails and the store locks.
+//
+// Each durable step has a test hook named after it (wal:install,
+// wal:install:sync, wal:op:<i>, wal:op:<i>:sync, wal:removed), so a crash,
+// or a failed fsync, can be simulated at every one.
+//
 // Phase 1's commit order (objects, then the entry as the commit point,
 // then state.json, repaired by the replay on unlock) is unchanged for
 // local-only vaults, and the checkpoint journal keeps its own files.
@@ -91,10 +101,14 @@ func (l layout) walPath(rel string) (string, error) {
 	return filepath.Join(l.vault(), filepath.FromSlash(rel)), nil
 }
 
+// errWALOutstanding means a commit found the journal of an earlier one still
+// in place.
+var errWALOutstanding = errors.New("store: an earlier commit is unfinished")
+
 // commitTxn writes t atomically (see above). The caller holds the file
-// lock. If the journal is written but applying it fails, the store is
-// locked: memory may no longer match the files, and the next unlock
-// replays the journal.
+// lock. If the journal may be installed but the commit did not finish, the
+// store is locked: memory may no longer match the files, and the next
+// unlock replays the journal.
 func (s *Store) commitTxn(t *txn) error {
 	if t.empty() {
 		return nil
@@ -108,17 +122,63 @@ func (s *Store) commitTxn(t *txn) error {
 	if err != nil {
 		return err
 	}
+	// Never overwrite a journal that is still there: it is a commit that
+	// has not finished, and only a replay may finish it.
+	if _, err := os.Lstat(s.l.walFile()); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			err = errWALOutstanding
+		}
+		return s.interrupted(err)
+	}
 	if err := s.hook("wal:before"); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(s.l.walFile(), b); err != nil {
+	if installed, err := s.installWAL(b); err != nil {
+		if installed {
+			return s.interrupted(err)
+		}
 		return err
 	}
 	if err := s.applyWAL(t.ops); err != nil {
-		s.dropLocked(fmt.Errorf("store: a commit was interrupted (%w); unlock to finish it", err))
-		return err
+		return s.interrupted(err)
 	}
 	return nil
+}
+
+// interrupted locks the store after a commit that may have installed its
+// journal without finishing, and returns err. The next unlock replays the
+// journal.
+func (s *Store) interrupted(err error) error {
+	s.dropLocked(fmt.Errorf("store: a commit was interrupted (%w); unlock to finish it", err))
+	return err
+}
+
+// installWAL writes wal.json whole: a fsynced temporary file renamed into
+// place, then the directory fsynced. installed reports whether the journal
+// may be in place, which it may be from the rename on, failed or not.
+func (s *Store) installWAL(b []byte) (installed bool, err error) {
+	tmp, err := writeTemp(s.l.walFile(), b)
+	if err != nil {
+		return false, err
+	}
+	if err := s.hook("wal:install"); err != nil {
+		os.Remove(tmp)
+		return false, err
+	}
+	if err := os.Rename(tmp, s.l.walFile()); err != nil {
+		os.Remove(tmp)
+		return true, err
+	}
+	return true, s.syncDirStep("wal:install:sync", s.l.vault())
+}
+
+// syncDirStep fsyncs dir after a step that changed it. stage is the test
+// hook that simulates that fsync failing.
+func (s *Store) syncDirStep(stage, dir string) error {
+	if err := s.hook(stage); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 // applyWAL applies the journaled operations and then removes the journal.
@@ -130,7 +190,7 @@ func (s *Store) applyWAL(ops []walOp) error {
 		if err := s.hook(fmt.Sprintf("wal:op:%d", i)); err != nil {
 			return err
 		}
-		if err := s.l.applyOp(op); err != nil {
+		if err := s.applyOp(i, op); err != nil {
 			return err
 		}
 	}
@@ -140,22 +200,40 @@ func (s *Store) applyWAL(ops []walOp) error {
 	if err := os.Remove(s.l.walFile()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return syncDir(s.l.vault())
+	return s.syncDirStep("wal:removed", s.l.vault())
 }
 
-func (l layout) applyOp(op walOp) error {
-	p, err := l.walPath(op.Path)
+// applyOp applies operation i durably: the file's data is fsynced before
+// it is linked or renamed into place, and its directory after. A replay
+// redoes every step, including the fsyncs of a file that is already there.
+func (s *Store) applyOp(i int, op walOp) error {
+	p, err := s.l.walPath(op.Path)
 	if err != nil {
 		return err
 	}
+	sync := fmt.Sprintf("wal:op:%d:sync", i)
 	switch op.Op {
 	case walPut:
-		return writeFileAtomic(p, op.Data)
+		tmp, err := writeTemp(p, op.Data)
+		if err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, p); err != nil {
+			os.Remove(tmp)
+			return err
+		}
 	case walCreate:
-		err := createExclusive(p, op.Data)
+		tmp, err := writeTemp(p, op.Data)
+		if err != nil {
+			return err
+		}
+		err = os.Link(tmp, p)
+		os.Remove(tmp)
 		if errors.Is(err, os.ErrExist) {
-			// Written before a crash, or by an earlier replay. It must be
-			// exactly this file: an entry is never replaced.
+			// Written before a crash, or by an earlier replay, either of
+			// which may have stopped before it was durable. It must be
+			// exactly this file: an entry is never replaced. Then it is
+			// made durable as a fresh one would be.
 			old, rerr := os.ReadFile(p)
 			if rerr != nil {
 				return rerr
@@ -163,16 +241,19 @@ func (l layout) applyOp(op walOp) error {
 			if !bytes.Equal(old, op.Data) {
 				return fmt.Errorf("%w: %s differs from the journaled file", ErrCorrupt, op.Path)
 			}
-			return nil
+			err = syncFile(p)
 		}
-		return err
+		if err != nil {
+			return err
+		}
 	case walDelete:
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		return syncDir(filepath.Dir(p))
+	default:
+		return fmt.Errorf("%w: journal operation %q", ErrCorrupt, op.Op)
 	}
-	return fmt.Errorf("%w: journal operation %q", ErrCorrupt, op.Op)
+	return s.syncDirStep(sync, filepath.Dir(p))
 }
 
 // replayWAL finishes a transaction that a crash interrupted. It runs, under

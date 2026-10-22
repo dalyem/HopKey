@@ -22,6 +22,7 @@
 //	vault/server.json          present in a server-backed vault (§11.1)
 //	vault/outbox/<n>.json      outbox records, sealed under local_key (outbox.go)
 //	vault/outbox.json          the outbox counter
+//	vault/revoked.json         present once a checkpoint revoked this device (§5.5)
 //
 // One process owns the vault at a time: Open takes vault/owner.lock for the
 // life of the Store, and a second Open fails with ErrVaultBusy. That process
@@ -49,11 +50,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/filelock"
 	"github.com/dalyem/hopkey/internal/model"
@@ -85,6 +88,10 @@ var (
 	// ErrVaultBusy means another Store (another process, normally the hop
 	// daemon) has the vault open.
 	ErrVaultBusy = errors.New("store: the vault is busy (another hop process owns it)")
+	// ErrDeviceRevoked means an authenticated checkpoint revoked this device
+	// (§5.5). Its vault can't be unlocked or used again, with the device key
+	// or the password: sign in again as a new device.
+	ErrDeviceRevoked = errors.New("store: this device was revoked from the account; its vault can't be used here again")
 
 	errClosed = errors.New("store: the vault store is closed")
 
@@ -123,6 +130,7 @@ func (h Head) Short() string {
 // Info describes the vault for hop status. It holds no secrets.
 type Info struct {
 	Locked      bool   `json:"locked"`
+	Revoked     bool   `json:"revoked,omitempty"`     // see ErrDeviceRevoked
 	LockReason  string `json:"lock_reason,omitempty"` // why the last unlock failed
 	DeviceStore string `json:"device_key_store"`
 	DeviceID    string `json:"device_id,omitempty"`
@@ -177,6 +185,9 @@ type Store struct {
 	// syncHalt is the error that stopped syncing (an equivocation or a
 	// rule violation in a server entry).
 	syncHalt error
+	// revoked is set for good once a checkpoint revokes this device
+	// (§5.5, revoke): it wraps ErrDeviceRevoked.
+	revoked error
 
 	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
@@ -219,7 +230,8 @@ func (s *Store) deviceName() string {
 
 // Open opens the vault in cfg.DataDir and unlocks it with the device key.
 // If the device key cannot be read, the store is returned locked (Info says
-// why) so that hop unlock --password can still reach it. A vault that fails
+// why) so that hop unlock --password can still reach it. So is the vault of
+// a revoked device, which never unlocks again. A vault that fails
 // verification is an error.
 //
 // The returned Store owns the vault until Close: a second Open, in this
@@ -237,7 +249,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := s.own(); err != nil {
 		return nil, err
 	}
-	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) {
+	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) {
 		s.Close()
 		return nil, err
 	}
@@ -327,6 +339,9 @@ func (s *Store) Unlock(ctx context.Context) error {
 		return nil
 	}
 	err := s.unlockLocked()
+	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+		err = s.revoke(rev)
+	}
 	if err != nil {
 		s.dropLocked(err)
 	}
@@ -336,6 +351,9 @@ func (s *Store) Unlock(ctx context.Context) error {
 func (s *Store) unlockLocked() error {
 	if s.owner == nil {
 		return errClosed
+	}
+	if err := s.checkRevoked(); err != nil {
+		return err
 	}
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
@@ -384,6 +402,14 @@ func (s *Store) unlockLocked() error {
 		return err
 	}
 	s.state, s.sec, s.dev, s.rec, s.repaired, s.server = st, sec, dev, rec, repaired, server
+	return s.finishUnlock()
+}
+
+// finishUnlock is what every unlock does once its verified state is
+// installed: device.json, account.json, the outbox candidates that verified
+// history decides, and the checkpoint journals. The caller holds the file
+// lock, and locks the store again if it fails.
+func (s *Store) finishUnlock() error {
 	if err := s.reconcileDevice(); err != nil {
 		return err
 	}
@@ -394,6 +420,65 @@ func (s *Store) unlockLocked() error {
 		return err
 	}
 	return s.recoverJournal()
+}
+
+// revokedFile is vault/revoked.json, the terminal revocation record (§5.5):
+// the device and the checkpoint that revoked it.
+type revokedFile struct {
+	V        int         `json:"v"`
+	DeviceID model.ID    `json:"device_id"`
+	Seq      uint64      `json:"seq,string"`
+	H        crypto.Hash `json:"h"`
+}
+
+func (l layout) revokedFile() string { return filepath.Join(l.vault(), "revoked.json") }
+
+// revoke handles an authenticated checkpoint that revokes this device
+// (§5.5, "Revoked here?"): it records the revocation durably, wipes every
+// decrypted secret and cancels in-flight requests, and from then on every
+// use and every unlock of this vault fails with ErrDeviceRevoked, after a
+// restart too. The revoking entry is never decrypted or written. The
+// caller holds s.mu and, when there is one, the file lock.
+func (s *Store) revoke(rev *vaultlog.RevokedError) error {
+	s.revoked = fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, rev.DeviceID, rev.Head.Seq)
+	b, err := canonjson.Marshal(revokedFile{V: 1, DeviceID: rev.DeviceID, Seq: rev.Head.Seq, H: rev.Head.H})
+	if err == nil {
+		err = writeFileAtomic(s.l.revokedFile(), b)
+	}
+	s.dropLocked(s.revoked)
+	if err != nil {
+		return fmt.Errorf("%w; recording it on disk failed: %v", s.revoked, err)
+	}
+	return s.revoked
+}
+
+// checkRevoked fails with ErrDeviceRevoked once this device is revoked. Any
+// file at vault/revoked.json counts: only hop writes it. The caller holds
+// s.mu.
+func (s *Store) checkRevoked() error {
+	if s.revoked != nil {
+		return s.revoked
+	}
+	b, err := os.ReadFile(s.l.revokedFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	var f revokedFile
+	if err != nil || canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
+		s.revoked = fmt.Errorf("%w (%s)", ErrDeviceRevoked, s.l.revokedFile())
+	} else {
+		s.revoked = fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, f.DeviceID, f.Seq)
+	}
+	return s.revoked
+}
+
+// lockedErr is the error for a use of the vault while it is locked:
+// ErrDeviceRevoked for a revoked device. The caller holds s.mu.
+func (s *Store) lockedErr() error {
+	if s.revoked != nil {
+		return s.revoked
+	}
+	return errLocked
 }
 
 // deviceAccount opens this device's unlock blob (§6.2) in the stored state
@@ -572,7 +657,7 @@ func (s *Store) Head() (Head, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == nil {
-		return Head{}, errLocked
+		return Head{}, s.lockedErr()
 	}
 	return Head{Seq: s.state.Head.Seq, H: s.state.Head.H.String()}, nil
 }
@@ -581,7 +666,7 @@ func (s *Store) Head() (Head, error) {
 func (s *Store) Info() Info {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info := Info{Locked: s.state == nil, KitPending: s.kit != nil}
+	info := Info{Locked: s.state == nil, KitPending: s.kit != nil, Revoked: s.checkRevoked() != nil}
 	if cfg, err := s.readDeviceConfig(); err == nil {
 		info.DeviceStore = s.deviceStore(cfg).Describe()
 		info.AccountID = cfg.AccountID.String()
@@ -638,6 +723,9 @@ func (s *Store) catchUp() error {
 			return err
 		}
 		if st, sec, err = vaultlog.Transition(st, sec, s.dev, w, objs); err != nil {
+			if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+				return s.revoke(rev)
+			}
 			return fmt.Errorf("%w: entry %d: %w", ErrCorrupt, w.Entry.Seq, err)
 		}
 	}
@@ -706,7 +794,7 @@ func (s *Store) Snapshot(context.Context) (model.Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
-		return model.Snapshot{}, errLocked
+		return model.Snapshot{}, s.lockedErr()
 	}
 	if !s.server {
 		return snapshotOf(s.sec), nil
@@ -831,7 +919,7 @@ func put[T any](s *Store, it *T, typ model.Type) (*T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
-		return nil, errLocked
+		return nil, s.lockedErr()
 	}
 	h := header(it)
 	isNew := h.ItemID.IsZero()
@@ -899,7 +987,7 @@ func (s *Store) Delete(_ context.Context, id model.ID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
-		return errLocked
+		return s.lockedErr()
 	}
 	if s.server {
 		return s.queueDelete(id)
