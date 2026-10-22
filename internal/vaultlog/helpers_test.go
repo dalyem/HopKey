@@ -115,7 +115,39 @@ var (
 	idGrant   = fixedID(0x81)
 	idOpD1    = fixedID(0x91)
 	idOpD2    = fixedID(0x92)
+	idK3      = fixedID(0x33)
 )
+
+// enrolled returns the DeviceInfo of id with an enroll_transcript, as
+// enrollment by approval sets it (rev 10 item 14).
+func (w *world) enrolled(id model.ID) DeviceInfo {
+	d := w.infos[id]
+	d.EnrollTranscript = crypto.SomeHash(crypto.SHA256(fixedBytes("transcript-"+d.Name, 32)))
+	return d
+}
+
+// resignCert replaces a device_add's cert_sig with a valid one under acct,
+// so a test reaches the rule it targets rather than the certificate check.
+func resignCert(t testing.TB, d *DeviceAddOp, acct *crypto.AccountKeys) {
+	t.Helper()
+	sig, err := crypto.SignCert(acct, &d.Cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.CertSig = sig
+}
+
+// deviceAddFor returns the device_add op for id.
+func deviceAddFor(t testing.TB, e *Entry, id model.ID) *DeviceAddOp {
+	t.Helper()
+	for _, d := range opsOf[*DeviceAddOp](e) {
+		if d.Cert.DeviceID == id {
+			return d
+		}
+	}
+	t.Fatalf("no device_add for %v", id)
+	return nil
+}
 
 func keyItem(t testing.TB, id model.ID, label string) *model.Key {
 	pub, _ := sshKey(t, label)

@@ -233,12 +233,13 @@ func (o *AccountKeysOp) Public(accountID model.ID) crypto.AccountPublic {
 	return crypto.AccountPublic{AccountID: accountID, AKV: o.AKV, KEMPK: o.KEMPK, SigPK: ed25519.PublicKey(o.SigPK)}
 }
 
-// SPEC GAP (§4.1, §5.2): kdf_version is a u32 in the creds schema and only
-// version 1 exists, but no log rule restricts it; clients reject other
-// versions at login (§4.1), so the log does not.
+// kdf_version MUST be 1 in suite 1 (rev 10 item 15).
 func (o *CredsOp) validate() error {
 	if err := checkOpName(o, o.Op); err != nil {
 		return err
+	}
+	if o.KDFVersion != crypto.KDFv1.Version {
+		return fail(RuleKDFVersion, "creds: kdf_version %d, want %d", o.KDFVersion, crypto.KDFv1.Version)
 	}
 	if len(o.Salt) != 16 {
 		return schemaFail(o.Op, "salt is %d bytes, want 16", len(o.Salt))
@@ -378,6 +379,10 @@ func (o *DeployOp) validate() error {
 	if err := checkID(o.Op, "key_item_id", o.KeyItemID); err != nil {
 		return err
 	}
+	// A deploy_op MUST have at least one target (rev 10 item 9).
+	if len(o.Targets) == 0 {
+		return fail(RuleDeployTargets, "deploy_op %v has no targets", o.OpID)
+	}
 	seen := make(map[model.ID]bool, len(o.Targets))
 	for _, t := range o.Targets {
 		if err := checkID(o.Op, "targets.host_item_id", t.HostItemID); err != nil {
@@ -398,11 +403,8 @@ func (o *DeployOp) validate() error {
 }
 
 // Closed reports whether every target is done or abandoned (§10.3). An op
-// that is not closed is incomplete.
-//
-// SPEC GAP (§10.3): an op with no targets is not addressed. By the
-// definition "an op whose targets are all done or abandoned is closed", it
-// is closed; this code follows that wording.
+// that is not closed is incomplete. A valid op has at least one target
+// (rev 10 item 9).
 func (o *DeployOp) Closed() bool {
 	for _, t := range o.Targets {
 		if t.State != TargetDone && t.State != TargetAbandoned {

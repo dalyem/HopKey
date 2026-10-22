@@ -3,8 +3,13 @@ package vaultlog
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -135,6 +140,55 @@ func TestScenario(t *testing.T) {
 		&model.Snippet{Header: model.Header{ItemID: idS1, Type: model.TypeSnippet}, Name: "s1", Command: "uptime", Params: []string{}},
 	}}, b)
 
+	// A key item holding a real OpenSSH private key, which is multi-line
+	// (text≤16384 allows LF since rev 8), and a host pinning a real host
+	// key line.
+	_, priv3, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv3, "k3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pem3 := string(pem.EncodeToMemory(block))
+	if strings.Count(pem3, "\n") < 3 {
+		t.Fatalf("fixture: private key is not multi-line: %q", pem3)
+	}
+	sshPub3, err := ssh.NewPublicKey(priv3.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub3 := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub3))) + " k3"
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostPub, err := ssh.NewPublicKey(hostPriv.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2pinned := *a.sec.Items[idH2].Item.(*model.Host)
+	h2pinned.HostKeys = []string{strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostPub)))}
+	post(Changes{Put: []crypto.Item{
+		&model.Key{Header: model.Header{ItemID: idK3, Type: model.TypeKey}, Name: "k3", KeyType: "ed25519", PrivateKey: pem3, PublicKey: pub3},
+		&h2pinned,
+	}}, b)
+	gotK3 := b.sec.Items[idK3].Item.(*model.Key)
+	if gotK3.PrivateKey != pem3 {
+		t.Fatal("B's private key differs from A's")
+	}
+	raw, err := ssh.ParseRawPrivateKey([]byte(gotK3.PrivateKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k, ok := raw.(*ed25519.PrivateKey); !ok || !k.Equal(priv3) {
+		t.Fatalf("B's private key parses as %T, not the generated key", raw)
+	}
+	if fp, err := SSHFingerprint(gotK3.PublicKey); err != nil || fp != ssh.FingerprintSHA256(sshPub3) {
+		t.Fatalf("fingerprint of K3: %q, %v", fp, err)
+	}
+
 	// A grant over K1, H1 and S1.
 	tok, err := crypto.NewToken(idGrant, ed25519.PublicKey(a.st.Account.SigPK))
 	if err != nil {
@@ -191,10 +245,7 @@ func TestScenario(t *testing.T) {
 
 	// Enroll C by approval. C opens its unlock blob, anchors at genesis
 	// (anchor_seq, anchor_h) and replays the log as transitions.
-	var transcript crypto.OptHash
-	copy(transcript[:], fixedBytes("transcript", 32))
-	infoC := w.infos[idDevC]
-	infoC.EnrollTranscript = transcript
+	infoC := w.enrolled(idDevC)
 	enroll := post(Changes{Devices: []DeviceInfo{infoC}}, b)
 	addC := opsOf[*DeviceAddOp](&enroll.Entry)[0]
 	unlockC, err := crypto.ParseHPKEEnvelope(server[addC.UnlockSHA256])
