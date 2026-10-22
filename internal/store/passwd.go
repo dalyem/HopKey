@@ -29,7 +29,7 @@ import (
 // cannot, the journal is kept and Info warns that its kit is lost.
 //
 // A wrong password leaves the store as it was, locked or not.
-func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretKey string) error {
+func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretKey string) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owner == nil {
@@ -110,6 +110,16 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 		next.DeviceID = old.DeviceID
 	}
 	next.StaleDevices = append(slices.Clone(cfg.StaleDevices), rec.DeviceID)
+	// From here device.json may be ahead of memory. If the replacement
+	// fails and the store stays unlocked with the old key, memory takes the
+	// file's bookkeeping, so the next hop passwd revokes the new device.
+	defer func() {
+		if err != nil && s.state != nil {
+			if c, rerr := s.readDeviceConfig(); rerr == nil {
+				s.devCfg = c
+			}
+		}
+	}()
 	if err := s.writeDeviceConfig(next); err != nil {
 		return err
 	}
@@ -159,6 +169,11 @@ func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, 
 	}
 	defer unlock()
 	if err := s.catchUp(); err != nil {
+		return Kit{}, err
+	}
+	// The stale devices to revoke come from device.json, not memory: a
+	// failed password unlock in this process may have recorded one there.
+	if err := s.reloadDeviceConfig(); err != nil {
 		return Kit{}, err
 	}
 	sk, err := s.rec.secretKey()
@@ -257,10 +272,10 @@ func (s *Store) PendingKit() *Kit {
 	return &k
 }
 
-// AckKit records that the user has the pending kit: its Secret Key is in
-// the device key store (stored again if an earlier attempt failed), and
-// then its journal is deleted. It refuses, and the kit stays pending, while
-// the Secret Key cannot be stored.
+// AckKit records that the user has the pending kit: its Secret Key is
+// durably in the device key store (stored, or made durable, again if an
+// earlier attempt failed), and then its journal is deleted. It refuses,
+// and the kit stays pending, while the Secret Key cannot be stored durably.
 func (s *Store) AckKit() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -278,6 +293,9 @@ func (s *Store) AckKit() error {
 	if err := s.persistKitSK(); err != nil {
 		return fmt.Errorf("store: the new Secret Key is not saved on this device (%w), so the Emergency Kit stays pending; run hop passwd to try again", err)
 	}
+	if !s.kitSKDurable {
+		return errors.New("store: the new Secret Key is not saved durably on this device, so the Emergency Kit stays pending; run hop passwd to try again")
+	}
 	if err := s.removeJournal(s.kitSeq); err != nil {
 		return err
 	}
@@ -286,9 +304,13 @@ func (s *Store) AckKit() error {
 }
 
 // persistKitSK makes the device key store hold the pending kit's Secret
-// Key. It reads the durable record first, so a retry after a failure, or
-// after a crash, does only what is still missing. The record in memory
-// changes only after the save succeeded. The caller holds the file lock.
+// Key, durably. It reads the stored record first, so a retry after a
+// failure, or after a crash, does only what is still missing. A record that
+// reads back is not yet durable: a file save can rename device.key into
+// place and then fail to fsync the directory. So unless a save of this kit
+// fully succeeded (kitSKDurable), the record found is made durable again
+// before it is relied on. The record in memory changes only after that.
+// The caller holds the file lock.
 func (s *Store) persistKitSK() error {
 	k := s.kit
 	if _, err := crypto.ParseSecretKey(k.SecretKey); err != nil {
@@ -300,10 +322,17 @@ func (s *Store) persistKitSK() error {
 		done := cur.DeviceID == s.rec.DeviceID && cur.SecretKey == k.SecretKey
 		cur.zero()
 		if done {
-			s.rec.SecretKey, s.skErr = k.SecretKey, nil
+			if !s.kitSKDurable {
+				if err := ds.sync(); err != nil {
+					s.skErr = err
+					return err
+				}
+			}
+			s.rec.SecretKey, s.skErr, s.kitSKDurable = k.SecretKey, nil, true
 			return nil
 		}
 	}
+	s.kitSKDurable = false
 	next := s.rec.clone()
 	next.SecretKey = k.SecretKey
 	if err := ds.save(next); err != nil {
@@ -312,7 +341,7 @@ func (s *Store) persistKitSK() error {
 		return err
 	}
 	s.rec.zero()
-	s.rec, s.skErr = next, nil
+	s.rec, s.skErr, s.kitSKDurable = next, nil, true
 	return nil
 }
 
@@ -517,7 +546,7 @@ func (s *Store) resealJournals(st *vaultlog.State, from, to *vaultlog.LocalDevic
 //   - Anything else, superseded by another entry at its seq or by a later
 //     checkpoint, is deleted without being shown.
 func (s *Store) recoverJournal() error {
-	s.kit, s.kitOrphaned, s.skErr = nil, false, nil
+	s.kit, s.kitOrphaned, s.skErr, s.kitSKDurable = nil, false, nil, false
 	seqs, err := s.journalSeqs()
 	if err != nil {
 		return err

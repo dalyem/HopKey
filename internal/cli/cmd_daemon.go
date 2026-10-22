@@ -30,9 +30,14 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	}
 	vault, err := e.OpenStore()
 	if errors.Is(err, store.ErrVaultBusy) {
-		// Another daemon got there first and owns the vault.
-		fmt.Fprintln(e.Stderr, "hop daemon is already running")
-		return nil
+		// Another process owns the vault. Only a daemon that answers on the
+		// control socket makes this one redundant; anything else (hop init,
+		// a daemon stuck before it serves) is a failure to report.
+		if daemonAnswers(ctx, e) {
+			fmt.Fprintln(e.Stderr, "hop daemon is already running")
+			return nil
+		}
+		return failf("the vault is busy (another hop process owns it)")
 	}
 	if err != nil {
 		return failf("opening the vault: %v", err)
@@ -62,6 +67,32 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 		return d.Close()
 	case <-d.Done():
 		return nil
+	}
+}
+
+// busyWait is how long a daemon that finds the vault busy waits for the
+// owner to answer on the control socket: a daemon that has just opened the
+// vault listens on it a moment later.
+var busyWait = 2 * time.Second
+
+// daemonAnswers reports whether a daemon answers a status request on the
+// control socket within busyWait.
+func daemonAnswers(ctx context.Context, e *Env) bool {
+	deadline := time.Now().Add(busyWait)
+	for {
+		if c, err := daemon.Dial(ctx, e.Paths.ControlSocket()); err == nil {
+			cctx, cancel := context.WithDeadline(ctx, deadline.Add(time.Second))
+			err = c.Call(cctx, daemon.OpStatus, nil, nil)
+			cancel()
+			c.Close()
+			if err == nil {
+				return true
+			}
+		}
+		if !time.Now().Before(deadline) || ctx.Err() != nil {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

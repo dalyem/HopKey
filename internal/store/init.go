@@ -137,6 +137,13 @@ func (p *PendingInit) Kit() Kit { return p.kit }
 // DeviceStore says where Commit will keep the device key.
 func (p *PendingInit) DeviceStore() string { return p.s.deviceStore(p.devCfg).Describe() }
 
+// UnsealedFile reports whether Commit will write the device private keys
+// and the Secret Key unencrypted to the device key file (the file store
+// without HOP_DEVICE_PASSPHRASE), and names that file.
+func (p *PendingInit) UnsealedFile() (string, bool) {
+	return p.s.l.deviceKeyFile(), p.s.deviceStore(p.devCfg).Unsealed()
+}
+
 // Commit writes the vault: the device key first (so a vault never exists
 // that this device cannot open), then device.json, the genesis objects and
 // entry, state.json and account.json. It returns the unlocked store, which
