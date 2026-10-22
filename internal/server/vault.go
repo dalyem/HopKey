@@ -229,9 +229,12 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 		if h := s.hooks.beforeSend; h != nil {
 			h()
 		}
-		unlock := s.accounts.rlock(p.accountID)
+		unlock, err := s.accounts.rlock(r.Context(), p.accountID)
+		if err != nil {
+			return err
+		}
 		defer unlock()
-		err := s.store.View(r.Context(), func(tx Tx) error {
+		err = s.store.View(r.Context(), func(tx Tx) error {
 			_, err := s.vaultAuth(tx, tok, vaultID, okV)
 			return err
 		})
@@ -534,7 +537,9 @@ type postLogRequest struct {
 // commit that invalidates credentials is made, and long-polls notified,
 // under the account's admission lock (accountLocks): the first attempt
 // runs without it, and one that finds it would invalidate rolls back and
-// runs again holding it.
+// runs again holding it. It waits for that lock without its validation
+// slot, which a slow reader of the account would otherwise keep from every
+// other account, and takes a slot again before the second attempt.
 func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error {
 	tok, ok := bearer(r)
 	if !ok {
@@ -556,7 +561,7 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 	if !ok {
 		return errBusy
 	}
-	defer release()
+	defer func() { release() }()
 	if h := s.hooks.validating; h != nil {
 		h()
 	}
@@ -589,7 +594,17 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 	}
 	err = write(false)
 	if errors.Is(err, errNeedsAccountLock) {
-		unlock := s.accounts.lock(p.accountID)
+		release()
+		release = func() {}
+		var unlock func()
+		if unlock, err = s.accounts.lock(r.Context(), p.accountID); err != nil {
+			return err
+		}
+		if release, ok = s.validate.acquire(r.Context()); !ok {
+			release = func() {}
+			unlock()
+			return errBusy
+		}
 		if err = write(true); err == nil && committed {
 			s.hub.notify(vaultID)
 			committed = false // notified

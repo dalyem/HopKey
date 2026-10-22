@@ -99,16 +99,15 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, errors.New("server: no store")
 	}
 	s := &Server{
-		origin:   origin,
-		store:    cfg.Store,
-		proxies:  cfg.TrustedProxies,
-		log:      cfg.Logger,
-		now:      cfg.Now,
-		lim:      DefaultLimits(),
-		rates:    DefaultRates(),
-		hub:      newHub(),
-		accounts: newAccountLocks(),
-		stop:     make(chan struct{}),
+		origin:  origin,
+		store:   cfg.Store,
+		proxies: cfg.TrustedProxies,
+		log:     cfg.Logger,
+		now:     cfg.Now,
+		lim:     DefaultLimits(),
+		rates:   DefaultRates(),
+		hub:     newHub(),
+		stop:    make(chan struct{}),
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -130,6 +129,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	s.limiter = newRateLimiter(s.now, 100_000)
 	s.validate = newQueue(s.lim.ValidationJobs, s.lim.ValidationQueue)
+	s.accounts = newAccountLocks(s.lim.LockWaitersPerAccount, s.lim.LockWaiters)
 	s.signups = newQueue(s.lim.SignupJobs, s.lim.SignupQueue)
 	s.polls = newPollLimiter(s.lim)
 	s.routes()
@@ -764,57 +764,132 @@ func (h *hub) notify(v model.ID) {
 // read lock from its admission check until it has been written, within
 // AdmitWrite. So no response leaves after an invalidation of its
 // credential commits, and a slow reader can only delay its own account's
-// invalidating commits, and only for AdmitWrite. A lock exists only while
-// someone holds or waits for it, so the map is bounded by the requests in
-// flight.
+// invalidating commits, and only for AdmitWrite.
+//
+// A waiting writer holds back new readers, so readers cannot starve it.
+// Every wait ends with its request's context. Writers wait with a prepared
+// wire in memory, so at most perAccount of them wait for one account and
+// at most total for all; a writer beyond either is refused with errBusy at
+// once. An account's entry exists only while someone holds or waits for
+// its lock, so the map is bounded by the requests in flight.
 type accountLocks struct {
-	mu sync.Mutex
-	m  map[model.ID]*accountLock
+	mu         sync.Mutex
+	m          map[model.ID]*accountLock
+	perAccount int
+	total      int
+	waiting    int // writers waiting, all accounts
 }
 
 type accountLock struct {
-	sync.RWMutex
-	refs int // holders and waiters
+	readers int  // read holders
+	writer  bool // the write holder
+	writers int  // writers waiting
+	refs    int  // holders and waiters
+	// changed is closed, and replaced, whenever the lock is released or a
+	// waiting writer gives up.
+	changed chan struct{}
 }
 
-func newAccountLocks() *accountLocks { return &accountLocks{m: map[model.ID]*accountLock{}} }
+func newAccountLocks(perAccount, total int) *accountLocks {
+	return &accountLocks{m: map[model.ID]*accountLock{}, perAccount: perAccount, total: total}
+}
 
+// ref returns the account's lock with a reference taken. l.mu is held.
 func (l *accountLocks) ref(id model.ID) *accountLock {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	a := l.m[id]
 	if a == nil {
-		a = &accountLock{}
+		a = &accountLock{changed: make(chan struct{})}
 		l.m[id] = a
 	}
 	a.refs++
 	return a
 }
 
+// unref drops a reference, and the entry with the last one. l.mu is held.
 func (l *accountLocks) unref(id model.ID, a *accountLock) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if a.refs--; a.refs == 0 {
 		delete(l.m, id)
 	}
 }
 
-// lock takes the account's write lock and returns its release.
-func (l *accountLocks) lock(id model.ID) func() {
-	a := l.ref(id)
-	a.Lock()
-	return func() {
-		a.Unlock()
-		l.unref(id, a)
+// wake lets every waiter recheck the lock. l.mu is held.
+func (a *accountLock) wake() {
+	close(a.changed)
+	a.changed = make(chan struct{})
+}
+
+// wait blocks until a changes or ctx ends. l.mu is held on entry and on
+// return.
+func (l *accountLocks) wait(ctx context.Context, a *accountLock) error {
+	ch := a.changed
+	l.mu.Unlock()
+	defer l.mu.Lock()
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-// rlock takes the account's read lock and returns its release.
-func (l *accountLocks) rlock(id model.ID) func() {
+// lock takes the account's write lock and returns its release. It fails
+// with errBusy when too many writers wait already, and with ctx's error
+// when ctx ends first.
+func (l *accountLocks) lock(ctx context.Context, id model.ID) (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	a := l.ref(id)
-	a.RLock()
-	return func() {
-		a.RUnlock()
-		l.unref(id, a)
+	if a.writer || a.readers > 0 {
+		if a.writers >= l.perAccount || l.waiting >= l.total {
+			l.unref(id, a)
+			return nil, errBusy
+		}
+		a.writers++
+		l.waiting++
+		var err error
+		for err == nil && (a.writer || a.readers > 0) {
+			err = l.wait(ctx, a)
+		}
+		a.writers--
+		l.waiting--
+		if err != nil {
+			// Readers held back by this writer may go now.
+			a.wake()
+			l.unref(id, a)
+			return nil, err
+		}
 	}
+	a.writer = true
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		a.writer = false
+		a.wake()
+		l.unref(id, a)
+	}, nil
+}
+
+// rlock takes the account's read lock and returns its release. It fails
+// with ctx's error when ctx ends first.
+func (l *accountLocks) rlock(ctx context.Context, id model.ID) (func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	a := l.ref(id)
+	var err error
+	for err == nil && (a.writer || a.writers > 0) {
+		err = l.wait(ctx, a)
+	}
+	if err != nil {
+		l.unref(id, a)
+		return nil, err
+	}
+	a.readers++
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if a.readers--; a.readers == 0 {
+			a.wake()
+		}
+		l.unref(id, a)
+	}, nil
 }

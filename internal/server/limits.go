@@ -39,6 +39,12 @@ type Limits struct {
 	SignupJobs      int
 	SignupQueue     int
 
+	// LockWaitersPerAccount and LockWaiters bound the invalidating writes
+	// waiting for an account's admission lock, for one account and for all.
+	// They wait without a validation slot, each with its prepared wire.
+	LockWaitersPerAccount int
+	LockWaiters           int
+
 	RequestDeadline time.Duration
 	PollDeadline    time.Duration
 	// AdmitWrite bounds how long an admitted log response may take to be
@@ -80,6 +86,9 @@ func DefaultLimits() Limits {
 		ValidationQueue: 16,
 		SignupJobs:      2,
 		SignupQueue:     8,
+
+		LockWaitersPerAccount: 4,
+		LockWaiters:           16,
 
 		RequestDeadline: 30 * time.Second,
 		PollDeadline:    60 * time.Second,
