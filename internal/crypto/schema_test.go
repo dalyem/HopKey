@@ -20,7 +20,7 @@ func hdr(t model.Type, id byte) model.Header {
 
 func testKey(id byte, grant model.ID) *model.Key {
 	return &model.Key{Header: hdr(model.TypeKey, id), Name: "k", KeyType: "ed25519",
-		PrivateKey: "PRIVATE", PublicKey: "ssh-ed25519 AAAA", DedicatedGrant: grant}
+		PrivateKey: "PRIVATE", PublicKey: testSSHLine, DedicatedGrant: grant}
 }
 
 func TestItemSchemasValid(t *testing.T) {
@@ -242,7 +242,7 @@ func TestTextFields(t *testing.T) {
 		t.Error("CR in snippet.description accepted")
 	}
 	k := testKey(2, model.ID{})
-	k.PublicKey = "ssh-ed25519 AAAA\n"
+	k.PublicKey = testSSHLine + "\n"
 	if ValidateKey(k) == nil {
 		t.Error("LF in key.public_key (str≤8192) accepted")
 	}

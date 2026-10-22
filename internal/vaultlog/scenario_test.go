@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,17 +35,28 @@ func (c *client) apply(t *testing.T, wire *Wire, server ObjectFetcher) {
 }
 
 // sameView requires two clients to hold byte-identical state and the same
-// item keys and plaintexts.
+// item keys and plaintexts. The one exception is past_accounts: a client
+// knows only the account keys from its anchor on (rev 11), so a client
+// anchored later holds a suffix of the other's history.
 func sameView(t *testing.T, a, b *client) {
 	t.Helper()
-	sa, err := a.st.Marshal()
-	if err != nil {
-		t.Fatal(err)
+	pa, pb := a.st.PastAccounts, b.st.PastAccounts
+	if len(pa) < len(pb) {
+		pa, pb = pb, pa
 	}
-	sb, err := b.st.Marshal()
-	if err != nil {
-		t.Fatal(err)
+	if !slices.Equal(pa[len(pa)-len(pb):], pb) {
+		t.Fatalf("%s and %s hold unrelated account histories: %+v, %+v", a.name, b.name, a.st.PastAccounts, b.st.PastAccounts)
 	}
+	marshal := func(s *State) []byte {
+		c := s.clone()
+		c.PastAccounts = []PastAccount{}
+		b, err := c.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	sa, sb := marshal(a.st), marshal(b.st)
 	if !bytes.Equal(sa, sb) {
 		t.Fatalf("%s and %s hold different states:\n%s\n%s", a.name, b.name, sa, sb)
 	}
@@ -293,9 +305,14 @@ func TestScenario(t *testing.T) {
 		t.Fatal("checkpoint state is not as declared")
 	}
 
+	// The akv 1 key joins A's account history (rev 11).
+	if len(a.st.PastAccounts) != 1 || a.st.PastAccounts[0].AKV != 1 {
+		t.Fatalf("A's past accounts: %+v", a.st.PastAccounts)
+	}
+
 	// A fresh client F logs in with the new password: it opens the new
 	// pw_blob, anchors at the checkpoint for akv 2, and must reach the
-	// identical state.
+	// identical state, except that it knows no account key before akv 2.
 	var enc2 crypto.SymKey
 	copy(enc2[:], fixedBytes("creds2-enc", 32))
 	pw2, err := crypto.ParseAEADEnvelope(server[a.st.Creds.PwBlobSHA256])

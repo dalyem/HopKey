@@ -37,48 +37,51 @@ const (
 
 // Per-kind content rules (§5.3).
 const (
-	RuleGenesis            Rule = "genesis.contents"
-	RuleBootstrap          Rule = "bootstrap.contents"
-	RuleCheckpointOps      Rule = "checkpoint.contents" // exactly one account_keys, creds, vk_wrap, retired
-	RuleCheckpointAKV      Rule = "checkpoint.akv"
-	RuleCheckpointGen      Rule = "checkpoint.gen"
-	RuleCheckpointKV       Rule = "checkpoint.kv"
-	RuleSurvivorKeys       Rule = "checkpoint.survivor-keys"
-	RuleSurvivorCert       Rule = "checkpoint.survivor-cert" // name, enroll_transcript kept; issued_at = entry time (rev 10 item 13)
-	RuleDeviceCover        Rule = "checkpoint.devices"       // survivors ∪ revoked = pre-state active set, author survives
-	RuleCheckpointItems    Rule = "checkpoint.items"
-	RuleCheckpointGrants   Rule = "checkpoint.grants"
-	RuleCheckpointDeploy   Rule = "checkpoint.deploy-ops"
-	RuleCheckpointRetired  Rule = "checkpoint.retired"
-	RuleCheckpointUnlock   Rule = "checkpoint.unlock"        // the new unlock blob does not yield the authenticated account keys
-	RuleUniqueID           Rule = "id.unique"                // an added ID is live or retired already
-	RuleEnrollTranscript   Rule = "normal.enroll-transcript" // a normal entry's device_add has no enroll_transcript (rev 10 item 14)
-	RuleItemVersion        Rule = "item.version"
-	RuleItemType           Rule = "item.type"
-	RuleItemIV             Rule = "item.iv"
-	RuleItemIK             Rule = "item.ik" // same IK for ordinary edits, a fresh one in a checkpoint
-	RuleItemLive           Rule = "item.live"
-	RuleSSHKeyLine         Rule = "item.ssh-key"      // key.public_key or a host_keys entry is not an OpenSSH line (rev 10 item 11)
-	RuleGrantRecordDelete  Rule = "item.grant-delete" // a grant record is deleted before its grant_revoke
-	RuleGrantAdd           Rule = "grant.add"
-	RuleGrantNewRecord     Rule = "grant.new-record" // a new grant record without its grant_add
-	RuleGrantActive        Rule = "grant.active"
-	RuleBundleVersion      Rule = "grant.bundle-version"
-	RuleBundleRequired     Rule = "grant.bundle-required"
-	RuleGrantRecordMeta    Rule = "grant.record-meta"
-	RuleGrantRecordBinding Rule = "grant.record-binding" // §8.7 rules on an active grant's record
-	RuleDeployImmutable    Rule = "deploy.immutable"
-	RuleDeployState        Rule = "deploy.state"       // done and abandoned never change
-	RuleDeployRefs         Rule = "deploy.refs"        // an incomplete op names a live key and live hosts
-	RuleDeployTargets      Rule = "deploy.targets"     // an op has no targets (rev 10 item 9)
-	RuleDeployKeyVersion   Rule = "deploy.key-version" // a new op's key_item_version is not the key's current version (rev 10 item 10)
-	RuleDeployFingerprint  Rule = "deploy.fingerprint"
-	RuleDeployMaterial     Rule = "deploy.material" // a key's SSH material changes while an op is incomplete
-	RuleRefIntegrity       Rule = "ref.integrity"
-	RuleObjectMissing      Rule = "object.missing"
-	RuleObjectDigest       Rule = "object.digest"
-	RuleObjectEnvelope     Rule = "object.envelope" // a wire object is not an envelope (rev 10 item 17)
-	RuleDecrypt            Rule = "object.decrypt"
+	RuleGenesis             Rule = "genesis.contents"
+	RuleBootstrap           Rule = "bootstrap.contents"
+	RuleCheckpointOps       Rule = "checkpoint.contents" // exactly one account_keys, creds, vk_wrap, retired
+	RuleCheckpointAKV       Rule = "checkpoint.akv"
+	RuleCheckpointGen       Rule = "checkpoint.gen"
+	RuleCheckpointKV        Rule = "checkpoint.kv"
+	RuleCheckpointFreshKeys Rule = "checkpoint.fresh-keys" // account_keys reuse an earlier account key (rev 11)
+	RuleCheckpointFreshVK   Rule = "checkpoint.fresh-vk"   // the new VK equals the pre-state VK (rev 11, plaintext stage)
+	RuleSurvivorKeys        Rule = "checkpoint.survivor-keys"
+	RuleSurvivorCert        Rule = "checkpoint.survivor-cert" // name, enroll_transcript kept; issued_at = entry time (rev 10 item 13)
+	RuleDeviceCover         Rule = "checkpoint.devices"       // survivors ∪ revoked = pre-state active set, author survives
+	RuleCheckpointItems     Rule = "checkpoint.items"
+	RuleCheckpointGrants    Rule = "checkpoint.grants"
+	RuleCheckpointDeploy    Rule = "checkpoint.deploy-ops"
+	RuleCheckpointRetired   Rule = "checkpoint.retired"
+	RuleCheckpointUnlock    Rule = "checkpoint.unlock"        // the new unlock blob does not yield the authenticated account keys
+	RuleUniqueID            Rule = "id.unique"                // an added ID is live or retired already
+	RuleEnrollTranscript    Rule = "normal.enroll-transcript" // a normal entry's device_add has no enroll_transcript (rev 10 item 14)
+	RuleItemVersion         Rule = "item.version"
+	RuleItemType            Rule = "item.type"
+	RuleItemIV              Rule = "item.iv"
+	RuleItemIK              Rule = "item.ik" // same IK for ordinary edits, a fresh one in a checkpoint
+	RuleItemLive            Rule = "item.live"
+	RuleSSHKeyLine          Rule = "item.ssh-key"      // key.public_key or a host_keys entry is not an OpenSSH line (rev 10 item 11; enforced by crypto.ValidateKey/ValidateHost)
+	RuleGrantRecordDelete   Rule = "item.grant-delete" // a grant record is deleted before its grant_revoke
+	RuleGrantAdd            Rule = "grant.add"
+	RuleGrantNewRecord      Rule = "grant.new-record" // a new grant record without its grant_add
+	RuleGrantActive         Rule = "grant.active"
+	RuleBundleVersion       Rule = "grant.bundle-version"
+	RuleBundleRequired      Rule = "grant.bundle-required"
+	RuleGrantRecordMeta     Rule = "grant.record-meta"
+	RuleGrantRecordBinding  Rule = "grant.record-binding" // §8.7 rules on an active grant's record
+	RuleDeployImmutable     Rule = "deploy.immutable"
+	RuleDeployState         Rule = "deploy.state"       // done and abandoned never change
+	RuleDeployRefs          Rule = "deploy.refs"        // an incomplete op names a live key and live hosts
+	RuleDeployTargets       Rule = "deploy.targets"     // an op has no targets (rev 10 item 9)
+	RuleDeployKeyVersion    Rule = "deploy.key-version" // a new op's key_item_version is not the key's current version (rev 10 item 10)
+	RuleDeployFingerprint   Rule = "deploy.fingerprint"
+	RuleDeployMaterial      Rule = "deploy.material"   // a key's SSH material changes while an op is incomplete
+	RuleKeyMaterial         Rule = "item.key-material" // an item_put on an existing key changes key_type, private_key or public_key (rev 11)
+	RuleRefIntegrity        Rule = "ref.integrity"
+	RuleObjectMissing       Rule = "object.missing"
+	RuleObjectDigest        Rule = "object.digest"
+	RuleObjectEnvelope      Rule = "object.envelope" // a wire object is not an envelope (rev 10 item 17)
+	RuleDecrypt             Rule = "object.decrypt"
 )
 
 // Common snapshot invariants (§5.5).

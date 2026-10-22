@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/model"
 )
@@ -454,6 +455,39 @@ func reseal(t testing.TB, w *Wire, s *State, vk, ik crypto.SymKey, it crypto.Ite
 		t.Fatal(err)
 	}
 	body, err := crypto.SealItem(&ik, ctx, it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.WrapSHA256 = addObject(t, w, wrap)
+	p.BodySHA256 = addObject(t, w, body)
+}
+
+// resealRaw is reseal without the §6.5 validation of crypto.SealItem: it
+// encrypts JCS(it) under the §6.4 body AAD, so a test can hand a
+// transition a plaintext that no builder would produce.
+func resealRaw(t testing.TB, w *Wire, s *State, vk, ik crypto.SymKey, it crypto.Item) {
+	t.Helper()
+	h, err := crypto.ItemHeader(it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := putFor(t, &w.Entry, h.ItemID)
+	it, _, err = withHeader(it, p.ItemVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := itemContext(s, p)
+	wrap, err := crypto.WrapItemKey(&vk, ctx, &ik)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, err := canonjson.Marshal(it)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aad := slices.Concat(crypto.LP([]byte("hopkey/v1/item")), crypto.LP(ctx.AccountID[:]), crypto.LP(ctx.VaultID[:]),
+		crypto.LP(ctx.ItemID[:]), crypto.LP([]byte(ctx.Type)), crypto.U32(ctx.IV), crypto.U64(ctx.ItemVersion))
+	body, err := crypto.SealAEAD(&ik, pt, aad)
 	if err != nil {
 		t.Fatal(err)
 	}
