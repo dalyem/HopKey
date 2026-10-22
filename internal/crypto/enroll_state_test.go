@@ -3,18 +3,30 @@ package crypto
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/model"
 )
 
-// runToDelivery takes the rig through a confirmed SAS, Prepare and Deliver
-// and returns the delivery envelope.
+// runToDelivery takes the rig through an SAS confirmed on both devices,
+// Prepare and Deliver and returns the delivery envelope.
 func (r *enrollRig) runToDelivery(t *testing.T) (HPKEEnvelope, Hash) {
 	t.Helper()
 	r.runToOpen(t, fixedID(0x80))
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
+	return r.deliverFromA(t)
+}
+
+// deliverFromA confirms the SAS on A, prepares and delivers. D is left as
+// it is.
+func (r *enrollRig) deliverFromA(t *testing.T) (HPKEEnvelope, Hash) {
+	t.Helper()
 	if err := r.a.Confirm(true); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +213,9 @@ func TestEnrollmentCopiesBuffers(t *testing.T) {
 	if err := a.Confirm(true); err != nil {
 		t.Fatal(err)
 	}
+	if err := d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
 	prep, err := a.Prepare(r.acct, fixedID(0x41), 0)
 	if err != nil {
 		t.Fatal(err)
@@ -293,6 +308,9 @@ func TestDeviceDeadline(t *testing.T) {
 	// A valid delivery that arrives after the deadline is refused too.
 	r := newEnrollRig(t)
 	env, _ := r.runToDelivery(t)
+	if r.d.State() != DeviceConfirmed {
+		t.Fatalf("state %q before the deadline", r.d.State())
+	}
 	r.clock.advance(10 * time.Minute)
 	if _, err := r.d.HandleDelivery(env); !errors.Is(err, ErrEnrollExpired) || r.d.State() != DeviceFailed {
 		t.Fatalf("delivery after the deadline: %v, %q", err, r.d.State())
@@ -490,6 +508,9 @@ func TestInvalidMessagesChangeNothing(t *testing.T) {
 		t.Fatalf("real open after bad ones: %v", err)
 	}
 	_ = a.Confirm(true)
+	if err := d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := a.Prepare(r.acct, fixedID(0x41), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +531,7 @@ func TestInvalidMessagesChangeNothing(t *testing.T) {
 		t.Fatal("delivery v=2 accepted")
 	}
 	unchanged("delivery v=2", r.dp, st, n)
-	if d.State() != DeviceRevealed {
+	if d.State() != DeviceConfirmed {
 		t.Fatal("bad deliveries moved D")
 	}
 	if _, err := d.HandleDelivery(env); err != nil {
@@ -524,6 +545,9 @@ func TestInvalidMessagesChangeNothing(t *testing.T) {
 func TestDeliveryCertNameMustMatchOpen(t *testing.T) {
 	r := newEnrollRig(t)
 	r.runToOpen(t, fixedID(0x80))
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
 	open, _ := r.d.Open()
 	tr := r.d.transcript()
 	th := TranscriptHash(tr)
@@ -548,7 +572,7 @@ func TestDeliveryCertNameMustMatchOpen(t *testing.T) {
 	if _, err := r.d.HandleDelivery(build("new-laptoq")); !errors.Is(err, ErrCertName) {
 		t.Fatalf("certificate with another name: %v", err)
 	}
-	if !bytes.Equal(r.dp.state, st) || r.d.State() != DeviceRevealed {
+	if !bytes.Equal(r.dp.state, st) || r.d.State() != DeviceConfirmed {
 		t.Fatal("a rejected delivery changed D's state")
 	}
 	// The exported VerifyDelivery reads open.name back from T.
@@ -584,6 +608,245 @@ func TestTranscriptName(t *testing.T) {
 	} {
 		if _, err := transcriptName(bad); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// §7 step 6 (rev 9): D accepts a delivery only in CONFIRMED. A genuine
+// delivery that arrives before the user confirmed on D is discarded with
+// the persisted state byte-for-byte unchanged, and it is not kept: after
+// ConfirmSAS, D is CONFIRMED without a delivery until it is handed in again.
+func TestDeviceDiscardsDeliveryBeforeConfirm(t *testing.T) {
+	r := newEnrollRig(t)
+	r.runToOpen(t, fixedID(0x80))
+	env, anchorH := r.deliverFromA(t)
+	before, saves := bytes.Clone(r.dp.state), r.dp.saves
+	for _, d := range []*DeviceEnrollment{r.d, r.d, mustRestore(t, r.dp, r.clock.now)} {
+		if _, err := d.HandleDelivery(env); !errors.Is(err, ErrSASNotConfirmed) {
+			t.Fatalf("delivery before confirmation: %v", err)
+		}
+		if !bytes.Equal(r.dp.state, before) || r.dp.saves != saves || d.State() != DeviceRevealed {
+			t.Fatal("the early delivery changed D's state")
+		}
+	}
+
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
+	if r.d.State() != DeviceConfirmed || r.d.rec.Delivery != nil {
+		t.Fatal("D kept the early delivery")
+	}
+	if _, err := r.d.Delivered(); !errors.Is(err, ErrEnrollState) {
+		t.Fatalf("Delivered in CONFIRMED: %v", err)
+	}
+
+	// CONFIRMED was persisted: a restart keeps the decision, the same SAS
+	// and the open, and the delivery handed in again is accepted.
+	d2 := mustRestore(t, r.dp, r.clock.now)
+	if d2.State() != DeviceConfirmed {
+		t.Fatalf("restored state %q", d2.State())
+	}
+	s1, _ := r.d.SAS()
+	if s2, err := d2.SAS(); err != nil || s1 != s2 {
+		t.Fatalf("SAS after restoring CONFIRMED: %v", err)
+	}
+	if _, err := d2.Open(); err != nil {
+		t.Fatalf("Open in CONFIRMED: %v", err)
+	}
+	if _, err := d2.HandleChal(r.a.rec.Chal); !errors.Is(err, ErrChalAfterReveal) {
+		t.Fatalf("chal in CONFIRMED: %v", err)
+	}
+	v, err := d2.HandleDelivery(env)
+	if err != nil {
+		t.Fatalf("delivery after confirmation: %v", err)
+	}
+	if !v.Account.Pin().Equal(r.acct.Pin()) || v.AnchorH != anchorH || d2.State() != DeviceDone {
+		t.Fatal("delivery after confirmation gave the wrong result")
+	}
+
+	// A delivery before any chal is discarded the same way.
+	dp := &memPersister{}
+	d3, _, err := NewDeviceEnrollmentWithClock(dp, r.clock.now, "new-laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, saves = bytes.Clone(dp.state), dp.saves
+	if _, err := d3.HandleDelivery(env); !errors.Is(err, ErrSASNotConfirmed) {
+		t.Fatalf("delivery in COMMITTED: %v", err)
+	}
+	if !bytes.Equal(dp.state, before) || dp.saves != saves {
+		t.Fatal("a delivery in COMMITTED changed D's state")
+	}
+}
+
+// ConfirmSAS and RejectSAS are valid only in REVEALED with an SAS on
+// screen and before the deadline, and each persists before it returns.
+func TestDeviceSASDecisionStates(t *testing.T) {
+	// COMMITTED: no SAS yet.
+	dp := &memPersister{}
+	clock := &fakeClock{t: time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)}
+	d, _, err := NewDeviceEnrollmentWithClock(dp, clock.now, "n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saves := dp.saves
+	if err := d.ConfirmSAS(); !errors.Is(err, ErrEnrollState) {
+		t.Fatalf("ConfirmSAS in COMMITTED: %v", err)
+	}
+	if err := d.RejectSAS(); !errors.Is(err, ErrEnrollState) {
+		t.Fatalf("RejectSAS in COMMITTED: %v", err)
+	}
+	if dp.saves != saves || d.State() != DeviceCommitted {
+		t.Fatal("a refused decision changed D's state")
+	}
+
+	// A persist failure changes nothing, and D still accepts no delivery.
+	r := newEnrollRig(t)
+	r.runToOpen(t, fixedID(0x80))
+	env, _ := r.deliverFromA(t)
+	r.dp.fail = true
+	if err := r.d.ConfirmSAS(); !errors.Is(err, errPersist) || r.d.State() != DeviceRevealed {
+		t.Fatalf("ConfirmSAS with a failing persister: %v, %q", err, r.d.State())
+	}
+	if err := r.d.RejectSAS(); !errors.Is(err, errPersist) || r.d.State() != DeviceRevealed {
+		t.Fatalf("RejectSAS with a failing persister: %v, %q", err, r.d.State())
+	}
+	if kem, sig := r.d.DeviceKeys(); kem == nil || len(sig) == 0 {
+		t.Fatal("keys wiped although REJECTED was not persisted")
+	}
+	if _, err := r.d.HandleDelivery(env); !errors.Is(err, ErrSASNotConfirmed) {
+		t.Fatalf("delivery after a failed decision: %v", err)
+	}
+	r.dp.fail = false
+
+	// CONFIRMED and DONE: the decision is made.
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []string{"confirmed", "done"} {
+		if err := r.d.ConfirmSAS(); !errors.Is(err, ErrEnrollState) {
+			t.Fatalf("ConfirmSAS when %s: %v", step, err)
+		}
+		if err := r.d.RejectSAS(); !errors.Is(err, ErrEnrollState) {
+			t.Fatalf("RejectSAS when %s: %v", step, err)
+		}
+		if _, err := r.d.HandleDelivery(env); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The deadline: a decision at the deadline fails the attempt.
+	r2 := newEnrollRig(t)
+	r2.runToOpen(t, fixedID(0x80))
+	r2.clock.advance(EnrollDeadline)
+	if err := r2.d.ConfirmSAS(); !errors.Is(err, ErrEnrollExpired) || r2.d.State() != DeviceFailed {
+		t.Fatalf("ConfirmSAS at the deadline: %v, %q", err, r2.d.State())
+	}
+	if err := r2.d.RejectSAS(); !errors.Is(err, ErrEnrollExpired) {
+		t.Fatalf("RejectSAS after the deadline: %v", err)
+	}
+}
+
+// §7 step 4 (rev 9): REJECTED is terminal. The persisted record keeps only
+// the state, the enrollment keys are wiped from memory, and every later
+// call is refused, also past the deadline and after a restart.
+func TestDeviceRejectedIsTerminal(t *testing.T) {
+	r := newEnrollRig(t)
+	r.runToOpen(t, fixedID(0x80))
+	env, _ := r.deliverFromA(t) // a genuine delivery, to show it is refused
+	kemSK, seed, sigKey := r.d.rec.KEMSK, r.d.rec.SigSeed, r.d.sig
+	secrets := [][]byte{bytes.Clone(kemSK), bytes.Clone(seed), bytes.Clone(sigKey)}
+	if err := r.d.RejectSAS(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The persisted record: nothing but the state.
+	want, err := canonjson.Marshal(deviceRecord{V: Version, State: DeviceRejected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(r.dp.state, want) {
+		t.Fatalf("rejected record = %s", r.dp.state)
+	}
+	for _, sec := range secrets {
+		for _, enc := range []string{base64.RawURLEncoding.EncodeToString(sec), base64.StdEncoding.EncodeToString(sec)} {
+			if bytes.Contains(r.dp.state, []byte(enc)) || bytes.Contains(r.dp.state, sec) {
+				t.Fatal("the rejected record contains private key material")
+			}
+		}
+	}
+	// Memory: the key bytes D held are zeroed and the keys dropped.
+	for _, b := range [][]byte{kemSK, seed, sigKey} {
+		if !bytes.Equal(b, make([]byte, len(b))) {
+			t.Fatal("private key bytes left in memory")
+		}
+	}
+	if r.d.kem != nil || r.d.sig != nil || r.d.open.KEMPK != nil {
+		t.Fatal("D still references its enrollment keys")
+	}
+
+	refused := func(name string, d *DeviceEnrollment) {
+		t.Helper()
+		saves := r.dp.saves
+		errs := map[string]error{}
+		errs["SetEnrollID"] = d.SetEnrollID(fixedID(0x80))
+		_, errs["HandleChal"] = d.HandleChal(r.a.rec.Chal)
+		_, errs["Open"] = d.Open()
+		_, errs["SAS"] = d.SAS()
+		errs["ConfirmSAS"] = d.ConfirmSAS()
+		errs["RejectSAS"] = d.RejectSAS()
+		_, errs["HandleDelivery"] = d.HandleDelivery(env)
+		_, errs["Delivered"] = d.Delivered()
+		for call, err := range errs {
+			if !errors.Is(err, ErrSASRejected) {
+				t.Errorf("%s: %s after REJECTED: %v", name, call, err)
+			}
+		}
+		if c := d.Commit(); c != (EnrollCommit{}) {
+			t.Errorf("%s: Commit after REJECTED returned a commitment", name)
+		}
+		if kem, sig := d.DeviceKeys(); kem != nil || sig != nil {
+			t.Errorf("%s: DeviceKeys after REJECTED returned keys", name)
+		}
+		if d.State() != DeviceRejected || r.dp.saves != saves || !bytes.Equal(r.dp.state, want) {
+			t.Errorf("%s: a refused call changed D's state", name)
+		}
+	}
+	refused("in memory", r.d)
+	r.clock.advance(time.Hour) // past the deadline: still REJECTED, not FAILED
+	refused("past the deadline", r.d)
+	refused("restored", mustRestore(t, r.dp, r.clock.now))
+}
+
+// Restoring checks the new states for consistency: REJECTED holds nothing
+// but the state, and CONFIRMED holds its chal and no delivery.
+func TestRestoreDeviceDecisionStates(t *testing.T) {
+	r := newEnrollRig(t)
+	r.runToOpen(t, fixedID(0x80))
+	revealed := r.d.rec
+	for name, rec := range map[string]deviceRecord{
+		"rejected with keys":       {V: Version, State: DeviceRejected, KEMSK: revealed.KEMSK},
+		"rejected with a seed":     {V: Version, State: DeviceRejected, SigSeed: revealed.SigSeed},
+		"rejected with a chal":     {V: Version, State: DeviceRejected, Chal: revealed.Chal},
+		"rejected with an ID":      {V: Version, State: DeviceRejected, EnrollID: revealed.EnrollID},
+		"rejected with a deadline": {V: Version, State: DeviceRejected, Deadline: revealed.Deadline},
+		"confirmed without chal": func() deviceRecord {
+			c := revealed
+			c.State, c.Chal = DeviceConfirmed, nil
+			return c
+		}(),
+		"confirmed with a cert": func() deviceRecord {
+			c := revealed
+			c.State, c.Cert = DeviceConfirmed, &Cert{}
+			return c
+		}(),
+	} {
+		j, err := canonjson.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RestoreDeviceEnrollmentWithClock(&memPersister{}, r.clock.now, j); err == nil {
+			t.Errorf("%s: restored", name)
 		}
 	}
 }

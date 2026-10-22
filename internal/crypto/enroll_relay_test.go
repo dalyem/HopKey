@@ -17,17 +17,17 @@ import (
 // commits, chals, opens and deliveries (from a device it controls and from
 // account keys of its own), lets time pass and restarts either party.
 //
-// The property: no schedule produces a confirmed SAS match with
-// substituted keys. Whenever both screens show the same code, A's open is
-// D's own open and D's chal is A's own chal; A confirms only then, as a
-// user comparing the two screens would. Whenever D finishes after a
-// confirmed match, it holds the real account keys and a certificate for
-// its own keys.
+// The simulated user compares the two screens and, on each device waiting
+// for a decision, confirms only when D's code equals the code A showed and
+// rejects otherwise (§7 step 4, rev 9). The properties, checked after
+// every step and at the end of every schedule:
 //
-// D can also finish under the relay's own account after the screens
-// showed different codes, because §7 gives D no confirmation step; see the
-// SPEC GAP on DeviceEnrollment.HandleDelivery and
-// TestDeviceAcceptsRelayDeliveryAfterMismatch.
+//	(a) no schedule produces a confirmed SAS match, on A or on D, with
+//	    substituted keys: A's open is D's own open and D's chal is A's own
+//	    chal;
+//	(b) no schedule ends with D holding account keys other than the
+//	    honest account's. Whenever D finishes, it holds the real account
+//	    keys and a certificate for its own keys, and its user confirmed.
 
 // relayWorld is one schedule's state.
 type relayWorld struct {
@@ -44,17 +44,26 @@ type relayWorld struct {
 	m          *DeviceEnrollment // a device the relay controls
 	a          *Approval
 
+	// D's open and accepted chal, kept by the test because D wipes its own
+	// copies when its user rejects.
+	dOpen EnrollOpen
+	dChal *EnrollChal
+
 	// Wire messages the relay has seen or made, as JSON.
 	commits, chals, opens, deliveries [][]byte
+	forged                            map[string]bool // deliveries the relay sealed itself
 
-	confirmed   bool // A confirmed a match
-	done        bool // D reached DONE with the real account
-	substituted bool // D reached DONE under the relay's account (SPEC GAP)
+	confirmed  bool // A confirmed a match
+	dConfirmed bool // D's user confirmed a match
+	dRejected  bool // D's user rejected a mismatch
+	done       bool // D reached DONE
+	early      int  // deliveries D discarded before its user confirmed
+	attacks    int  // relay deliveries handed to D while its chal named the relay's account
 }
 
 func newRelayWorld(t testing.TB, pick func(int) int) *relayWorld {
 	w := &relayWorld{t: t, pick: pick, clock: &fakeClock{t: time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)},
-		eid: fixedID(0x80), dp: &memPersister{}, ap: &memPersister{}, bp: &memPersister{}}
+		eid: fixedID(0x80), dp: &memPersister{}, ap: &memPersister{}, bp: &memPersister{}, forged: map[string]bool{}}
 	w.acct = fixedAccount(t, 1)
 	var err error
 	w.evil, err = NewAccountKeys(w.acct.AccountID, 1, fixedKEM(t, "relay-kem"), fixedBytes("relay-sig", 32))
@@ -69,6 +78,7 @@ func newRelayWorld(t testing.TB, pick func(int) int) *relayWorld {
 		t.Fatal(err)
 	}
 	w.send(&w.commits, &c)
+	w.dOpen = *w.d.open.clone()
 	var mc EnrollCommit
 	if w.m, mc, err = NewDeviceEnrollmentWithClock(&memPersister{}, w.clock.now, "laptop"); err != nil {
 		t.Fatal(err)
@@ -91,6 +101,31 @@ func (w *relayWorld) send(pool *[][]byte, v any) {
 		w.t.Fatal(err)
 	}
 	*pool = append(*pool, j)
+}
+
+// handleChal hands a chal to dev and, if dev is D and accepts it, records
+// D's chal.
+func (w *relayWorld) handleChal(dev *DeviceEnrollment, ch *EnrollChal) (EnrollOpen, error) {
+	o, err := dev.HandleChal(ch)
+	if err == nil && dev == w.d {
+		w.dChal = ch.clone()
+	}
+	return o, err
+}
+
+// dTranscript is T as D built it.
+func (w *relayWorld) dTranscript() []byte {
+	return Transcript(Commitment(&w.dOpen), w.dChal, &w.dOpen)
+}
+
+// aShown returns the code A showed, once it accepted an open.
+func (w *relayWorld) aShown() (string, bool) {
+	ar := w.a.rec
+	if ar.Open == nil {
+		return "", false
+	}
+	sas, err := SAS(Transcript(ar.Commit.C, ar.Chal, ar.Open))
+	return sas, err == nil
 }
 
 func (w *relayWorld) from(pool [][]byte) ([]byte, bool) {
@@ -120,7 +155,7 @@ func (w *relayWorld) step() {
 		if b, ok := w.from(w.chals); ok {
 			var ch EnrollChal
 			if ParseEnrollMessage(b, &ch) == nil {
-				if o, err := dev.HandleChal(&ch); err == nil {
+				if o, err := w.handleChal(dev, &ch); err == nil {
 					w.send(&w.opens, &o)
 				}
 			}
@@ -145,10 +180,17 @@ func (w *relayWorld) step() {
 		}
 	case 6: // a delivery to D
 		if b, ok := w.from(w.deliveries); ok {
+			if w.forged[string(b)] && w.dChal != nil && w.dChal.AcctSigFp.Equal(w.evil.Pin().FpSig) {
+				w.attacks++
+			}
 			var env HPKEEnvelope
 			if canonjson.Unmarshal(b, &env) == nil {
-				if v, err := w.d.HandleDelivery(env); err == nil {
+				v, err := w.d.HandleDelivery(env)
+				switch {
+				case err == nil:
 					w.checkDone(v)
+				case errors.Is(err, ErrSASNotConfirmed):
+					w.early++
 				}
 			}
 		}
@@ -176,20 +218,28 @@ func (w *relayWorld) step() {
 	w.checkInvariants()
 }
 
-// compare is the user looking at both screens. A user confirms only when
-// D shows the same 8 digits as A.
+// compare is the user looking at both screens and deciding on each device
+// that waits for a decision. The user confirms only when D shows the same
+// 8 digits as A and rejects otherwise. A with no code on D's screen is
+// rejected; D with no code on A's screen waits.
 func (w *relayWorld) compare() {
-	if w.a.State() != ApprovalOpened {
-		return
-	}
-	aSAS, _, err := w.a.SAS()
-	if err != nil {
-		return
-	}
+	aSAS, aOK := w.aShown()
 	dSAS, err := w.d.SAS()
-	match := err == nil && dSAS == aSAS
-	if err := w.a.Confirm(match); err == nil && match {
-		w.confirmed = true
+	dOK := err == nil
+	match := aOK && dOK && aSAS == dSAS
+	if w.a.State() == ApprovalOpened {
+		if err := w.a.Confirm(match); err == nil && match {
+			w.confirmed = true
+		}
+	}
+	if w.d.State() == DeviceRevealed && aOK && dOK {
+		if match {
+			if w.d.ConfirmSAS() == nil {
+				w.dConfirmed = true
+			}
+		} else if w.d.RejectSAS() == nil {
+			w.dRejected = true
+		}
 	}
 }
 
@@ -248,11 +298,11 @@ func (w *relayWorld) forgeOpen() {
 // The relay's own delivery to D, consistent in every way except that it
 // can only sign with the relay's account keys.
 func (w *relayWorld) forgeDelivery() {
-	if w.d.rec.Chal == nil {
+	if w.dChal == nil {
 		return
 	}
-	o := w.d.open
-	th := TranscriptHash(w.d.transcript())
+	o := w.dOpen
+	th := TranscriptHash(w.dTranscript())
 	signer := w.evil
 	name := o.Name
 	switch w.pick(3) {
@@ -278,76 +328,103 @@ func (w *relayWorld) forgeDelivery() {
 	if err != nil {
 		w.t.Fatal(err)
 	}
-	unlock, err := SealHPKE(w.d.open.KEMPK, unlockInfo(&cert), aad, pt)
+	unlock, err := SealHPKE(w.dOpen.KEMPK, unlockInfo(&cert), aad, pt)
 	if err != nil {
 		w.t.Fatal(err)
 	}
-	env, err := SealDelivery(w.d.open.KEMPK, th, &EnrollDelivery{V: 1, Cert: cert, CertSig: sig, Unlock: unlock})
+	env, err := SealDelivery(w.dOpen.KEMPK, th, &EnrollDelivery{V: 1, Cert: cert, CertSig: sig, Unlock: unlock})
 	if err != nil {
 		w.t.Fatal(err)
 	}
 	w.send(&w.deliveries, &env)
+	w.forged[string(w.deliveries[len(w.deliveries)-1])] = true
 }
 
+// checkDone checks a delivery D accepted: property (b).
 func (w *relayWorld) checkDone(v *VerifiedDelivery) {
 	if !v.Account.Pin().Equal(w.acct.Pin()) {
-		// The SPEC GAP on HandleDelivery: D has no confirmation step, so it
-		// can finish under the relay's account after the user saw a
-		// mismatch. It must never happen after a confirmed match.
-		if w.confirmed {
-			w.t.Fatal("D finished with substituted account keys after a confirmed SAS match")
-		}
-		if ar := w.a.rec; ar.Open != nil {
-			aSAS, err1 := SAS(Transcript(ar.Commit.C, ar.Chal, ar.Open))
-			dSAS, err2 := SAS(w.d.transcript())
-			if err1 == nil && err2 == nil && aSAS == dSAS {
-				w.t.Fatal("D finished with substituted account keys while the screens matched")
-			}
-		}
-		w.substituted = true
-		return
+		w.t.Fatalf("property (b): D finished with the relay's account keys (D confirmed: %v, D rejected: %v)",
+			w.dConfirmed, w.dRejected)
 	}
-	if err := CheckCertKeys(&v.Cert, w.d.open.KEMPK, w.d.open.SigPK); err != nil {
+	if err := CheckCertKeys(&v.Cert, w.dOpen.KEMPK, w.dOpen.SigPK); err != nil {
 		w.t.Fatal("D finished with a certificate for other keys")
 	}
-	if !w.confirmed {
-		w.t.Fatal("D finished although nobody confirmed the SAS")
+	if !w.confirmed || !w.dConfirmed {
+		w.t.Fatalf("D finished without a confirmed SAS (A: %v, D: %v)", w.confirmed, w.dConfirmed)
 	}
 	w.done = true
 }
 
+// finish checks the end of a schedule: property (b) on whatever D holds,
+// in memory and after a restart from its persisted state.
+func (w *relayWorld) finish() {
+	d, err := RestoreDeviceEnrollmentWithClock(w.dp, w.clock.now, w.dp.state)
+	if err != nil {
+		w.t.Fatalf("restore at the end: %v", err)
+	}
+	for _, dev := range []*DeviceEnrollment{w.d, d} {
+		v, err := dev.Delivered()
+		if dev.State() != DeviceDone {
+			if err == nil {
+				w.t.Fatalf("property (b): D in state %q returned account keys", dev.State())
+			}
+			continue
+		}
+		if err != nil {
+			w.t.Fatalf("DONE without a delivery: %v", err)
+		}
+		if !v.Account.Pin().Equal(w.acct.Pin()) {
+			w.t.Fatal("property (b): the schedule ended with D holding the relay's account keys")
+		}
+	}
+}
+
 func (w *relayWorld) checkInvariants() {
 	ar := w.a.rec
-	dr := w.d.rec
 	// Equal screens imply the same open and chal on both sides.
-	if ar.Open != nil && dr.Chal != nil {
+	if ar.Open != nil && w.dChal != nil {
 		aSAS, err1 := SAS(Transcript(ar.Commit.C, ar.Chal, ar.Open))
-		dSAS, err2 := SAS(w.d.transcript())
+		dSAS, err2 := SAS(w.dTranscript())
 		if err1 == nil && err2 == nil && aSAS == dSAS {
 			w.sameKeys("matching SAS")
 		}
 	}
+	// Property (a).
 	if w.confirmed {
-		w.sameKeys("confirmed SAS")
+		w.sameKeys("SAS confirmed on A")
+	}
+	if w.dConfirmed {
+		w.sameKeys("SAS confirmed on D")
+	}
+	switch w.d.State() {
+	case DeviceConfirmed, DeviceDone:
+		if !w.dConfirmed {
+			w.t.Fatalf("D reached %q without its user confirming", w.d.State())
+		}
+	case DeviceRejected:
+		var rec deviceRecord
+		if err := canonjson.Unmarshal(w.dp.state, &rec); err != nil || !rec.onlyRejected() {
+			w.t.Fatal("D's rejected record keeps more than the state")
+		}
 	}
 	if ar.State == ApprovalPrepared || ar.State == ApprovalDelivered {
-		if !ar.Cert.KEMFp.Equal(FpKEM(w.d.open.KEMPK)) || !ar.Cert.SigFp.Equal(FpSig(w.d.open.SigPK)) {
+		if !ar.Cert.KEMFp.Equal(FpKEM(w.dOpen.KEMPK)) || !ar.Cert.SigFp.Equal(FpSig(w.dOpen.SigPK)) {
 			w.t.Fatal("A certified keys other than D's")
 		}
 	}
 }
 
 func (w *relayWorld) sameKeys(why string) {
-	ar, dr := w.a.rec, w.d.rec
-	o := w.d.open
-	if ar.Open == nil || dr.Chal == nil {
+	ar := w.a.rec
+	o := w.dOpen
+	if ar.Open == nil || w.dChal == nil {
 		w.t.Fatalf("%s without an open on A and a chal on D", why)
 	}
 	if !bytes.Equal(ar.Open.KEMPK, o.KEMPK) || !bytes.Equal(ar.Open.SigPK, o.SigPK) ||
 		!bytes.Equal(ar.Open.ND, o.ND) || ar.Open.Name != o.Name {
 		w.t.Fatalf("%s with substituted keys", why)
 	}
-	ac, dc := ar.Chal, dr.Chal
+	ac, dc := ar.Chal, w.dChal
 	if !bytes.Equal(ac.NA, dc.NA) || ac.EnrollID != dc.EnrollID || ac.AccountID != dc.AccountID ||
 		ac.ApproverDeviceID != dc.ApproverDeviceID || !ac.AcctSigFp.Equal(dc.AcctSigFp) || ac.AKV != dc.AKV {
 		w.t.Fatalf("%s with a substituted chal", why)
@@ -359,37 +436,41 @@ func runRelaySchedule(t testing.TB, pick func(int) int, steps int) *relayWorld {
 	for range steps {
 		w.step()
 	}
+	w.finish()
 	return w
 }
 
-// Seeded randomized schedules. The count of runs that got all the way to
-// DONE shows the schedules reach the end of the protocol.
+// Seeded randomized schedules. The counts show the schedules reach the end
+// of the protocol, reach both of D's decisions, and try the attack that
+// rev 9 closed (a relay delivery to a D whose chal names the relay's
+// account).
 func TestEnrollRelaySchedules(t *testing.T) {
 	runs, steps := 400, 80
 	if testing.Short() {
 		runs = 50
 	}
-	var confirmed, done, substituted int
+	var confirmed, dConfirmed, dRejected, done, early, attacked int
 	for seed := range uint64(runs) {
 		rng := rand.New(rand.NewPCG(seed, 0x6e726f6c6c))
 		w := runRelaySchedule(t, rng.IntN, steps)
-		if w.confirmed {
-			confirmed++
-		}
-		if w.done {
-			done++
-		}
-		if w.substituted {
-			substituted++
+		for _, c := range []struct {
+			n  *int
+			ok bool
+		}{{&confirmed, w.confirmed}, {&dConfirmed, w.dConfirmed}, {&dRejected, w.dRejected}, {&done, w.done},
+			{&early, w.early > 0}, {&attacked, w.attacks > 0}} {
+			if c.ok {
+				*c.n++
+			}
 		}
 		if t.Failed() {
 			t.Fatalf("seed %d failed", seed)
 		}
 	}
-	t.Logf("%d schedules: %d confirmed a match, %d finished enrollment, %d left D under the relay's account after a mismatch",
-		runs, confirmed, done, substituted)
-	if done == 0 {
-		t.Fatal("no schedule finished enrollment; the driver does not reach the end")
+	t.Logf("%d schedules: %d confirmed a match on A, %d on D, %d rejected on D, %d finished enrollment, "+
+		"%d had a delivery discarded before D's confirmation, %d handed D a relay delivery under a chal naming the relay's account",
+		runs, confirmed, dConfirmed, dRejected, done, early, attacked)
+	if done == 0 || dRejected == 0 || attacked == 0 {
+		t.Fatal("the driver does not reach the end, a rejection on D, or the relay-account attack")
 	}
 }
 
@@ -403,6 +484,13 @@ func FuzzEnrollRelay(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 1, 0, 3, 0, 4, 5, 6, 0, 6, 0})
 	f.Add([]byte{8, 0, 3, 1, 1, 0, 0, 3, 0, 4, 7, 0, 9, 6, 1, 6, 0})
 	f.Add([]byte{0, 0, 10, 240, 10, 240, 10, 240, 1, 0, 0})
+	// The rev 9 attack: a fresh chal naming the relay's account to D, then
+	// the relay's own delivery before D's user decides.
+	f.Add([]byte{7, 0, 1, 0, 0, 9, 0, 6, 0})
+	// The same after A's real chal: the relay changes acct_sig_fp, A gets
+	// D's open, the relay delivers before and after the user compares
+	// (rejecting on both devices).
+	f.Add([]byte{0, 0, 7, 0, 1, 1, 1, 0, 1, 3, 0, 9, 0, 6, 1, 4, 9, 0, 6, 2})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 512 {
 			return
@@ -420,6 +508,7 @@ func FuzzEnrollRelay(f *testing.F) {
 		for i < len(data) {
 			w.step()
 		}
+		w.finish()
 	})
 }
 
@@ -433,7 +522,16 @@ func TestEnrollRelayForgeriesRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.d.HandleChal(&ch); err != nil {
+	open, err := w.handleChal(w.d, &ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The codes match and the user confirms, so the forgeries reach the
+	// step 6 checks.
+	if _, _, err := w.a.HandleOpen(&open); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.d.ConfirmSAS(); err != nil {
 		t.Fatal(err)
 	}
 	for i := range 3 {
@@ -449,12 +547,13 @@ func TestEnrollRelayForgeriesRefused(t *testing.T) {
 	}
 }
 
-// SPEC GAP evidence (see DeviceEnrollment.HandleDelivery): the relay gives
-// D a chal naming its own account fingerprint. The screens differ and the
-// user rejects on A, but D accepts the relay's own delivery anyway,
-// because §7 never tells D the user's verdict. This test records the
-// spec-literal behavior and must change with the spec.
-func TestDeviceAcceptsRelayDeliveryAfterMismatch(t *testing.T) {
+// The rev 9 attack: the relay gives D a chal naming its own account
+// fingerprint, so the screens differ and the user rejects on A. The relay
+// then hands D a delivery sealed under its own account keys, which passes
+// every step 6 check. D discards it while its user has not confirmed,
+// leaving its persisted state unchanged, and refuses it after its user
+// rejects.
+func TestDeviceRefusesDeliveryAfterRejectedSAS(t *testing.T) {
 	w := runRelaySchedule(t, func(int) int { return 0 }, 0)
 	var c EnrollCommit
 	_ = ParseEnrollMessage(w.commits[0], &c) // D's real commit
@@ -464,7 +563,7 @@ func TestDeviceAcceptsRelayDeliveryAfterMismatch(t *testing.T) {
 	}
 	forged := *ch.clone()
 	forged.AcctSigFp = w.evil.Pin().FpSig
-	open, err := w.d.HandleChal(&forged)
+	open, err := w.handleChal(w.d, &forged)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,11 +582,36 @@ func TestDeviceAcceptsRelayDeliveryAfterMismatch(t *testing.T) {
 	w.forgeDelivery()
 	var env HPKEEnvelope
 	_ = canonjson.Unmarshal(w.deliveries[len(w.deliveries)-1], &env)
-	v, err := w.d.HandleDelivery(env)
+
+	// D's user has not decided yet.
+	before, saves := bytes.Clone(w.dp.state), w.dp.saves
+	if _, err := w.d.HandleDelivery(env); !errors.Is(err, ErrSASNotConfirmed) {
+		t.Fatalf("delivery before D's decision: %v (state %q)", err, w.d.State())
+	}
+	if !bytes.Equal(w.dp.state, before) || w.dp.saves != saves || w.d.State() != DeviceRevealed {
+		t.Fatal("the discarded delivery changed D's state")
+	}
+
+	// D's user sees the mismatch too and rejects.
+	if err := w.d.RejectSAS(); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []*DeviceEnrollment{w.d, mustRestore(t, w.dp, w.clock.now)} {
+		if _, err := d.HandleDelivery(env); !errors.Is(err, ErrSASRejected) {
+			t.Fatalf("delivery after the rejection: %v", err)
+		}
+		if _, err := d.Delivered(); err == nil {
+			t.Fatal("D holds account keys after the rejection")
+		}
+	}
+	w.finish()
+}
+
+func mustRestore(t *testing.T, p *memPersister, now Clock) *DeviceEnrollment {
+	t.Helper()
+	d, err := RestoreDeviceEnrollmentWithClock(p, now, p.state)
 	if err != nil {
-		t.Fatalf("the gap is closed (update the SPEC GAP note): %v", err)
+		t.Fatal(err)
 	}
-	if v.Account.Pin().Equal(w.acct.Pin()) || !v.Account.Pin().FpSig.Equal(w.evil.Pin().FpSig) {
-		t.Fatal("expected D to hold the relay's account keys")
-	}
+	return d
 }

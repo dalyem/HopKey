@@ -264,6 +264,9 @@ func TestEnrollmentHappyPath(t *testing.T) {
 	if err := r.a.Confirm(true); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
 	prep, err := r.a.Prepare(r.acct, fixedID(0x41), ts(t, "2026-10-22T12:00:00Z"))
 	if err != nil {
 		t.Fatal(err)
@@ -458,6 +461,9 @@ func TestRelaySubstitutionChangesSAS(t *testing.T) {
 func TestSubstitutedDelivery(t *testing.T) {
 	r := newEnrollRig(t)
 	r.runToOpen(t, fixedID(0x80))
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
 	open, _ := r.d.Open()
 	th := TranscriptHash(r.d.transcript())
 
@@ -475,7 +481,7 @@ func TestSubstitutedDelivery(t *testing.T) {
 	if _, err := r.d.HandleDelivery(env); !errors.Is(err, ErrAccountMismatch) {
 		t.Fatalf("substituted delivery: %v", err)
 	}
-	if r.d.State() != DeviceRevealed {
+	if r.d.State() != DeviceConfirmed {
 		t.Fatal("a rejected delivery changed D's state")
 	}
 
@@ -626,6 +632,9 @@ func TestBudgetPersistFailureReservesNothing(t *testing.T) {
 func TestApprovalRestartMidway(t *testing.T) {
 	r := newEnrollRig(t)
 	r.runToOpen(t, fixedID(0x80))
+	if err := r.d.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
 	sas1, _, _ := r.a.SAS()
 	a2, err := RestoreApproval(r.budget, r.ap, r.ap.state)
 	if err != nil {
