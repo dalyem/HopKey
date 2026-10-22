@@ -35,6 +35,11 @@ func TestSplitDirective(t *testing.T) {
 		{"Port 2222", "port", []string{"2222"}},
 		{"Include conf.d/*", "include", []string{"conf.d/*"}},
 		{"Host", "host", nil},
+		{`Match 'exec' "touch x"`, "match", []string{"exec", "touch x"}},
+		{`Match "ex""ec" cmd`, "match", []string{"exec", "cmd"}},
+		{`Match !exec "a \" b"`, "match", []string{"!exec", `a " b`}},
+		{`IdentityFile my\ key`, "identityfile", []string{"my key"}},
+		{`Match user a#b # comment`, "match", []string{"user", "a#b"}},
 	}
 	for _, tt := range tests {
 		key, args := splitDirective(tt.in)
@@ -102,14 +107,15 @@ Host dup web
 	if len(s.matchExec) != 0 {
 		t.Errorf("matchExec = %q", s.matchExec)
 	}
-	if !s.users["deploy"] || !s.users["x"] || !s.users["global"] || !s.users["nobody"] {
-		t.Errorf("users = %v", s.users)
+	if len(s.unscanned) != 0 {
+		t.Errorf("unscanned = %q", s.unscanned)
 	}
-	if !s.identity[filepath.Join(sshDir, "id_web")] || !s.identity[filepath.Join(sshDir, "id_other")] {
-		t.Errorf("identity = %v", s.identity)
+	// Every Host line is kept by file and line, with its literal words only.
+	if got := s.hostLines[hostLoc{main, 11}]; !slices.Equal(got, []string{"web", "web-alias", "prod,comma"}) {
+		t.Errorf("hostLines[%s:11] = %q", main, got)
 	}
-	if len(s.warnings) != 0 {
-		t.Errorf("warnings = %q", s.warnings)
+	if !s.declares(main, 11, "WEB") || s.declares(main, 11, "bad") || s.declares(main, 7, "web") {
+		t.Errorf("declares: web on its own line, bad is negated, line 7 is Host *")
 	}
 
 	// Match exec, in a file that is only included.
@@ -123,14 +129,158 @@ Host dup web
 		t.Errorf("matchExec = %q, want %q", s.matchExec, want)
 	}
 
-	// Includes nested too deeply stop, as ssh's do.
+	// Includes nested too deeply stop, as ssh's do, and are not scanned.
 	loop := write("loop", "Include loop\nHost looped\n")
 	s = newConfigScan(home, "")
 	if err := s.scan(loop); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.aliases) != 1 || len(s.warnings) == 0 {
-		t.Errorf("a self-including file: aliases %v, warnings %q", s.aliases, s.warnings)
+	if len(s.aliases) != 1 || len(s.unscanned) == 0 || !strings.Contains(s.unscanned[0], "nested too deeply") {
+		t.Errorf("a self-including file: aliases %v, unscanned %q", s.aliases, s.unscanned)
+	}
+}
+
+func TestMatchRunsCommand(t *testing.T) {
+	tests := []struct {
+		line string
+		want bool
+	}{
+		{`Match exec "true"`, true},
+		{`Match !exec "true"`, true},
+		{`MATCH EXEC "true"`, true},
+		{`match Exec true`, true},
+		{`Match "exec" "touch x"`, true},
+		{`Match 'exec' 'touch x'`, true},
+		{`Match "!ex""ec" cmd`, true},
+		{`Match host x exec y`, true},
+		{`Match host x !exec "y z"`, true},
+		{`Match all exec y`, true},
+		{`Match canonical final exec y`, true},
+		{`Match originalhost h user u localuser l exec c`, true},
+		{`Match newcriterion x exec y`, true},
+		{`Match newcriterion exec`, true},
+		{`Match=exec "true"`, true},
+		{`Match host exec`, false}, // a host named exec
+		{`Match originalhost exec,other user exec`, false},
+		{`Match host h`, false},
+		{`Match all`, false},
+		{`Match canonical host x`, false},
+		{`Match host x # exec y`, false},
+		{`Match user "exec"`, false},
+		{`Match`, false},
+	}
+	for _, tt := range tests {
+		key, args := splitDirective(tt.line)
+		if key != "match" {
+			t.Fatalf("%q: key %q", tt.line, key)
+		}
+		if got := matchRunsCommand(args); got != tt.want {
+			t.Errorf("matchRunsCommand(%q) = %v, want %v", tt.line, got, tt.want)
+		}
+	}
+}
+
+func TestConfigScanFlagsMatchExecInAnyForm(t *testing.T) {
+	home := t.TempDir()
+	cfg := filepath.Join(home, "config")
+	os.WriteFile(cfg, []byte("Match !exec \"x\"\nMatch host h EXEC y\nMatch host exec\n  # Match exec in a comment\n"), 0o600)
+	s := newConfigScan(home, "")
+	if err := s.scan(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{cfg + ":1", cfg + ":2"}; !slices.Equal(s.matchExec, want) {
+		t.Errorf("matchExec = %q, want %q", s.matchExec, want)
+	}
+}
+
+func TestIncludeResolution(t *testing.T) {
+	home := "/home/h"
+	s := newConfigScan(home, "")
+	tests := []struct {
+		in, want, why string
+	}{
+		{"conf.d/*", "/home/h/.ssh/conf.d/*", ""},
+		{"~/x/*.conf", "/home/h/x/*.conf", ""},
+		{"/etc/ssh/a", "/etc/ssh/a", ""},
+		{"%d/.ssh/a", "/home/h/.ssh/a", ""},
+		{"a%%b", "/home/h/.ssh/a%b", ""},
+		{"${HOME}/a", "", "environment variable"},
+		{"/x/${SITE}/*", "", "environment variable"},
+		{"~bob/a", "", "~user"},
+		{"/x/%h/a", "", "token"},
+		{"%u", "", "token"},
+		{"/x/%", "", "token"},
+	}
+	for _, tt := range tests {
+		got, why := s.resolveInclude(tt.in)
+		if got != tt.want || (tt.why == "") != (why == "") || !strings.Contains(why, tt.why) {
+			t.Errorf("resolveInclude(%q) = %q, %q; want %q, %q", tt.in, got, why, tt.want, tt.why)
+		}
+	}
+}
+
+// Whatever ssh will read and hop cannot check is listed; what ssh skips is not.
+func TestConfigScanUnscannedIncludes(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	os.MkdirAll(filepath.Join(sshDir, "dir.d", "sub"), 0o700)
+	os.WriteFile(filepath.Join(sshDir, "dir.d", "ok.conf"), []byte("Host ok\n"), 0o600)
+	cfg := filepath.Join(sshDir, "config")
+	body := "Include ${HOME}/a\nInclude ~bob/b\nInclude /x/%h\nInclude dir.d/*\nInclude missing.conf\nInclude /bad[\nHost last\n"
+	os.WriteFile(cfg, []byte(body), 0o600)
+	s := newConfigScan(home, "")
+	if err := s.scan(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// ${HOME}, ~user, a token and a bad glob; not the missing file, nor the
+	// subdirectory the glob matched.
+	if len(s.unscanned) != 4 {
+		t.Fatalf("unscanned = %q", s.unscanned)
+	}
+	for i, want := range []string{cfg + ":1", cfg + ":2", cfg + ":3", cfg + ":6"} {
+		if !strings.HasPrefix(s.unscanned[i], want+": Include ") {
+			t.Errorf("unscanned[%d] = %q, want it to start with %s", i, s.unscanned[i], want)
+		}
+	}
+	if got := len(s.aliases); got != 2 {
+		t.Errorf("aliases = %v, want ok and last", s.aliases)
+	}
+
+	// A file that exists and cannot be read is listed too.
+	s = newConfigScan(home, "")
+	s.readFile = func(p string) (io.ReadCloser, error) {
+		if strings.HasSuffix(p, "ok.conf") {
+			return nil, os.ErrPermission
+		}
+		return os.Open(p)
+	}
+	os.WriteFile(cfg, []byte("Include dir.d/*\n"), 0o600)
+	if err := s.scan(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.unscanned) != 1 || !strings.Contains(s.unscanned[0], "ok.conf") || !strings.Contains(s.unscanned[0], "cannot be read") {
+		t.Errorf("unreadable include: unscanned = %q", s.unscanned)
+	}
+}
+
+// hop's own generated config gives no aliases but is still read for what it
+// makes ssh do.
+func TestConfigScanSafetyScansTheExcludedDir(t *testing.T) {
+	home := t.TempDir()
+	hopDir := filepath.Join(home, ".ssh", "hop")
+	os.MkdirAll(hopDir, 0o700)
+	os.WriteFile(filepath.Join(hopDir, "config"), []byte("Host generated\nMatch exec \"x\"\nInclude ${HOME}/y\n"), 0o600)
+	cfg := filepath.Join(home, ".ssh", "config")
+	os.WriteFile(cfg, []byte("Include "+filepath.Join(hopDir, "config")+"\nHost mine\n"), 0o600)
+	s := newConfigScan(home, hopDir)
+	if err := s.scan(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.aliases) != 1 || s.aliases[0].Name != "mine" {
+		t.Errorf("aliases = %v: the generated config names nothing to import", s.aliases)
+	}
+	if len(s.matchExec) != 1 || len(s.unscanned) != 1 {
+		t.Errorf("matchExec = %q, unscanned = %q: the excluded file is still checked", s.matchExec, s.unscanned)
 	}
 }
 

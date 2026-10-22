@@ -7,6 +7,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,40 +27,75 @@ type sshSettings struct {
 	HostKeyAlias  string
 	IdentityFiles []string // as printed: defaults included, tokens unexpanded
 
-	// Traced says that ssh's debug output named the config it read, so that
-	// Reached means something. Reached is true when a Host line that names
-	// the alias literally applied to it. ssh -G itself prints the same
-	// defaults for a name the config never mentions.
+	// Applied lists the Host declarations ssh's debug output says applied to
+	// the name, by file and line. Traced says that the output named the config
+	// ssh read, and Garbled that a line about an applied Host block was not in
+	// the form hop knows. Without Traced and with Garbled, Applied cannot be
+	// trusted (see traceProblem). ssh -G itself prints the same defaults for a
+	// name the config never mentions.
+	Applied []hostLoc
 	Traced  bool
-	Reached bool
+	Garbled bool
+}
+
+// traceProblem says why Applied cannot be trusted, or "".
+func (s sshSettings) traceProblem() string {
+	switch {
+	case !s.Traced:
+		return "ssh -v did not report which configuration files it read"
+	case s.Garbled:
+		return "ssh -v reported an applied Host block in a form hop cannot read"
+	}
+	return ""
+}
+
+// errTraceUnverified is the error of an ssh whose -v output hop cannot use to
+// tell which Host blocks applied. The import stops: guessing would import
+// settings from blocks that ssh did not apply.
+type errTraceUnverified struct{ why string }
+
+func (e *errTraceUnverified) Error() string {
+	return "can't verify which Host blocks applied with this OpenSSH version: " + e.why + "; nothing was imported"
 }
 
 // sshProbeTimeout bounds one ssh -G. ssh -G does no network I/O unless the
 // config asks for CanonicalizeHostname, which does DNS.
 const sshProbeTimeout = 15 * time.Second
 
-// sshProbeEnviron is the whole environment ssh -G runs in: HOME and PATH,
-// plus whatever the Env adds for itself (the tests' passwd shim). Nothing
-// else from the caller's environment reaches ssh, so a variable cannot change
-// what a Match line sees or what a command it runs inherits.
-func (e *Env) sshProbeEnviron() []string {
+// sshProber runs `ssh -G`. home is the passwd home: the HOME of the child, and
+// what ssh expands ~ to whatever HOME says.
+type sshProber struct {
+	env  *Env
+	bin  string
+	home string
+}
+
+// environ is the whole environment ssh -G runs in: HOME and PATH, plus
+// whatever the Env adds for itself (the tests' passwd shim). Nothing else from
+// the caller's environment reaches ssh, so a variable cannot change what a
+// Match line sees or what a command it runs inherits.
+func (p *sshProber) environ() []string {
 	path := ""
-	if e.Getenv != nil {
-		path = e.Getenv("PATH")
+	if p.env.Getenv != nil {
+		path = p.env.Getenv("PATH")
 	}
 	if path == "" {
 		path = "/usr/local/bin:/usr/bin:/bin"
 	}
-	return append([]string{"HOME=" + e.Home, "PATH=" + path}, e.SSHProbeEnv...)
+	return append([]string{"HOME=" + p.home, "PATH=" + path}, p.env.SSHProbeEnv...)
 }
 
-// runSSHG runs `ssh -G -v -F config -- name` and parses its output. -v adds
-// debug lines on stderr that say which Host lines applied.
-func runSSHG(ctx context.Context, e *Env, sshBin, config, name string) (sshSettings, error) {
+// run runs `ssh -G -F config -- name` and parses its output. With trace it
+// adds -v, whose debug lines on stderr say which Host lines applied.
+func (p *sshProber) run(ctx context.Context, config, name string, trace bool) (sshSettings, error) {
 	ctx, cancel := context.WithTimeout(ctx, sshProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, sshBin, "-G", "-v", "-F", config, "--", name)
-	cmd.Env = e.sshProbeEnviron()
+	args := []string{"-G"}
+	if trace {
+		args = append(args, "-v")
+	}
+	cmd := exec.CommandContext(ctx, p.bin, append(args, "-F", config, "--", name)...)
+	cmd.Env = p.environ()
 	cmd.Stdin = nil // /dev/null
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &limitedBuffer{buf: &stderr, max: 1 << 20}
@@ -66,7 +106,39 @@ func runSSHG(ctx context.Context, e *Env, sshBin, config, name string) (sshSetti
 		}
 		return sshSettings{}, fmt.Errorf("ssh -G failed: %s", sshError(stderr.String(), err))
 	}
-	return parseSSHG(stdout.String(), stderr.String(), name), nil
+	return parseSSHG(stdout.String(), stderr.String()), nil
+}
+
+// defaults is what this ssh prints for name when no config says anything: the
+// values hop must not mistake for the user's.
+func (p *sshProber) defaults(ctx context.Context, name string) (sshSettings, error) {
+	return p.run(ctx, os.DevNull, name, false)
+}
+
+// verifyTrace checks, once, that this ssh's -v output names the Host line that
+// applied, on a config of hop's own.
+func (p *sshProber) verifyTrace(ctx context.Context) error {
+	dir, err := os.MkdirTemp("", "hop-trace")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	config := filepath.Join(dir, "config")
+	const name = "hop-trace-probe"
+	if err := os.WriteFile(config, []byte("Host "+name+"\n  User hop\n"), 0o600); err != nil {
+		return err
+	}
+	set, err := p.run(ctx, config, name, true)
+	if err != nil {
+		return err
+	}
+	if why := set.traceProblem(); why != "" {
+		return &errTraceUnverified{why}
+	}
+	if !slices.Contains(set.Applied, hostLoc{filepath.Clean(config), 1}) {
+		return &errTraceUnverified{"ssh -v did not report the Host line that applied to a test config"}
+	}
+	return nil
 }
 
 // limitedBuffer drops what exceeds max, so a noisy ssh cannot fill memory.
@@ -94,9 +166,14 @@ func sshError(stderr string, err error) string {
 	return err.Error()
 }
 
+// appliedLine is ssh's debug line for a Host block that applies:
+// "debug1: <file> line <n>: Applying options for <pattern>". The file is the
+// text up to the last " line N: Applying options for ", whatever it holds.
+var appliedLine = regexp.MustCompile(`^debug\d*: (.*) line ([0-9]+): Applying options for `)
+
 // parseSSHG reads ssh -G's "key value" lines (lower-case keys) and the debug
 // lines of -v.
-func parseSSHG(stdout, stderr, name string) sshSettings {
+func parseSSHG(stdout, stderr string) sshSettings {
 	var s sshSettings
 	for _, line := range strings.Split(stdout, "\n") {
 		key, val, _ := strings.Cut(strings.TrimSpace(line), " ")
@@ -122,21 +199,36 @@ func parseSSHG(stdout, stderr, name string) sshSettings {
 		if strings.Contains(line, "Reading configuration data") {
 			s.Traced = true
 		}
-		if _, pat, ok := strings.Cut(line, ": Applying options for "); ok && strings.EqualFold(strings.TrimSpace(pat), name) {
-			s.Reached = true
+		if !strings.Contains(line, "Applying options for") {
+			continue
 		}
+		m := appliedLine.FindStringSubmatch(strings.TrimRight(line, "\r"))
+		n, err := 0, error(nil)
+		if m != nil {
+			n, err = strconv.Atoi(m[2])
+		}
+		if m == nil || err != nil {
+			s.Garbled = true
+			continue
+		}
+		s.Applied = append(s.Applied, hostLoc{filepath.Clean(m[1]), n})
 	}
 	return s
 }
 
-// defaultSSHUser asks ssh which user it uses when no config says: the name
-// ssh -G prints for a config with nothing in it.
-func defaultSSHUser(ctx context.Context, e *Env, sshBin string) string {
-	s, err := runSSHG(ctx, e, sshBin, os.DevNull, "hop-default-user-probe")
-	if err != nil {
-		return ""
+// passwdHome is the home directory OpenSSH uses for ~.
+func (e *Env) passwdHome() (string, error) {
+	if e.PasswdHome != nil {
+		return e.PasswdHome()
 	}
-	return s.User
+	u, err := user.Current()
+	if err != nil {
+		return "", err
+	}
+	if u.HomeDir == "" {
+		return "", errors.New("the passwd entry has no home directory")
+	}
+	return u.HomeDir, nil
 }
 
 // checkSSH finds the ssh client, or says why import cannot work without it.
