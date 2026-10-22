@@ -76,23 +76,24 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 var busyWait = 2 * time.Second
 
 // daemonAnswers reports whether a daemon answers a status request on the
-// control socket within busyWait.
+// control socket within busyWait. One deadline covers every dial and every
+// status request: a daemon that answers later counts as not answering.
 func daemonAnswers(ctx context.Context, e *Env) bool {
-	deadline := time.Now().Add(busyWait)
+	ctx, cancel := context.WithTimeout(ctx, busyWait)
+	defer cancel()
 	for {
 		if c, err := daemon.Dial(ctx, e.Paths.ControlSocket()); err == nil {
-			cctx, cancel := context.WithDeadline(ctx, deadline.Add(time.Second))
-			err = c.Call(cctx, daemon.OpStatus, nil, nil)
-			cancel()
+			err = c.Call(ctx, daemon.OpStatus, nil, nil)
 			c.Close()
 			if err == nil {
 				return true
 			}
 		}
-		if !time.Now().Before(deadline) || ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return false
+		case <-time.After(50 * time.Millisecond):
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 

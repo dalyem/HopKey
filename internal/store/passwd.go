@@ -151,9 +151,11 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 // Recovery Key, with every grant revoked. It revokes the stale devices that
 // password unlocks on this machine left behind, and only those; every
 // other active device is recertified. current must open
-// the account. The candidate is journaled, sealed to the device key, before
-// anything is written; the returned kit comes from a candidate verified as
-// committed in the log (§5.4). The kit stays pending until AckKit.
+// the account. This device's key is first saved durably in the device key
+// store, and nothing is written to the log unless that succeeds. The
+// candidate is journaled, sealed to the device key, before anything is
+// written; the returned kit comes from a candidate verified as committed
+// in the log (§5.4). The kit stays pending until AckKit.
 func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -189,6 +191,16 @@ func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, 
 		return Kit{}, err
 	}
 	old.Zero()
+	// This device survives the checkpoint and gets a new unlock blob, and
+	// its journal is sealed to it alone. Its key must be durably in the
+	// device key store before anything is built: a password unlock that
+	// failed may have left there the key of a stale device, which this
+	// checkpoint revokes. If the new Secret Key then fails to save and the
+	// process stops, the key on disk still opens the new checkpoint and
+	// its journal.
+	if err := s.deviceStore(s.devCfg).storeDurably(s.rec); err != nil {
+		return Kit{}, fmt.Errorf("store: the password was not changed: this device's key could not be saved durably first: %w", err)
+	}
 
 	acctID := s.state.Account.AccountID
 	newSK, err := crypto.NewSecretKey()
