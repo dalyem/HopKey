@@ -17,8 +17,8 @@ import (
 //   - a file that already exists must be a regular file owned by uid;
 //   - one with a mode other than 0600 is tightened to it.
 //
-// A log that grew past maxLogSize is moved to path+".1" first, keeping one
-// previous generation.
+// A log that grew past maxLogSize is set to 0600 and moved to path+".1"
+// first, keeping one previous generation.
 func openLog(path string, uid int) (*os.File, error) {
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
@@ -28,6 +28,11 @@ func openLog(path string, uid int) (*os.File, error) {
 			return nil, fmt.Errorf("the daemon log %s is not a regular file", path)
 		}
 		if fi.Size() > maxLogSize {
+			// Tighten the mode first: the previous generation keeps whatever
+			// mode the file has when it is renamed.
+			if err := tighten(path); err != nil {
+				return nil, err
+			}
 			if err := os.Rename(path, path+".1"); err != nil {
 				return nil, err
 			}
@@ -60,4 +65,18 @@ func openLog(path string, uid int) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// tighten sets the mode of the regular file at path to 0600, without following
+// a symlink put there since the caller looked.
+func tighten(path string) error {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("opening the daemon log: %w", err)
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return fmt.Errorf("the daemon log %s is not a regular file", path)
+	}
+	return f.Chmod(0o600)
 }

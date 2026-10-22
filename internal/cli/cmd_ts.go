@@ -50,7 +50,8 @@ type TSEntry struct {
 
 // tsLink fills in h's Tailscale link from n. Pins come from the node's
 // published SSH host keys, which the control plane vouches for, but only when
-// the host has none of its own. It reports how many pins it added.
+// the host has none of its own. It reports how many pins it added. A host
+// that is Tailscale SSH or got those pins is set to route tailnet.
 func tsLink(h *model.Host, n tailscale.Node, pin bool) int {
 	h.Tailscale = &model.Tailscale{StableNodeID: n.ID, DNSName: n.DNSName, SSH: n.SSH()}
 	if n.DNSName != "" && !slices.ContainsFunc(h.Addresses, func(a string) bool { return strings.EqualFold(a, n.DNSName) }) {
@@ -67,6 +68,14 @@ func tsLink(h *model.Host, n tailscale.Node, pin bool) int {
 				added++
 			}
 		}
+	}
+	// A Tailscale SSH host, or one pinned to the keys Tailscale publishes for
+	// the node, answers only on the tailnet: the direct sshd is not Tailscale's
+	// and does not share those keys. Say so in the vault, so it holds when
+	// Tailscale is down, and never falls back to a direct address. A route the
+	// user chose, direct or tailnet, stays as it is.
+	if (h.Tailscale.SSH == "yes" || added > 0) && (h.Route == "" || h.Route == resolve.RouteAuto) {
+		h.Route = resolve.RouteTailnet
 	}
 	return added
 }

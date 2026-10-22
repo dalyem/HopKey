@@ -41,8 +41,11 @@ type Host struct {
 	ProxyJump string        // alias of another Host in the same Write; empty means a direct connection
 	PublicKey ssh.PublicKey // selects the agent key; the private half never leaves the agent
 	// Keyless is for a host reached through Tailscale SSH, which authenticates
-	// the tailnet identity and needs no key. Its block has no IdentityFile and
-	// sets IdentitiesOnly, so the agent offers it nothing. PublicKey must be nil.
+	// the tailnet identity and needs no key. Its block turns public key
+	// authentication off, names no agent and no key file (IdentityFile none,
+	// so ssh adds none of its default ~/.ssh/id_* files), and sets
+	// IdentitiesOnly: nothing is offered whatever the server asks for.
+	// PublicKey must be nil.
 	Keyless  bool
 	HostKeys []ssh.PublicKey // pinned server keys; none means ssh refuses the host
 }
@@ -306,8 +309,13 @@ func render(opts Options, hosts []Host) (*files, error) {
 		if h.ProxyJump != "" {
 			fmt.Fprintf(&config, "  ProxyJump %s\n", h.ProxyJump)
 		}
-		fmt.Fprintf(&config, "  IdentityAgent %s\n", agentSock)
-		if !h.Keyless {
+		if h.Keyless {
+			// Tailscale SSH authenticates the tailnet identity. Offer
+			// nothing: no agent, no configured key, no default ~/.ssh key.
+			config.WriteString("  PubkeyAuthentication no\n")
+			config.WriteString("  IdentityFile none\n")
+		} else {
+			fmt.Fprintf(&config, "  IdentityAgent %s\n", agentSock)
 			fmt.Fprintf(&config, "  IdentityFile %s\n", pubPath)
 		}
 		config.WriteString("  IdentitiesOnly yes\n")

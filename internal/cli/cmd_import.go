@@ -41,6 +41,7 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "import ssh-config", commands["import"].usage)
 	withKeys := fs.Bool("with-keys", false, "import the private keys named by IdentityFile (default: only record the reference)")
 	dryRun := fs.Bool("dry-run", false, "show what would be imported")
+	allowExec := fs.Bool("allow-match-exec", false, "let ssh run the commands of `Match exec` lines while it reads the config")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	pos, _, err := parseFlags(fs, args[1:])
 	if err != nil {
@@ -55,21 +56,27 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 		path = pos[0]
 	}
 
-	parser := newSSHConfigParser(e.Home, e.Paths.ConfigDir)
-	if err := parser.parseFile(path, 0); err != nil {
+	sshBin, err := checkSSH(e)
+	if err != nil {
+		return err
+	}
+	scan := newConfigScan(e.Home, e.Paths.ConfigDir)
+	if err := scan.scan(path); err != nil {
 		return failf("%v", err)
+	}
+	if len(scan.matchExec) > 0 && !*allowExec {
+		return failf("%s uses `Match exec` (%s). Reading the config with ssh -G would run those commands. "+
+			"Check what they do, then pass --allow-match-exec to import anyway",
+			path, strings.Join(scan.matchExec, ", "))
 	}
 	l, err := listAll(ctx, e)
 	if err != nil {
 		return err
 	}
-	imp := &importer{ctx: ctx, e: e, parser: parser, l: l, withKeys: *withKeys, dryRun: *dryRun,
+	imp := &importer{ctx: ctx, e: e, scan: scan, sshBin: sshBin, config: path, l: l, withKeys: *withKeys, dryRun: *dryRun,
 		report: ImportReport{Source: path, DryRun: *dryRun}}
 	imp.run()
-	imp.report.Warnings = append(parser.warnings, imp.warnings...)
-	if parser.defaults {
-		imp.report.Warnings = append(imp.report.Warnings, "settings under 'Host *' or 'Match' blocks were not imported")
-	}
+	imp.report.Warnings = append(scan.warnings, imp.warnings...)
 	if *asJSON {
 		return printJSON(e, imp.report)
 	}
@@ -83,26 +90,43 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	for _, w := range imp.report.Warnings {
 		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", w)
 	}
-	if !*dryRun && len(imp.report.Entries) > 0 {
+	if !*dryRun && slices.ContainsFunc(imp.report.Entries, func(en ImportEntry) bool { return en.Kind == "host" && en.Status == "imported" }) {
 		fmt.Fprintf(e.Stderr, "hop: imported hosts have no pinned host keys yet; pin each with: hop trust <host>\n")
 	}
 	return nil
 }
 
+// candidate is a host the import is working out: one Host line's worth of
+// aliases that ssh -G gave the same settings.
+type candidate struct {
+	host      model.Host
+	source    string
+	sig       string
+	identity  []string // expanded IdentityFile paths ssh was told about
+	jump      string   // ProxyJump, "" for none
+	entry     int      // index in the report
+	skipped   bool
+	jumpTo    *model.Host // set by planJumps: the vault host, or the saved candidate
+	jumpToCnd *candidate
+	saved     *model.Host
+}
+
 type importer struct {
 	ctx      context.Context
 	e        *Env
-	parser   *sshConfigParser
+	scan     *configScan
+	sshBin   string
+	config   string
 	l        *daemon.ListResult
 	withKeys bool
 	dryRun   bool
 	report   ImportReport
 	warnings []string
-	saved    map[string]model.Host // by lower-cased name: what was written, for the jump pass
 }
 
-func (im *importer) add(kind, name, status, reason string) {
+func (im *importer) add(kind, name, status, reason string) int {
 	im.report.Entries = append(im.report.Entries, ImportEntry{Kind: kind, Name: name, Status: status, Reason: reason})
+	return len(im.report.Entries) - 1
 }
 
 func (im *importer) warnf(format string, args ...any) {
@@ -127,95 +151,247 @@ func (im *importer) taken(name string) (string, bool) {
 	return "", false
 }
 
+// skip leaves a host out and says why, in the report and as a warning.
+func (im *importer) skip(entry int, name, source, reason string) {
+	im.report.Entries[entry].Status, im.report.Entries[entry].Reason = "skipped", reason
+	im.warnf("host %s (%s) was not imported: %s", name, source, reason)
+}
+
+// run imports every alias the config names, each with the settings ssh -G
+// gives it. Whatever ssh would do with the name is what the vault host does:
+// hop never evaluates the config itself.
 func (im *importer) run() {
-	im.saved = map[string]model.Host{}
-	var blocks []sshBlock // the ones that were imported, for the jump pass
-	for _, b := range im.parser.blocks {
-		names := b.concrete()
-		name := names[0]
-		if owner, ok := im.taken(name); ok {
-			im.add("host", name, "exists", fmt.Sprintf("already in the vault as %q", owner))
+	defaultUser := defaultSSHUser(im.ctx, im.e, im.sshBin)
+	var cands []*candidate
+	bySource := map[string][]*candidate{}
+	for _, a := range im.scan.aliases {
+		if owner, ok := im.taken(a.Name); ok {
+			im.add("host", a.Name, "exists", fmt.Sprintf("already in the vault as %q", owner))
 			continue
 		}
-		if len(b.Unsupported) > 0 {
-			reason := strings.Join(b.Unsupported, "; ")
-			im.add("host", name, "skipped", reason)
-			im.warnf("host %s (%s) was not imported: %s", name, b.Source, reason)
+		if !sshconfig.ValidAlias(a.Name) {
+			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source,
+				fmt.Sprintf("%q is not usable as a host name (letters, digits, '.', '_' and '-')", a.Name))
 			continue
 		}
-		h, err := im.hostFor(b, names)
+		set, err := runSSHG(im.ctx, im.e, im.sshBin, im.config, a.Name)
 		if err != nil {
-			im.add("host", name, "skipped", err.Error())
+			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, err.Error())
 			continue
 		}
+		c, why := im.candidateFor(a, set, defaultUser)
+		if why != "" {
+			im.skip(im.add("host", a.Name, "", ""), a.Name, a.Source, why)
+			continue
+		}
+		// Names from one Host line that ssh treats alike are one host.
+		if i := slices.IndexFunc(bySource[a.Source], func(o *candidate) bool { return o.sig == c.sig }); i >= 0 {
+			o := bySource[a.Source][i]
+			o.host.Aliases = append(o.host.Aliases, a.Name)
+			continue
+		}
+		c.entry = im.add("host", a.Name, "", "")
+		cands = append(cands, c)
+		bySource[a.Source] = append(bySource[a.Source], c)
+	}
+	im.planJumps(cands)
+	im.save(cands)
+}
+
+// candidateFor turns ssh -G's answer for one alias into a vault host, or says
+// why importing it would not behave as ssh does.
+func (im *importer) candidateFor(a configAlias, set sshSettings, defaultUser string) (*candidate, string) {
+	if set.Traced && !set.Reached {
+		return nil, "no Host line applies to this name under ssh's rules (it is negated, or its file is only included where a Match does not hold)"
+	}
+	if pc := set.ProxyCommand; pc != "" && !strings.EqualFold(pc, "none") {
+		return nil, fmt.Sprintf("ProxyCommand %q cannot be reproduced; importing it as a direct connection would change where ssh connects", pc)
+	}
+	addr := set.HostName
+	if addr == "" {
+		addr = a.Name
+	}
+	if !sshconfig.ValidHostName(addr) {
+		return nil, fmt.Sprintf("HostName %q is not usable", addr)
+	}
+	port := uint32(22)
+	if set.Port != "" {
+		n, err := strconv.Atoi(set.Port)
+		if err != nil || n <= 0 || n >= 65536 {
+			return nil, fmt.Sprintf("Port %q is not usable", set.Port)
+		}
+		port = uint32(n)
+	}
+	user := set.User
+	if user == defaultUser && !im.scan.users[user] {
+		user = "" // ssh's own default, not something the config says
+	}
+	if user != "" && !sshconfig.ValidUser(user) {
+		return nil, fmt.Sprintf("User %q is not usable", user)
+	}
+	c := &candidate{source: a.Source, jump: set.ProxyJump}
+	if strings.EqualFold(c.jump, "none") {
+		c.jump = ""
+	}
+	defaults := onlyDefaultIdentities(im.e.Home, set.IdentityFiles, im.scan.identity)
+	for _, f := range set.IdentityFiles {
+		path, ok := im.identityPath(f, a.Name, addr, user, set.User, port)
+		switch {
+		case strings.EqualFold(f, "none") || (ok && defaults):
+		case !ok:
+			im.warnf("host %s: IdentityFile %s uses a token hop does not expand; the key is not referenced", a.Name, f)
+		default:
+			c.identity = append(c.identity, path)
+		}
+	}
+	if set.HostKeyAlias != "" {
+		im.warnf("host %s: HostKeyAlias %s is not imported; hop pins host keys under the host's own name", a.Name, set.HostKeyAlias)
+	}
+	c.host = model.Host{
+		Name: a.Name, Addresses: []string{addr}, Port: port, User: user,
+		Route: resolve.RouteAuto, AgentAccess: "allow",
+		Description: "Imported from " + a.Source,
+	}
+	c.sig = strings.Join([]string{addr, strconv.Itoa(int(port)), user, c.jump, strings.Join(c.identity, "\x00")}, "\x01")
+	return c, ""
+}
+
+// identityPath expands the tokens ssh -G leaves in an IdentityFile value:
+// ~, %d, %h, %n, %r, %p and %%. Any other token (%l, %u, %C ...) depends on
+// something hop does not know, so ok is false.
+func (im *importer) identityPath(raw, alias, host, user, remoteUser string, port uint32) (path string, ok bool) {
+	var sb strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '%' {
+			sb.WriteByte(raw[i])
+			continue
+		}
+		i++
+		if i == len(raw) {
+			return "", false
+		}
+		switch raw[i] {
+		case '%':
+			sb.WriteByte('%')
+		case 'd':
+			sb.WriteString(im.e.Home)
+		case 'h':
+			sb.WriteString(host)
+		case 'n':
+			sb.WriteString(alias)
+		case 'r':
+			sb.WriteString(remoteUser)
+		case 'p':
+			sb.WriteString(strconv.Itoa(int(port)))
+		default:
+			return "", false
+		}
+	}
+	return normIdentity(im.e.Home, sb.String()), true
+}
+
+// onlyDefaultIdentities reports whether the IdentityFile values ssh -G printed
+// are its own defaults. ssh lists ~/.ssh/id_rsa, id_ecdsa, id_ed25519 and the
+// rest when, and only when, the config gave the host no IdentityFile; a host
+// with one of its own gets just its own. So a list of default-named files that
+// has the whole set (id_rsa and id_ed25519 among at least three) is ssh's,
+// unless the config itself names every one of them.
+func onlyDefaultIdentities(home string, files []string, named map[string]bool) bool {
+	if len(files) < 3 {
+		return false
+	}
+	names := map[string]bool{}
+	allNamed := true
+	for _, f := range files {
+		p := normIdentity(home, f)
+		if filepath.Dir(p) != filepath.Join(home, ".ssh") {
+			return false
+		}
+		switch base := filepath.Base(p); base {
+		case "id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk", "id_xmss", "id_dsa":
+			names[base] = true
+		default:
+			return false
+		}
+		allNamed = allNamed && named[p]
+	}
+	return names["id_rsa"] && names["id_ed25519"] && !allNamed
+}
+
+// save writes the candidates that are still in, attaching their keys when
+// asked, and then links the jump hosts once every host exists.
+func (im *importer) save(cands []*candidate) {
+	for _, c := range cands {
+		if c.skipped {
+			continue
+		}
+		im.attachKey(c)
 		if im.dryRun {
-			im.add("host", name, im.imported(), "")
-			im.l.Hosts = append(im.l.Hosts, h) // so later blocks see the name as taken
-			blocks = append(blocks, b)
+			im.report.Entries[c.entry].Status = im.imported()
 			continue
 		}
 		var saved model.Host
-		if err := call(im.ctx, im.e, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved); err != nil {
-			im.add("host", name, "failed", err.Error())
+		if err := call(im.ctx, im.e, daemon.OpPutHost, daemon.PutHostParams{Host: c.host}, &saved); err != nil {
+			im.report.Entries[c.entry].Status, im.report.Entries[c.entry].Reason = "failed", err.Error()
+			c.skipped = true
 			continue
 		}
-		im.add("host", name, im.imported(), "")
+		im.report.Entries[c.entry].Status = im.imported()
+		c.saved = &saved
 		im.l.Hosts = append(im.l.Hosts, saved)
-		im.saved[strings.ToLower(saved.Name)] = saved
-		blocks = append(blocks, b)
 	}
-	im.linkJumps(blocks)
+	if im.dryRun {
+		return
+	}
+	for _, c := range cands {
+		if c.skipped || c.jump == "" || c.saved == nil {
+			continue
+		}
+		target := c.jumpTo
+		if c.jumpToCnd != nil {
+			target = c.jumpToCnd.saved
+		}
+		if target == nil {
+			im.warnf("host %s: its jump host %q was not saved, so %s has no jump; hop edit %s --jump <host>", c.host.Name, c.jump, c.host.Name, c.host.Name)
+			continue
+		}
+		withJump := *c.saved
+		withJump.JumpHostID = target.ItemID
+		var again model.Host
+		if err := call(im.ctx, im.e, daemon.OpPutHost, daemon.PutHostParams{Host: withJump}, &again); err != nil {
+			im.warnf("host %s: setting jump host %s: %v", c.host.Name, target.Name, err)
+			continue
+		}
+		c.saved = &again
+	}
 }
 
-// hostFor builds the host a block describes, importing its key if asked.
-func (im *importer) hostFor(b sshBlock, names []string) (model.Host, error) {
-	name := names[0]
-	for _, n := range names {
-		if !sshconfig.ValidAlias(n) {
-			return model.Host{}, fmt.Errorf("%q is not usable as a host name (letters, digits, '.', '_' and '-')", n)
-		}
+// attachKey imports the first usable key the host's IdentityFile lines name,
+// or records the references in its description.
+func (im *importer) attachKey(c *candidate) {
+	if len(c.identity) == 0 {
+		return
 	}
-	addr := strings.ReplaceAll(b.HostName, "%h", name)
-	if addr == "" {
-		addr = name
-	}
-	if !sshconfig.ValidHostName(addr) {
-		return model.Host{}, fmt.Errorf("HostName %q is not usable", addr)
-	}
-	if b.User != "" && !sshconfig.ValidUser(b.User) {
-		return model.Host{}, fmt.Errorf("User %q is not usable", b.User)
-	}
-	h := model.Host{
-		Name: name, Aliases: names[1:], Addresses: []string{addr}, Port: 22, User: b.User,
-		Route: resolve.RouteAuto, AgentAccess: "allow",
-		Description: "Imported from " + b.Source,
-	}
-	if b.Port != 0 {
-		h.Port = uint32(b.Port)
-	}
-	if len(b.IdentityFiles) == 0 {
-		return h, nil
-	}
+	files := strings.Join(c.identity, ", ")
 	if !im.withKeys {
-		h.Description += "; ssh config IdentityFile: " + strings.Join(b.IdentityFiles, ", ") + " (not imported; hop key add <path>, then hop edit " + name + " --key <name>)"
-		return h, nil
+		c.host.Description += "; ssh config IdentityFile: " + files + " (not imported; hop key add <path>, then hop edit " + c.host.Name + " --key <name>)"
+		return
 	}
-	for _, f := range b.IdentityFiles {
-		id, note, err := im.importKey(im.parser.expand(f))
+	for _, f := range c.identity {
+		id, note, err := im.importKey(f)
 		if err != nil {
-			im.warnf("host %s: IdentityFile %s: %v", name, f, err)
+			im.warnf("host %s: IdentityFile %s: %v", c.host.Name, f, err)
 			continue
 		}
-		h.KeyID = id
+		c.host.KeyID = id
 		if note != "" {
-			h.Description += "; " + note
+			c.host.Description += "; " + note
 		}
 		break
 	}
-	if h.KeyID.IsZero() {
-		h.Description += "; ssh config IdentityFile: " + strings.Join(b.IdentityFiles, ", ") + " (could not be imported)"
+	if c.host.KeyID.IsZero() {
+		c.host.Description += "; ssh config IdentityFile: " + files + " (could not be imported)"
 	}
-	return h, nil
 }
 
 // importKey makes sure the key in path is in the vault and returns its ID. A
@@ -288,10 +464,27 @@ func parseJump(s string) jumpSpec {
 	return j
 }
 
-// jumpTarget finds the vault host a ProxyJump names. The first step that
-// matches anything decides, and a step that matches several hosts is
-// ambiguous: hop does not pick one. Steps: a name or alias, then an address.
-func (im *importer) jumpTarget(host string) (target *model.Host, ambiguous []string) {
+// jumpHit is a host a ProxyJump could mean: one already in the vault, or one
+// this import is about to create.
+type jumpHit struct {
+	host model.Host
+	cand *candidate // nil for a vault host
+}
+
+// jumpTarget finds the host a ProxyJump names among the vault's hosts and the
+// candidates still in. The first step that matches anything decides, and a
+// step that matches several hosts is ambiguous: hop does not pick one.
+// Steps: a name or alias, then an address.
+func (im *importer) jumpTarget(host string, cands []*candidate) (target *jumpHit, ambiguous []string) {
+	var pool []jumpHit
+	for _, h := range im.l.Hosts {
+		pool = append(pool, jumpHit{host: h})
+	}
+	for _, c := range cands {
+		if !c.skipped {
+			pool = append(pool, jumpHit{host: c.host, cand: c})
+		}
+	}
 	steps := []func(h model.Host) bool{
 		func(h model.Host) bool {
 			return slices.ContainsFunc(resolve.Names(h), func(n string) bool { return strings.EqualFold(n, host) })
@@ -301,73 +494,75 @@ func (im *importer) jumpTarget(host string) (target *model.Host, ambiguous []str
 		},
 	}
 	for _, match := range steps {
-		var found []*model.Host
-		for i := range im.l.Hosts {
-			if match(im.l.Hosts[i]) {
-				found = append(found, &im.l.Hosts[i])
+		var found []jumpHit
+		for _, p := range pool {
+			if match(p.host) {
+				found = append(found, p)
 			}
 		}
 		switch len(found) {
 		case 0:
 			continue
 		case 1:
-			return found[0], nil
+			return &found[0], nil
 		}
-		for _, h := range found {
-			ambiguous = append(ambiguous, h.Name)
+		for _, p := range found {
+			ambiguous = append(ambiguous, p.host.Name)
 		}
 		return nil, ambiguous
 	}
 	return nil, nil
 }
 
-// linkJumps sets jump hosts once every host exists. Only a single ProxyJump
-// hop that the vault host reproduces exactly is imported: a user or port on
-// the hop that differs from the vault host's own would change which account
-// or service the jump connects to, so the host is left without the jump and
-// a warning says so.
-func (im *importer) linkJumps(blocks []sshBlock) {
-	for _, b := range blocks {
-		if b.ProxyJump == "" || strings.EqualFold(b.ProxyJump, "none") {
-			continue
+// planJumps settles every candidate's ProxyJump before anything is saved.
+// Only a single hop that a vault host reproduces exactly can be imported: a
+// user or port on the hop that differs from the vault host's own would change
+// which account or service the jump connects to. A host whose jump cannot be
+// imported is skipped, because a host imported without it would connect
+// directly where ssh goes through the jump. Skipping a host can strand
+// another that jumps through it, so this repeats until nothing changes.
+func (im *importer) planJumps(cands []*candidate) {
+	for changed := true; changed; {
+		changed = false
+		for _, c := range cands {
+			if c.skipped || c.jump == "" {
+				continue
+			}
+			if why := im.jumpProblem(c, cands); why != "" {
+				c.skipped, changed = true, true
+				im.skip(c.entry, c.host.Name, c.source, why)
+			}
 		}
-		name := b.concrete()[0]
-		if strings.Contains(b.ProxyJump, ",") {
-			im.warnf("host %s: ProxyJump %q has several hops; only single-hop jumps are imported, so %s was imported without it", name, b.ProxyJump, name)
-			continue
-		}
-		jump := parseJump(b.ProxyJump)
-		target, ambiguous := im.jumpTarget(jump.host)
-		switch {
-		case len(ambiguous) > 0:
-			im.warnf("host %s: ProxyJump host %q matches several vault hosts (%s); %s was imported without the jump, pick one with hop edit %s --jump <host>",
-				name, jump.host, strings.Join(ambiguous, ", "), name, name)
-			continue
-		case target == nil:
-			im.warnf("host %s: ProxyJump host %q is not in the vault; add it, then hop edit %s --jump <host>", name, jump.host, name)
-			continue
-		}
-		if strings.EqualFold(target.Name, name) {
-			im.warnf("host %s: ProxyJump %q is the host itself; %s was imported without the jump", name, b.ProxyJump, name)
-			continue
-		}
-		if why := jumpOverride(jump, *target); why != "" {
-			im.warnf("host %s: ProxyJump %q %s; hop cannot import that, so %s was imported without the jump (hop edit %s --jump %s uses the vault host as it is)",
-				name, b.ProxyJump, why, name, name, target.Name)
-			continue
-		}
-		saved, ok := im.saved[strings.ToLower(name)]
-		if im.dryRun || !ok {
-			continue
-		}
-		saved.JumpHostID = target.ItemID
-		var again model.Host
-		if err := call(im.ctx, im.e, daemon.OpPutHost, daemon.PutHostParams{Host: saved}, &again); err != nil {
-			im.warnf("host %s: setting jump host %s: %v", name, target.Name, err)
-			continue
-		}
-		im.saved[strings.ToLower(name)] = again
 	}
+}
+
+// jumpProblem says why c's ProxyJump cannot be imported, or "" after setting
+// where it goes.
+func (im *importer) jumpProblem(c *candidate, cands []*candidate) string {
+	name := c.host.Name
+	if strings.Contains(c.jump, ",") {
+		return fmt.Sprintf("ProxyJump %q has several hops; only a single-hop jump can be imported", c.jump)
+	}
+	jump := parseJump(c.jump)
+	hit, ambiguous := im.jumpTarget(jump.host, cands)
+	switch {
+	case len(ambiguous) > 0:
+		return fmt.Sprintf("ProxyJump host %q matches several hosts (%s); pick one after importing with hop edit %s --jump <host>", jump.host, strings.Join(ambiguous, ", "), name)
+	case hit == nil:
+		return fmt.Sprintf("ProxyJump host %q is not in the vault; add it, import again, or use hop edit %s --jump <host>", jump.host, name)
+	case hit.cand == c:
+		return fmt.Sprintf("ProxyJump %q is the host itself", c.jump)
+	}
+	if why := jumpOverride(jump, hit.host); why != "" {
+		return fmt.Sprintf("ProxyJump %q %s; hop cannot import that (hop edit %s --jump %s uses the vault host as it is)", c.jump, why, name, hit.host.Name)
+	}
+	if hit.cand != nil {
+		c.jumpTo, c.jumpToCnd = nil, hit.cand
+	} else {
+		h := hit.host
+		c.jumpTo, c.jumpToCnd = &h, nil
+	}
+	return ""
 }
 
 // jumpOverride says how the hop's own user or port differs from the vault

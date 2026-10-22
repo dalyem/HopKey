@@ -284,7 +284,7 @@ func (d *Daemon) plan(snap model.Snapshot, ts *tailscale.Status, pubs map[model.
 func (d *Daemon) checkHost(h model.Host, ts *tailscale.Status, pubs map[model.ID]ssh.PublicKey, keyProblem map[model.ID]string, p *plan, warn func(string, ...any)) string {
 	// A Tailscale SSH host needs no key: Tailscale authenticates the tailnet
 	// identity, so its block offers none and the route is forced to the tailnet.
-	if _, only := resolve.TailscaleSSHOnly(h, ts); only && h.KeyID.IsZero() {
+	if _, only := resolve.TailscaleSSHOnly(h); only && h.KeyID.IsZero() {
 		p.keyless = true
 	} else {
 		switch {
