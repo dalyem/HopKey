@@ -1,0 +1,624 @@
+package server
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math"
+	"net/url"
+	"os"
+	"path/filepath"
+	"time"
+
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
+
+	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/vaultlog"
+)
+
+// schemaVersion is stored in meta; Open refuses a database from a newer
+// server.
+const schemaVersion = "2"
+
+// schema is the multi-tenant SQLite schema. IDs and digests are BLOBs of
+// their raw bytes; times are Unix seconds.
+//
+// The enrollment relay (slice C2) adds its own tables.
+const schema = `
+CREATE TABLE IF NOT EXISTS meta (
+	k TEXT PRIMARY KEY,
+	v BLOB NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS accounts (
+	account_id   BLOB PRIMARY KEY,
+	email        TEXT NOT NULL UNIQUE,
+	vault_id     BLOB NOT NULL UNIQUE,
+	kdf_version  INTEGER NOT NULL,
+	salt         BLOB NOT NULL,
+	auth_sha256  BLOB NOT NULL,
+	rauth_sha256 BLOB NOT NULL,
+	cred_gen     INTEGER NOT NULL,
+	used_bytes   INTEGER NOT NULL,
+	quota_bytes  INTEGER NOT NULL,
+	reserve      INTEGER NOT NULL,
+	created_at   INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS vaults (
+	vault_id        BLOB PRIMARY KEY,
+	account_id      BLOB NOT NULL UNIQUE REFERENCES accounts (account_id),
+	head_seq        INTEGER NOT NULL,
+	head_h          BLOB NOT NULL,
+	public_state    BLOB NOT NULL,
+	last_bootstrap  INTEGER NOT NULL,
+	last_checkpoint INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS log (
+	vault_id BLOB NOT NULL REFERENCES vaults (vault_id),
+	seq      INTEGER NOT NULL,
+	h        BLOB NOT NULL,
+	kind     TEXT NOT NULL,
+	wire     BLOB NOT NULL,
+	PRIMARY KEY (vault_id, seq),
+	UNIQUE (vault_id, h)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS objects (
+	vault_id BLOB NOT NULL REFERENCES vaults (vault_id),
+	sha256   BLOB NOT NULL,
+	body     BLOB NOT NULL,
+	seq      INTEGER NOT NULL,
+	PRIMARY KEY (vault_id, sha256)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS devices (
+	account_id BLOB NOT NULL REFERENCES accounts (account_id),
+	device_id  BLOB NOT NULL,
+	sig_pk     BLOB NOT NULL,
+	active     INTEGER NOT NULL,
+	added_seq  INTEGER NOT NULL,
+	PRIMARY KEY (account_id, device_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS receipts (
+	account_id BLOB NOT NULL REFERENCES accounts (account_id),
+	device_id  BLOB NOT NULL,
+	how        TEXT NOT NULL,
+	seq        INTEGER NOT NULL,
+	h          BLOB NOT NULL,
+	PRIMARY KEY (account_id, device_id)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS sessions (
+	token_hash BLOB PRIMARY KEY,
+	account_id BLOB NOT NULL,
+	vault_id   BLOB NOT NULL,
+	device_id  BLOB NOT NULL,
+	expires_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS sessions_device ON sessions (account_id, device_id);
+CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions (expires_at);
+
+CREATE TABLE IF NOT EXISTS login_tokens (
+	token_hash    BLOB PRIMARY KEY,
+	kind          TEXT NOT NULL,
+	account_id    BLOB NOT NULL,
+	vault_id      BLOB NOT NULL,
+	cred_gen      INTEGER NOT NULL,
+	expires_at    INTEGER NOT NULL,
+	bootstrap_seq INTEGER,
+	bootstrap_h   BLOB
+) STRICT;
+CREATE INDEX IF NOT EXISTS login_tokens_expiry ON login_tokens (expires_at);
+
+CREATE TABLE IF NOT EXISTS challenges (
+	hash       BLOB PRIMARY KEY,
+	kind       TEXT NOT NULL,
+	origin     TEXT NOT NULL,
+	account_id BLOB NOT NULL,
+	device_id  BLOB NOT NULL,
+	operation  TEXT NOT NULL,
+	email      TEXT NOT NULL,
+	cap_hash   BLOB NOT NULL,
+	expires_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS challenges_device ON challenges (account_id, device_id, expires_at);
+CREATE INDEX IF NOT EXISTS challenges_cap ON challenges (cap_hash, expires_at);
+CREATE INDEX IF NOT EXISTS challenges_expiry ON challenges (expires_at);
+
+CREATE TABLE IF NOT EXISTS registrations (
+	cap_hash       BLOB PRIMARY KEY,
+	email          TEXT NOT NULL,
+	created_at     INTEGER NOT NULL,
+	expires_at     INTEGER NOT NULL,
+	consumed_at    INTEGER,
+	ack_account_id BLOB,
+	ack_vault_id   BLOB,
+	ack_digest     BLOB,
+	ack_seq        INTEGER,
+	ack_h          BLOB
+) STRICT;
+`
+
+// SQLite is the Store backed by one SQLite database in WAL mode. Writes go
+// through a single connection and begin with BEGIN IMMEDIATE, so they are
+// serialized; reads use a pool of read-only connections.
+type SQLite struct {
+	w *sql.DB
+	r *sql.DB
+}
+
+// OpenSQLite opens (creating if needed) the database file at path.
+func OpenSQLite(path string) (*SQLite, error) {
+	dsn := func(extra url.Values) string {
+		q := url.Values{}
+		q.Set("_busy_timeout", "10000")
+		q.Set("_journal_mode", "WAL")
+		q.Set("_synchronous", "FULL")
+		q.Set("_foreign_keys", "1")
+		for k, v := range extra {
+			q[k] = v
+		}
+		return "file:" + (&url.URL{Path: path}).EscapedPath() + "?" + q.Encode()
+	}
+	w, err := sql.Open("sqlite", dsn(url.Values{"_txlock": {"immediate"}}))
+	if err != nil {
+		return nil, err
+	}
+	w.SetMaxOpenConns(1)
+	w.SetConnMaxIdleTime(0)
+	if _, err := w.Exec(schema); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("server: creating schema: %w", err)
+	}
+	s := &SQLite{w: w}
+	if err := s.checkVersion(); err != nil {
+		w.Close()
+		return nil, err
+	}
+	r, err := sql.Open("sqlite", dsn(url.Values{"_query_only": {"1"}}))
+	if err != nil {
+		w.Close()
+		return nil, err
+	}
+	r.SetMaxOpenConns(16)
+	s.r = r
+	return s, nil
+}
+
+func (s *SQLite) checkVersion() error {
+	var v []byte
+	err := s.w.QueryRow(`SELECT v FROM meta WHERE k = 'schema_version'`).Scan(&v)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = s.w.Exec(`INSERT INTO meta (k, v) VALUES ('schema_version', ?)`, []byte(schemaVersion))
+		return err
+	case err != nil:
+		return err
+	case string(v) != schemaVersion:
+		return fmt.Errorf("server: database schema version %q is not %q", v, schemaVersion)
+	}
+	return nil
+}
+
+func (s *SQLite) Close() error {
+	return errors.Join(s.r.Close(), s.w.Close())
+}
+
+func (s *SQLite) View(ctx context.Context, fn func(Tx) error) error {
+	tx, err := s.r.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(&sqliteTx{ctx: ctx, tx: tx}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) Update(ctx context.Context, fn func(Tx) error) error {
+	tx, err := s.w.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(&sqliteTx{ctx: ctx, tx: tx}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Backup writes a consistent snapshot with VACUUM INTO.
+func (s *SQLite) Backup(ctx context.Context, path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(abs); err == nil {
+		return fmt.Errorf("server: backup target %s exists", abs)
+	}
+	_, err = s.w.ExecContext(ctx, `VACUUM INTO ?`, abs)
+	return err
+}
+
+type sqliteTx struct {
+	ctx context.Context
+	tx  *sql.Tx
+}
+
+func (t *sqliteTx) exec(q string, args ...any) error {
+	_, err := t.tx.ExecContext(t.ctx, q, args...)
+	return mapErr(err)
+}
+
+func (t *sqliteTx) row(q string, args ...any) *sql.Row {
+	return t.tx.QueryRowContext(t.ctx, q, args...)
+}
+
+// mapErr turns a uniqueness violation into ErrDuplicate and a missing row
+// into ErrNotFound.
+func mapErr(err error) error {
+	var se *sqlite.Error
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrNotFound
+	case errors.As(err, &se) && (se.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE || se.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY):
+		return fmt.Errorf("%w: %v", ErrDuplicate, err)
+	}
+	return err
+}
+
+func unix(t time.Time) int64 { return t.Unix() }
+
+func fromUnix(s int64) time.Time { return time.Unix(s, 0).UTC() }
+
+func scanID(b []byte, id *model.ID) error {
+	if len(b) != len(id) {
+		return fmt.Errorf("server: stored id has %d bytes", len(b))
+	}
+	copy(id[:], b)
+	return nil
+}
+
+func scanHash(b []byte, h *crypto.Hash) error {
+	if len(b) != len(h) {
+		return fmt.Errorf("server: stored hash has %d bytes", len(b))
+	}
+	copy(h[:], b)
+	return nil
+}
+
+func (t *sqliteTx) Meta(key string) ([]byte, error) {
+	var v []byte
+	err := t.row(`SELECT v FROM meta WHERE k = ?`, key).Scan(&v)
+	return v, mapErr(err)
+}
+
+func (t *sqliteTx) SetMeta(key string, v []byte) error {
+	return t.exec(`INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`, key, v)
+}
+
+const accountCols = `account_id, email, vault_id, kdf_version, salt, auth_sha256, rauth_sha256, cred_gen, used_bytes, quota_bytes, reserve, created_at`
+
+func (t *sqliteTx) scanAccount(r *sql.Row) (*Account, error) {
+	var a Account
+	var id, vid, auth, rauth []byte
+	var created int64
+	err := r.Scan(&id, &a.Email, &vid, &a.KDFVersion, &a.Salt, &auth, &rauth, &a.CredGen, &a.UsedBytes, &a.QuotaBytes, &a.Reserve, &created)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if err := errors.Join(scanID(id, &a.ID), scanID(vid, &a.VaultID), scanHash(auth, &a.AuthSHA256), scanHash(rauth, &a.RAuthSHA256)); err != nil {
+		return nil, err
+	}
+	a.CreatedAt = fromUnix(created)
+	return &a, nil
+}
+
+func (t *sqliteTx) Account(id model.ID) (*Account, error) {
+	return t.scanAccount(t.row(`SELECT `+accountCols+` FROM accounts WHERE account_id = ?`, id[:]))
+}
+
+func (t *sqliteTx) AccountByEmail(email string) (*Account, error) {
+	return t.scanAccount(t.row(`SELECT `+accountCols+` FROM accounts WHERE email = ?`, email))
+}
+
+func (t *sqliteTx) AccountTaken(id model.ID, email string, vaultID model.ID) (bool, error) {
+	var n int
+	err := t.row(`SELECT
+		(SELECT COUNT(*) FROM accounts WHERE account_id = ? OR email = ? OR vault_id = ?) +
+		(SELECT COUNT(*) FROM vaults WHERE vault_id = ?)`, id[:], email, vaultID[:], vaultID[:]).Scan(&n)
+	return n > 0, mapErr(err)
+}
+
+func (t *sqliteTx) InsertAccount(a *Account) error {
+	return t.exec(`INSERT INTO accounts (`+accountCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID[:], a.Email, a.VaultID[:], a.KDFVersion, a.Salt, a.AuthSHA256[:], a.RAuthSHA256[:],
+		a.CredGen, a.UsedBytes, a.QuotaBytes, a.Reserve, unix(a.CreatedAt))
+}
+
+func (t *sqliteTx) UpdateAccount(a *Account) error {
+	return t.exec(`UPDATE accounts SET kdf_version = ?, salt = ?, auth_sha256 = ?, rauth_sha256 = ?,
+		cred_gen = ?, used_bytes = ?, quota_bytes = ?, reserve = ? WHERE account_id = ?`,
+		a.KDFVersion, a.Salt, a.AuthSHA256[:], a.RAuthSHA256[:], a.CredGen, a.UsedBytes, a.QuotaBytes, a.Reserve, a.ID[:])
+}
+
+func (t *sqliteTx) Vault(id model.ID) (*Vault, error) {
+	var v Vault
+	var vid, aid, h []byte
+	err := t.row(`SELECT vault_id, account_id, head_seq, head_h, public_state, last_bootstrap, last_checkpoint
+		FROM vaults WHERE vault_id = ?`, id[:]).Scan(&vid, &aid, &v.Head.Seq, &h, &v.PublicState, &v.LastBootstrap, &v.LastCheckpoint)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	if err := errors.Join(scanID(vid, &v.ID), scanID(aid, &v.AccountID), scanHash(h, &v.Head.H)); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+func (t *sqliteTx) InsertVault(v *Vault) error {
+	return t.exec(`INSERT INTO vaults (vault_id, account_id, head_seq, head_h, public_state, last_bootstrap, last_checkpoint)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, v.ID[:], v.AccountID[:], v.Head.Seq, v.Head.H[:], v.PublicState, v.LastBootstrap, v.LastCheckpoint)
+}
+
+func (t *sqliteTx) UpdateVault(v *Vault) error {
+	return t.exec(`UPDATE vaults SET head_seq = ?, head_h = ?, public_state = ?, last_bootstrap = ?, last_checkpoint = ?
+		WHERE vault_id = ?`, v.Head.Seq, v.Head.H[:], v.PublicState, v.LastBootstrap, v.LastCheckpoint, v.ID[:])
+}
+
+func scanEntry(sc interface{ Scan(...any) error }) (*LogEntry, error) {
+	var e LogEntry
+	var h []byte
+	var kind string
+	if err := sc.Scan(&e.Seq, &h, &kind, &e.Wire); err != nil {
+		return nil, mapErr(err)
+	}
+	e.Kind = vaultlog.Kind(kind)
+	return &e, scanHash(h, &e.H)
+}
+
+// Entry and Entries take any u64 seq. SQLite integers are signed 64-bit,
+// so no stored seq exceeds math.MaxInt64, and a larger one cannot be bound
+// as a parameter.
+func (t *sqliteTx) Entry(vaultID model.ID, seq uint64) (*LogEntry, error) {
+	if seq > math.MaxInt64 {
+		return nil, ErrNotFound
+	}
+	return scanEntry(t.row(`SELECT seq, h, kind, wire FROM log WHERE vault_id = ? AND seq = ?`, vaultID[:], seq))
+}
+
+func (t *sqliteTx) EntryByHash(vaultID model.ID, h crypto.Hash) (*LogEntry, error) {
+	return scanEntry(t.row(`SELECT seq, h, kind, wire FROM log WHERE vault_id = ? AND h = ?`, vaultID[:], h[:]))
+}
+
+func (t *sqliteTx) Entries(vaultID model.ID, after uint64, fromStart bool, limit int, fn func(*LogEntry) bool) error {
+	if !fromStart && after >= math.MaxInt64 {
+		return nil
+	}
+	q := `SELECT seq, h, kind, wire FROM log WHERE vault_id = ? AND seq > ? ORDER BY seq LIMIT ?`
+	args := []any{vaultID[:], after, limit}
+	if fromStart {
+		q = `SELECT seq, h, kind, wire FROM log WHERE vault_id = ? ORDER BY seq LIMIT ?`
+		args = []any{vaultID[:], limit}
+	}
+	rows, err := t.tx.QueryContext(t.ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return err
+		}
+		if !fn(e) {
+			break
+		}
+	}
+	return rows.Err()
+}
+
+func (t *sqliteTx) InsertEntry(vaultID model.ID, e *LogEntry) error {
+	return t.exec(`INSERT INTO log (vault_id, seq, h, kind, wire) VALUES (?, ?, ?, ?, ?)`,
+		vaultID[:], e.Seq, e.H[:], string(e.Kind), e.Wire)
+}
+
+func (t *sqliteTx) Object(vaultID model.ID, h crypto.Hash) ([]byte, error) {
+	var b []byte
+	err := t.row(`SELECT body FROM objects WHERE vault_id = ? AND sha256 = ?`, vaultID[:], h[:]).Scan(&b)
+	return b, mapErr(err)
+}
+
+func (t *sqliteTx) InsertObject(vaultID model.ID, h crypto.Hash, body []byte, seq uint64) error {
+	return t.exec(`INSERT INTO objects (vault_id, sha256, body, seq) VALUES (?, ?, ?, ?)
+		ON CONFLICT (vault_id, sha256) DO NOTHING`, vaultID[:], h[:], body, seq)
+}
+
+func (t *sqliteTx) Device(accountID, deviceID model.ID) (*Device, error) {
+	d := Device{AccountID: accountID, DeviceID: deviceID}
+	err := t.row(`SELECT sig_pk, active, added_seq FROM devices WHERE account_id = ? AND device_id = ?`,
+		accountID[:], deviceID[:]).Scan(&d.SigPK, &d.Active, &d.AddedSeq)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &d, nil
+}
+
+func (t *sqliteTx) PutDevice(d *Device) error {
+	return t.exec(`INSERT INTO devices (account_id, device_id, sig_pk, active, added_seq) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (account_id, device_id) DO UPDATE SET active = excluded.active`,
+		d.AccountID[:], d.DeviceID[:], d.SigPK, d.Active, d.AddedSeq)
+}
+
+func (t *sqliteTx) Receipt(accountID, deviceID model.ID) (*Receipt, error) {
+	r := Receipt{AccountID: accountID, DeviceID: deviceID}
+	var how string
+	var h []byte
+	err := t.row(`SELECT how, seq, h FROM receipts WHERE account_id = ? AND device_id = ?`,
+		accountID[:], deviceID[:]).Scan(&how, &r.Seq, &h)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	r.How = vaultlog.DepartureKind(how)
+	return &r, scanHash(h, &r.H)
+}
+
+func (t *sqliteTx) InsertReceipt(r *Receipt) error {
+	return t.exec(`INSERT INTO receipts (account_id, device_id, how, seq, h) VALUES (?, ?, ?, ?, ?)`,
+		r.AccountID[:], r.DeviceID[:], string(r.How), r.Seq, r.H[:])
+}
+
+func (t *sqliteTx) Session(tokenHash crypto.Hash) (*Session, error) {
+	s := Session{TokenHash: tokenHash}
+	var aid, vid, did []byte
+	var exp int64
+	err := t.row(`SELECT account_id, vault_id, device_id, expires_at FROM sessions WHERE token_hash = ?`,
+		tokenHash[:]).Scan(&aid, &vid, &did, &exp)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	s.ExpiresAt = fromUnix(exp)
+	return &s, errors.Join(scanID(aid, &s.AccountID), scanID(vid, &s.VaultID), scanID(did, &s.DeviceID))
+}
+
+func (t *sqliteTx) InsertSession(s *Session) error {
+	return t.exec(`INSERT INTO sessions (token_hash, account_id, vault_id, device_id, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		s.TokenHash[:], s.AccountID[:], s.VaultID[:], s.DeviceID[:], unix(s.ExpiresAt))
+}
+
+func (t *sqliteTx) DeleteSessions(accountID model.ID, deviceID *model.ID) error {
+	if deviceID == nil {
+		return t.exec(`DELETE FROM sessions WHERE account_id = ?`, accountID[:])
+	}
+	return t.exec(`DELETE FROM sessions WHERE account_id = ? AND device_id = ?`, accountID[:], deviceID[:])
+}
+
+func (t *sqliteTx) LoginToken(tokenHash crypto.Hash) (*LoginToken, error) {
+	l := LoginToken{TokenHash: tokenHash}
+	var kind string
+	var aid, vid, bh []byte
+	var exp int64
+	var bseq sql.NullInt64
+	err := t.row(`SELECT kind, account_id, vault_id, cred_gen, expires_at, bootstrap_seq, bootstrap_h
+		FROM login_tokens WHERE token_hash = ?`, tokenHash[:]).Scan(&kind, &aid, &vid, &l.CredGen, &exp, &bseq, &bh)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	l.Kind = TokenKind(kind)
+	l.ExpiresAt = fromUnix(exp)
+	if bseq.Valid {
+		l.Bootstrap = &vaultlog.Head{Seq: uint64(bseq.Int64)}
+		if err := scanHash(bh, &l.Bootstrap.H); err != nil {
+			return nil, err
+		}
+	}
+	return &l, errors.Join(scanID(aid, &l.AccountID), scanID(vid, &l.VaultID))
+}
+
+func (t *sqliteTx) InsertLoginToken(l *LoginToken) error {
+	return t.exec(`INSERT INTO login_tokens (token_hash, kind, account_id, vault_id, cred_gen, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)`, l.TokenHash[:], string(l.Kind), l.AccountID[:], l.VaultID[:], l.CredGen, unix(l.ExpiresAt))
+}
+
+func (t *sqliteTx) SetLoginTokenBootstrap(tokenHash crypto.Hash, h vaultlog.Head) error {
+	return t.exec(`UPDATE login_tokens SET bootstrap_seq = ?, bootstrap_h = ? WHERE token_hash = ?`,
+		h.Seq, h.H[:], tokenHash[:])
+}
+
+func (t *sqliteTx) Challenge(hash crypto.Hash) (*Challenge, error) {
+	c := Challenge{Hash: hash}
+	var kind string
+	var aid, did, capHash []byte
+	var exp int64
+	err := t.row(`SELECT kind, origin, account_id, device_id, operation, email, cap_hash, expires_at
+		FROM challenges WHERE hash = ?`, hash[:]).Scan(&kind, &c.Origin, &aid, &did, &c.Operation, &c.Email, &capHash, &exp)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	c.Kind = ChallengeKind(kind)
+	c.ExpiresAt = fromUnix(exp)
+	return &c, errors.Join(scanID(aid, &c.AccountID), scanID(did, &c.DeviceID), scanHash(capHash, &c.CapHash))
+}
+
+func (t *sqliteTx) InsertChallenge(c *Challenge) error {
+	return t.exec(`INSERT INTO challenges (hash, kind, origin, account_id, device_id, operation, email, cap_hash, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, c.Hash[:], string(c.Kind), c.Origin, c.AccountID[:], c.DeviceID[:],
+		c.Operation, c.Email, c.CapHash[:], unix(c.ExpiresAt))
+}
+
+func (t *sqliteTx) DeleteChallenge(hash crypto.Hash) error {
+	return t.exec(`DELETE FROM challenges WHERE hash = ?`, hash[:])
+}
+
+func (t *sqliteTx) CountChallenges(now time.Time, scope ChallengeScope) (int, error) {
+	q := `SELECT COUNT(*) FROM challenges WHERE expires_at > ?`
+	args := []any{unix(now)}
+	if scope.AccountID != nil && scope.DeviceID != nil {
+		q += ` AND account_id = ? AND device_id = ?`
+		args = append(args, scope.AccountID[:], scope.DeviceID[:])
+	}
+	if scope.CapHash != nil {
+		q += ` AND cap_hash = ?`
+		args = append(args, scope.CapHash[:])
+	}
+	var n int
+	err := t.row(q, args...).Scan(&n)
+	return n, mapErr(err)
+}
+
+func (t *sqliteTx) Registration(capHash crypto.Hash) (*Registration, error) {
+	r := Registration{CapHash: capHash}
+	var created, exp int64
+	var consumed, ackSeq sql.NullInt64
+	var aid, vid, digest, ackH []byte
+	err := t.row(`SELECT email, created_at, expires_at, consumed_at, ack_account_id, ack_vault_id, ack_digest, ack_seq, ack_h
+		FROM registrations WHERE cap_hash = ?`, capHash[:]).Scan(&r.Email, &created, &exp, &consumed, &aid, &vid, &digest, &ackSeq, &ackH)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	r.CreatedAt, r.ExpiresAt = fromUnix(created), fromUnix(exp)
+	if consumed.Valid {
+		a := &Ack{Head: vaultlog.Head{Seq: uint64(ackSeq.Int64)}}
+		if err := errors.Join(scanID(aid, &a.AccountID), scanID(vid, &a.VaultID), scanHash(digest, &a.Digest), scanHash(ackH, &a.Head.H)); err != nil {
+			return nil, err
+		}
+		r.Ack = a
+	}
+	return &r, nil
+}
+
+func (t *sqliteTx) InsertRegistration(r *Registration) error {
+	return t.exec(`INSERT INTO registrations (cap_hash, email, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		r.CapHash[:], r.Email, unix(r.CreatedAt), unix(r.ExpiresAt))
+}
+
+func (t *sqliteTx) ConsumeRegistration(capHash crypto.Hash, a *Ack, at time.Time) error {
+	res, err := t.tx.ExecContext(t.ctx, `UPDATE registrations SET consumed_at = ?, ack_account_id = ?, ack_vault_id = ?,
+		ack_digest = ?, ack_seq = ?, ack_h = ? WHERE cap_hash = ? AND consumed_at IS NULL`,
+		unix(at), a.AccountID[:], a.VaultID[:], a.Digest[:], a.Head.Seq, a.Head.H[:], capHash[:])
+	if err != nil {
+		return mapErr(err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return fmt.Errorf("server: registration capability was not consumable (%d rows, %v)", n, err)
+	}
+	return nil
+}
+
+func (t *sqliteTx) DeleteExpired(now time.Time) error {
+	n := unix(now)
+	return errors.Join(
+		t.exec(`DELETE FROM sessions WHERE expires_at <= ?`, n),
+		t.exec(`DELETE FROM login_tokens WHERE expires_at <= ?`, n),
+		t.exec(`DELETE FROM challenges WHERE expires_at <= ?`, n),
+	)
+}

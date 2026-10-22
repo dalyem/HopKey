@@ -10,3 +10,6 @@
 .env.*
 *.pem
 *.key
+
+# Build cache of scripts/check.sh
+/.check-cache/

@@ -6,6 +6,15 @@ set -eu
 PATH="$PATH:/usr/local/go/bin"
 export PATH
 
+# Kiln's /tmp (and $HOME under it) is a 512 MiB tmpfs. The race build of the
+# pure-Go SQLite driver alone needs about 100 MiB of cache, so keep the
+# build cache on the workspace disk unless the caller chose a location.
+# Build temp files stay in /tmp: tests inherit that directory, and the
+# safepath tests need a private one.
+: "${GOCACHE:=$PWD/.check-cache/go-build}"
+mkdir -p "$GOCACHE"
+export GOCACHE
+
 case "${1:-}" in
 vet)
 	go vet ./...
