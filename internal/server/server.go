@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,14 @@ type Server struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+
+	// hooks are nil outside tests, which set them before the first request
+	// to pause a request at a fixed point.
+	hooks struct {
+		beforeSend func() // getLog: a response is built, before its admission check
+		validating func() // postLog: a validation slot is held, before any decoding
+		prepare    func() // each call of prepare
+	}
 }
 
 // New returns a Server. It creates the prelogin secret on first use.
@@ -361,7 +370,7 @@ func (s *Server) wrap(rt *route) http.Handler {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request, c *call) error {
-	if !s.limiter.allow(c.route.pattern+"|ip|"+ipKey(c.ip), c.route.ipRate) {
+	if !s.limiter.allow(c.route.pattern+"|ip", ipKey(c.ip), c.route.ipRate) {
 		return errRateLimited
 	}
 	if ce := r.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
@@ -432,6 +441,112 @@ func depthWithin(b []byte, max int) bool {
 			}
 		case '}', ']':
 			depth--
+		}
+	}
+	return true
+}
+
+// collectionsWithin scans a request body for the R14 collection limits
+// before the strict decoder builds anything: the arrays at
+// prefix.entry.ops (MaxOps) and prefix.objects (MaxObjects) and, when the
+// member at prefix is itself an array of wires (signup), its length
+// (MaxSignupWires). Array elements leave no name in a path, so for signup
+// the ops of every wire are at wires.entry.ops.
+//
+// It only refuses early. It does not validate, and member names are
+// compared as written, so a name spelled with escapes is missed here; the
+// strict decoder and prepare enforce the same limits on every request.
+func (s *Server) collectionsWithin(b []byte, prefix ...string) bool {
+	return arrayLens(b, func(path []string, n int) bool {
+		switch {
+		case slices.Equal(path, prefix):
+			return n <= s.lim.MaxSignupWires
+		case len(path) != len(prefix)+1 && len(path) != len(prefix)+2:
+			return true
+		case !slices.Equal(path[:len(prefix)], prefix):
+			return true
+		}
+		rest := path[len(prefix):]
+		switch {
+		case slices.Equal(rest, []string{"entry", "ops"}):
+			return n <= s.lim.MaxOps
+		case slices.Equal(rest, []string{"objects"}):
+			return n <= s.lim.MaxObjects
+		}
+		return true
+	})
+}
+
+// arrayLens calls fn with the member-name path (array indexes left out)
+// and the element count of each array in b as the array closes, and stops
+// with false when fn returns false. It counts brackets and commas outside
+// strings; b need not be valid JSON.
+func arrayLens(b []byte, fn func(path []string, n int) bool) bool {
+	type frame struct {
+		array    bool
+		key      string // object: the current member's name
+		wantKey  bool   // object: the next string is a member name
+		nonEmpty bool   // array
+		commas   int    // array
+		pathLen  int    // len(path) outside this container
+	}
+	var stack []frame
+	var path []string
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		var top *frame
+		if len(stack) > 0 {
+			top = &stack[len(stack)-1]
+			if top.array && c != ']' && c != ',' {
+				top.nonEmpty = true
+			}
+		}
+		switch c {
+		case '"':
+			j := i + 1
+			for j < len(b) && b[j] != '"' {
+				if b[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			if top != nil && !top.array && top.wantKey {
+				top.key = string(b[i+1 : min(j, len(b))])
+				top.wantKey = false
+			}
+			i = j
+		case '{', '[':
+			n := len(path)
+			if top != nil && !top.array {
+				path = append(path, top.key)
+			}
+			stack = append(stack, frame{array: c == '[', wantKey: c == '{', pathLen: n})
+		case '}', ']':
+			if top == nil {
+				return true
+			}
+			if top.array {
+				n := top.commas
+				if top.nonEmpty {
+					n++
+				}
+				if !fn(path, n) {
+					return false
+				}
+			}
+			path = path[:top.pathLen]
+			stack = stack[:len(stack)-1]
+		case ',':
+			if top != nil {
+				if top.array {
+					top.commas++
+				} else {
+					top.wantKey = true
+				}
+			}
 		}
 	}
 	return true

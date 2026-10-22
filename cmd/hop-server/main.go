@@ -3,6 +3,7 @@
 //	hop-server serve --listen ADDR --data DIR --origin URL [--tls-cert FILE --tls-key FILE]
 //	                 [--insecure-http] [--trusted-proxy CIDR]...
 //	hop-server invite EMAIL [--ttl 7d] --data DIR
+//	hop-server quota ACCOUNT_ID|EMAIL SIZE --data DIR
 //	hop-server backup PATH --data DIR
 //	hop-server version
 package main
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -40,13 +42,15 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: hop-server serve|invite|backup|version")
+		return errors.New("usage: hop-server serve|invite|quota|backup|version")
 	}
 	switch args[0] {
 	case "serve":
 		return serve(args[1:], stderr)
 	case "invite":
 		return invite(args[1:], stdout)
+	case "quota":
+		return quota(args[1:], stdout)
 	case "backup":
 		return backup(args[1:], stdout)
 	case "version":
@@ -241,6 +245,58 @@ func parseTTL(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("--ttl %q: want Nd or a positive duration", s)
 	}
 	return d, nil
+}
+
+// quota sets an account's storage quota. Raising it far enough to free the
+// whole recovery reserve also ends a capacity-exhausted state (R13).
+func quota(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("quota", flag.ContinueOnError)
+	data := fs.String("data", "", "data directory")
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 {
+		return errors.New("usage: hop-server quota ACCOUNT_ID|EMAIL SIZE --data DIR (SIZE in bytes, or with KiB, MiB, GiB or TiB)")
+	}
+	size, err := parseSize(pos[1])
+	if err != nil {
+		return err
+	}
+	st, err := openStore(*data)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	q, err := server.SetQuota(context.Background(), st, pos[0], size, server.DefaultLimits())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "account %s <%s>: quota %d bytes, used %d bytes, recovery reserve %d bytes, reserve %s\n",
+		q.AccountID, q.Email, q.QuotaBytes, q.UsedBytes, q.ReserveBytes, q.Reserve)
+	if q.Reserve != server.ReserveIntact {
+		fmt.Fprintf(stdout, "the reserve is still spent: a quota of at least %d bytes replenishes it\n", q.UsedBytes+q.ReserveBytes)
+	}
+	return nil
+}
+
+// parseSize parses a byte count, optionally with a binary unit.
+func parseSize(s string) (int64, error) {
+	num, mult := s, int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40}} {
+		if n, ok := strings.CutSuffix(s, u.suffix); ok {
+			num, mult = n, u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(num, 10, 64)
+	if err != nil || n <= 0 || n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("size %q: want a positive number of bytes, KiB, MiB, GiB or TiB", s)
+	}
+	return n * mult, nil
 }
 
 func backup(args []string, stdout io.Writer) error {

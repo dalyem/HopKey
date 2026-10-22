@@ -2,11 +2,12 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -449,50 +450,6 @@ func TestPagingAndSingletonCap(t *testing.T) {
 	wantCode(t, e.do("GET", logPath(v)+"?wait=56", tok, nil), 400, "bad_request", "wait over 55")
 }
 
-// R13: ordinary writes leave the recovery reserve; a bootstrap and the
-// checkpoint after it may spend it; then the account is exhausted.
-func TestQuotaAndRecoveryReserve(t *testing.T) {
-	e := newEnv(t, withLimits(func(l *Limits) { l.MaxWireResponse = 64 << 10 }))
-	v := newVault(t, "a@example.com")
-	e.publish(v)
-	A := v.dev(0)
-	tok := e.session(v, A)
-	var used int64
-	e.view(func(tx Tx) error {
-		a, err := tx.Account(v.accountID())
-		used = a.UsedBytes
-		return err
-	})
-	reserve := int64(64<<10) + entryOverhead
-	if err := e.st.Update(context.Background(), func(tx Tx) error {
-		a, err := tx.Account(v.accountID())
-		if err != nil {
-			return err
-		}
-		a.QuotaBytes = used + 2*reserve + 4000
-		return tx.UpdateAccount(a)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	e.mustPost(v, tok, v.normal(A, 1, 100))
-	big, _, _, err := vaultlog.BuildNormal(v.st, v.sec, v.devs[A], vaultlog.Changes{Put: []crypto.Item{snippet(t, strings.Repeat("z", 4000))}}, v.now(), v.archive)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantCode(t, e.post(v, tok, big), 507, "quota_exhausted", "an ordinary write into the reserve")
-
-	_, wb := v.bootstrap("dev-b")
-	e.mustPost(v, e.recoverToken(v), wb)
-	wantCode(t, e.post(v, tok, v.unrecorded(A)), 507, "quota_exhausted", "an ordinary write after the bootstrap")
-	e.mustPost(v, tok, v.checkpoint(A))
-	tok = e.session(v, A)
-	wantCode(t, e.post(v, tok, v.unrecorded(A)), 507, "quota_exhausted", "an ordinary write after the recovery")
-	r, _ := e.readLog(v, tok, "")
-	wantStatus(t, r, 200, "reads in the exhausted state")
-	r, _ = e.readLog(v, e.login(v), "")
-	wantStatus(t, r, 200, "login in the exhausted state")
-}
-
 // The manual page assembly is exactly the JCS encoding, and its length
 // formulas match.
 func TestPageEncodingIsJCS(t *testing.T) {
@@ -561,4 +518,226 @@ func TestPageAlwaysMakesProgress(t *testing.T) {
 		}
 		query = "?after=" + itoa(want)
 	}
+}
+
+// pauser pauses the first request that reaches a hook after it is armed.
+type pauser struct {
+	armed   atomic.Bool
+	once    sync.Once
+	paused  chan struct{}
+	resumed chan struct{}
+}
+
+func newPauser() *pauser {
+	return &pauser{paused: make(chan struct{}), resumed: make(chan struct{})}
+}
+
+func (p *pauser) hook() {
+	if p.armed.Load() {
+		p.once.Do(func() {
+			close(p.paused)
+			<-p.resumed
+		})
+	}
+}
+
+func (p *pauser) waitPaused(t *testing.T) {
+	t.Helper()
+	select {
+	case <-p.paused:
+	case <-time.After(15 * time.Second):
+		t.Fatal("no request reached the hook")
+	}
+}
+
+// A log response is admitted by a fresh authentication immediately before
+// it is written: a credential revoked or expired after the page was built
+// gets a 401 with no data (R2), including on the shutdown path.
+func TestLogResponseAdmissionRechecksAuth(t *testing.T) {
+	for _, mode := range []string{"read", "long-poll"} {
+		t.Run(mode+" revoked by a checkpoint", func(t *testing.T) {
+			p := newPauser()
+			e := newEnv(t, withHooks(func(s *Server) { s.hooks.beforeSend = p.hook }))
+			v := newVault(t, "a@example.com")
+			e.publish(v)
+			A := v.dev(0)
+			reader, writer := e.session(v, A), e.session(v, A)
+			var got <-chan resp
+			if mode == "read" {
+				p.armed.Store(true)
+				ch := make(chan resp, 1)
+				go func() { ch <- e.do("GET", logPath(v), reader, nil) }()
+				got = ch
+			} else {
+				got = e.startPoll(v, reader, v.head().Seq)
+				p.armed.Store(true)
+				// The commit wakes the poll, which builds a page holding it.
+				e.mustPost(v, writer, v.normal(A, 1, 10))
+			}
+			p.waitPaused(t)
+			e.mustPost(v, writer, v.checkpoint(A))
+			close(p.resumed)
+			r := waitResp(t, got)
+			wantCode(t, r, 401, "unauthorized", "a page built before the checkpoint")
+			if strings.Contains(string(r.body), "entries") {
+				t.Errorf("the 401 carries data: %s", r.body)
+			}
+		})
+	}
+	t.Run("expired at shutdown", func(t *testing.T) {
+		e := newEnv(t)
+		v := newVault(t, "a@example.com")
+		e.publish(v)
+		poll := e.startPoll(v, e.session(v, v.dev(0)), v.head().Seq)
+		e.clock.advance(SessionTTL)
+		e.srv.Close()
+		r := waitResp(t, poll)
+		wantCode(t, r, 401, "unauthorized", "a poll woken by shutdown after its session expired")
+		if strings.Contains(string(r.body), "entries") {
+			t.Errorf("the 401 carries data: %s", r.body)
+		}
+	})
+	t.Run("valid at shutdown", func(t *testing.T) {
+		e := newEnv(t)
+		v := newVault(t, "a@example.com")
+		e.publish(v)
+		poll := e.startPoll(v, e.session(v, v.dev(0)), v.head().Seq)
+		e.srv.Close()
+		var p logPage
+		e.must(waitResp(t, poll), 200, &p)
+		if len(p.Entries) != 0 || p.Head != v.head() {
+			t.Errorf("shutdown answer %+v", p)
+		}
+	})
+}
+
+// R14: a write takes a validation slot before any of its body is decoded,
+// so with every slot and queue position taken another write gets a 429
+// and is never parsed.
+func TestValidationSlotBeforeParsing(t *testing.T) {
+	var prepares atomic.Int64
+	entered, release := make(chan struct{}, 2), make(chan struct{})
+	e := newEnv(t, withLimits(func(l *Limits) { l.ValidationJobs, l.ValidationQueue = 1, 1 }), withHooks(func(s *Server) {
+		s.hooks.prepare = func() { prepares.Add(1) }
+		s.hooks.validating = func() {
+			entered <- struct{}{}
+			<-release
+		}
+	}))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	tok := e.session(v, v.dev(0))
+	w := v.normal(v.dev(0), 1, 10)
+	base := prepares.Load()
+
+	first, second := make(chan resp, 1), make(chan resp, 1)
+	go func() { first <- e.post(v, tok, w) }()
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the first write never took the slot")
+	}
+	go func() { second <- e.post(v, tok, w) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		e.srv.validate.mu.Lock()
+		n := e.srv.validate.waiting
+		e.srv.validate.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the second write never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	wantCode(t, e.post(v, tok, w), 429, "busy", "a write with the slot and the queue full")
+	if n := prepares.Load() - base; n != 0 {
+		t.Errorf("%d wires prepared while every slot was held", n)
+	}
+	close(release)
+	wantStatus(t, waitResp(t, first), 200, "the write holding the slot")
+	wantStatus(t, waitResp(t, second), 200, "the queued write")
+	if n := prepares.Load() - base; n != 2 {
+		t.Errorf("%d wires prepared, want the 2 admitted ones", n)
+	}
+}
+
+// R14 collection limits refuse a write from a scan of its bytes, before
+// the strict decoder or prepare runs.
+func TestCollectionLimitsBeforeParsing(t *testing.T) {
+	var prepares atomic.Int64
+	e := newEnv(t, withHooks(func(s *Server) { s.hooks.prepare = func() { prepares.Add(1) } }))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	tok := e.session(v, v.dev(0))
+	base := prepares.Load()
+	many := func(n int) string { return "[" + strings.Repeat(`{"a":[1,"]"]},`, n-1) + `{}]` }
+	for name, body := range map[string]string{
+		"8,193 ops":      `{"wire":{"entry":{"ops":` + many(8193) + `},"sigs":[],"objects":[]}}`,
+		"16,385 objects": `{"wire":{"entry":{"ops":[]},"sigs":[],"objects":` + many(16385) + `}}`,
+	} {
+		wantCode(t, e.do("POST", logPath(v), tok, []byte(body)), 413, "too_large", name)
+	}
+	// At the limits the scan passes, and the decoder rejects the shape.
+	wantCode(t, e.do("POST", logPath(v), tok, []byte(`{"wire":{"entry":{"ops":`+many(8192)+`},"sigs":[],"objects":`+many(16384)+`}}`)),
+		400, "invalid_entry", "a malformed wire at the limits")
+	if n := prepares.Load() - base; n != 0 {
+		t.Errorf("%d wires prepared", n)
+	}
+	code := e.invite("b@example.com")
+	wires := `{"email":"b@example.com","registration_code":"` + code + `","challenge":"","pop_sig":"","wires":[` +
+		strings.Repeat(`{},`, 16384) + `{}]}`
+	wantCode(t, e.do("POST", "/v1/signup", "", []byte(wires)), 413, "too_large", "16,385 signup wires")
+	ops := `{"email":"b@example.com","registration_code":"` + code + `","challenge":"","pop_sig":"","wires":[{},` +
+		`{"entry":{"ops":` + many(8193) + `}}]}`
+	wantCode(t, e.do("POST", "/v1/signup", "", []byte(ops)), 413, "too_large", "a signup wire with 8,193 ops")
+}
+
+func TestArrayLens(t *testing.T) {
+	type got struct {
+		path string
+		n    int
+	}
+	var out []got
+	arrayLens([]byte(` {"a":[1, [2,3], {"b":[]}, "x]\\\",[" ], "c":{"d":[ {} ,{"e":[1]}]}}`), func(path []string, n int) bool {
+		out = append(out, got{strings.Join(path, "."), n})
+		return true
+	})
+	want := []got{{"a", 2}, {"a.b", 0}, {"a", 4}, {"c.d.e", 1}, {"c.d", 2}}
+	if len(out) != len(want) {
+		t.Fatalf("arrays %v, want %v", out, want)
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Errorf("arrays %v, want %v", out, want)
+			break
+		}
+	}
+}
+
+// Cursors anywhere in the u64 range: a page after the head is empty, and an
+// entry past 2^63-1 is absent, never a 500. wait is compared before it
+// becomes a duration, so values that would overflow are refused.
+func TestLargeCursorsAndWaits(t *testing.T) {
+	e := newEnv(t)
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	tok := e.session(v, v.dev(0))
+	for _, after := range []string{"9223372036854775807", "9223372036854775808", "18446744073709551615"} {
+		for _, wait := range []string{"", "&wait=55"} {
+			r, p := e.readLog(v, tok, "?after="+after+wait)
+			if r.status != 200 || len(p.Entries) != 0 || p.Head != v.head() {
+				t.Errorf("after=%s%s: %s", after, wait, r)
+			}
+		}
+		wantCode(t, e.do("GET", "/v1/vaults/"+v.vaultID().String()+"/entries/"+after, tok, nil), 404, "not_found", "entry "+after)
+	}
+	wantCode(t, e.do("GET", logPath(v)+"?after=18446744073709551616", tok, nil), 400, "bad_request", "after = 2^64")
+	wantCode(t, e.do("GET", "/v1/vaults/"+v.vaultID().String()+"/entries/18446744073709551616", tok, nil), 404, "not_found", "entry 2^64")
+	for _, wait := range []string{"56", "18446744074", "9223372036854775808", "18446744073709551615", "18446744073709551616"} {
+		wantCode(t, e.do("GET", logPath(v)+"?wait="+wait, tok, nil), 400, "bad_request", "wait="+wait)
+	}
+	r, _ := e.readLog(v, tok, "?wait=0")
+	wantStatus(t, r, 200, "wait=0")
 }

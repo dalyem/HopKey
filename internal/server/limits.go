@@ -113,14 +113,22 @@ func DefaultRates() Rates {
 	}
 }
 
-// rateLimiter holds token buckets by key. Its key storage is bounded: when
-// it is full, buckets that have refilled completely (and so carry no
-// information) are dropped first, then arbitrary ones.
+// rateLimiter holds token buckets by scope and key. Its key storage is
+// bounded, and it never forgets a bucket that is still refilling, since
+// that would hand the key a fresh bucket. When the store is full, buckets
+// that have refilled completely (and so carry no information) are dropped.
+// If none has, a new key shares its scope's overflow bucket, at the same
+// rate, until one has: the overflow is never more permissive than a bucket
+// of its own, and a full store cannot be used to escape a limit.
 type rateLimiter struct {
-	mu      sync.Mutex
-	now     func() time.Time
-	max     int
-	buckets map[string]*bucket
+	mu       sync.Mutex
+	now      func() time.Time
+	max      int
+	buckets  map[string]*bucket
+	overflow map[string]*bucket // by scope; there are few scopes
+	// nextFull is the earliest time a stored bucket can have refilled, so
+	// a full store is not rescanned on every new key before then.
+	nextFull time.Time
 }
 
 type bucket struct {
@@ -130,7 +138,7 @@ type bucket struct {
 }
 
 func newRateLimiter(now func() time.Time, max int) *rateLimiter {
-	return &rateLimiter{now: now, max: max, buckets: map[string]*bucket{}}
+	return &rateLimiter{now: now, max: max, buckets: map[string]*bucket{}, overflow: map[string]*bucket{}}
 }
 
 func (b *bucket) refill(now time.Time) {
@@ -143,21 +151,35 @@ func (b *bucket) refill(now time.Time) {
 	b.last = now
 }
 
-// allow takes one token from the bucket key, created full at rate r.
-func (l *rateLimiter) allow(key string, r Rate) bool {
+// fullAt is when b will have refilled completely.
+func (b *bucket) fullAt() time.Time {
+	missing := float64(b.rate.N) - b.tokens
+	return b.last.Add(time.Duration(missing / float64(b.rate.N) * float64(b.rate.Per)))
+}
+
+// allow takes one token from the bucket of key in scope, created full at
+// rate r. scope names the route and bucket kind, such as
+// "POST /v1/login|account".
+func (l *rateLimiter) allow(scope, key string, r Rate) bool {
 	if r.N <= 0 {
 		return true
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	b, ok := l.buckets[key]
+	k := scope + "|" + key
+	b, ok := l.buckets[k]
 	if !ok {
 		if len(l.buckets) >= l.max {
 			l.evict(now)
 		}
-		b = &bucket{tokens: float64(r.N), last: now, rate: r}
-		l.buckets[key] = b
+		if len(l.buckets) < l.max {
+			b = &bucket{tokens: float64(r.N), last: now, rate: r}
+			l.buckets[k] = b
+		} else if b = l.overflow[scope]; b == nil {
+			b = &bucket{tokens: float64(r.N), last: now, rate: r}
+			l.overflow[scope] = b
+		}
 	}
 	b.refill(now)
 	if b.tokens < 1 {
@@ -167,18 +189,25 @@ func (l *rateLimiter) allow(key string, r Rate) bool {
 	return true
 }
 
+// evict drops the buckets that have refilled completely. When it finds
+// none, it records when the first one will have.
 func (l *rateLimiter) evict(now time.Time) {
+	if now.Before(l.nextFull) {
+		return
+	}
+	var next time.Time
 	for k, b := range l.buckets {
 		b.refill(now)
 		if b.tokens >= float64(b.rate.N) {
 			delete(l.buckets, k)
+			continue
+		}
+		if t := b.fullAt(); next.IsZero() || t.Before(next) {
+			next = t
 		}
 	}
-	for k := range l.buckets {
-		if len(l.buckets) < l.max {
-			return
-		}
-		delete(l.buckets, k)
+	if len(l.buckets) >= l.max {
+		l.nextFull = next
 	}
 }
 

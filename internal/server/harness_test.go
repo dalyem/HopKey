@@ -78,10 +78,17 @@ func unlimitedRates() *Rates {
 	return &Rates{r, r, r, r, r, r, r}
 }
 
-type envOpt func(*Config)
+// envConfig is what envOpts set: the server's Config, and test hooks
+// installed before the server takes its first request.
+type envConfig struct {
+	Config
+	hooks []func(*Server)
+}
+
+type envOpt func(*envConfig)
 
 func withLimits(f func(*Limits)) envOpt {
-	return func(c *Config) {
+	return func(c *envConfig) {
 		l := DefaultLimits()
 		if c.Limits != nil {
 			l = *c.Limits
@@ -91,14 +98,18 @@ func withLimits(f func(*Limits)) envOpt {
 	}
 }
 
-func withRates(r Rates) envOpt { return func(c *Config) { c.Rates = &r } }
+func withRates(r Rates) envOpt { return func(c *envConfig) { c.Rates = &r } }
 
 func withProxies(p ...string) envOpt {
-	return func(c *Config) {
+	return func(c *envConfig) {
 		for _, s := range p {
 			c.TrustedProxies = append(c.TrustedProxies, netip.MustParsePrefix(s))
 		}
 	}
+}
+
+func withHooks(f func(*Server)) envOpt {
+	return func(c *envConfig) { c.hooks = append(c.hooks, f) }
 }
 
 func newEnv(t *testing.T, opts ...envOpt) *env {
@@ -113,15 +124,18 @@ func newEnvAt(t *testing.T, path string, opts ...envOpt) *env {
 		t.Fatal(err)
 	}
 	e := &env{t: t, st: st, clock: &clock{t: time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)}, logs: &syncBuffer{}, path: path}
-	cfg := Config{
+	cfg := envConfig{Config: Config{
 		Origin: testOrigin, Store: st, Now: e.clock.now, Rates: unlimitedRates(),
 		Logger: slog.New(slog.NewTextHandler(e.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-	}
+	}}
 	for _, o := range opts {
 		o(&cfg)
 	}
-	if e.srv, err = New(context.Background(), cfg); err != nil {
+	if e.srv, err = New(context.Background(), cfg.Config); err != nil {
 		t.Fatal(err)
+	}
+	for _, h := range cfg.hooks {
+		h(e.srv)
 	}
 	e.ts = httptest.NewServer(e.srv.Handler())
 	t.Cleanup(func() {

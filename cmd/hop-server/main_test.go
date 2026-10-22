@@ -63,6 +63,39 @@ func TestParseTTL(t *testing.T) {
 	}
 }
 
+func TestParseSize(t *testing.T) {
+	for in, want := range map[string]int64{"1": 1, "4096": 4096, "512MiB": 512 << 20, "2GiB": 2 << 30, "1TiB": 1 << 40, "8KiB": 8 << 10} {
+		if got, err := parseSize(in); err != nil || got != want {
+			t.Errorf("parseSize(%q) = %d, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"", "0", "-1", "1.5GiB", "MiB", "1MB", "1 MiB", "9223372036854775807TiB", "99999999999999999999"} {
+		if _, err := parseSize(in); err == nil {
+			t.Errorf("parseSize(%q) succeeded", in)
+		}
+	}
+}
+
+// quota needs an account and a size; SetQuota itself is tested in the
+// server package.
+func TestQuotaCommand(t *testing.T) {
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"quota", "--data", dir},
+		{"quota", "a@example.com", "--data", dir},
+		{"quota", "a@example.com", "1GB", "--data", dir},
+		{"quota", "a@example.com", "1GiB"},
+	} {
+		if err := run(args, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+			t.Errorf("%v succeeded", args)
+		}
+	}
+	err := run([]string{"quota", "a@example.com", "1GiB", "--data", dir}, &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "no such account") {
+		t.Errorf("quota for an unknown account: %v", err)
+	}
+}
+
 // invite prints one code that the server accepts for exactly that email;
 // backup writes a database holding the invite.
 func TestInviteAndBackup(t *testing.T) {

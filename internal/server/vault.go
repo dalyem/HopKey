@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/hex"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -12,10 +13,6 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
-
-// entryOverhead is what R13 counts for an entry's durable metadata on top
-// of its stored wire.
-const entryOverhead = 512
 
 // headSeqReserve is the width R9 reserves for head.seq when it admits a
 // wire: 20 decimal digits, the longest u64.
@@ -81,6 +78,13 @@ func (s *Server) page(tx Tx, v *Vault, after uint64, fromStart bool) ([]byte, in
 	size := frameLen(digits(v.Head.Seq))
 	b := append([]byte(nil), pageOpen...)
 	n := 0
+	if !fromStart && after >= v.Head.Seq {
+		// Nothing follows the head; any u64 after, up to 2^64-1, gets an
+		// empty page without a query.
+		b = append(b, pageMid...)
+		b = appendHead(b, v.Head)
+		return append(b, pageClose...), 0, nil
+	}
 	err := tx.Entries(v.ID, after, fromStart, s.lim.MaxPageEntries, func(e *LogEntry) bool {
 		add := itemLen(e.Seq, len(e.Wire))
 		if n > 0 {
@@ -153,7 +157,7 @@ func (s *Server) vaultAuth(tx Tx, tok crypto.Hash, vaultID model.ID, ok bool) (*
 // accountBucket applies the per-account bucket of an authenticated
 // endpoint (R14).
 func (s *Server) accountBucket(c *call, p *principal) error {
-	if !s.limiter.allow(c.route.pattern+"|account|"+p.accountID.String(), s.rates.Account) {
+	if !s.limiter.allow(c.route.pattern+"|account", p.accountID.String(), s.rates.Account) {
 		return errRateLimited
 	}
 	return nil
@@ -162,8 +166,10 @@ func (s *Server) accountBucket(c *call, p *principal) error {
 // getLog: GET /v1/vaults/{id}/log?after=SEQ&wait=SECONDS →
 // {entries:[{seq,h,wire}], head:{seq,h}}. With nothing after after, it
 // waits up to wait seconds (at most 55) for a commit. Each wake-up
-// re-authenticates and reads in one snapshot, so a credential invalidated
-// while waiting gets a 401 with no data (R2).
+// re-authenticates and reads in one snapshot, and every response is
+// admitted by a fresh authentication immediately before it is written, so
+// a credential invalidated while the page was built or while waiting gets
+// a 401 with no data (R2).
 func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 	tok, ok := bearer(r)
 	if !ok {
@@ -185,7 +191,8 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 	var wait time.Duration
 	if vs, present := q["wait"]; present {
 		n, ok := parseU64s(vs[0])
-		if len(vs) != 1 || !ok || time.Duration(n)*time.Second > s.lim.MaxPollWait {
+		// Compare before converting: a large n overflows a Duration.
+		if len(vs) != 1 || !ok || n > uint64(s.lim.MaxPollWait/time.Second) {
 			return errBadRequest("wait")
 		}
 		wait = time.Duration(n) * time.Second
@@ -209,6 +216,26 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 		})
 		return
 	}
+	// send admits a response. The read that built body authenticated in
+	// its own snapshot, which may be older than a commit that invalidated
+	// the credential since; so authenticate again in a new read
+	// transaction. SQLite orders each read transaction wholly before or
+	// after each write transaction, so a credential whose invalidation has
+	// committed fails here, and nothing is written for it.
+	send := func(body []byte) error {
+		if h := s.hooks.beforeSend; h != nil {
+			h()
+		}
+		err := s.store.View(r.Context(), func(tx Tx) error {
+			_, err := s.vaultAuth(tx, tok, vaultID, okV)
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		writeRaw(w, http.StatusOK, body)
+		return nil
+	}
 	body, n, beyond, err := read()
 	if err != nil {
 		return err
@@ -217,8 +244,7 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 		return err
 	}
 	if n > 0 || wait == 0 || beyond {
-		writeRaw(w, http.StatusOK, body)
-		return nil
+		return send(body)
 	}
 	release, ok := s.polls.acquire(hex.EncodeToString(p.tokenHash[:]), p.accountID.String(), ipKey(c.ip))
 	if !ok {
@@ -233,8 +259,7 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 		}
 		left := time.Until(deadline)
 		if n > 0 || beyond || left <= 0 {
-			writeRaw(w, http.StatusOK, body)
-			return nil
+			return send(body)
 		}
 		if exp := p.expiresAt.Sub(s.now()); exp < left {
 			left = max(exp, 0)
@@ -245,8 +270,7 @@ func (s *Server) getLog(w http.ResponseWriter, r *http.Request, c *call) error {
 		case <-t.C:
 		case <-s.stop:
 			t.Stop()
-			writeRaw(w, http.StatusOK, body)
-			return nil
+			return send(body)
 		case <-r.Context().Done():
 			t.Stop()
 			return r.Context().Err()
@@ -272,7 +296,8 @@ func (s *Server) getEntry(w http.ResponseWriter, r *http.Request, c *call) error
 		if err := s.accountBucket(c, p); err != nil {
 			return err
 		}
-		if !okS {
+		// SQLite cannot hold a seq above 2^63-1, so no such entry exists.
+		if !okS || seq > math.MaxInt64 {
 			return errNotFound
 		}
 		e, err := tx.Entry(vaultID, seq)
@@ -328,18 +353,19 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, c *call) erro
 }
 
 // prepared is a parsed wire ready to validate and store: the wire with only
-// the supplied objects its entry names, its canonical bytes and its R13
-// cost.
+// the supplied objects its entry names, and its canonical bytes.
 type prepared struct {
 	w     *vaultlog.Wire
 	h     crypto.Hash
 	canon []byte
-	cost  int64
 }
 
 // prepare enforces the collection and size limits that need no state (R9,
 // R14) and drops supplied objects the entry does not name (R11).
 func (s *Server) prepare(w *vaultlog.Wire) (*prepared, error) {
+	if h := s.hooks.prepare; h != nil {
+		h()
+	}
 	if len(w.Entry.Ops) > s.lim.MaxOps || len(w.Objects) > s.lim.MaxObjects {
 		return nil, errTooLarge
 	}
@@ -372,7 +398,7 @@ func (s *Server) prepare(w *vaultlog.Wire) (*prepared, error) {
 	if singletonLen(w.Entry.Seq, len(canon)) > s.lim.MaxWireResponse {
 		return nil, errTooLarge
 	}
-	return &prepared{w: sw, h: h, canon: canon, cost: int64(len(canon)) + entryOverhead}, nil
+	return &prepared{w: sw, h: h, canon: canon}, nil
 }
 
 // storeObjects fetches the committed objects of one vault.
@@ -389,37 +415,13 @@ func (f storeObjects) FetchObject(h crypto.Hash) ([]byte, error) {
 	return b, err
 }
 
-// reserve is one maximum-size entry with its metadata: the size of each
-// half of the R13 recovery reserve.
-func (s *Server) reserve() int64 { return int64(s.lim.MaxWireResponse) + entryOverhead }
-
-// admits applies R13. Ordinary writes leave room for a maximum-size
-// bootstrap followed by a maximum-size checkpoint. A bootstrap may spend
-// the bootstrap half of that reserve, and a checkpoint that follows a
-// bootstrap (completing the recovery sequence) may spend the rest.
-// v is nil for a signup.
-func (s *Server) admits(a *Account, v *Vault, kind vaultlog.Kind, cost int64) bool {
-	quota := a.QuotaBytes
-	if quota <= 0 {
-		quota = s.lim.QuotaBytes
-	}
-	need := a.UsedBytes + cost
-	switch {
-	case v != nil && kind == vaultlog.KindBootstrap:
-		need += s.reserve()
-	case v != nil && kind == vaultlog.KindCheckpoint && v.LastBootstrap > v.LastCheckpoint:
-	default:
-		need += 2 * s.reserve()
-	}
-	return need <= quota
-}
-
 // applyEntry writes a validated entry and everything it determines, inside
 // the commit transaction (R2): the entry, the objects it names, its
 // devices, its departures (sessions ended, permanent receipts), and on a
 // checkpoint the end of every session of the account. deps are the
-// Departures of the entry's post-state. It updates a and v in memory;
-// setState and the caller's writes complete them.
+// Departures of the entry's post-state. It updates v in memory; the
+// caller charges a (R13), and setState and the caller's writes complete
+// both.
 func (s *Server) applyEntry(tx Tx, a *Account, v *Vault, pw *prepared, deps []vaultlog.Departure) error {
 	e := &pw.w.Entry
 	if err := tx.InsertEntry(v.ID, &LogEntry{Seq: e.Seq, H: pw.h, Kind: e.Kind, Wire: pw.canon}); err != nil {
@@ -465,24 +467,19 @@ func (s *Server) applyEntry(tx Tx, a *Account, v *Vault, pw *prepared, deps []va
 		v.LastBootstrap = int64(e.Seq)
 	}
 	v.Head = vaultlog.Head{Seq: e.Seq, H: pw.h}
-	a.UsedBytes += pw.cost
 	return nil
 }
 
 // setState records the post-state of the last applied entry: the derived
 // creds (auth and rauth hashes, salt, kdf_version, generation) and the
-// public state the next commit starts from.
-func setState(a *Account, v *Vault, post *vaultlog.PublicState) error {
+// public state the next commit starts from, serialized as ps.
+func setState(a *Account, v *Vault, post *vaultlog.PublicState, ps []byte) error {
 	creds, ok := post.Creds()
 	if !ok || post.Head() != v.Head {
 		return errors.New("server: post-state does not match the applied entries")
 	}
 	a.KDFVersion, a.Salt, a.CredGen = creds.KDFVersion, creds.Salt, creds.Gen
 	a.AuthSHA256, a.RAuthSHA256 = creds.AuthSHA256, creds.RAuthSHA256
-	ps, err := post.Marshal()
-	if err != nil {
-		return err
-	}
 	v.PublicState = ps
 	return nil
 }
@@ -513,7 +510,8 @@ type postLogRequest struct {
 // check prev against the head (409 head_conflict otherwise), ApplyPublic,
 // check the quota, then write the entry and everything derived from it. A
 // login or recovery token's one bootstrap is consumed in the same
-// transaction (R6).
+// transaction (R6). The request holds a validation slot (R14) before any
+// of its body is decoded, so a full queue refuses it with no parsing.
 func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error {
 	tok, ok := bearer(r)
 	if !ok {
@@ -531,6 +529,17 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 	if err := s.accountBucket(c, p); err != nil {
 		return err
 	}
+	release, ok := s.validate.acquire(r.Context())
+	if !ok {
+		return errBusy
+	}
+	defer release()
+	if h := s.hooks.validating; h != nil {
+		h()
+	}
+	if !s.collectionsWithin(c.body, "wire") {
+		return errTooLarge
+	}
 	var req postLogRequest
 	if err := s.decode(c.body, &req); err != nil {
 		return err
@@ -546,11 +555,6 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 	if err != nil {
 		return err
 	}
-	release, ok := s.validate.acquire(r.Context())
-	if !ok {
-		return errBusy
-	}
-	defer release()
 
 	var result vaultlog.Head
 	committed := false
@@ -591,8 +595,9 @@ func (s *Server) postLog(w http.ResponseWriter, r *http.Request, c *call) error 
 // write transaction, after the caller authorized the write: an identical
 // committed H returns that commit (committed is false); otherwise prev must
 // be the head (409 head_conflict), ApplyPublic must accept the wire against
-// the stored public state, and R13 must admit it; then the entry and
-// everything derived from it are written. The caller notifies long-polls
+// the stored public state, and R13 must admit what the commit persists;
+// then the entry and everything derived from it are written, with the
+// charge and the account's reserve state. The caller notifies long-polls
 // after the transaction commits.
 func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared) (vaultlog.Head, bool, error) {
 	old, err := tx.EntryByHash(vaultID, pw.h)
@@ -625,13 +630,26 @@ func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared) (vault
 	if err != nil {
 		return vaultlog.Head{}, false, errInvalidEntry(err)
 	}
-	if !s.admits(a, v, e.Kind, pw.cost) {
-		return vaultlog.Head{}, false, errQuota
-	}
-	if err := s.applyEntry(tx, a, v, pw, post.Departures()); err != nil {
+	ps, err := post.Marshal()
+	if err != nil {
 		return vaultlog.Head{}, false, err
 	}
-	if err := setState(a, v, post); err != nil {
+	deps := post.Departures()
+	cost, err := entryCost(pw, len(deps), txStored{tx, vaultID, accountID})
+	if err != nil {
+		return vaultlog.Head{}, false, err
+	}
+	cost += int64(len(ps)) - int64(len(v.PublicState))
+	reserve, ok := s.admit(a, v, e.Kind, cost)
+	if !ok {
+		return vaultlog.Head{}, false, errQuota
+	}
+	if err := s.applyEntry(tx, a, v, pw, deps); err != nil {
+		return vaultlog.Head{}, false, err
+	}
+	a.UsedBytes += cost
+	a.Reserve = reserve
+	if err := setState(a, v, post, ps); err != nil {
 		return vaultlog.Head{}, false, err
 	}
 	if err := tx.UpdateVault(v); err != nil {

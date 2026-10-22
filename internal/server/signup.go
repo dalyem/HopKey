@@ -9,6 +9,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
 
@@ -174,6 +175,9 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request, c *call) error {
 	if err != nil {
 		return err
 	}
+	if !s.collectionsWithin(body, "wires") {
+		return errTooLarge
+	}
 	var req signupRequest
 	if err := s.decode(body, &req); err != nil {
 		return err
@@ -223,9 +227,11 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request, c *call) error {
 	}
 
 	// Validate the whole publication from empty state, keeping only what
-	// the commit needs: each entry's departures and the final state.
+	// the commit needs: each entry's departures, the final state and the
+	// R13 charge, in which each object counts once.
 	deps := make([][]vaultlog.Departure, len(pws))
 	objs := vaultlog.ObjectMap{}
+	have := pubStored{objs, map[model.ID]bool{}}
 	var cost int64
 	var final *vaultlog.PublicState
 	for i, pw := range pws {
@@ -236,12 +242,26 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request, c *call) error {
 		if i > 0 && (post.VaultID() != final.VaultID() || post.AccountID() != final.AccountID()) {
 			return errBadRequest("the publication changes its account or vault")
 		}
+		deps[i], final = post.Departures(), post
+		c, err := entryCost(pw, len(deps[i]), have)
+		if err != nil {
+			return err
+		}
+		cost += c
 		for _, o := range pw.w.Objects {
 			objs[o.SHA256] = o.Body
 		}
-		deps[i], final = post.Departures(), post
-		cost += pw.cost
+		for _, op := range pw.w.Entry.Ops {
+			if d, ok := op.(*vaultlog.DeviceAddOp); ok {
+				have.devices[d.Cert.DeviceID] = true
+			}
+		}
 	}
+	ps, err := final.Marshal()
+	if err != nil {
+		return err
+	}
+	cost += int64(len(ps))
 	head := final.Head()
 	acct, _ := final.Account()
 	pop := &crypto.SignupPoP{
@@ -279,7 +299,7 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request, c *call) error {
 		}
 		a := &Account{ID: final.AccountID(), Email: email, VaultID: final.VaultID(), CreatedAt: now}
 		v := &Vault{ID: final.VaultID(), AccountID: a.ID, LastBootstrap: -1}
-		if !s.admits(a, nil, "", cost) {
+		if _, ok := s.admit(a, nil, "", cost); !ok {
 			return errQuota
 		}
 		// The rows exist first (the log references them) and are completed
@@ -296,7 +316,8 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request, c *call) error {
 				return err
 			}
 		}
-		if err := setState(a, v, final); err != nil {
+		a.UsedBytes = cost
+		if err := setState(a, v, final, ps); err != nil {
 			return err
 		}
 		if err := tx.UpdateVault(v); err != nil {

@@ -116,7 +116,37 @@ type Account struct {
 	CredGen     uint32 // creds.gen
 	UsedBytes   int64  // R13 accounting
 	QuotaBytes  int64  // 0: the server default
+	Reserve     ReserveState
 	CreatedAt   time.Time
+}
+
+// ReserveState is how much of the R13 recovery reserve an account has
+// spent. Only an operator raising the quota (SetQuota) returns an account
+// to ReserveIntact.
+type ReserveState int
+
+const (
+	// ReserveIntact: no write has spent the reserve.
+	ReserveIntact ReserveState = iota
+	// ReserveBootstrapSpent: a bootstrap was admitted on the reserve's
+	// bootstrap half. Only the checkpoint that completes the recovery may
+	// spend the rest.
+	ReserveBootstrapSpent
+	// ReserveExhausted: a checkpoint completed a recovery on the reserve.
+	// The capacity-exhausted state: no write may spend the reserve again.
+	ReserveExhausted
+)
+
+func (r ReserveState) String() string {
+	switch r {
+	case ReserveIntact:
+		return "intact"
+	case ReserveBootstrapSpent:
+		return "bootstrap-spent"
+	case ReserveExhausted:
+		return "exhausted"
+	}
+	return "unknown"
 }
 
 // Vault is a vault's head and the public state at that head.

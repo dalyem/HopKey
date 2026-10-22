@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,7 +21,7 @@ import (
 
 // schemaVersion is stored in meta; Open refuses a database from a newer
 // server.
-const schemaVersion = "1"
+const schemaVersion = "2"
 
 // schema is the multi-tenant SQLite schema. IDs and digests are BLOBs of
 // their raw bytes; times are Unix seconds.
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 	cred_gen     INTEGER NOT NULL,
 	used_bytes   INTEGER NOT NULL,
 	quota_bytes  INTEGER NOT NULL,
+	reserve      INTEGER NOT NULL,
 	created_at   INTEGER NOT NULL
 ) STRICT;
 
@@ -304,13 +306,13 @@ func (t *sqliteTx) SetMeta(key string, v []byte) error {
 	return t.exec(`INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`, key, v)
 }
 
-const accountCols = `account_id, email, vault_id, kdf_version, salt, auth_sha256, rauth_sha256, cred_gen, used_bytes, quota_bytes, created_at`
+const accountCols = `account_id, email, vault_id, kdf_version, salt, auth_sha256, rauth_sha256, cred_gen, used_bytes, quota_bytes, reserve, created_at`
 
 func (t *sqliteTx) scanAccount(r *sql.Row) (*Account, error) {
 	var a Account
 	var id, vid, auth, rauth []byte
 	var created int64
-	err := r.Scan(&id, &a.Email, &vid, &a.KDFVersion, &a.Salt, &auth, &rauth, &a.CredGen, &a.UsedBytes, &a.QuotaBytes, &created)
+	err := r.Scan(&id, &a.Email, &vid, &a.KDFVersion, &a.Salt, &auth, &rauth, &a.CredGen, &a.UsedBytes, &a.QuotaBytes, &a.Reserve, &created)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -338,15 +340,15 @@ func (t *sqliteTx) AccountTaken(id model.ID, email string, vaultID model.ID) (bo
 }
 
 func (t *sqliteTx) InsertAccount(a *Account) error {
-	return t.exec(`INSERT INTO accounts (`+accountCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	return t.exec(`INSERT INTO accounts (`+accountCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.ID[:], a.Email, a.VaultID[:], a.KDFVersion, a.Salt, a.AuthSHA256[:], a.RAuthSHA256[:],
-		a.CredGen, a.UsedBytes, a.QuotaBytes, unix(a.CreatedAt))
+		a.CredGen, a.UsedBytes, a.QuotaBytes, a.Reserve, unix(a.CreatedAt))
 }
 
 func (t *sqliteTx) UpdateAccount(a *Account) error {
 	return t.exec(`UPDATE accounts SET kdf_version = ?, salt = ?, auth_sha256 = ?, rauth_sha256 = ?,
-		cred_gen = ?, used_bytes = ?, quota_bytes = ? WHERE account_id = ?`,
-		a.KDFVersion, a.Salt, a.AuthSHA256[:], a.RAuthSHA256[:], a.CredGen, a.UsedBytes, a.QuotaBytes, a.ID[:])
+		cred_gen = ?, used_bytes = ?, quota_bytes = ?, reserve = ? WHERE account_id = ?`,
+		a.KDFVersion, a.Salt, a.AuthSHA256[:], a.RAuthSHA256[:], a.CredGen, a.UsedBytes, a.QuotaBytes, a.Reserve, a.ID[:])
 }
 
 func (t *sqliteTx) Vault(id model.ID) (*Vault, error) {
@@ -384,7 +386,13 @@ func scanEntry(sc interface{ Scan(...any) error }) (*LogEntry, error) {
 	return &e, scanHash(h, &e.H)
 }
 
+// Entry and Entries take any u64 seq. SQLite integers are signed 64-bit,
+// so no stored seq exceeds math.MaxInt64, and a larger one cannot be bound
+// as a parameter.
 func (t *sqliteTx) Entry(vaultID model.ID, seq uint64) (*LogEntry, error) {
+	if seq > math.MaxInt64 {
+		return nil, ErrNotFound
+	}
 	return scanEntry(t.row(`SELECT seq, h, kind, wire FROM log WHERE vault_id = ? AND seq = ?`, vaultID[:], seq))
 }
 
@@ -393,6 +401,9 @@ func (t *sqliteTx) EntryByHash(vaultID model.ID, h crypto.Hash) (*LogEntry, erro
 }
 
 func (t *sqliteTx) Entries(vaultID model.ID, after uint64, fromStart bool, limit int, fn func(*LogEntry) bool) error {
+	if !fromStart && after >= math.MaxInt64 {
+		return nil
+	}
 	q := `SELECT seq, h, kind, wire FROM log WHERE vault_id = ? AND seq > ? ORDER BY seq LIMIT ?`
 	args := []any{vaultID[:], after, limit}
 	if fromStart {

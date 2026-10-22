@@ -52,7 +52,7 @@ func (s *Server) prelogin(w http.ResponseWriter, r *http.Request, c *call) error
 	if err != nil {
 		return errBadRequest("invalid email")
 	}
-	if !s.limiter.allow(c.route.pattern+"|email|"+email, s.rates.PreloginEmail) {
+	if !s.limiter.allow(c.route.pattern+"|email", email, s.rates.PreloginEmail) {
 		return errRateLimited
 	}
 	resp := preloginResponse{KDFVersion: 1, Salt: s.synthetic(labelSyntheticSalt, email)}
@@ -117,7 +117,7 @@ func (s *Server) issueLoginToken(w http.ResponseWriter, r *http.Request, c *call
 	if len(secret) != 32 || accountID.IsZero() {
 		return errBadRequest("request does not match the schema")
 	}
-	if !s.limiter.allow(c.route.pattern+"|account|"+accountID.String(), s.rates.LoginAccount) {
+	if !s.limiter.allow(c.route.pattern+"|account", accountID.String(), s.rates.LoginAccount) {
 		return errRateLimited
 	}
 	tok, tokHash, err := newSecret()
@@ -190,7 +190,7 @@ func (s *Server) authChallenge(w http.ResponseWriter, r *http.Request, c *call) 
 	if req.Operation != crypto.OperationSession && req.Operation != crypto.OperationRetireStatus {
 		return errBadRequest("unknown operation")
 	}
-	if !s.limiter.allow(c.route.pattern+"|device|"+req.AccountID.String()+"/"+req.DeviceID.String(), s.rates.Device) {
+	if !s.limiter.allow(c.route.pattern+"|device", req.AccountID.String()+"/"+req.DeviceID.String(), s.rates.Device) {
 		return errRateLimited
 	}
 	ch, chHash, err := newChallenge()
@@ -260,8 +260,9 @@ type sessionResponse struct {
 // every commit (R2): the challenge must be a device challenge for operation
 // "session", bound to this account and device and to the configured
 // origin, and unexpired; the device must be active; the signature must
-// verify over the object rebuilt from the bound values (R5). Only then is
-// the challenge consumed and the session issued.
+// verify over the object rebuilt from the bound values (R5); and the
+// account's bucket must admit the request (R14). Only then is the
+// challenge consumed and the session issued, so a refusal changes nothing.
 func (s *Server) authSession(w http.ResponseWriter, r *http.Request, c *call) error {
 	var req sessionRequest
 	if err := s.decode(c.body, &req); err != nil {
@@ -306,6 +307,11 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request, c *call) er
 		if crypto.VerifyDeviceAuth(ed25519.PublicKey(d.SigPK), obj, req.Sig) != nil {
 			return errUnauthorized
 		}
+		// The signature established the account; its bucket must admit the
+		// request before anything is consumed or issued.
+		if !s.limiter.allow(c.route.pattern+"|account", ch.AccountID.String(), s.rates.Account) {
+			return errRateLimited
+		}
 		a, err := tx.Account(ch.AccountID)
 		if err != nil {
 			return err
@@ -322,9 +328,6 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request, c *call) er
 	})
 	if err != nil {
 		return err
-	}
-	if !s.limiter.allow(c.route.pattern+"|account|"+req.AccountID.String(), s.rates.Account) {
-		return errRateLimited
 	}
 	writeJSON(w, http.StatusOK, resp)
 	return nil

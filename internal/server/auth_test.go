@@ -341,21 +341,68 @@ func TestQueueRefusesWhenFull(t *testing.T) {
 	}
 }
 
+// The limiter's key store is bounded, but churning keys never replenishes
+// a bucket that is still refilling: while no stored bucket has refilled,
+// new keys share one overflow bucket per scope (R14).
 func TestRateLimiterBoundsKeys(t *testing.T) {
 	c := &clock{t: time.Unix(0, 0)}
 	l := newRateLimiter(c.now, 8)
 	r := Rate{N: 1, Per: time.Hour}
+	if !l.allow("s", "a", r) || l.allow("s", "a", r) {
+		t.Error("a bucket of 1 per hour")
+	}
 	for i := range 100 {
-		l.allow("k"+itoa(uint64(i)), r)
+		l.allow("s", "k"+itoa(uint64(i)), r)
 	}
 	if len(l.buckets) > 8 {
 		t.Errorf("%d buckets kept, max 8", len(l.buckets))
 	}
-	if !l.allow("a", r) || l.allow("a", r) {
-		t.Error("a bucket of 1 per hour")
+	if l.allow("s", "a", r) {
+		t.Error("key churn replenished an exhausted bucket")
+	}
+	if l.allow("s", "new", r) {
+		t.Error("a new key in a full store escaped the scope's overflow bucket")
+	}
+	if !l.allow("other", "new", r) {
+		t.Error("another scope shares the overflow bucket")
 	}
 	c.advance(time.Hour)
-	if !l.allow("a", r) {
+	if !l.allow("s", "a", r) {
 		t.Error("the bucket did not refill")
 	}
+	if !l.allow("s", "new", r) || l.allow("s", "new", r) {
+		t.Error("after the buckets refilled, a new key did not get a bucket of its own")
+	}
+	if len(l.buckets) > 8 {
+		t.Errorf("%d buckets kept, max 8", len(l.buckets))
+	}
+}
+
+// A session request refused by the account bucket consumes nothing: the
+// challenge stays valid and no session is stored (R14).
+func TestSessionRateLimitChangesNothing(t *testing.T) {
+	rates := *unlimitedRates()
+	rates.Account = Rate{N: 1, Per: 30 * time.Second}
+	e := newEnv(t, withRates(rates))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	A := v.dev(0)
+	e.session(v, A)
+	sessions := e.count(`SELECT COUNT(*) FROM sessions`)
+	chal := e.newChallenge(v, A, "session")
+	sig := e.signAuth(v, A, "session", testOrigin, chal)
+	wantCode(t, e.sessionResp(v, A, chal, sig), 429, "rate_limited", "a session over the account bucket")
+	if n := e.count(`SELECT COUNT(*) FROM sessions`); n != sessions {
+		t.Errorf("%d sessions after the refusal, %d before", n, sessions)
+	}
+	h := crypto.SHA256(chal)
+	if e.count(`SELECT COUNT(*) FROM challenges WHERE hash = ?`, h[:]) != 1 {
+		t.Error("the refused request consumed the challenge")
+	}
+	// Once the bucket refills, the same challenge still issues a session.
+	e.clock.advance(30 * time.Second)
+	var sr sessionResponse
+	e.must(e.sessionResp(v, A, chal, sig), 200, &sr)
+	r, _ := e.readLog(v, sr.AccessToken, "")
+	wantStatus(t, r, 200, "the session issued after the refusal")
 }
