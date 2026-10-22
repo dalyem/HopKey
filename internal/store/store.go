@@ -8,9 +8,11 @@
 // Layout, under the data directory ($XDG_DATA_HOME/hop, else
 // ~/.local/share/hop), every directory 0700 and every file 0600:
 //
-//	device.json                which device key store is in use, this device's ID and
-//	                           stale devices to revoke (no secrets)
+//	device.json                which device key store is in use, this device's ID, a pending
+//	                           device (a password unlock's, or SignIn's), stale devices to
+//	                           revoke, a login merge's destination device (no secrets)
 //	device.key                 the device key, when the file store is used (§11)
+//	device.next.key            a login merge's destination device key, file store (mergefile.go)
 //	vault/owner.lock           held by the one process that has the vault open
 //	vault/lock                 the writer lock
 //	vault/entries/<seq>.json   signed entries (the wire without its objects), append-only
@@ -19,10 +21,14 @@
 //	vault/account.json         account_id, salt, kdf_version, pw_blob, rk_blob, verifier hashes
 //	vault/journal/<seq>.json   checkpoint candidates, sealed to the device key (§10.1)
 //	vault/wal.json             the write-ahead journal of a multi-file commit (wal.go)
-//	vault/server.json          present in a server-backed vault (§11.1)
+//	vault/server.json          present in a server-backed vault (§11.1): its server, the sign-in
+//	                           email, and a recovery's due checkpoint (outbox.go)
 //	vault/outbox/<n>.json      outbox records, sealed under local_key (outbox.go)
 //	vault/outbox.json          the outbox counter
 //	vault/revoked.json         present once a checkpoint revoked this device (§5.5)
+//	vault/publish.json         a pending publication, sealed under local_key (publish.go)
+//	vault/retire.json          a logout in progress: RETIRING or RETIRED (retire.go)
+//	vault/merge.json           a login merge's journal and import bundle, sealed (mergefile.go)
 //
 // device.json names this device and, while a password unlock is enrolling
 // one, its pending replacement; only those two are ever a source of the
@@ -110,7 +116,9 @@ var (
 	// unlocked vault. It is for a lost device key, so it runs only locked.
 	ErrAlreadyUnlocked = errors.New("store: the vault is already unlocked; hop lock first to replace the device key with the password")
 
-	errClosed = errors.New("store: the vault store is closed")
+	// ErrClosed means the Store is closed, or closing: Close refuses every
+	// operation that would wait on the server once it has begun.
+	ErrClosed = errors.New("store: the vault store is closed")
 
 	errLocked = fmt.Errorf("%w; run hop unlock", model.ErrLocked)
 )
@@ -157,6 +165,15 @@ type Info struct {
 	// StaleDevices counts devices this machine enrolled and lost the key
 	// of (password unlocks), still active in the log until hop passwd.
 	StaleDevices int `json:"stale_devices,omitempty"`
+	// Publishing means a publication is journaled and not resolved yet
+	// (§4.3): local appends are refused until it finishes.
+	Publishing bool `json:"publishing,omitempty"`
+	// Logout is the state of a logout in progress, StateRetiring or
+	// StateRetired (§11.1).
+	Logout string `json:"logout,omitempty"`
+	// Merge is the state of a login merge in progress (§4.4), or "present"
+	// while the vault is locked and its journal can't be read.
+	Merge string `json:"merge,omitempty"`
 	// Warnings are for the user, one sentence each.
 	Warnings []string `json:"warnings,omitempty"`
 }
@@ -192,8 +209,11 @@ type Store struct {
 	// server says the vault is server-backed (vault/server.json).
 	server bool
 	// syncMu serializes Pull and PushHead. Neither holds mu while it waits
-	// on the server.
+	// on the server. Take it with lockSync.
 	syncMu sync.Mutex
+	// closing is set, under mu, once Close begins: lockSync refuses from
+	// then on, and trackRequest returns contexts already cancelled.
+	closing bool
 	// gen is the generation (Generation): it counts unlocks, locks,
 	// self-locks and revocations. A pull or push started in an earlier
 	// generation discards its result (§11.2); cancels are its in-flight
@@ -204,6 +224,9 @@ type Store struct {
 	// syncHalt is the error that stopped syncing (an equivocation or a
 	// rule violation in a server entry).
 	syncHalt error
+	// pubAlarm is the equivocation the last publication resolution found
+	// (§4.3, §5.6); the publication stays pending.
+	pubAlarm error
 	// revoked is set for good once a checkpoint revokes this device
 	// (§5.5, revoke): it wraps ErrDeviceRevoked. revokedC is closed then
 	// (Revoked), and isRevoked set (IsRevoked).
@@ -214,6 +237,9 @@ type Store struct {
 	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
 	testHook func(stage string) error // simulates crashes in tests
+	// testSignIn sees a merge sign-in's secrets once its device record is
+	// made, so tests can check they are zeroed.
+	testSignIn func(o *signInSecrets)
 }
 
 var _ model.Store = (*Store)(nil)
@@ -273,7 +299,14 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := s.own(); err != nil {
 		return nil, err
 	}
-	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) && !errors.Is(err, ErrKeyStoreUnavailable) {
+	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) &&
+		!errors.Is(err, ErrKeyStoreUnavailable) && !errors.Is(err, ErrLoggingOut) {
+		s.Close()
+		return nil, err
+	}
+	// A logout in progress (§11.1): RETIRING stays locked until Logout
+	// resolves it; RETIRED resumes its cleanup here.
+	if err := s.openRetirement(); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -295,7 +328,24 @@ func (s *Store) own() error {
 
 // Close drops every secret from memory and gives up the vault, so another
 // Open can take it. The Store cannot be unlocked again.
+//
+// It cancels the requests in flight first, and then waits for the
+// operations that made them (every one that waits on a server holds
+// syncMu) to return before it gives up vault/owner.lock: one that met a
+// revocation records it while this Store still owns the vault, so no other
+// owner can install or use the revoked device meanwhile.
+//
+// Once it has begun, every operation that would wait on the server (each
+// takes syncMu with lockSync) refuses with ErrClosed, including one already
+// queued for syncMu, so none starts work Close could not cancel.
 func (s *Store) Close() error {
+	s.mu.Lock()
+	s.closing = true
+	s.dropLocked(nil)
+	s.mu.Unlock()
+	s.hook("close:drain")
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropLocked(nil)
@@ -305,6 +355,20 @@ func (s *Store) Close() error {
 	err := s.owner.Close()
 	s.owner = nil
 	return err
+}
+
+// lockSync takes syncMu, or returns ErrClosed (without it) once Close has
+// begun. The caller releases syncMu.
+func (s *Store) lockSync() error {
+	s.syncMu.Lock()
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing {
+		s.syncMu.Unlock()
+		return ErrClosed
+	}
+	return nil
 }
 
 // lockFile takes the vault's writer lock. Every write, and every unlock
@@ -344,6 +408,7 @@ func (s *Store) dropLocked(reason error) {
 	if s.rec != nil {
 		s.rec.zero()
 	}
+	zeroDevice(s.dev)
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
 	s.lockErr = reason
@@ -390,17 +455,73 @@ func (s *Store) Unlock(ctx context.Context) error {
 }
 
 func (s *Store) unlockLocked() error {
+	v, unlock, err := s.loadVault(false)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	s.state, s.sec, s.dev, s.rec, s.repaired, s.server = v.st, v.sec, v.dev, v.rec, v.repaired, v.server
+	s.gen.Add(1)
+	return s.finishUnlock()
+}
+
+// loaded is the vault as loadVault verified it, not yet installed.
+type loaded struct {
+	rec      *deviceRecord
+	dev      *vaultlog.LocalDevice
+	st       *vaultlog.State
+	sec      *vaultlog.Secrets
+	repaired string
+	server   bool
+}
+
+// zero drops the loaded secrets.
+func (v *loaded) zero() {
+	if v.sec != nil {
+		if v.sec.Account != nil {
+			v.sec.Account.Zero()
+		}
+		v.sec.VK.Zero()
+		for id := range v.sec.Items {
+			p := v.sec.Items[id]
+			p.IK.Zero()
+			delete(v.sec.Items, id)
+		}
+	}
+	if v.rec != nil {
+		v.rec.zero()
+	}
+}
+
+// loadVault reads the device key and verifies the log on disk (§5.5),
+// finishing a commit or a write that a crash interrupted, and returns the
+// result without installing it. It returns holding the file lock, with the
+// func that releases it. A vault with a retirement journal (retire.go) is
+// refused with ErrLoggingOut unless forRetirement: only a logout's own
+// resolution may load it, and never for application use. The caller holds
+// s.mu.
+func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
 	if s.owner == nil {
-		return errClosed
+		return nil, nil, ErrClosed
 	}
 	if err := s.checkRevoked(); err != nil {
 		// A revocation whose tombstone failed retries it.
 		s.retryTombstone()
-		return err
+		return nil, nil, err
+	}
+	if !forRetirement {
+		if err := s.refuseRetiring(); err != nil {
+			return nil, nil, err
+		}
 	}
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
-		return err
+		return nil, nil, err
+	}
+	// A login merge whose destination is installed finishes switching
+	// device.json to it before any key is read (mergefile.go).
+	if cfg, err = s.promoteNext(cfg); err != nil {
+		return nil, nil, err
 	}
 	s.devCfg = cfg
 	rec, err := s.deviceStore(cfg).load()
@@ -410,50 +531,60 @@ func (s *Store) unlockLocked() error {
 		s.setRevoked(err)
 	}
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
+	ok := false
 	defer func() {
-		if s.rec != rec {
+		if !ok {
 			rec.zero()
 		}
 	}()
 	dev, err := rec.device()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	unlock, err := s.lockFile()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	defer unlock()
+	defer func() {
+		if !ok {
+			unlock()
+		}
+	}()
 	// A v1 record becomes v2 with a local_key, durably, before anything
 	// uses it (§11, rev 16). If that fails, the vault stays locked.
 	if err := s.deviceStore(cfg).upgradeRecord(rec); err != nil {
-		return err
+		return nil, nil, err
 	}
 	if err := s.replayWAL(); err != nil {
-		return err
+		return nil, nil, err
+	}
+	// The journal just replayed may be the one that started a logout.
+	if !forRetirement {
+		if err := s.refuseRetiring(); err != nil {
+			return nil, nil, err
+		}
 	}
 	server, err := s.l.serverBacked()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	stored, raw, err := s.readStoredState()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	acct, err := deviceAccount(s.l, stored, dev)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	st, sec, repaired, err := s.replay(stored, raw, acct, dev, nil)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	s.state, s.sec, s.dev, s.rec, s.repaired, s.server = st, sec, dev, rec, repaired, server
-	s.gen.Add(1)
-	return s.finishUnlock()
+	ok = true
+	return &loaded{rec: rec, dev: dev, st: st, sec: sec, repaired: repaired, server: server}, unlock, nil
 }
 
 // finishUnlock is what every unlock does once its verified state is
@@ -470,7 +601,11 @@ func (s *Store) finishUnlock() error {
 	if err := s.settleAtUnlock(); err != nil {
 		return err
 	}
-	return s.recoverJournal()
+	if err := s.recoverJournal(); err != nil {
+		return err
+	}
+	// A login merge whose source was dropped enqueues its imports.
+	return s.resumeMerge()
 }
 
 // revokedFile is vault/revoked.json, the terminal revocation record (§5.5):
@@ -607,39 +742,78 @@ func (s *Store) destroyDeviceRecord(id model.ID) []string {
 	return failed
 }
 
-// retryTombstone writes the tombstone of the device revoked.json names,
-// for a revocation whose tombstone failed. It is best effort: the marker
-// already makes the revocation terminal. The caller holds s.mu.
+// retryTombstone writes the tombstone of the device revoked.json names, or
+// of a device this data directory is that the sign-in ledger records as
+// revoked, for a revocation whose tombstone failed. It is best effort: the
+// marker or the ledger already makes the revocation terminal. The caller
+// holds s.mu.
 func (s *Store) retryTombstone() {
 	b, err := os.ReadFile(s.l.revokedFile())
 	var f revokedFile
-	if err != nil || canonjson.Unmarshal(b, &f) != nil || f.V != 1 || f.DeviceID.IsZero() {
+	if err == nil && canonjson.Unmarshal(b, &f) == nil && f.V == 1 && !f.DeviceID.IsZero() {
+		s.tombstoneRecord(f.DeviceID)
 		return
 	}
-	s.tombstoneRecord(f.DeviceID)
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return
+	}
+	if id, err := s.ledgerRevokedSelf(cfg); err == nil && !id.IsZero() {
+		s.tombstoneRecord(id)
+	}
+}
+
+// ledgerRevokedSelf returns the device this data directory is (cfg.self)
+// that the sign-in ledger records as revoked from cfg's account, or the
+// zero ID. A ledger that does not parse is ErrCorrupt.
+func (s *Store) ledgerRevokedSelf(cfg deviceConfig) (model.ID, error) {
+	g, err := s.l.readLedger()
+	if err != nil {
+		return model.ID{}, err
+	}
+	for _, id := range cfg.self() {
+		if g.isRevoked(cfg.AccountID, id) {
+			return id, nil
+		}
+	}
+	return model.ID{}, nil
 }
 
 // checkRevoked fails with ErrDeviceRevoked once this device is revoked: a
-// file at vault/revoked.json (any file counts: only hop writes it), or the
-// tombstone of a device this data directory is, DeviceID or the pending
-// replacement, in the device key store (deviceStore.revokedSelf). A device
-// key store it cannot read conclusively fails with ErrKeyStoreUnavailable,
-// which is not a revocation: nothing is recorded, and the next check reads
-// again. The caller holds s.mu.
+// file at vault/revoked.json (any file counts: only hop writes it), a
+// device this data directory is, DeviceID or the pending replacement, that
+// the sign-in ledger records as revoked from its account (ledger.go: a
+// sign-in's revocation whose tombstone was not written, or that a later
+// owner installed anyway), or the tombstone of one of them in the device
+// key store (deviceStore.revokedSelf). A ledger that does not parse fails
+// with ErrCorrupt, and a device key store it cannot read conclusively with
+// ErrKeyStoreUnavailable: neither is a revocation, so nothing is recorded
+// and the next check reads again, but neither lets a key be used. The
+// caller holds s.mu.
 func (s *Store) checkRevoked() error {
 	if s.revoked != nil {
 		return s.revoked
 	}
 	b, err := os.ReadFile(s.l.revokedFile())
 	if errors.Is(err, os.ErrNotExist) {
-		if cfg, err := s.readDeviceConfig(); err == nil {
-			err := s.deviceStore(cfg).revokedSelf()
-			if errors.Is(err, ErrDeviceRevoked) {
-				s.setRevoked(err)
-			}
+		cfg, err := s.readDeviceConfig()
+		if err != nil {
+			// Without device.json there is no self device; the ledger must
+			// still parse.
+			_, err := s.l.readLedger()
 			return err
 		}
-		return nil
+		if id, err := s.ledgerRevokedSelf(cfg); err != nil {
+			return err
+		} else if !id.IsZero() {
+			s.setRevoked(fmt.Errorf("%w: %w (device %v, recorded in %s)", ErrDeviceRevoked, ErrSignInRevoked, id, s.l.ledgerFile()))
+			return s.revoked
+		}
+		err = s.deviceStore(cfg).revokedSelf()
+		if errors.Is(err, ErrDeviceRevoked) {
+			s.setRevoked(err)
+		}
+		return err
 	}
 	var f revokedFile
 	if err != nil || canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
@@ -913,6 +1087,24 @@ func (s *Store) Info() Info {
 	if s.syncHalt != nil {
 		info.Warnings = append(info.Warnings, s.syncHalt.Error())
 	}
+	info.Publishing, _ = s.l.publicationPending()
+	if s.pubAlarm != nil {
+		info.Warnings = append(info.Warnings, "the publication stopped: "+s.pubAlarm.Error())
+	}
+	if j, err := s.readRetireFile(); err == nil && j != nil {
+		info.Logout = j.State
+	}
+	if exists, _ := s.l.mergeExists(); exists {
+		info.Merge = "present"
+		if s.state != nil {
+			if unlock, err := s.lockFile(); err == nil {
+				if m, err := s.readMerge(s.rec); err == nil && m != nil {
+					info.Merge = m.j.State
+				}
+				unlock()
+			}
+		}
+	}
 	return info
 }
 
@@ -978,6 +1170,9 @@ func (s *Store) write(ch vaultlog.Changes, check func() error) error {
 		return err
 	}
 	defer unlock()
+	if err := s.refuseLocalAppend(); err != nil {
+		return err
+	}
 	if err := s.catchUp(); err != nil {
 		return err
 	}

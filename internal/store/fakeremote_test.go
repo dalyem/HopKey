@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -22,9 +23,10 @@ import (
 )
 
 // fakeRemote is an in-memory server log (§5.4): it commits a wire only if
-// its prev is the head, treats an identical H as idempotent, and returns a
-// *HeadConflictError otherwise. Knobs simulate a lost response, a delayed
-// commit and a slow response.
+// its prev is the head and it passes the server's public validation
+// (vaultlog.ApplyPublic, plan R1), treats an identical H as idempotent,
+// and returns a *HeadConflictError for another prev. Knobs simulate a lost
+// response, a delayed commit and a slow response.
 type fakeRemote struct {
 	mu      sync.Mutex
 	entries [][]byte // bare wires (no objects), index = seq
@@ -32,6 +34,9 @@ type fakeRemote struct {
 	objects map[crypto.Hash][]byte
 	posts   []crypto.Hash // H of every wire posted, in order
 	delayed []*vaultlog.Wire
+	// pub is the public state at pubH, the head it was computed for.
+	pub  *vaultlog.PublicState
+	pubH crypto.Hash
 
 	// onPost, if set, decides each post: whether to commit it and what
 	// error to return. A nil error with commit false is not allowed.
@@ -173,8 +178,54 @@ func (f *fakeRemote) Post(ctx context.Context, w *vaultlog.Wire) (vaultlog.Head,
 	return head, nil
 }
 
-// commit applies the server's rule: prev must be the head; an identical H
-// already committed returns that commit.
+// errRejected is the fake server's 422: a wire that fails the public
+// validation of the transition algorithm.
+var errRejected = errors.New("fake: the entry fails validation")
+
+// publicLocked returns the public state at the head, replaying the log
+// with ApplyPublic, as the server derives it, unless it is cached for this
+// head. The caller holds f.mu.
+func (f *fakeRemote) publicLocked() (*vaultlog.PublicState, error) {
+	if len(f.hashes) == 0 {
+		return nil, nil
+	}
+	if head := f.headLocked(); f.pub != nil && f.pub.Head().Seq == head.Seq && f.pubH.Equal(head.H) {
+		return f.pub, nil
+	}
+	var pub *vaultlog.PublicState
+	for _, b := range f.entries {
+		w, err := vaultlog.ParseWire(b)
+		if err != nil {
+			return nil, err
+		}
+		if pub, err = vaultlog.ApplyPublic(pub, w, vaultlog.ObjectMap(f.objects)); err != nil {
+			return nil, err
+		}
+	}
+	f.pub, f.pubH = pub, f.headLocked().H
+	return pub, nil
+}
+
+// credsGen is the creds gen at the head, as the server tracks it (plan R2).
+func (f *fakeRemote) credsGen() (uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pub, err := f.publicLocked()
+	if err != nil {
+		return 0, err
+	}
+	c, ok := pub.Creds()
+	if !ok {
+		return 0, errors.New("fake: no vault")
+	}
+	return c.Gen, nil
+}
+
+// commit applies the server's rules: an identical H already committed
+// returns that commit; prev must be the head; and the wire must pass the
+// public validation (vaultlog.ApplyPublic) against the public state at the
+// head, with the objects it carries and those the server holds, before
+// anything is changed.
 func (f *fakeRemote) commit(w *vaultlog.Wire) (vaultlog.Head, error) {
 	h, err := w.Entry.Hash()
 	if err != nil {
@@ -188,6 +239,25 @@ func (f *fakeRemote) commit(w *vaultlog.Wire) (vaultlog.Head, error) {
 	head := f.headLocked()
 	if w.Entry.Seq != head.Seq+1 || !w.Entry.Prev.Equal(head.H) {
 		return vaultlog.Head{}, &HeadConflictError{Head: head}
+	}
+	pre, err := f.publicLocked()
+	if err != nil {
+		return vaultlog.Head{}, err
+	}
+	carried, err := vaultlog.WireObjects(w)
+	if err != nil {
+		return vaultlog.Head{}, fmt.Errorf("%w: %v", errRejected, err)
+	}
+	objs := vaultlog.ObjectMap{}
+	for d, b := range f.objects {
+		objs[d] = b
+	}
+	for d, b := range carried {
+		objs[d] = b
+	}
+	post, err := vaultlog.ApplyPublic(pre, w, objs)
+	if err != nil {
+		return vaultlog.Head{}, fmt.Errorf("%w: %w", errRejected, err)
 	}
 	for _, o := range w.Objects {
 		c, err := canonjson.Canonicalize(o.Body)
@@ -204,6 +274,7 @@ func (f *fakeRemote) commit(w *vaultlog.Wire) (vaultlog.Head, error) {
 	}
 	f.entries = append(f.entries, b)
 	f.hashes = append(f.hashes, h)
+	f.pub, f.pubH = post, h
 	return vaultlog.Head{Seq: w.Entry.Seq, H: h}, nil
 }
 

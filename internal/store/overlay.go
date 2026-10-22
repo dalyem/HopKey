@@ -248,6 +248,9 @@ func (s *Store) queuePut(it crypto.Item, isNew bool) error {
 		return err
 	}
 	defer unlock()
+	if err := s.refuseImportingWrite(); err != nil {
+		return err
+	}
 	ov, err := s.overlayLocked()
 	if err != nil {
 		return err
@@ -301,6 +304,9 @@ func (s *Store) queueDelete(id model.ID) error {
 		return err
 	}
 	defer unlock()
+	if err := s.refuseImportingWrite(); err != nil {
+		return err
+	}
 	ov, err := s.overlayLocked()
 	if err != nil {
 		return err

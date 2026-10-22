@@ -86,15 +86,20 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if r != nil {
 		// The bootstrap waits on the server without s.mu or the file lock;
 		// syncMu keeps Pull and PushHead out meanwhile.
-		s.syncMu.Lock()
+		if err := s.lockSync(); err != nil {
+			return err
+		}
 		defer s.syncMu.Unlock()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owner == nil {
-		return errClosed
+		return ErrClosed
 	}
 	if err := s.checkRevoked(); err != nil {
+		return err
+	}
+	if err := s.refuseRetiring(); err != nil {
 		return err
 	}
 	if r != nil && s.state != nil {
@@ -102,6 +107,12 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	}
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
+		return err
+	}
+	// A login merge whose destination is installed finishes switching
+	// device.json to it first, as loadVault does: otherwise the records
+	// and the self devices below would be the dropped source's.
+	if cfg, err = s.promoteNext(cfg); err != nil {
 		return err
 	}
 	// The device key this device has now, if it can still be read: the
@@ -163,12 +174,22 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err := s.replayWAL(); err != nil {
 		return err
 	}
+	// The journal just replayed may be the one that started a logout.
+	if err := s.refuseRetiring(); err != nil {
+		return err
+	}
 	server, err := s.l.serverBacked()
 	if err != nil {
 		return err
 	}
 	if server && r == nil {
 		return fmt.Errorf("%w: use the server to unlock with the password", ErrServerBacked)
+	}
+	if !server {
+		// A local bootstrap is a local append.
+		if err := s.refuseLocalAppend(); err != nil {
+			return err
+		}
 	}
 	a, stored, raw, err := s.readAccountFile()
 	if err != nil {
@@ -429,7 +450,15 @@ func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen
 			if err != nil {
 				return err
 			}
-			if head.Seq <= st.Head.Seq {
+			// The server's head is checked as Pull checks it: behind the
+			// verified head is a regression, and the same seq with another
+			// H an equivocation (§5.6).
+			switch {
+			case head.Seq < st.Head.Seq:
+				return fmt.Errorf("%w: the server is at seq %d, this device at %d", ErrServerBehind, head.Seq, st.Head.Seq)
+			case head.Seq == st.Head.Seq && !head.H.Equal(st.Head.H):
+				return &vaultlog.EquivocationError{Seq: st.Head.Seq, Have: st.Head.H, Got: head.H}
+			case head.Seq == st.Head.Seq:
 				return nil
 			}
 			if st.Head.Seq == before {
@@ -502,6 +531,9 @@ func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, 
 		return Kit{}, err
 	}
 	defer unlock()
+	if err := s.refuseLocalAppend(); err != nil {
+		return Kit{}, err
+	}
 	if err := s.catchUp(); err != nil {
 		return Kit{}, err
 	}

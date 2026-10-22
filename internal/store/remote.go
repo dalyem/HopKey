@@ -73,6 +73,9 @@ const maxPushAttempts = 8
 func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closing {
+		return nil, 0, nil, ErrClosed
+	}
 	if s.state == nil {
 		return nil, 0, nil, s.lockedErr()
 	}
@@ -91,12 +94,17 @@ func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(
 	return ctx, gen, done, nil
 }
 
-// trackRequest derives a context for requests to the server that Lock
-// cancels (§11.2). It returns the lock generation it started in, and a func
-// that stops tracking the context and cancels it. The caller holds s.mu,
-// and holds it when it calls that func.
+// trackRequest derives a context for requests to the server that Lock and
+// Close cancel (§11.2). It returns the lock generation it started in, and a
+// func that stops tracking the context and cancels it. Once Close has begun
+// the context is cancelled already. The caller holds s.mu, and holds it
+// when it calls that func.
 func (s *Store) trackRequest(ctx context.Context) (context.Context, uint64, func()) {
 	ctx, cancel := context.WithCancel(ctx)
+	if s.closing {
+		cancel()
+		return ctx, s.gen.Load(), func() {}
+	}
 	if s.cancels == nil {
 		s.cancels = map[uint64]context.CancelFunc{}
 	}
@@ -137,7 +145,9 @@ func (s *Store) halt(err error) error {
 // Pull returns ErrDeviceRevoked. A lock while Pull waits discards the
 // response (§11.2).
 func (s *Store) Pull(ctx context.Context, r Remote) error {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return err
+	}
 	defer s.syncMu.Unlock()
 	return s.pullLocked(ctx, r)
 }
@@ -268,6 +278,9 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 		if err != nil {
 			return st, sec, err
 		}
+		// TODO(D2 review round 3, tracked follow-up): the secrets this
+		// entry supersedes are not zeroed (see supersede), nor are nsec's
+		// when commitVerified fails.
 		if err := s.commitVerified(c.Wire, h, next, rec); err != nil {
 			return st, sec, err
 		}
@@ -280,8 +293,9 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 // harmless if a crash leaves them unreferenced), then, in one transaction,
 // the entry, state.json and every outbox record it settles (§11.1). A
 // record whose candidate is this entry is deleted; a record whose live
-// candidate was at this seq with another H has it marked dead. rec opens
-// the outbox. The caller holds s.mu and the file lock.
+// candidate was at this seq with another H has it marked dead, and a login
+// merge's receipt for an import it settles is written with it (§4.4). rec
+// opens the outbox. The caller holds s.mu and the file lock.
 func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.State, rec *deviceRecord) error {
 	if err := s.l.writeObjects(w); err != nil {
 		return err
@@ -353,6 +367,7 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 	if err != nil {
 		return err
 	}
+	receipts := map[model.ID][]mergeReceipt{}
 	for _, r := range recs {
 		c := r.live()
 		if c == nil || c.Seq > head {
@@ -364,11 +379,21 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 		}
 		if h.Equal(c.H) {
 			t.remove(outboxRel(r.N))
+			if !r.Import.IsZero() {
+				// A login merge's import: its receipt is written in this
+				// same commit (§4.4).
+				receipts[r.Import] = append(receipts[r.Import], mergeReceipt{ItemID: r.Intent.ItemID, Seq: c.Seq, H: c.H})
+			}
 			continue
 		}
 		c.Status = statusDead
 		delete(r.Wires, c.H)
 		if err := s.putRecordAs(t, r, rec, vaultID); err != nil {
+			return err
+		}
+	}
+	for txnID, rs := range receipts {
+		if err := s.addReceipts(t, rec, txnID, rs); err != nil {
 			return err
 		}
 	}
@@ -449,7 +474,9 @@ func holdInfo(res merge.Result) *HoldInfo {
 // resolves it. A held head blocks every record behind it. A lock discards
 // whatever is in flight (§11.2).
 func (s *Store) PushHead(ctx context.Context, r Remote) (PushResult, error) {
-	s.syncMu.Lock()
+	if err := s.lockSync(); err != nil {
+		return PushResult{}, err
+	}
 	defer s.syncMu.Unlock()
 	pushed := uint64(0)
 	for attempt := 0; attempt < maxPushAttempts; attempt++ {
