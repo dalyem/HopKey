@@ -107,6 +107,12 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err != nil {
 		return err
 	}
+	// A login merge whose destination is installed finishes switching
+	// device.json to it first, as loadVault does: otherwise the records
+	// and the self devices below would be the dropped source's.
+	if cfg, err = s.promoteNext(cfg); err != nil {
+		return err
+	}
 	// The device key this device has now, if it can still be read: the
 	// record of the device device.json names, or of its pending
 	// replacement (load). A tombstone of either is a revocation whose
@@ -442,7 +448,15 @@ func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen
 			if err != nil {
 				return err
 			}
-			if head.Seq <= st.Head.Seq {
+			// The server's head is checked as Pull checks it: behind the
+			// verified head is a regression, and the same seq with another
+			// H an equivocation (§5.6).
+			switch {
+			case head.Seq < st.Head.Seq:
+				return fmt.Errorf("%w: the server is at seq %d, this device at %d", ErrServerBehind, head.Seq, st.Head.Seq)
+			case head.Seq == st.Head.Seq && !head.H.Equal(st.Head.H):
+				return &vaultlog.EquivocationError{Seq: st.Head.Seq, Have: st.Head.H, Got: head.H}
+			case head.Seq == st.Head.Seq:
 				return nil
 			}
 			if st.Head.Seq == before {

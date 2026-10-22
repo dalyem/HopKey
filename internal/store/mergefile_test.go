@@ -72,7 +72,7 @@ func cloneAccount(t *testing.T, s *Store) *crypto.AccountKeys {
 
 func (m *mergeFix) params(t *testing.T) SignInParams {
 	t.Helper()
-	return SignInParams{Account: cloneAccountKeys(t, m.acct), SecretKey: m.dst.kit.SecretKey}
+	return SignInParams{ServerURL: m.srv.origin, Email: testEmail, Account: cloneAccountKeys(t, m.acct), SecretKey: m.dst.kit.SecretKey}
 }
 
 func cloneAccountKeys(t *testing.T, a *crypto.AccountKeys) *crypto.AccountKeys {
@@ -101,7 +101,7 @@ func (m *mergeFix) sourceIDs() []model.ID {
 // signIn runs MergeSignIn on s against the fixture's server.
 func (m *mergeFix) signIn(t *testing.T, s *Store) (MergeStatus, error) {
 	t.Helper()
-	return s.MergeSignIn(context.Background(), signInRemote{m.srv}, m.params(t))
+	return s.MergeSignIn(context.Background(), m.srv.login(t), m.params(t))
 }
 
 func mergeFileExists(t *testing.T, cfg Config) bool {
@@ -418,8 +418,8 @@ func TestLoginMergePreflight(t *testing.T) {
 		if _, err := m.src.s.MergeStart(); err != nil {
 			t.Fatal(err)
 		}
-		p := SignInParams{Account: cloneAccount(t, m.src.s), SecretKey: m.src.kit.SecretKey}
-		if _, err := m.src.s.MergeSignIn(ctx, signInRemote{m.srv}, p); !errors.Is(err, ErrMergeRefused) {
+		p := SignInParams{ServerURL: m.srv.origin, Email: testEmail, Account: cloneAccount(t, m.src.s), SecretKey: m.src.kit.SecretKey}
+		if _, err := m.src.s.MergeSignIn(ctx, m.srv.login(t), p); !errors.Is(err, ErrMergeRefused) {
 			t.Errorf("signing in to the source's own account: %v", err)
 		}
 	})
@@ -466,7 +466,7 @@ func TestLoginMergeCrashAtEachState(t *testing.T) {
 	}
 	var crashes []crash
 	for _, st := range []string{"wal:before", "wal:install:sync", "wal:op:0", "wal:removed",
-		"signin:record", "signin:next", "signin:fetch", "signin:post", "signin:drop", "signin:promote", "merge:enqueue"} {
+		"signin:record", "signin:intent", "signin:next", "signin:fetch", "signin:post", "signin:drop", "signin:promote", "merge:enqueue"} {
 		crashes = append(crashes, crash{st, func() func(string) error { return crashAt(st) }})
 	}
 	for _, st := range []string{"wal:install:sync", "wal:op:0", "wal:op:3", "wal:op:7", "wal:applied", "wal:removed"} {
@@ -493,15 +493,19 @@ func TestLoginMergeCrashAtEachState(t *testing.T) {
 				}
 				dc := diskDeviceConfig(t, m.src.cfg)
 				if dc.AccountID.String() == m.src.kit.AccountID && dc.Next != nil {
-					// The destination record is durable: it must read back.
+					// The destination record is durable: it must read back,
+					// unless the crash came between naming it in device.json
+					// and creating it (the intent), when it must be absent.
 					ns := (&Store{cfg: m.src.cfg, l: layout{data: m.src.cfg.DataDir}}).nextStore(dc)
-					rec, err := ns.loadID(dc.Next.DeviceID)
-					if err != nil {
-						t.Errorf("device.json names a destination record that does not read: %v", err)
-					} else {
+					state, rec, err := ns.probeSlot(dc.Next.DeviceID)
+					if rec != nil {
 						rec.zero()
 					}
+					if want := map[bool]slotState{true: slotAbsent, false: slotRecord}[c.name == "signin:intent"]; err != nil || state != want {
+						t.Errorf("device.json names a destination record in state %v (%v); want %v", state, err, want)
+					}
 				}
+				noUntrackedRecords(t, m.src.cfg, "after the crash")
 				s = open(t, m.src.cfg)
 				if !s.ServerBacked() {
 					// Still the source: whole, until both are durable.
@@ -604,8 +608,15 @@ func TestLoginMergeSourceDeletedOnlyWithDurableDestination(t *testing.T) {
 	if _, err := m.signIn(t, s); err == nil {
 		t.Fatal("signed in without a durable destination record")
 	}
-	if dc := diskDeviceConfig(t, m.src.cfg); dc.Next != nil {
-		t.Error("device.json names a destination record that was never stored")
+	// device.json names the destination device before its record is
+	// stored (the intent), so no record is ever untracked; the keychain
+	// refused the record, so there is none.
+	dc := diskDeviceConfig(t, m.src.cfg)
+	if dc.Next == nil {
+		t.Fatal("device.json does not name the destination device it tried to store")
+	}
+	if _, err := ring.memRing.Get(keychainService, slotOf(dc.Next.AccountID, dc.Next.DeviceID)); err == nil {
+		t.Error("the keychain holds the refused destination record")
 	}
 	if len(m.r.hashes) != posts {
 		t.Error("a bootstrap was posted for a device whose record is not durable")

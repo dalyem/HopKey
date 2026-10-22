@@ -8,8 +8,9 @@
 // Layout, under the data directory ($XDG_DATA_HOME/hop, else
 // ~/.local/share/hop), every directory 0700 and every file 0600:
 //
-//	device.json                which device key store is in use, this device's ID and
-//	                           stale devices to revoke (no secrets)
+//	device.json                which device key store is in use, this device's ID, a pending
+//	                           device (a password unlock's, or SignIn's), stale devices to
+//	                           revoke, a login merge's destination device (no secrets)
 //	device.key                 the device key, when the file store is used (§11)
 //	device.next.key            a login merge's destination device key, file store (mergefile.go)
 //	vault/owner.lock           held by the one process that has the vault open
@@ -20,7 +21,8 @@
 //	vault/account.json         account_id, salt, kdf_version, pw_blob, rk_blob, verifier hashes
 //	vault/journal/<seq>.json   checkpoint candidates, sealed to the device key (§10.1)
 //	vault/wal.json             the write-ahead journal of a multi-file commit (wal.go)
-//	vault/server.json          present in a server-backed vault (§11.1)
+//	vault/server.json          present in a server-backed vault (§11.1): its server, the sign-in
+//	                           email, and a recovery's due checkpoint (outbox.go)
 //	vault/outbox/<n>.json      outbox records, sealed under local_key (outbox.go)
 //	vault/outbox.json          the outbox counter
 //	vault/revoked.json         present once a checkpoint revoked this device (§5.5)
@@ -230,6 +232,9 @@ type Store struct {
 	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
 	testHook func(stage string) error // simulates crashes in tests
+	// testSignIn sees a merge sign-in's secrets once its device record is
+	// made, so tests can check they are zeroed.
+	testSignIn func(o *signInSecrets)
 }
 
 var _ model.Store = (*Store)(nil)

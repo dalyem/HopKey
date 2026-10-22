@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -18,12 +19,21 @@ import (
 //	vault/retire.json = JCS({"v":1, "state":"RETIRING"|"RETIRED", "account_id":id, "vault_id":id,
 //	                         "device_id":id, "outcome":""|"committed"|"departed"|"unknown",
 //	                         "candidates":[{"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead"}],
-//	                         "wires":[wire, ...]})
+//	                         "wires":[wire, ...],
+//	                         "key_store":"keychain"|"file", "records":[{"account_id":id, "device_id":id}, ...]})
 //
 // It is plain JCS: the candidates are public log data, and RETIRED must
 // stay readable after the device record (and local_key with it) is gone. A
 // local attacker who can write it can at worst make this device delete its
 // own copy of the vault, which deleting the files does too.
+//
+// key_store and records name every device record the cleanup deletes,
+// taken from device.json when the logout is journaled (which fails if
+// device.json can't be read): this device, its pending replacement, its
+// stale devices, and a login merge's destination devices. The cleanup
+// deletes those whatever device.json says by then, and stops, keeping the
+// journal, if a record can't be deleted or device.json is there but can't
+// be read: it never reports a logout done while a record may be left.
 //
 // Logout refuses while a merge file, a checkpoint journal or an
 // unacknowledged kit exists, and while the outbox holds anything unless
@@ -151,6 +161,35 @@ type retireJournal struct {
 	Outcome    string          `json:"outcome"`
 	Candidates []candidate     `json:"candidates"`
 	Wires      []canonjson.Raw `json:"wires"`
+	KeyStore   string          `json:"key_store"`
+	Records    []retireRecord  `json:"records"`
+}
+
+// retireRecord is a device record the logout's cleanup deletes: the
+// keychain entry of device_id under account_id (deviceStore.slot).
+type retireRecord struct {
+	AccountID model.ID `json:"account_id"`
+	DeviceID  model.ID `json:"device_id"`
+}
+
+// retireRecords lists every device record cfg names, for the journal.
+func retireRecords(cfg deviceConfig) []retireRecord {
+	var out []retireRecord
+	add := func(acct model.ID, ids ...model.ID) {
+		for _, id := range ids {
+			r := retireRecord{AccountID: acct, DeviceID: id}
+			if !id.IsZero() && !slices.Contains(out, r) {
+				out = append(out, r)
+			}
+		}
+	}
+	add(cfg.AccountID, cfg.self()...)
+	add(cfg.AccountID, cfg.StaleDevices...)
+	if cfg.Next != nil {
+		add(cfg.Next.AccountID, cfg.Next.DeviceID)
+		add(cfg.Next.AccountID, cfg.Next.Stale...)
+	}
+	return out
 }
 
 func (j *retireJournal) live() *candidate {
@@ -202,7 +241,8 @@ func (s *Store) readRetireFile() (*retireJournal, error) {
 		return nil, err
 	}
 	var j retireJournal
-	if canonjson.Unmarshal(b, &j) != nil || j.V != retireVersion || (j.State != StateRetiring && j.State != StateRetired) {
+	if canonjson.Unmarshal(b, &j) != nil || j.V != retireVersion || (j.State != StateRetiring && j.State != StateRetired) ||
+		(j.KeyStore != DeviceStoreKeychain && j.KeyStore != DeviceStoreFile) {
 		return nil, fmt.Errorf("%w: %s does not parse", ErrCorrupt, s.l.retireFile())
 	}
 	return &j, nil
@@ -225,6 +265,9 @@ func putRetirement(t *txn, j *retireJournal) error {
 	}
 	if j.Wires == nil {
 		j.Wires = []canonjson.Raw{}
+	}
+	if j.Records == nil {
+		j.Records = []retireRecord{}
 	}
 	b, err := canonjson.Marshal(j)
 	if err != nil {
@@ -351,11 +394,14 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 	}
 	if opts.LocalOnly {
 		defer unlock()
+		// The records to delete are journaled first: without device.json
+		// nothing would say which they are, so nothing is journaled.
 		cfg, err := s.readDeviceConfig()
-		j := &retireJournal{V: retireVersion, State: StateRetired, Outcome: OutcomeUnknown}
-		if err == nil {
-			j.AccountID, j.DeviceID = cfg.AccountID, cfg.DeviceID
+		if err != nil {
+			return nil, fmt.Errorf("store: the logout was not started: %w", err)
 		}
+		j := &retireJournal{V: retireVersion, State: StateRetired, Outcome: OutcomeUnknown,
+			AccountID: cfg.AccountID, DeviceID: cfg.DeviceID, KeyStore: cfg.Store, Records: retireRecords(cfg)}
 		if s.state != nil {
 			j.VaultID = s.state.VaultID
 		}
@@ -385,7 +431,8 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 	if err != nil {
 		return nil, err
 	}
-	j := &retireJournal{V: retireVersion, State: StateRetiring, AccountID: v.st.Account.AccountID, VaultID: v.st.VaultID, DeviceID: v.dev.ID}
+	j := &retireJournal{V: retireVersion, State: StateRetiring, AccountID: v.st.Account.AccountID, VaultID: v.st.VaultID, DeviceID: v.dev.ID,
+		KeyStore: s.devCfg.Store, Records: retireRecords(s.devCfg)}
 	if err := addRetireCandidate(j, w); err != nil {
 		return nil, err
 	}
@@ -476,6 +523,13 @@ func (s *Store) cleanupRetired() error {
 	if err := s.replayWAL(); err != nil {
 		return err
 	}
+	j, err := s.readRetireFile()
+	if err != nil {
+		return err
+	}
+	if j == nil || j.State != StateRetired {
+		return fmt.Errorf("%w: the logout's cleanup needs its RETIRED journal", ErrCorrupt)
+	}
 	// The outbox, in one commit.
 	ns, err := s.l.outboxNumbers()
 	if err != nil {
@@ -515,19 +569,10 @@ func (s *Store) cleanupRetired() error {
 	if err := s.hook("retire:cache"); err != nil {
 		return err
 	}
-	// The device record: every self record, then device.json.
-	if cfg, err := s.readDeviceConfig(); err == nil {
-		ds := s.deviceStore(cfg)
-		if cfg.Store == DeviceStoreKeychain {
-			for _, id := range cfg.self() {
-				if err := ds.deleteSlot(id); err != nil {
-					return fmt.Errorf("deleting the device key of %v: %w", id, err)
-				}
-			}
-			for _, id := range cfg.StaleDevices {
-				ds.deleteSlot(id) // best effort: a stale device's key is useless here
-			}
-		}
+	// The device records: every one the journal names, then any other
+	// device.json names, then device.json.
+	if err := s.deleteRetiredRecords(j); err != nil {
+		return fmt.Errorf("the logout journal is kept: %w", err)
 	}
 	for _, name := range []string{"device.key", nextKeyName} {
 		if err := os.Remove(filepath.Join(s.l.data, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -550,6 +595,50 @@ func (s *Store) cleanupRetired() error {
 		return err
 	}
 	return syncDir(s.l.vault())
+}
+
+// deleteRetiredRecords deletes, each one conclusively (one already gone
+// counts), the keychain entry of every device record the journal j names,
+// and then of any other device device.json still names. The journal's go
+// first, whatever device.json holds. A device.json that is there but
+// can't be read or doesn't parse then stops the cleanup, as a failed
+// deletion does: the journal stays, and the next attempt tries again. The
+// caller holds the file lock.
+func (s *Store) deleteRetiredRecords(j *retireJournal) error {
+	del := func(recs []retireRecord) error {
+		if j.KeyStore != DeviceStoreKeychain {
+			return nil // device.key and device.next.key are deleted by name
+		}
+		for _, r := range recs {
+			ds := s.deviceStore(deviceConfig{V: 1, Store: j.KeyStore, AccountID: r.AccountID})
+			if err := ds.deleteSlot(r.DeviceID); err != nil {
+				return fmt.Errorf("deleting the device key of %v: %w", r.DeviceID, err)
+			}
+		}
+		return nil
+	}
+	if err := del(j.Records); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(s.l.deviceConfig()); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("device.json can't be read, so device keys it names may be left: %w", err)
+	}
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return fmt.Errorf("device.json can't be read, so device keys it names may be left: %w", err)
+	}
+	if cfg.Store != j.KeyStore {
+		return fmt.Errorf("%w: device.json names the %s device key store, the logout journal the %s", ErrDeviceKey, cfg.Store, j.KeyStore)
+	}
+	var more []retireRecord
+	for _, r := range retireRecords(cfg) {
+		if !slices.Contains(j.Records, r) {
+			more = append(more, r)
+		}
+	}
+	return del(more)
 }
 
 // resolveRetirement resolves RETIRING (§11.1) and, once RETIRED, cleans up.

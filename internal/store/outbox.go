@@ -420,36 +420,110 @@ func (s *Store) appendRecord(in merge.Intent) (uint64, error) {
 	return n, s.commitTxn(t)
 }
 
+// serverFile is vault/server.json, present in a server-backed vault. It
+// says which server the vault syncs with and how this device signed in,
+// so that the sync engine can reconnect, and sign in again, without asking:
+//
+//	JCS({"v":2, "server":str, "email":str, "recovery_gen":u32})
+//
+// server is the server's origin and email the normalized sign-in email,
+// both "" for a vault that EnableServerMode switched without either.
+// recovery_gen is the creds gen a recovery sign-in (§4.5) found, and 0
+// otherwise: until a verified checkpoint moves creds past it, the
+// recovery's checkpoint with new credentials (§10.1) is due. Phase 2's
+// first format, {"v":1}, reads as v2 with nothing in it. Nothing in it is
+// secret.
+type serverFile struct {
+	V           int    `json:"v"`
+	Server      string `json:"server"`
+	Email       string `json:"email"`
+	RecoveryGen uint32 `json:"recovery_gen"`
+}
+
+const serverFileVersion = 2
+
+// readServerFile reads vault/server.json, or returns nil when the vault is
+// local-only.
+func (l layout) readServerFile() (*serverFile, error) {
+	b, err := os.ReadFile(l.serverFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var f serverFile
+	if err := canonjson.Unmarshal(b, &f); err == nil && f.V == serverFileVersion {
+		return &f, nil
+	}
+	var v1 struct {
+		V int `json:"v"`
+	}
+	if err := canonjson.Unmarshal(b, &v1); err != nil || v1.V != 1 {
+		return nil, fmt.Errorf("%w: %s does not parse", ErrCorrupt, l.serverFile())
+	}
+	return &serverFile{V: serverFileVersion}, nil
+}
+
 // serverBacked reports whether vault/server.json marks the vault as
 // server-backed.
 func (l layout) serverBacked() (bool, error) {
-	b, err := os.ReadFile(l.serverFile())
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	var m struct {
-		V int `json:"v"`
-	}
-	if err := canonjson.Unmarshal(b, &m); err != nil || m.V != 1 {
-		return false, fmt.Errorf("%w: %s does not parse", ErrCorrupt, l.serverFile())
-	}
-	return true, nil
+	f, err := l.readServerFile()
+	return f != nil, err
 }
 
-// serverModeOps adds the switch to server-backed mode to t. D2's
-// publication and E's login commit it together with their own files.
-func serverModeOps(t *txn) error {
-	b, err := canonjson.Marshal(struct {
-		V int `json:"v"`
-	}{1})
+// serverModeOps adds the switch to server-backed mode, with f's server and
+// sign-in, to t. The publication and the sign-ins commit it together with
+// their own files.
+func serverModeOps(t *txn, f serverFile) error {
+	f.V = serverFileVersion
+	b, err := canonjson.Marshal(f)
 	if err != nil {
 		return err
 	}
 	t.put(serverRel, b)
 	return nil
+}
+
+// ServerInfo is what a server-backed vault keeps about its server
+// (vault/server.json). It holds no secrets.
+type ServerInfo struct {
+	// Server is the server's origin, and Email the normalized sign-in
+	// email: "" when the vault was switched without them
+	// (EnableServerMode).
+	Server string `json:"server,omitempty"`
+	Email  string `json:"email,omitempty"`
+	// CheckpointDue means a recovery sign-in (§4.5) is not finished: a
+	// checkpoint with new credentials (§10.1) must commit first. It stays
+	// set, across restarts, until a verified checkpoint moves the
+	// credentials past the generation the recovery found. While the vault
+	// is locked it is reported from the file alone, so it may be stale
+	// in the safe direction.
+	CheckpointDue bool `json:"checkpoint_due,omitempty"`
+}
+
+// ServerInfo returns the server a server-backed vault syncs with, and
+// whether a recovery's checkpoint is due. It fails with
+// ErrNotServerBacked for a local-only vault. It works while the vault is
+// locked.
+func (s *Store) ServerInfo() (ServerInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := s.l.readServerFile()
+	if err != nil {
+		return ServerInfo{}, err
+	}
+	if f == nil {
+		return ServerInfo{}, ErrNotServerBacked
+	}
+	return s.serverInfoOf(f), nil
+}
+
+// serverInfoOf is f as ServerInfo, checked against verified state when the
+// store is unlocked. The caller holds s.mu.
+func (s *Store) serverInfoOf(f *serverFile) ServerInfo {
+	due := f.RecoveryGen != 0 && (s.state == nil || s.state.Creds.Gen <= f.RecoveryGen)
+	return ServerInfo{Server: f.Server, Email: f.Email, CheckpointDue: due}
 }
 
 // EnableServerMode makes the vault server-backed (§11.1) in one durable
@@ -480,7 +554,7 @@ func (s *Store) EnableServerMode() error {
 		return err
 	}
 	t := &txn{}
-	if err := serverModeOps(t); err != nil {
+	if err := serverModeOps(t, serverFile{}); err != nil {
 		return err
 	}
 	if err := s.commitTxn(t); err != nil {

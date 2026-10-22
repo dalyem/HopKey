@@ -469,31 +469,106 @@ func (r retirer) Reauthenticate(ctx context.Context, auth DeviceAuth) error {
 	return nil
 }
 
-// signInRemote is the fake server as a login sees it.
-type signInRemote struct{ f *fakeServer }
+// signInRemote is the fake server as a login or recovery sees it: one
+// token (plan R6), bound to the account's credential generation when it
+// was issued (R2), which a checkpoint ends. It reads the log and commits
+// one bootstrap: the commit consumes it, atomically, and records the entry
+// hash; a validation failure or a head conflict does not. An identical
+// retry returns the recorded commit, and any other bootstrap is refused.
+type signInRemote struct {
+	f   *fakeServer
+	gen uint32
+	lax bool // the token survives a credential change (lenient)
 
-func (s signInRemote) EntryAt(ctx context.Context, seq uint64) (Committed, error) {
+	mu       sync.Mutex
+	consumed *vaultlog.Head // the bootstrap commit, once there is one
+}
+
+// errTokenInvalid is the fake server's 401 for a login or recovery token.
+var errTokenInvalid = errors.New("fake: the login token is not valid")
+
+// login issues a login token for the account on f, at its current
+// credential generation.
+func (f *fakeServer) login(t testing.TB) *signInRemote {
+	t.Helper()
+	gen, err := f.credsGen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &signInRemote{f: f, gen: gen}
+}
+
+// valid checks the token against the credential generation now.
+func (s *signInRemote) valid() error {
+	if s.f.down != nil {
+		return s.f.down
+	}
+	gen, err := s.f.credsGen()
+	if err != nil {
+		return err
+	}
+	if gen != s.gen && !s.lax {
+		return fmt.Errorf("%w: the credentials changed (gen %d, issued at %d)", errTokenInvalid, gen, s.gen)
+	}
+	return nil
+}
+
+func (s *signInRemote) EntryAt(ctx context.Context, seq uint64) (Committed, error) {
+	if err := s.valid(); err != nil {
+		return Committed{}, err
+	}
 	return s.f.entryAt(seq)
 }
 
-func (s signInRemote) Since(ctx context.Context, after uint64) ([]Committed, vaultlog.Head, error) {
-	return s.f.fakeRemote.Since(ctx, after)
+func (s *signInRemote) Since(ctx context.Context, after uint64) ([]Committed, vaultlog.Head, error) {
+	if err := s.valid(); err != nil {
+		return nil, vaultlog.Head{}, err
+	}
+	cs, head, err := s.f.fakeRemote.Since(ctx, after)
+	if err != nil {
+		return nil, head, err
+	}
+	// Authorization is checked again before the response goes out (R2).
+	if err := s.valid(); err != nil {
+		return nil, vaultlog.Head{}, err
+	}
+	return cs, head, nil
 }
 
-func (s signInRemote) Post(ctx context.Context, w *vaultlog.Wire) (vaultlog.Head, error) {
+func (s *signInRemote) Post(ctx context.Context, w *vaultlog.Wire) (vaultlog.Head, error) {
+	if err := s.valid(); err != nil {
+		return vaultlog.Head{}, err
+	}
 	if w.Entry.Kind != vaultlog.KindBootstrap {
 		return vaultlog.Head{}, errors.New("fake: a login token posts only a bootstrap")
 	}
-	if s.f.onPost != nil {
-		commit, err := s.f.onPost(w)
-		if commit {
-			if _, cerr := s.f.commit(w); cerr != nil {
-				return vaultlog.Head{}, cerr
-			}
-		}
+	h, err := w.Entry.Hash()
+	if err != nil {
 		return vaultlog.Head{}, err
 	}
-	return s.f.commit(w)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.consumed != nil {
+		if s.consumed.H.Equal(h) {
+			return *s.consumed, nil
+		}
+		return vaultlog.Head{}, fmt.Errorf("%w: its bootstrap is used", errTokenInvalid)
+	}
+	s.f.mu.Lock()
+	s.f.posts = append(s.f.posts, h)
+	s.f.mu.Unlock()
+	commit, perr := true, error(nil)
+	if s.f.onPost != nil {
+		commit, perr = s.f.onPost(w)
+	}
+	var head vaultlog.Head
+	if commit {
+		if head, err = s.f.commit(w); err != nil {
+			return vaultlog.Head{}, err
+		}
+		s.consumed = &head
+	}
+	return head, perr
 }
 
 // nopTB is a testing.TB stand-in for helpers called off the test

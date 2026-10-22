@@ -790,7 +790,7 @@ func (s *Store) applyPublished(j *publicationJSON, entries []Committed, head vau
 		return false, err
 	}
 	t := &txn{}
-	if err := serverModeOps(t); err != nil {
+	if err := serverModeOps(t, serverFile{Server: j.Server, Email: j.Email}); err != nil {
 		return false, err
 	}
 	t.remove(publishRel)

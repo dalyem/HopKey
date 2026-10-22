@@ -73,17 +73,27 @@ type deviceConfig struct {
 	Pending      *pendingDevice `json:"pending,omitempty"`
 	StaleDevices []model.ID     `json:"stale_devices,omitempty"`
 	// Next is the destination device of a login merge (mergefile.go), of
-	// another account: its record is durable in the device key store (its
-	// keychain entry, or device.next.key) from sign-in on, and it replaces
-	// this device once the destination vault is installed (promoteNext).
-	// It is never self and never a source of this vault's device key.
+	// another account. It is written before its record is (the intent), so
+	// the device key store never holds a record device.json does not name;
+	// the record is durable in the device key store (its keychain entry, or
+	// device.next.key) before its bootstrap is posted, and it replaces this
+	// device once the destination vault is installed (promoteNext). It is
+	// never self and never a source of this vault's device key.
 	Next *nextDevice `json:"next,omitempty"`
 }
 
-// nextDevice is device.json's next member: {"account_id":id, "device_id":id}.
+// nextDevice is device.json's next member:
+// {"account_id":id, "device_id":id, "stale":[id, ...]}.
+//
+// Stale are destination devices that an earlier attempt named here and
+// whose record was then found, conclusively, to be gone: a bootstrap may
+// have committed for any of them, so they become stale devices of the
+// destination account when it is installed, and hop passwd revokes the
+// ones that are active.
 type nextDevice struct {
-	AccountID model.ID `json:"account_id"`
-	DeviceID  model.ID `json:"device_id"`
+	AccountID model.ID   `json:"account_id"`
+	DeviceID  model.ID   `json:"device_id"`
+	Stale     []model.ID `json:"stale,omitempty"`
 }
 
 // pendingDevice is device.json's pending member: {"device_id":id}.
@@ -494,6 +504,65 @@ func (d *deviceStore) revokedSelf() error {
 		}
 	}
 	return nil
+}
+
+// slotState is what the device key store holds for one device.
+type slotState int
+
+const (
+	slotAbsent    slotState = iota // confirmed: keyring.ErrNotFound, or no file
+	slotRecord                     // the device's record
+	slotTombstone                  // its tombstone (§5.5): terminal
+)
+
+// probeSlot reads what the store holds for device id, a device that a
+// sign-in named before creating its record (the intent): its record (which
+// the caller then owns), its tombstone, or a confirmed absence. Nothing
+// else is concluded: a read that fails for any other reason is
+// ErrKeyStoreUnavailable, and content that is neither id's record nor a
+// tombstone of this account is ErrDeviceKey. Neither changes anything.
+// device.key or device.next.key holds one device's record, so for the file
+// store a tombstone of this account there counts whichever device it names.
+func (d *deviceStore) probeSlot(id model.ID) (slotState, *deviceRecord, error) {
+	var raw []byte
+	switch d.cfg.Store {
+	case DeviceStoreKeychain:
+		s, err := d.ring.Get(keychainService, d.slot(id))
+		if errors.Is(err, keyring.ErrNotFound) {
+			return slotAbsent, nil, nil
+		}
+		if err != nil {
+			return 0, nil, fmt.Errorf("%w: the keychain entry of device %v could not be read: %v", ErrKeyStoreUnavailable, id, err)
+		}
+		raw = []byte(s)
+		if t, ok := parseTombstone(raw); ok {
+			if t.AccountID != d.cfg.AccountID || t.DeviceID != id {
+				return 0, nil, fmt.Errorf("%w: the keychain entry of device %v holds another device's tombstone", ErrDeviceKey, id)
+			}
+			return slotTombstone, nil, nil
+		}
+	case DeviceStoreFile:
+		b, err := readKeyFile(d.l.deviceKeyFile())
+		if errors.Is(err, os.ErrNotExist) {
+			return slotAbsent, nil, nil
+		}
+		if err != nil {
+			return 0, nil, fmt.Errorf("%w: %v", ErrKeyStoreUnavailable, err)
+		}
+		if t, ok := parseTombstone(b); ok {
+			if t.AccountID != d.cfg.AccountID {
+				return 0, nil, fmt.Errorf("%w: %s holds another account's tombstone", ErrDeviceKey, d.l.deviceKeyFile())
+			}
+			return slotTombstone, nil, nil
+		}
+	default:
+		return 0, nil, fmt.Errorf("%w: unknown store %q", ErrDeviceKey, d.cfg.Store)
+	}
+	rec, err := d.loadID(id)
+	if err != nil {
+		return 0, nil, err
+	}
+	return slotRecord, rec, nil
 }
 
 // loadID reads the record of device id, and fails unless that is what the
