@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"io"
 	"os"
@@ -219,6 +220,35 @@ func TestConfigScanFlagsMatchExecInAnyForm(t *testing.T) {
 	}
 	if got := s.matchExec[0].text; got != `Match !exec "x"` {
 		t.Errorf("the line text = %q", got)
+	}
+}
+
+// Every error reaches the terminal display-safe, and JSON keeps values intact
+// while format characters are escaped.
+func TestErrorsAndJSONAreDisplaySafe(t *testing.T) {
+	var out bytes.Buffer
+	e := &Env{Stderr: &out}
+	reportError(e, "open /tmp/x\x1b[2J\u202eevil: no such file\n  next line", nil)
+	got := out.String()
+	if strings.ContainsAny(got, "\x1b\u202e") || !strings.Contains(got, "\n  next line") {
+		t.Errorf("text error not display-safe (or lost its layout): %q", got)
+	}
+	out.Reset()
+	reportError(e, "bad \u202e name", []string{"--json"})
+	if strings.ContainsRune(out.String(), 0x202e) || !strings.Contains(out.String(), `\u202e`) {
+		t.Errorf("JSON error = %q, want the bidi override escaped", out.String())
+	}
+	var js bytes.Buffer
+	e.Stdout = &js
+	if err := printJSON(e, map[string]string{"name": "a\u202eb\U000e0001c"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(js.String(), 0x202e) || strings.ContainsRune(js.String(), 0xe0001) {
+		t.Errorf("printJSON left format characters raw: %q", js.String())
+	}
+	var back map[string]string
+	if err := json.Unmarshal(js.Bytes(), &back); err != nil || back["name"] != "a\u202eb\U000e0001c" {
+		t.Errorf("escaped JSON does not round-trip: %v, %q", err, back["name"])
 	}
 }
 

@@ -53,9 +53,17 @@ func (s sshSettings) traceProblem() string {
 // tell which Host blocks applied: missing, in a form hop does not know, or too
 // long to keep. The import stops: guessing would import settings from blocks
 // that ssh did not apply.
-type errTraceUnverified struct{ why string }
+type errTraceUnverified struct {
+	why string
+	// settings marks a settings (stdout) overflow: the trace may be fine,
+	// but the settings cannot be read whole.
+	settings bool
+}
 
 func (e *errTraceUnverified) Error() string {
+	if e.settings {
+		return "can't read the settings ssh -G printed: " + e.why + "; nothing was imported"
+	}
 	return "can't verify which Host blocks applied with this OpenSSH version: " + e.why + "; nothing was imported"
 }
 
@@ -113,12 +121,12 @@ func (p *sshProber) run(ctx context.Context, config, name string, trace bool) (s
 	// says which Host blocks applied, so nothing read from this probe can be
 	// trusted, whether or not ssh succeeded.
 	if errBuf.overflow {
-		return sshSettings{}, &errTraceUnverified{fmt.Sprintf("ssh wrote more than %d bytes to stderr, which hop does not keep", maxProbeStderr)}
+		return sshSettings{}, &errTraceUnverified{why: fmt.Sprintf("ssh wrote more than %d bytes to stderr, which hop does not keep", maxProbeStderr)}
 	}
 	// Partial settings would be parsed as if complete, so a cut-off stdout
 	// fails the probe rather than importing guesses.
 	if outBuf.overflow {
-		return sshSettings{}, &errTraceUnverified{fmt.Sprintf("ssh -G wrote more than %d bytes of settings, which hop does not keep", maxProbeStdout)}
+		return sshSettings{}, &errTraceUnverified{why: fmt.Sprintf("ssh -G wrote more than %d bytes of settings, which hop does not keep", maxProbeStdout), settings: true}
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -153,10 +161,10 @@ func (p *sshProber) verifyTrace(ctx context.Context) error {
 		return err
 	}
 	if why := set.traceProblem(); why != "" {
-		return &errTraceUnverified{why}
+		return &errTraceUnverified{why: why}
 	}
 	if !slices.Contains(set.Applied, hostLoc{filepath.Clean(config), 1}) {
-		return &errTraceUnverified{"ssh -v did not report the Host line that applied to a test config"}
+		return &errTraceUnverified{why: "ssh -v did not report the Host line that applied to a test config"}
 	}
 	return nil
 }

@@ -43,8 +43,9 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	usage := fs.Usage
 	fs.Usage = func() {
 		usage()
-		fmt.Fprint(e.Stderr, "\nThe import reads the config with ssh -G, as connecting does: that runs any `Match exec` commands in it and may do DNS lookups.\n"+
-			"hop lists what its scan found (best effort) and asks first; importing your config carries the same trust as using it.\n")
+		fmt.Fprint(e.Stderr, "\nThe import evaluates the config and its Includes with ssh -G. That runs any `Match exec` commands in them as you,\n"+
+			"possibly once per host and even with --dry-run, and may do DNS lookups. hop lists what its scan found (best effort)\n"+
+			"and asks first. Only import configs you trust.\n")
 	}
 	withKeys := fs.Bool("with-keys", false, "import the private keys named by IdentityFile (default: only record the reference)")
 	dryRun := fs.Bool("dry-run", false, "show what would be imported")
@@ -126,15 +127,17 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 		return printJSON(e, imp.report)
 	}
 	for _, en := range imp.report.Entries {
-		line := fmt.Sprintf("%-12s %s %s", en.Status, en.Kind, en.Name)
+		// Names and reasons quote config values (paths, IdentityFile,
+		// HostKeyAlias, ssh's own errors), so they are made display-safe.
+		line := fmt.Sprintf("%-12s %s %s", en.Status, en.Kind, printable(en.Name))
 		if en.Reason != "" {
-			line += ": " + en.Reason
+			line += ": " + displaySafe(en.Reason)
 		}
 		e.printf("%s\n", line)
 	}
 	// The scan's findings were printed with the notice.
 	for _, w := range slices.Concat(warnings, imp.warnings) {
-		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", w)
+		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", displaySafe(w))
 	}
 	if !*dryRun && slices.ContainsFunc(imp.report.Entries, func(en ImportEntry) bool { return en.Kind == "host" && en.Status == "imported" }) {
 		fmt.Fprintf(e.Stderr, "hop: imported hosts have no pinned host keys yet; pin each with: hop trust <host>\n")
@@ -301,7 +304,7 @@ func (im *importer) run() error {
 			continue
 		}
 		if why := set.traceProblem(); why != "" {
-			return &errTraceUnverified{why}
+			return &errTraceUnverified{why: why}
 		}
 		// What this ssh prints for the name when no config says anything. A
 		// value equal to it is a default, not something the config set.

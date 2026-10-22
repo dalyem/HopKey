@@ -2305,7 +2305,11 @@ esac`,
 		before := e.vaultHostCount(t)
 		for _, args := range [][]string{{"--yes"}, {"--yes", "--dry-run"}} {
 			stderr := e.importFails(t, name, args...)
-			if !strings.Contains(stderr, "can't verify which Host blocks applied with this OpenSSH version") || !strings.Contains(stderr, "nothing was imported") {
+			want := "can't verify which Host blocks applied with this OpenSSH version"
+			if strings.HasSuffix(name, "stdout") {
+				want = "can't read the settings ssh -G printed"
+			}
+			if !strings.Contains(stderr, want) || !strings.Contains(stderr, "nothing was imported") {
 				t.Errorf("%s %v: stderr = %q", name, args, stderr)
 			}
 			if e.vaultHostCount(t) != before {

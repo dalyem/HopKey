@@ -9,6 +9,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,8 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf16"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
@@ -172,13 +175,55 @@ func Run(ctx context.Context, args []string, e *Env) int {
 }
 
 // reportError prints a failure to stderr, as JSON when the caller asked for it.
+// Errors often quote paths and config text, so what reaches the terminal is
+// made display-safe here, for every command.
 func reportError(e *Env, msg string, args []string) {
 	if wantsJSON(args) {
 		b, _ := json.Marshal(map[string]string{"error": msg})
-		fmt.Fprintln(e.Stderr, string(b))
+		fmt.Fprintln(e.Stderr, string(escapeFormatChars(b)))
 		return
 	}
-	fmt.Fprintf(e.Stderr, "hop: %s\n", msg)
+	fmt.Fprintf(e.Stderr, "hop: %s\n", displaySafe(msg))
+}
+
+// displaySafe neutralizes what could redraw or reorder the terminal: C0
+// controls other than newline and tab, DEL, C1 (which covers the CSI
+// introducer) and Unicode format characters such as bidi overrides. Callers
+// that quote a single untrusted value use printable, which also maps newlines.
+func displaySafe(s string) string {
+	return strings.Map(func(c rune) rune {
+		if c == '\n' || c == '\t' {
+			return c
+		}
+		if c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0) || unicode.Is(unicode.Cf, c) {
+			return '?'
+		}
+		return c
+	}, s)
+}
+
+// escapeFormatChars rewrites Unicode format characters in encoded JSON as
+// \uXXXX escapes. encoding/json already escapes ASCII controls; this keeps
+// values intact for machines while bidi overrides stay inert on a terminal.
+// Format characters are never JSON syntax, so they only occur inside strings.
+func escapeFormatChars(b []byte) []byte {
+	if !bytes.ContainsFunc(b, func(c rune) bool { return unicode.Is(unicode.Cf, c) }) {
+		return b
+	}
+	var out bytes.Buffer
+	for _, c := range string(b) {
+		if unicode.Is(unicode.Cf, c) {
+			if c > 0xffff {
+				hi, lo := utf16.EncodeRune(c)
+				fmt.Fprintf(&out, "\\u%04x\\u%04x", hi, lo)
+			} else {
+				fmt.Fprintf(&out, "\\u%04x", c)
+			}
+			continue
+		}
+		out.WriteRune(c)
+	}
+	return out.Bytes()
 }
 
 func wantsJSON(args []string) bool {
@@ -278,10 +323,15 @@ func wasSet(fs *flag.FlagSet, name string) bool {
 }
 
 func printJSON(e *Env, v any) error {
-	enc := json.NewEncoder(e.Stdout)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
-	return enc.Encode(v)
+	if err := enc.Encode(v); err != nil {
+		return err
+	}
+	_, err := e.Stdout.Write(escapeFormatChars(buf.Bytes()))
+	return err
 }
 
 // confirm asks a yes/no question on stderr. yes short-circuits it. Without a
