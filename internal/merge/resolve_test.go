@@ -46,6 +46,13 @@ func TestResolutionTable(t *testing.T) {
 		// keepMine and edit say whether the table allows the choice; a
 		// refused choice is checked against the row.
 		keepMine, edit bool
+		// editWant, when set, is the complete replacement Edit must
+		// return. Rows whose replacement other tests pin (conflict puts,
+		// fresh creates) leave it nil.
+		editWant *Intent
+		// editHoldsAgain says rebuilding the edited replacement against
+		// the same S still holds, with this cause.
+		editHoldsAgain Cause
 	}{
 		{
 			name:   "put, item live, guarded conflict",
@@ -82,6 +89,7 @@ func TestResolutionTable(t *testing.T) {
 			cause:  CauseRuleFailure,
 			edited: host(t, 1, name("y")),
 			row:    RowWriteBlocked, keepMine: false, edit: true,
+			editWant: ptr(create(host(t, 1, name("y")))),
 		},
 		{
 			name:   "put, item live, rule failure",
@@ -90,6 +98,7 @@ func TestResolutionTable(t *testing.T) {
 			s:      host(t, 7),
 			edited: host(t, 7, name("y")),
 			row:    RowWriteBlocked, keepMine: false, edit: true,
+			editWant: ptr(put(host(t, 7), host(t, 7, name("y")))),
 		},
 		{
 			name:   "create, ID taken",
@@ -98,6 +107,8 @@ func TestResolutionTable(t *testing.T) {
 			s:      host(t, 3),
 			edited: host(t, 1, name("y")),
 			row:    RowWriteBlocked, keepMine: false, edit: true,
+			editWant:       ptr(create(host(t, 1, name("y")))),
+			editHoldsAgain: CauseIDTaken,
 		},
 	}
 	for _, tc := range tests {
@@ -127,6 +138,18 @@ func TestResolutionTable(t *testing.T) {
 					t.Errorf("edit: %v", err)
 				} else if err := got.Validate(); err != nil {
 					t.Errorf("edit produced an invalid intent: %v", err)
+				} else {
+					if tc.editWant != nil {
+						sameIntent(t, got, *tc.editWant)
+					}
+					if tc.editHoldsAgain != "" {
+						// The ID is still taken, so the edited create
+						// holds again (live or retired IDs are never freed).
+						r := Rebuild(got, tc.s, true, false)
+						if r.Kind != KindHold || r.Cause != tc.editHoldsAgain {
+							t.Errorf("rebuilding the edit = %s %s, want a %s hold", r.Kind, r.Cause, tc.editHoldsAgain)
+						}
+					}
 				}
 			} else {
 				wantRefusal(t, err, ChoiceEdit, tc.row)
@@ -547,3 +570,5 @@ func TestRetryAfterTheBlockerClears(t *testing.T) {
 		t.Errorf("keep mine after the retry: %v", err)
 	}
 }
+
+func ptr[T any](v T) *T { return &v }

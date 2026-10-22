@@ -85,7 +85,7 @@ for name, item in [("key at version 5", key), ("snippet", snippet), ("credential
 vault = "0123456789abcdef0123456789abcdef"
 txn = "fedcba9876543210fedcba9876543210"
 rows = [{"item_id": i["item_id"], "type": i["type"], "digest": item_digest[i["item_id"]]}
-        for i in (snippet, key, credential)]
+        for i in (credential, snippet, key)]  # item_ids c0…, 50…, a0…: not in order
 for name, r in [("three rows, unsorted input", rows), ("no rows", [])]:
     sorted_rows = sorted(r, key=lambda x: x["item_id"])
     msg, digest = D("hopkey/v1/merge-discard", {"vault_id": vault, "txn_id": txn, "items": sorted_rows})

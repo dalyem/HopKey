@@ -109,6 +109,11 @@
       "txn_id": "fedcba9876543210fedcba9876543210",
       "rows": [
         {
+          "item_id": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+          "type": "credential",
+          "digest": "764be8fc97ccbf1b3f7314ce637caeb088b89ee5433932c3a150f223d0e8301e"
+        },
+        {
           "item_id": "5050505050505050505050505050505a",
           "type": "snippet",
           "digest": "5a00d5340f58d6c9f8354d34d3e1bc9eb0e6692d2aaee74fb9f6e291ce27a536"
@@ -117,11 +122,6 @@
           "item_id": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
           "type": "key",
           "digest": "a245371785f6c3f8ac1e8b73eba0b1b855a189751a793a7cf3d4cfc931fdf7c9"
-        },
-        {
-          "item_id": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
-          "type": "credential",
-          "digest": "764be8fc97ccbf1b3f7314ce637caeb088b89ee5433932c3a150f223d0e8301e"
         }
       ],
       "message": "{\"items\":[{\"digest\":\"5a00d5340f58d6c9f8354d34d3e1bc9eb0e6692d2aaee74fb9f6e291ce27a536\",\"item_id\":\"5050505050505050505050505050505a\",\"type\":\"snippet\"},{\"digest\":\"a245371785f6c3f8ac1e8b73eba0b1b855a189751a793a7cf3d4cfc931fdf7c9\",\"item_id\":\"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0\",\"type\":\"key\"},{\"digest\":\"764be8fc97ccbf1b3f7314ce637caeb088b89ee5433932c3a150f223d0e8301e\",\"item_id\":\"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\",\"type\":\"credential\"}],\"txn_id\":\"fedcba9876543210fedcba9876543210\",\"vault_id\":\"0123456789abcdef0123456789abcdef\"}",
