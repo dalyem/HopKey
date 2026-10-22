@@ -17,6 +17,7 @@ import (
 	"github.com/dalyem/hopkey/internal/sshagent"
 	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/sshkeys"
+	"github.com/dalyem/hopkey/internal/store"
 )
 
 const maxRequest = 4 << 20 // bytes in one request line
@@ -130,6 +131,9 @@ func (d *Daemon) handle(req Request) Response {
 	defer cancel()
 	result, err := d.dispatch(ctx, req)
 	if err != nil {
+		d.mu.Lock()
+		d.followStore(err)
+		d.mu.Unlock()
 		return errorResponse(err)
 	}
 	var raw json.RawMessage
@@ -194,7 +198,7 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 
 func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 	snap, st, err := d.fresh(ctx)
-	if errors.Is(err, model.ErrLocked) {
+	if errors.Is(err, model.ErrLocked) || errors.Is(err, store.ErrDeviceRevoked) {
 		snap, st, err = model.Snapshot{}, lockedState(), nil
 	}
 	if err != nil {

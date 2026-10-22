@@ -188,7 +188,7 @@ func (s *Store) applyPulled(gen uint64, entries []Committed, head vaultlog.Head)
 	}
 	defer unlock()
 	before := s.state.Head.Seq
-	st, sec, err := s.applyEntries(s.state, s.sec, s.dev, entries, s.rec)
+	st, sec, err := s.applyEntries(s.state, s.sec, s.dev, nil, entries, s.rec)
 	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
 		return false, s.revoke(rev)
 	}
@@ -230,9 +230,10 @@ func (s *Store) haltOn(err error) error {
 // even with an error. Entries this device already holds are compared with
 // what it holds (§5.6). rec is the device record whose local_key opens the
 // outbox: a password unlock passes the new record, which carries the old
-// one's local_key, before it is saved. The caller holds s.mu and the file
-// lock.
-func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaultlog.DeviceKey, entries []Committed, rec *deviceRecord) (*vaultlog.State, *vaultlog.Secrets, error) {
+// one's local_key, before it is saved. A password unlock has no dev, and
+// passes in self the devices this machine is (see transition). The caller
+// holds s.mu and the file lock.
+func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaultlog.DeviceKey, self []model.ID, entries []Committed, rec *deviceRecord) (*vaultlog.State, *vaultlog.Secrets, error) {
 	objs := objectDir(s.l.objects())
 	for _, c := range entries {
 		if c.Wire == nil {
@@ -263,7 +264,7 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 		if c.Seq != st.Head.Seq+1 {
 			return st, sec, fmt.Errorf("store: the server skipped from seq %d to %d", st.Head.Seq, c.Seq)
 		}
-		next, nsec, err := vaultlog.Transition(st, sec, dev, c.Wire, objs)
+		next, nsec, err := transition(st, sec, dev, self, c.Wire, objs)
 		if err != nil {
 			return st, sec, err
 		}
@@ -307,6 +308,27 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 		return err
 	}
 	return s.commitTxn(t)
+}
+
+// transition is vaultlog.Transition. With no dev (a password unlock, whose
+// device key is lost) it still takes the "revoked here" exit (§5.5) for
+// the devices in self, the ones this machine is in the log as: a
+// checkpoint that revokes one of them returns a *vaultlog.RevokedError
+// from the public stage, before anything is decrypted.
+func transition(st *vaultlog.State, sec *vaultlog.Secrets, dev vaultlog.DeviceKey, self []model.ID, w *vaultlog.Wire, objs vaultlog.ObjectFetcher) (*vaultlog.State, *vaultlog.Secrets, error) {
+	if dev != nil {
+		return vaultlog.Transition(st, sec, dev, w, objs)
+	}
+	c, err := vaultlog.CheckPublic(st, w, objs)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, id := range self {
+		if c.Revokes(id) {
+			return nil, nil, &vaultlog.RevokedError{DeviceID: id, Head: c.Post.Head}
+		}
+	}
+	return c.CheckPlaintext(sec, nil)
 }
 
 func (s *Store) entryHash(seq uint64) (crypto.Hash, error) {

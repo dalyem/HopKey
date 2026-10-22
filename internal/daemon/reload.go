@@ -31,6 +31,7 @@ type state struct {
 	lastError   string // set on a copy of the state when a later reload failed
 
 	locked  bool           // the vault is locked: nothing is loaded
+	revoked bool           // and for good: this device was revoked
 	snap    model.Snapshot // what it was built from, when head is set
 	head    store.Head     // the store's head at the time, if it has one
 	hasHead bool
@@ -75,6 +76,7 @@ func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
 		d.noteError(err)
+		d.followStore(err)
 		return model.Snapshot{}, err
 	}
 	next, err := d.apply(ctx, snap)
@@ -107,6 +109,9 @@ func (d *Daemon) fresh(ctx context.Context) (model.Snapshot, *state, error) {
 	}
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
+		d.mu.Lock()
+		d.followStore(err)
+		d.mu.Unlock()
 		return model.Snapshot{}, nil, err
 	}
 	if cur := d.state.Load(); cur != nil && cur.fingerprint == fingerprint(snap) {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/sshagent"
+	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/store"
 )
 
@@ -127,10 +128,75 @@ func (d *Daemon) lockVault(v Vault) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	v.Lock()
+	d.dropKeysLocked(false)
+	d.logf("vault locked")
+}
+
+// dropKeysLocked empties the agent and forgets the last snapshot, as a lock
+// does. For a revoked device it also writes an ssh config with no hosts, so
+// nothing the vault decrypted stays behind (§5.5). The caller holds d.mu.
+func (d *Daemon) dropKeysLocked(revoked bool) {
 	old := d.live.swap(sshagent.NewKeyring())
 	old.RemoveAll()
-	d.state.Store(lockedState())
-	d.logf("vault locked")
+	st := lockedState()
+	st.revoked = revoked
+	d.state.Store(st)
+	if revoked {
+		if err := sshconfig.Write(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, nil); err != nil {
+			d.logf("clearing the ssh config of a revoked device: %v", err)
+		}
+	}
+}
+
+// followStore takes the daemon to the locked state when err, from any use
+// of the store, says the vault is locked (an interrupted commit locks it)
+// or this device is revoked: the agent stops serving keys the vault no
+// longer has unlocked, as after hop lock. The store's own state decides,
+// so a vault unlocked again since err is left alone. The caller holds d.mu.
+func (d *Daemon) followStore(err error) {
+	if !errors.Is(err, model.ErrLocked) && !errors.Is(err, store.ErrDeviceRevoked) {
+		return
+	}
+	v, ok := d.store.(Vault)
+	if !ok {
+		return
+	}
+	_, herr := v.Head()
+	if herr == nil {
+		return
+	}
+	revoked := errors.Is(herr, store.ErrDeviceRevoked)
+	if cur := d.state.Load(); cur != nil && cur.locked && (cur.revoked || !revoked) {
+		return
+	}
+	d.dropKeysLocked(revoked)
+	if revoked {
+		d.logf("this device was revoked: the agent is empty and the vault can't be unlocked here again (%v)", herr)
+	} else {
+		d.logf("the vault locked itself: %v", herr)
+	}
+}
+
+// watchRevoked drops the keys at once when the store reports that this
+// device was revoked, by a pull or any other path, rather than at the next
+// request.
+func (d *Daemon) watchRevoked() {
+	rv, ok := d.store.(interface{ Revoked() <-chan struct{} })
+	if !ok {
+		return
+	}
+	ch := rv.Revoked()
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		select {
+		case <-ch:
+			d.mu.Lock()
+			d.followStore(store.ErrDeviceRevoked)
+			d.mu.Unlock()
+		case <-d.ctx.Done():
+		}
+	}()
 }
 
 func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error {

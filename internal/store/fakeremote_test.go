@@ -271,6 +271,10 @@ func secondDevice(t *testing.T, f *fixture, r *fakeRemote) *fixture {
 	}
 	cfg := testConfig(t)
 	copyDir(t, f.cfg.DataDir, cfg.DataDir)
+	// The copy has no device key of its own: it opens locked.
+	if err := os.Remove(filepath.Join(cfg.DataDir, "device.key")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
 	b, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)

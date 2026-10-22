@@ -92,6 +92,9 @@ var (
 	// (§5.5). Its vault can't be unlocked or used again, with the device key
 	// or the password: sign in again as a new device.
 	ErrDeviceRevoked = errors.New("store: this device was revoked from the account; its vault can't be used here again")
+	// ErrAlreadyUnlocked means UnlockWithPasswordRemote was called on an
+	// unlocked vault. It is for a lost device key, so it runs only locked.
+	ErrAlreadyUnlocked = errors.New("store: the vault is already unlocked; hop lock first to replace the device key with the password")
 
 	errClosed = errors.New("store: the vault store is closed")
 
@@ -186,8 +189,10 @@ type Store struct {
 	// rule violation in a server entry).
 	syncHalt error
 	// revoked is set for good once a checkpoint revokes this device
-	// (§5.5, revoke): it wraps ErrDeviceRevoked.
-	revoked error
+	// (§5.5, revoke): it wraps ErrDeviceRevoked. revokedC is closed then
+	// (Revoked).
+	revoked  error
+	revokedC chan struct{}
 
 	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
@@ -353,6 +358,8 @@ func (s *Store) unlockLocked() error {
 		return errClosed
 	}
 	if err := s.checkRevoked(); err != nil {
+		// A revocation whose wipe of the device record failed retries it.
+		s.destroyDeviceRecord()
 		return err
 	}
 	cfg, err := s.readDeviceConfig()
@@ -364,21 +371,23 @@ func (s *Store) unlockLocked() error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if s.rec != rec {
+			rec.zero()
+		}
+	}()
 	dev, err := rec.device()
 	if err != nil {
-		rec.zero()
 		return err
 	}
 	unlock, err := s.lockFile()
 	if err != nil {
-		rec.zero()
 		return err
 	}
 	defer unlock()
 	// A v1 record becomes v2 with a local_key, durably, before anything
 	// uses it (§11, rev 16). If that fails, the vault stays locked.
 	if err := s.deviceStore(cfg).upgradeRecord(rec); err != nil {
-		rec.zero()
 		return err
 	}
 	if err := s.replayWAL(); err != nil {
@@ -397,7 +406,7 @@ func (s *Store) unlockLocked() error {
 	if err != nil {
 		return err
 	}
-	st, sec, repaired, err := s.replay(stored, raw, acct, dev)
+	st, sec, repaired, err := s.replay(stored, raw, acct, dev, nil)
 	if err != nil {
 		return err
 	}
@@ -434,22 +443,55 @@ type revokedFile struct {
 func (l layout) revokedFile() string { return filepath.Join(l.vault(), "revoked.json") }
 
 // revoke handles an authenticated checkpoint that revokes this device
-// (§5.5, "Revoked here?"): it records the revocation durably, wipes every
-// decrypted secret and cancels in-flight requests, and from then on every
-// use and every unlock of this vault fails with ErrDeviceRevoked, after a
-// restart too. The revoking entry is never decrypted or written. The
-// caller holds s.mu and, when there is one, the file lock.
+// (§5.5, "Revoked here?"): it records the revocation durably, deletes the
+// device record from the device key store, wipes every decrypted secret
+// and cancels in-flight requests, and from then on every use and every
+// unlock of this vault fails with ErrDeviceRevoked, after a restart too.
+// The revoking entry is never decrypted or written. The caller holds s.mu
+// and, when there is one, the file lock.
+//
+// The device record goes whether or not revoked.json was written: a
+// revoked device's keys have no further use (§5.5 wipes them), and without
+// them an Open can't unlock even if the marker was lost. A password unlock
+// can't bring the vault back either: a server-backed vault refuses a local
+// one, and the server path meets the revocation again. If both the marker
+// and the deletion fail, the error says so, and a restart that still finds
+// the device record unlocks with it until the next pull meets the
+// revocation again.
 func (s *Store) revoke(rev *vaultlog.RevokedError) error {
-	s.revoked = fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, rev.DeviceID, rev.Head.Seq)
+	s.setRevoked(fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, rev.DeviceID, rev.Head.Seq))
+	var failed []string
 	b, err := canonjson.Marshal(revokedFile{V: 1, DeviceID: rev.DeviceID, Seq: rev.Head.Seq, H: rev.Head.H})
+	if err == nil {
+		err = s.hook("revoke:marker")
+	}
 	if err == nil {
 		err = writeFileAtomic(s.l.revokedFile(), b)
 	}
-	s.dropLocked(s.revoked)
 	if err != nil {
-		return fmt.Errorf("%w; recording it on disk failed: %v", s.revoked, err)
+		failed = append(failed, fmt.Sprintf("recording it on disk failed: %v", err))
+	}
+	if err := s.destroyDeviceRecord(); err != nil {
+		failed = append(failed, fmt.Sprintf("deleting the device key failed: %v", err))
+	}
+	s.dropLocked(s.revoked)
+	if len(failed) > 0 {
+		return fmt.Errorf("%w; %s", s.revoked, strings.Join(failed, "; "))
 	}
 	return s.revoked
+}
+
+// destroyDeviceRecord deletes this device's record from the device key
+// store (deviceStore.destroy). The caller holds s.mu.
+func (s *Store) destroyDeviceRecord() error {
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return err
+	}
+	if err := s.hook("revoke:destroy"); err != nil {
+		return err
+	}
+	return s.deviceStore(cfg).destroy()
 }
 
 // checkRevoked fails with ErrDeviceRevoked once this device is revoked. Any
@@ -465,11 +507,39 @@ func (s *Store) checkRevoked() error {
 	}
 	var f revokedFile
 	if err != nil || canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
-		s.revoked = fmt.Errorf("%w (%s)", ErrDeviceRevoked, s.l.revokedFile())
+		s.setRevoked(fmt.Errorf("%w (%s)", ErrDeviceRevoked, s.l.revokedFile()))
 	} else {
-		s.revoked = fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, f.DeviceID, f.Seq)
+		s.setRevoked(fmt.Errorf("%w (device %v, by the checkpoint at seq %d)", ErrDeviceRevoked, f.DeviceID, f.Seq))
 	}
 	return s.revoked
+}
+
+// setRevoked records err, which wraps ErrDeviceRevoked, as this device's
+// revocation and closes the Revoked channel. The caller holds s.mu.
+func (s *Store) setRevoked(err error) {
+	if s.revoked == nil {
+		close(s.revokedChan())
+	}
+	s.revoked = err
+}
+
+// revokedChan returns the Revoked channel, made on first use. The caller
+// holds s.mu.
+func (s *Store) revokedChan() chan struct{} {
+	if s.revokedC == nil {
+		s.revokedC = make(chan struct{})
+	}
+	return s.revokedC
+}
+
+// Revoked returns a channel that is closed once this device is revoked
+// (ErrDeviceRevoked), by a pull or any other path that meets the revoking
+// checkpoint. The daemon watches it to drop the keys it serves at once.
+func (s *Store) Revoked() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checkRevoked()
+	return s.revokedChan()
 }
 
 // lockedErr is the error for a use of the vault while it is locked:
@@ -566,8 +636,9 @@ func (s *Store) readStoredState() (*vaultlog.State, []byte, error) {
 // crashed before state.json was updated: each is verified by the transition
 // algorithm before it is applied, and state.json is then rewritten; the
 // returned note says so. dev crosses a checkpoint in that tail; with no dev
-// (a password unlock) such a tail is an error.
-func (s *Store) replay(stored *vaultlog.State, raw []byte, acct *crypto.AccountKeys, dev vaultlog.DeviceKey) (*vaultlog.State, *vaultlog.Secrets, string, error) {
+// (a password unlock) such a tail is an error, or a *vaultlog.RevokedError
+// if it revokes a device in self (see transition).
+func (s *Store) replay(stored *vaultlog.State, raw []byte, acct *crypto.AccountKeys, dev vaultlog.DeviceKey, self []model.ID) (*vaultlog.State, *vaultlog.Secrets, string, error) {
 	seqs, err := s.l.entrySeqs()
 	if err != nil {
 		return nil, nil, "", err
@@ -638,7 +709,7 @@ func (s *Store) replay(stored *vaultlog.State, raw []byte, acct *crypto.AccountK
 		note = fmt.Sprintf("finished a write that a crash interrupted: state.json moved from seq %d to %d", last, len(wires)-1)
 	}
 	for i := int(last) + 1; i < len(wires); i++ {
-		if st, sec, err = vaultlog.Transition(st, sec, dev, wires[i], objs); err != nil {
+		if st, sec, err = transition(st, sec, dev, self, wires[i], objs); err != nil {
 			return nil, nil, "", fmt.Errorf("%w: entry %d past the state head: %w", ErrCorrupt, i, err)
 		}
 	}

@@ -192,6 +192,7 @@ func TestLocalKeyCarriedOverAReplacementRecord(t *testing.T) {
 	s := f.s
 	_, h := addHost(t, s, "web")
 	oldDev, key := s.dev.ID, bytes.Clone(s.rec.LocalKey)
+	s.Lock()
 	if err := s.UnlockWithPasswordRemote(ctx, r, []byte(testPassword), ""); err != nil {
 		t.Fatal(err)
 	}

@@ -50,11 +50,22 @@ func (s *Store) UnlockWithPassword(ctx context.Context, password []byte, secretK
 // saved and the new device stays listed as stale, so the next hop passwd
 // revokes it if it committed.
 //
+// It runs only on a locked vault, and returns ErrAlreadyUnlocked otherwise:
+// it is for a lost device key. The vault stays locked until the new device
+// record is saved and installed, so no read or write sees a state or an
+// outbox in between, and every failure leaves it locked.
+//
+// A checkpoint on the server that revokes this device (the one device.json
+// names, or the one whose record is still readable) is met in the public
+// stage, before anything is decrypted: the device is revoked (§5.5) and it
+// returns ErrDeviceRevoked.
+//
 // It waits on the server without holding the store's mutex, so Lock is
-// never blocked behind it. A lock (§11.2) cancels its in-flight request and
-// discards whatever arrives afterwards: it then returns ErrSyncInterrupted,
-// having saved no device record and installed nothing. Verified entries it
-// committed before the lock stay committed.
+// never blocked behind it. A lock (§11.2), or an unlock with the device
+// key, cancels its in-flight request and discards whatever arrives
+// afterwards: it then returns ErrSyncInterrupted, having saved no device
+// record and installed nothing. Verified entries it committed before stay
+// committed.
 func (s *Store) UnlockWithPasswordRemote(ctx context.Context, r Remote, password []byte, secretKey string) error {
 	if r == nil {
 		return errors.New("store: no server")
@@ -77,6 +88,9 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err := s.checkRevoked(); err != nil {
 		return err
 	}
+	if r != nil && s.state != nil {
+		return ErrAlreadyUnlocked
+	}
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
 		return err
@@ -93,6 +107,16 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 			old.zero()
 		}
 	}()
+	// The devices this machine is in the log as, public: the one
+	// device.json names and the one whose record can still be read. A
+	// checkpoint that revokes either revokes this device (transition).
+	var self []model.ID
+	if !cfg.DeviceID.IsZero() {
+		self = append(self, cfg.DeviceID)
+	}
+	if old != nil && old.DeviceID != cfg.DeviceID {
+		self = append(self, old.DeviceID)
+	}
 	var sk *crypto.SecretKey
 	switch {
 	case secretKey != "":
@@ -114,6 +138,11 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 		return err
 	}
 	defer fl.unlock()
+	defer func() {
+		if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+			err = s.revoke(rev)
+		}
+	}()
 	if err := s.replayWAL(); err != nil {
 		return err
 	}
@@ -135,7 +164,7 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if !acct.Pin().Equal(stored.Pin()) {
 		return fmt.Errorf("%w: account.json does not match state.json", ErrCorrupt)
 	}
-	st, sec, repaired, err := s.replay(stored, raw, acct, nil)
+	st, sec, repaired, err := s.replay(stored, raw, acct, nil, self)
 	if err != nil {
 		return err
 	}
@@ -198,22 +227,14 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 		}
 	} else {
 		// From here every request to the server runs outside s.mu, and a
-		// lock in the meantime discards its result.
+		// lock or an unlock in the meantime discards its result. The store
+		// stays locked throughout.
 		rctx, gen, untrack := s.trackRequest(ctx)
 		defer untrack()
-		st0 := s.state
-		// If this fails after committing verified entries, a store that is
-		// still unlocked in the same session moves to them: memory never
-		// runs behind the files, whose outbox records they may have settled.
-		defer func() {
-			if err != nil && st0 != nil && s.gen == gen && s.state == st0 && st.Head.Seq > st0.Head.Seq {
-				s.state, s.sec = st, sec
-			}
-		}()
-		if st, sec, err = s.bootstrapRemote(rctx, r, fl, gen, st0, st, sec, info, rec); err != nil {
+		if st, sec, err = s.bootstrapRemote(rctx, r, fl, gen, st, sec, info, rec, append(self, rec.DeviceID)); err != nil {
 			return err
 		}
-		if s.gen != gen || s.state != st0 {
+		if s.gen != gen || s.state != nil {
 			return ErrSyncInterrupted
 		}
 	}
@@ -260,16 +281,17 @@ func (h *fileHold) unlock() {
 }
 
 // outside runs f, a request to the server, without s.mu or the file lock,
-// and then takes both back (§11.2). The caller holds both, and holds s.mu
-// again when outside returns; it holds the file lock again unless outside
-// fails. A lock or an unlock while f ran (the generation gen or the state
-// st0 changed) discards f's result: outside returns ErrSyncInterrupted.
-func (s *Store) outside(fl *fileHold, gen uint64, st0 *vaultlog.State, f func() error) error {
+// and then takes both back (§11.2). The caller holds both on a locked
+// store, and holds s.mu again when outside returns; it holds the file lock
+// again unless outside fails. A lock or an unlock while f ran (the
+// generation gen changed, or the store is unlocked) discards f's result:
+// outside returns ErrSyncInterrupted.
+func (s *Store) outside(fl *fileHold, gen uint64, f func() error) error {
 	fl.unlock()
 	s.mu.Unlock()
 	err := f()
 	s.mu.Lock()
-	if s.gen != gen || s.state != st0 {
+	if s.gen != gen || s.state != nil {
 		return ErrSyncInterrupted
 	}
 	if lerr := fl.lock(); lerr != nil {
@@ -307,16 +329,17 @@ func (s *Store) dropLostRecords() error {
 // the server's log shows it, verified. With an error it returns the last
 // state it committed, (st, sec) if none. Each verified entry is committed
 // with the outbox records it settles, opened with rec's local_key (carried
-// over from the old record). Every request runs outside s.mu (see outside),
-// and nothing is committed once the store has left generation gen or the
-// state st0. The caller holds s.mu and the file lock (fl).
-func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen uint64, st0 *vaultlog.State, st *vaultlog.State, sec *vaultlog.Secrets, info vaultlog.DeviceInfo, rec *deviceRecord) (*vaultlog.State, *vaultlog.Secrets, error) {
+// over from the old record). self are the devices this machine is in the
+// log as (see transition). Every request runs outside s.mu (see outside),
+// and nothing is committed once the store has left generation gen or been
+// unlocked. The caller holds s.mu and the file lock (fl) on a locked store.
+func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen uint64, st *vaultlog.State, sec *vaultlog.Secrets, info vaultlog.DeviceInfo, rec *deviceRecord, self []model.ID) (*vaultlog.State, *vaultlog.Secrets, error) {
 	catchUp := func() error {
 		for {
 			var entries []Committed
 			var head vaultlog.Head
 			after := st.Head.Seq
-			if err := s.outside(fl, gen, st0, func() (err error) {
+			if err := s.outside(fl, gen, func() (err error) {
 				if err := s.hook("passwd:since"); err != nil {
 					return err
 				}
@@ -327,7 +350,7 @@ func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen
 			}
 			before := st.Head.Seq
 			var err error
-			st, sec, err = s.applyEntries(st, sec, nil, entries, rec)
+			st, sec, err = s.applyEntries(st, sec, nil, self, entries, rec)
 			if err != nil {
 				return err
 			}
@@ -351,7 +374,7 @@ func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen
 		if err != nil {
 			return st, sec, err
 		}
-		if err := s.outside(fl, gen, st0, func() error {
+		if err := s.outside(fl, gen, func() error {
 			if _, err := r.Post(ctx, w); err != nil && !errors.Is(err, ErrHeadConflict) {
 				return err
 			}

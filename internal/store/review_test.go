@@ -144,6 +144,7 @@ func TestLockInterruptsAPasswordUnlock(t *testing.T) {
 			pushAll(t, b, p.r)
 			before := stateHead(t, p.a.cfg)
 			oldDev := deviceOf(a)
+			a.Lock()
 
 			entered, release, giveUp := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			cancelled := make(chan bool, 1)
@@ -210,7 +211,7 @@ func TestLockInterruptsAPasswordUnlock(t *testing.T) {
 // §11.1: a password unlock commits each entry it pulls together with the
 // outbox records it settles, with the local_key the new record carries
 // over. A crash before the new record is saved leaves no record whose
-// candidate verified history has already committed.
+// candidate verified history has already committed, and the store locked.
 func TestPasswordUnlockSettlesACommittedCandidate(t *testing.T) {
 	ctx := context.Background()
 	f, r := serverVault(t)
@@ -229,14 +230,13 @@ func TestPasswordUnlockSettlesACommittedCandidate(t *testing.T) {
 	}
 	cand := recs[0].live().Seq
 
+	s.Lock()
 	s.testHook = crashAt("passwd:save")
 	if err := s.UnlockWithPasswordRemote(ctx, r, []byte(testPassword), ""); !errors.Is(err, errCrash) {
 		t.Fatalf("password unlock with a crash before the record is saved: %v", err)
 	}
-	// The store, still unlocked with the old key, moved to what was
-	// committed: the settled edit stays visible.
-	if got, _ := hostByID(t, s, h.ItemID); got.Description != "committed, response lost" {
-		t.Errorf("host in the overlay after the failed password unlock: %+v", got)
+	if _, err := s.Snapshot(ctx); !errors.Is(err, model.ErrLocked) {
+		t.Errorf("the failed password unlock left the store unlocked: %v", err)
 	}
 	if got := stateHead(t, f.cfg); got.Seq < cand {
 		t.Fatalf("the candidate's entry was not committed: head %d, candidate %d", got.Seq, cand)

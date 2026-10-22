@@ -36,8 +36,9 @@ import (
 // starts is never overwritten: the commit fails and the store locks.
 //
 // Each durable step has a test hook named after it (wal:install,
-// wal:install:sync, wal:op:<i>, wal:op:<i>:sync, wal:removed), so a crash,
-// or a failed fsync, can be simulated at every one.
+// wal:install:sync, wal:op:<i>, wal:op:<i>:sync, wal:removed, and
+// wal:replay:sync before a replay), so a crash, or a failed fsync, can be
+// simulated at every one.
 //
 // Phase 1's commit order (objects, then the entry as the commit point,
 // then state.json, repaired by the replay on unlock) is unchanged for
@@ -260,6 +261,12 @@ func (s *Store) applyOp(i int, op walOp) error {
 // the file lock, before anything reads the vault's files. A journal that
 // does not parse was not written by hop (it appears whole or not at all)
 // and fails closed.
+//
+// The journal may be one whose install failed after the rename, before its
+// directory was fsynced. Before any operation is applied, wal.json and
+// vault/ are fsynced, so a crash during the replay can't keep some of its
+// operations and lose the journal that finishes the rest. If that fails,
+// the replay stops and the vault stays locked.
 func (s *Store) replayWAL() error {
 	b, err := os.ReadFile(s.l.walFile())
 	if errors.Is(err, os.ErrNotExist) {
@@ -276,6 +283,15 @@ func (s *Store) replayWAL() error {
 		if _, err := s.l.walPath(op.Path); err != nil {
 			return err
 		}
+	}
+	if err := s.hook("wal:replay:sync"); err != nil {
+		return err
+	}
+	if err := syncFile(s.l.walFile()); err != nil {
+		return err
+	}
+	if err := syncDir(s.l.vault()); err != nil {
+		return err
 	}
 	return s.applyWAL(w.Ops)
 }

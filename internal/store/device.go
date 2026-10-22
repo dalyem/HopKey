@@ -526,6 +526,26 @@ func (d *deviceStore) storeDurably(rec *deviceRecord) error {
 	return nil
 }
 
+// destroy deletes the device record for good: the keychain entry, or
+// device.key with its directory fsynced after. A record that is already
+// gone is no error. Only a revoked device does this (§5.5).
+func (d *deviceStore) destroy() error {
+	switch d.cfg.Store {
+	case DeviceStoreKeychain:
+		if err := d.ring.Delete(keychainService, d.user()); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+			return err
+		}
+		return nil
+	case DeviceStoreFile:
+		path := d.l.deviceKeyFile()
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return syncDir(filepath.Dir(path))
+	}
+	return fmt.Errorf("unknown device key store %q", d.cfg.Store)
+}
+
 // equal reports whether r and o are the same record.
 func (r *deviceRecord) equal(o *deviceRecord) bool {
 	return r.V == o.V && r.AccountID == o.AccountID && r.DeviceID == o.DeviceID &&
