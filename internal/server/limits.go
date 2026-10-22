@@ -34,6 +34,14 @@ type Limits struct {
 	ChallengesPerCapability int
 	ChallengesPerProcess    int
 
+	// Enrollment relay mailboxes (R7, R8): live mailboxes per creating IP
+	// and per process, and per mailbox the messages and the bytes of
+	// their canonical bodies.
+	MailboxesPerIP      int
+	MailboxesPerProcess int
+	MailboxMessages     int
+	MailboxBytes        int
+
 	ValidationJobs  int
 	ValidationQueue int
 	SignupJobs      int
@@ -82,6 +90,11 @@ func DefaultLimits() Limits {
 		ChallengesPerCapability: 16,
 		ChallengesPerProcess:    10000,
 
+		MailboxesPerIP:      3,
+		MailboxesPerProcess: 1000,
+		MailboxMessages:     8,
+		MailboxBytes:        64 << 10,
+
 		ValidationJobs:  4,
 		ValidationQueue: 16,
 		SignupJobs:      2,
@@ -113,6 +126,8 @@ type Rates struct {
 	IP            Rate // every other endpoint, per IP
 	Account       Rate // every other endpoint, per authenticated account
 	Device        Rate // auth/challenge, per (account ID, device ID)
+	EnrollIP      Rate // POST /v1/enroll, per IP
+	Claim         Rate // POST /v1/enroll/claim, per approving device
 }
 
 // DefaultRates returns the R14 rates.
@@ -125,6 +140,8 @@ func DefaultRates() Rates {
 		IP:            Rate{60, time.Minute},
 		Account:       Rate{60, time.Minute},
 		Device:        Rate{60, time.Minute},
+		EnrollIP:      Rate{10, time.Minute},
+		Claim:         Rate{60, time.Minute},
 	}
 }
 

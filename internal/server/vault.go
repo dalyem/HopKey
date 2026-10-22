@@ -660,7 +660,10 @@ func (s *Server) postTx(tx Tx, tok crypto.Hash, vaultID model.ID, okV bool, pw *
 // charge and the account's reserve state. The caller notifies long-polls
 // after the transaction commits. A commit that would invalidate
 // credentials fails with errNeedsAccountLock unless locked reports that
-// the caller holds the account's admission lock.
+// the caller holds the account's admission lock. Every *apiError it
+// returns (head_conflict, invalid_entry, quota_exhausted) comes before its
+// first write, so a caller may still commit its own writes after one
+// (retirePost does).
 func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared, locked bool) (vaultlog.Head, bool, error) {
 	old, err := tx.EntryByHash(vaultID, pw.h)
 	if err == nil {

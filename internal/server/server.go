@@ -34,6 +34,7 @@ const (
 	ChallengeTTL  = 60 * time.Second // R3, R5
 	SessionTTL    = 15 * time.Minute // §9
 	LoginTokenTTL = 10 * time.Minute // R6
+	MailboxTTL    = 10 * time.Minute // R7, §7
 )
 
 // Config configures a Server.
@@ -69,7 +70,8 @@ type Server struct {
 	validate *queue
 	signups  *queue
 	polls    *pollLimiter
-	hub      *hub
+	hub      *hub // by vault
+	mbox     *hub // by enroll ID
 	accounts *accountLocks
 	mux      *http.ServeMux
 
@@ -107,6 +109,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		lim:     DefaultLimits(),
 		rates:   DefaultRates(),
 		hub:     newHub(),
+		mbox:    newHub(),
 		stop:    make(chan struct{}),
 	}
 	if s.log == nil {
@@ -173,7 +176,8 @@ func loadSecret(ctx context.Context, st Store) ([]byte, error) {
 	return secret, err
 }
 
-// janitor deletes expired sessions, tokens and challenges once a minute.
+// janitor deletes expired sessions, tokens, challenges and mailboxes once
+// a minute.
 func (s *Server) janitor() {
 	defer s.wg.Done()
 	t := time.NewTicker(time.Minute)
@@ -187,6 +191,10 @@ func (s *Server) janitor() {
 			if err != nil {
 				s.log.Error("deleting expired credentials", "err", err)
 			}
+			// Mailboxes come and go, and one that expires is never
+			// notified; waking every mailbox poll frees their channels,
+			// and each poll just reads again.
+			s.mbox.reset()
 		}
 	}
 }
@@ -309,6 +317,14 @@ func (s *Server) routes() {
 		{pattern: "GET /v1/vaults/{vault}/entries/{seq}", ipRate: s.rates.IP, h: s.getEntry},
 		{pattern: "GET /v1/vaults/{vault}/objects/{sha256}", ipRate: s.rates.IP, h: s.getObject},
 		{pattern: "POST /v1/vaults/{vault}/log", ipRate: s.rates.IP, body: lim.MaxBody, h: s.postLog},
+		{pattern: "POST /v1/enroll", ipRate: s.rates.EnrollIP, body: lim.MaxBody, h: s.enrollCreate},
+		{pattern: "POST /v1/enroll/claim", ipRate: s.rates.IP, body: lim.MaxBody, h: s.enrollClaim},
+		// A message body is at most the mailbox's byte limit, so the
+		// request is too, apart from its wrapper.
+		{pattern: "POST /v1/enroll/{enroll}/msg", ipRate: s.rates.IP, body: int64(lim.MailboxBytes) + 1024, h: s.enrollPost},
+		{pattern: "GET /v1/enroll/{enroll}/msg", ipRate: s.rates.IP, poll: true, h: s.enrollGet},
+		{pattern: "POST /v1/retire-status", ipRate: s.rates.IP, body: lim.MaxBody, h: s.retireStatus},
+		{pattern: "POST /v1/retire-status/post", ipRate: s.rates.IP, body: lim.MaxBody, h: s.retirePost},
 	} {
 		s.mux.Handle(rt.pattern, s.wrap(rt))
 	}
@@ -736,8 +752,9 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request, c *call) error 
 	return nil
 }
 
-// hub wakes long-polls when a vault commits. Waiters take the vault's
-// channel before they read; a commit closes it.
+// hub wakes long-polls when a vault commits (s.hub) or a mailbox gets a
+// message (s.mbox). Waiters take the ID's channel before they read; a
+// commit or message closes it.
 type hub struct {
 	mu    sync.Mutex
 	chans map[model.ID]chan struct{}
@@ -754,6 +771,16 @@ func (h *hub) watch(v model.ID) <-chan struct{} {
 		h.chans[v] = ch
 	}
 	return ch
+}
+
+// reset wakes every waiter and forgets every channel.
+func (h *hub) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for v, ch := range h.chans {
+		close(ch)
+		delete(h.chans, v)
+	}
 }
 
 func (h *hub) notify(v model.ID) {
