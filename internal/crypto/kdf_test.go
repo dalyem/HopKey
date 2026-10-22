@@ -5,16 +5,79 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode"
 
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/text/unicode/norm"
 )
 
-// The NFKC tables are pinned so a change of Unicode version is noticed.
-// See the SPEC GAP on UnicodeVersion: the spec asks for 15.0.0, which x/text
-// does not provide on Go 1.27.
+// §4.1 pins Unicode 17.0.0 for both NFKC (x/text norm built with Go 1.27)
+// and the assigned-code-point check (the standard library tables).
 func TestUnicodeVersionPinned(t *testing.T) {
 	if UnicodeVersion != "17.0.0" {
-		t.Fatalf("NFKC tables are Unicode %s; the pinned value is 17.0.0", UnicodeVersion)
+		t.Fatalf("UnicodeVersion = %s", UnicodeVersion)
+	}
+	if norm.Version != "17.0.0" {
+		t.Fatalf("NFKC tables are Unicode %s; §4.1 pins 17.0.0", norm.Version)
+	}
+	if unicode.Version != "17.0.0" {
+		t.Fatalf("unicode tables are Unicode %s; §4.1 pins 17.0.0", unicode.Version)
+	}
+}
+
+// Every code point must be assigned (not Cn) in Unicode 17.0.0 (§4.1).
+func TestUnassignedCodePointRejected(t *testing.T) {
+	for name, r := range map[string]rune{
+		"U+0378 (Greek block gap)":   0x0378,
+		"U+FDD0 (noncharacter)":      0xFDD0,
+		"U+FFFF (noncharacter)":      0xFFFF,
+		"U+2FFFF (plane 2 end)":      0x2FFFF,
+		"U+E0080 (tag block gap)":    0xE0080,
+		"U+10FFFF (last code point)": 0x10FFFF,
+	} {
+		pw := "password" + string(r)
+		if _, err := NormalizePassword([]byte(pw)); !errors.Is(err, ErrUnassignedCodePoint) {
+			t.Errorf("%s: %v", name, err)
+		}
+		// The check runs before Argon2, so the full derivation fails too.
+		sk := SecretKey{Hint: "ABCDEF"}
+		if _, err := DeriveLoginKeys([]byte(pw), make([]byte, SaltSize), &sk, fixedID(1), KDFv1); !errors.Is(err, ErrUnassignedCodePoint) {
+			t.Errorf("%s: DeriveLoginKeys: %v", name, err)
+		}
+	}
+	// Assigned code points of other categories pass: private use (Co),
+	// format (Cf), a 17.0.0 addition and a TAB (Cc, assigned).
+	for name, r := range map[string]rune{
+		"U+E000 (Co)":             0xE000,
+		"U+00AD (Cf)":             0x00AD,
+		"U+0009 (Cc)":             0x0009,
+		"U+10940 (Sidetic, 17.0)": 0x10940,
+	} {
+		if _, err := NormalizePassword([]byte("password" + string(r))); err != nil {
+			t.Errorf("%s rejected: %v", name, err)
+		}
+	}
+}
+
+// The standard library's Cn table is the complement of the other
+// categories, so isAssigned agrees with "has a general category".
+func TestCnTableIsComplement(t *testing.T) {
+	assigned := []*unicode.RangeTable{unicode.L, unicode.M, unicode.N, unicode.P, unicode.S, unicode.Z,
+		unicode.Cc, unicode.Cf, unicode.Co, unicode.Cs}
+	chars := 0 // assigned, excluding surrogates (Cs) and private use (Co)
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		in := unicode.In(r, assigned...)
+		if in != isAssigned(r) {
+			t.Fatalf("U+%04X: in other categories %v, isAssigned %v", r, in, isAssigned(r))
+		}
+		if in && !unicode.In(r, unicode.Cs, unicode.Co) {
+			chars++
+		}
+	}
+	// Unicode 17.0.0 encodes 159,801 graphic and format characters, plus
+	// the 65 controls.
+	if chars != 159801+65 {
+		t.Fatalf("%d assigned characters; Unicode 17.0.0 has 159,866", chars)
 	}
 }
 

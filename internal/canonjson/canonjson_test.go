@@ -217,6 +217,31 @@ func TestStrictDecoding(t *testing.T) {
 	}
 }
 
+// encoding/base64 skips CR and LF even in strict mode. A b64 value must
+// hold only base64url characters, so escaped line breaks and other
+// whitespace inside the string are rejected.
+func TestBase64RejectsLineBreaks(t *testing.T) {
+	var ok sample
+	if err := Unmarshal([]byte(strings.Replace(validSample, `"data":""`, `"data":"-_8"`, 1)), &ok); err != nil || string(ok.Data) != "\xfb\xff" {
+		t.Fatalf("clean value: %x, %v", ok.Data, err)
+	}
+	for name, val := range map[string]string{
+		"LF":       `-_\n8`,
+		"CR":       `-_\r8`,
+		"CRLF":     `-_\r\n8`,
+		"trailing": `-_8\n`,
+		"leading":  `\r-_8`,
+		"tab":      `-_\t8`,
+		"space":    `-_ 8`,
+	} {
+		in := strings.Replace(validSample, `"data":""`, `"data":"`+val+`"`, 1)
+		var s sample
+		if err := Unmarshal([]byte(in), &s); err == nil {
+			t.Errorf("%s: accepted %s as %x", name, in, s.Data)
+		}
+	}
+}
+
 func TestDepthLimit(t *testing.T) {
 	deep := strings.Repeat("[", maxDepth+2) + strings.Repeat("]", maxDepth+2)
 	if _, err := Canonicalize([]byte(deep)); err == nil {

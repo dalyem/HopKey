@@ -109,12 +109,11 @@ func (p AccountPin) Equal(o AccountPin) bool {
 // MarshalAcctPriv returns acct_priv = JCS({"v":1,"account_id","akv","kem_sk","sig_seed"}).
 // The caller should Zero the result when done.
 func (k *AccountKeys) MarshalAcctPriv() ([]byte, error) {
-	// crypto/hpke returns its internal seed here, not a copy: clearing it
-	// would destroy the key, so it is left alone.
-	kemSK, err := k.KEM.Bytes()
+	kemSK, err := kemPrivateBytes(k.KEM)
 	if err != nil {
 		return nil, err
 	}
+	defer clear(kemSK)
 	seed := k.Sig.Seed()
 	defer clear(seed)
 	return canonjson.Marshal(acctPriv{V: Version, AccountID: k.AccountID, AKV: k.AKV, KEMSK: kemSK, SigSeed: seed})
@@ -191,14 +190,12 @@ func openAcctBlob(key *SymKey, label string, e AEADEnvelope, accountID model.ID,
 //	rkKey = HKDF(RK, salt=account_id_bytes, info=lp("hopkey/v1/recovery-wrap"))
 //	rAuth = HKDF(RK, salt=account_id_bytes, info=lp("hopkey/v1/recovery-auth"))
 //
-// The server stores SHA-256(rAuth); the client sends rAuth itself.
-//
-// SPEC GAP (§4.2, §4.3, §12): RK's length, how it is generated and its
-// Emergency Kit text form are not specified. This function takes RK as
-// opaque bytes and only refuses an empty value; there is no RK generator.
+// The server stores SHA-256(rAuth); the client sends rAuth itself. RK must
+// be exactly 32 bytes (§12); see RecoveryKey for its generation and text
+// form.
 func RecoveryKeys(rk []byte, accountID model.ID) (rkKey SymKey, rAuth []byte, err error) {
-	if len(rk) == 0 {
-		return SymKey{}, nil, errors.New("crypto: empty recovery key")
+	if len(rk) != RecoveryKeySize {
+		return SymKey{}, nil, fmt.Errorf("crypto: recovery key must be %d bytes", RecoveryKeySize)
 	}
 	if accountID.IsZero() {
 		return SymKey{}, nil, errors.New("crypto: zero account ID")

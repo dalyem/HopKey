@@ -1,7 +1,9 @@
 package crypto
 
 import (
+	"errors"
 	"math/big"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -150,5 +152,158 @@ func TestParseSecretKeyRejects(t *testing.T) {
 	}
 	if _, err := GenerateSecretKey("ABCDE"); err == nil {
 		t.Error("5-symbol hint accepted")
+	}
+}
+
+// §12 layout: H1-HHHHHH-SSSSSS-SSSSS-SSSSS-SSSSS-SSSSSC. The final group
+// (what §4.3 has the user type back) includes the check symbol.
+func TestSecretKeyLayout(t *testing.T) {
+	sk, err := NewSecretKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`^H1-[0-9A-HJKMNP-TV-Z]{6}-[0-9A-HJKMNP-TV-Z]{6}(-[0-9A-HJKMNP-TV-Z]{5}){3}-[0-9A-HJKMNP-TV-Z]{5}[0-9A-HJKMNP-TV-Z*~$=U]$`)
+	if text := sk.String(); !re.MatchString(text) {
+		t.Fatalf("layout: %q", text)
+	}
+}
+
+// The hint is drawn at random at signup (§12): 6 Crockford symbols that
+// differ between keys.
+func TestNewSecretKeyRandomHint(t *testing.T) {
+	seen := map[string]bool{}
+	for range 64 {
+		sk, err := NewSecretKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h, ok := normalizeHint(sk.Hint); !ok || h != sk.Hint {
+			t.Fatalf("hint %q is not 6 canonical Crockford symbols", sk.Hint)
+		}
+		if sk.SK17[0]>>2 != 0 {
+			t.Fatal("generated SK17 has nonzero top bits")
+		}
+		seen[sk.Hint] = true
+	}
+	// 64 draws from 2^30 hints: a repeat is a broken generator.
+	if len(seen) != 64 {
+		t.Fatalf("%d distinct hints in 64 draws", len(seen))
+	}
+}
+
+// Recovery Key text form built with big.Int, independently of the
+// encoder: RK is 256 bits, padded on the right with 4 zero bits to 260,
+// split into 52 five-bit symbols, and the check symbol is the value of
+// those 52 symbols mod 37.
+func TestRecoveryKeyBitByBit(t *testing.T) {
+	const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ*~$=U"
+	var rk RecoveryKey
+	copy(rk[:], fixedBytes("rk bits", 32))
+	v := new(big.Int).Lsh(new(big.Int).SetBytes(rk[:]), 4)
+	var sym strings.Builder
+	for s := 51; s >= 0; s-- {
+		sym.WriteByte(alphabet[new(big.Int).And(new(big.Int).Rsh(v, uint(5*s)), big.NewInt(31)).Int64()])
+	}
+	check := alphabet[new(big.Int).Mod(v, big.NewInt(37)).Int64()]
+	want := "R1"
+	for i := 0; i < 52; i += 4 {
+		want += "-" + sym.String()[i:i+4]
+	}
+	want += string(check)
+	if got := rk.String(); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	re := regexp.MustCompile(`^R1(-[0-9A-HJKMNP-TV-Z]{4}){12}-[0-9A-HJKMNP-TV-Z]{4}[0-9A-HJKMNP-TV-Z*~$=U]$`)
+	if !re.MatchString(want) {
+		t.Fatalf("layout: %q", want)
+	}
+	back, err := ParseRecoveryKey(want)
+	if err != nil || back != rk {
+		t.Fatalf("parse: %v", err)
+	}
+
+	// All ones and all zeros.
+	var ones RecoveryKey
+	for i := range ones {
+		ones[i] = 0xff
+	}
+	if flat := strings.ReplaceAll(ones.String(), "-", ""); !strings.HasPrefix(flat, "R1"+strings.Repeat("Z", 51)+"G") {
+		t.Errorf("all ones: %s", flat) // the last symbol is one data bit and four zero padding bits
+	}
+	if flat := strings.ReplaceAll(RecoveryKey{}.String(), "-", ""); flat != "R1"+strings.Repeat("0", 53) {
+		t.Errorf("all zeros: %s", flat)
+	}
+}
+
+func TestParseRecoveryKeyLenient(t *testing.T) {
+	rk, err := NewRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := rk.String()
+	for _, v := range []string{
+		text,
+		strings.ToLower(text),
+		strings.ReplaceAll(text, "-", ""),
+		"-" + strings.ReplaceAll(text, "-", "--") + "-",
+		strings.ReplaceAll(strings.ReplaceAll(text, "1", "l"), "0", "o"),
+		strings.ReplaceAll(text, "1", "I"),
+	} {
+		back, err := ParseRecoveryKey(v)
+		if err != nil || back != rk {
+			t.Errorf("%q: %v", v, err)
+		}
+	}
+}
+
+func TestParseRecoveryKeyRejects(t *testing.T) {
+	var rk RecoveryKey
+	copy(rk[:], fixedBytes("rk reject", 32))
+	flat := strings.ReplaceAll(rk.String(), "-", "")
+	flip := func(i int) string {
+		b := []byte(flat)
+		if b[i] == '0' {
+			b[i] = '1'
+		} else {
+			b[i] = '0'
+		}
+		return string(b)
+	}
+	// Nonzero padding: the last data symbol gets a low bit set, and the
+	// check symbol is recomputed so that only the padding is wrong.
+	vals := make([]int, 52)
+	for i := range 52 {
+		vals[i] = crockfordValue(flat[2+i])
+	}
+	vals[51] |= 1
+	padded := "R1"
+	for _, v := range vals {
+		padded += string(crockfordAlphabet[v])
+	}
+	padded += string(checkSymbol(vals))
+	for name, in := range map[string]string{
+		"one symbol changed":   flip(10),
+		"check symbol changed": flip(len(flat) - 1),
+		"nonzero padding bits": padded,
+		"too short":            flat[:len(flat)-1],
+		"too long":             flat + "0",
+		"Secret Key prefix":    "H1" + flat[2:],
+		"bad prefix digit":     "R2" + flat[2:],
+		"bad character":        flat[:12] + "#" + flat[13:],
+		"U in the data":        flat[:12] + "U" + flat[13:],
+		"empty":                "",
+		"spaces":               strings.ReplaceAll(rk.String(), "-", " "),
+	} {
+		if _, err := ParseRecoveryKey(in); !errors.Is(err, ErrBadRecoveryKey) {
+			t.Errorf("%s: %q: %v", name, in, err)
+		}
+	}
+	// A Secret Key is not a Recovery Key and vice versa.
+	sk, _ := NewSecretKey()
+	if _, err := ParseRecoveryKey(sk.String()); err == nil {
+		t.Error("Secret Key parsed as a Recovery Key")
+	}
+	if _, err := ParseSecretKey(rk.String()); err == nil {
+		t.Error("Recovery Key parsed as a Secret Key")
 	}
 }

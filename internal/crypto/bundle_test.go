@@ -293,12 +293,95 @@ func TestBuildBundleRecordRules(t *testing.T) {
 	if _, err := SealBundle(f.acct, f.rec, b); err == nil {
 		t.Error("B.expires_at differing from the record sealed")
 	}
-	// An expired grant still gets bundles (see the SPEC GAP on BuildBundle).
+	// An expired grant still gets bundles: the author leaves out the expiry
+	// check (§8.6).
 	f = newGrantFixture(t)
 	f.rec.ExpiresAt = ts(t, "2000-01-01T00:00:00Z")
 	if _, err := BuildBundle(f.rec, f.items, f.acct.AccountID, 1, 1); err != nil {
 		t.Errorf("expired grant: %v", err)
 	}
+}
+
+// SealBundle signs only what BuildBundle would produce from the record
+// (§8.6): B's membership and host_key_map equal the record's, and the
+// record's rules hold for the plaintexts B carries.
+func TestSealBundleEnforcesRecord(t *testing.T) {
+	bundleItem := func(t *testing.T, it Item) BundleItem {
+		t.Helper()
+		h, _ := ItemHeader(it)
+		pt, err := MarshalItem(it)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return BundleItem{ItemID: h.ItemID, Type: h.Type, ItemVersion: h.ItemVersion, Plaintext: pt}
+	}
+	f := newGrantFixture(t)
+	if _, err := SealBundle(f.acct, f.rec, mustBuild(t, f)); err != nil {
+		t.Fatalf("BuildBundle result rejected: %v", err)
+	}
+
+	// An unrelated credential appended to a BuildBundle result. B is still
+	// structurally valid, so only the membership check stops it.
+	b := mustBuild(t, f)
+	extra := &model.Credential{Header: hdr(model.TypeCredential, 0x0d), Name: "db", Username: "root", Password: "hunter22"}
+	b.Items = append(b.Items, bundleItem(t, extra))
+	if _, err := validateBundle(b); err != nil {
+		t.Fatalf("widened bundle is not structurally valid, so the test proves nothing: %v", err)
+	}
+	if _, err := SealBundle(f.acct, f.rec, b); err == nil {
+		t.Error("bundle with an item the record does not list was signed")
+	}
+
+	// A listed item dropped.
+	b = mustBuild(t, f)
+	b.Items = b.Items[:len(b.Items)-1] // the snippet; nothing references it
+	if _, err := validateBundle(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SealBundle(f.acct, f.rec, b); err == nil {
+		t.Error("bundle missing a listed item was signed")
+	}
+
+	// host_key_map differing from the record, membership unchanged. The
+	// record maps nothing and the host's own key_id is the dedicated key.
+	f = newGrantFixture(t)
+	f.items[fixedID(0x01)].(*model.Host).KeyID = fixedID(0x02)
+	f.rec.HostKeyMap = map[model.ID]model.ID{}
+	b = mustBuild(t, f)
+	b.HostKeyMap = map[model.ID]model.ID{fixedID(0x01): fixedID(0x02)}
+	if _, err := validateBundle(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SealBundle(f.acct, f.rec, b); err == nil {
+		t.Error("bundle whose host_key_map differs from the record was signed")
+	}
+
+	// The dedicated-key rule applies to the plaintext in B: same
+	// membership, but B's copy of the key is dedicated to another grant.
+	f = newGrantFixture(t)
+	b = mustBuild(t, f)
+	k := *f.items[fixedID(0x02)].(*model.Key)
+	k.DedicatedGrant = fixedID(0x7e)
+	for i := range b.Items {
+		if b.Items[i].ItemID == fixedID(0x02) {
+			b.Items[i] = bundleItem(t, &k)
+		}
+	}
+	if _, err := validateBundle(b); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SealBundle(f.acct, f.rec, b); err == nil {
+		t.Error("bundle whose dedicated key belongs to another grant was signed")
+	}
+}
+
+func mustBuild(t *testing.T, f *grantFixture) *Bundle {
+	t.Helper()
+	b, err := BuildBundle(f.rec, f.items, f.acct.AccountID, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func TestBundlePin(t *testing.T) {

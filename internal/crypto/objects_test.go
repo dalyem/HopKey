@@ -41,8 +41,10 @@ func TestCertSignVerify(t *testing.T) {
 		"name":              func(c *Cert) { c.Name = "laptop2" },
 		"kem_fp":            func(c *Cert) { c.KEMFp[0] ^= 1 },
 		"sig_fp":            func(c *Cert) { c.SigFp[0] ^= 1 },
-		"enroll_transcript": func(c *Cert) { c.EnrollTranscript[0] = 1 },
-		"issued_at":         func(c *Cert) { c.IssuedAt++ },
+		"enroll_transcript": func(c *Cert) { c.EnrollTranscript = SomeHash(Hash{1}) },
+		// Present with an all-zero digest is not the same as "".
+		"enroll_transcript zero digest": func(c *Cert) { c.EnrollTranscript = SomeHash(Hash{}) },
+		"issued_at":                     func(c *Cert) { c.IssuedAt++ },
 	} {
 		m := c
 		mutate(&m)

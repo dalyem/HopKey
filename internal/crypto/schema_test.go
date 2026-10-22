@@ -1,8 +1,14 @@
 package crypto
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/pem"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/ssh"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/model"
@@ -129,15 +135,116 @@ func TestOtherSchemasReject(t *testing.T) {
 	}
 }
 
-// SPEC GAP evidence: str≤n forbids control characters, so a real
-// multi-line OpenSSH PEM cannot be stored as key.private_key. This test
-// records the current (spec-literal) behavior and must change with the
-// spec.
-func TestPrivateKeyPEMRejectedAsWritten(t *testing.T) {
+// key.private_key is text≤16384 (§6.5), so a real multi-line OpenSSH PEM,
+// generated here, passes. A CRLF copy passes after CRLFToLF.
+func TestPrivateKeyPEMAccepted(t *testing.T) {
+	_, edKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 3072)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, key := range map[string]any{"ed25519": edKey, "rsa-3072": rsaKey} {
+		blk, err := ssh.MarshalPrivateKey(key, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pemText := string(pem.EncodeToMemory(blk))
+		if !strings.HasPrefix(pemText, "-----BEGIN OPENSSH PRIVATE KEY-----\n") || strings.Count(pemText, "\n") < 3 {
+			t.Fatalf("%s: not a multi-line OpenSSH PEM: %q", name, pemText)
+		}
+		k := testKey(2, model.ID{})
+		k.PrivateKey = pemText
+		if err := ValidateKey(k); err != nil {
+			t.Errorf("%s PEM rejected: %v", name, err)
+		}
+		// Round trip through the item plaintext encoding.
+		b, err := MarshalItem(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		back, err := ParseItem(model.TypeKey, b)
+		if err != nil || back.(*model.Key).PrivateKey != pemText {
+			t.Errorf("%s PEM did not round-trip: %v", name, err)
+		}
+		crlf := strings.ReplaceAll(pemText, "\n", "\r\n")
+		k.PrivateKey = crlf
+		if ValidateKey(k) == nil {
+			t.Errorf("%s PEM with CRLF accepted", name)
+		}
+		k.PrivateKey = CRLFToLF(crlf)
+		if err := ValidateKey(k); err != nil || k.PrivateKey != pemText {
+			t.Errorf("%s PEM after CRLFToLF: %v", name, err)
+		}
+	}
+}
+
+// text≤n allows LF and TAB and rejects CR and every other Cc character
+// (§3). It applies to host.description, key.private_key, snippet.command
+// and snippet.description; str≤n fields still reject LF.
+func TestTextFields(t *testing.T) {
+	for name, tc := range map[string]struct {
+		s  string
+		ok bool
+	}{
+		"plain":       {"uptime", true},
+		"LF":          {"line 1\nline 2\n", true},
+		"TAB":         {"a\tb", true},
+		"CR":          {"a\rb", false},
+		"CRLF":        {"a\r\nb", false},
+		"NUL":         {"a\x00b", false},
+		"ESC":         {"a\x1bb", false},
+		"DEL":         {"a\x7fb", false},
+		"C1 NEL":      {"a\u0085b", false},
+		"VT":          {"a\vb", false},
+		"FF":          {"a\fb", false},
+		"invalid":     {"a\xffb", false},
+		"non-control": {"caf\u00e9 \u2028", true}, // U+2028 is Zl, not Cc
+	} {
+		if got := CheckText("f", tc.s, 64) == nil; got != tc.ok {
+			t.Errorf("CheckText %s: ok=%v, want %v", name, got, tc.ok)
+		}
+	}
+	if CheckText("f", strings.Repeat("a", 65), 64) == nil || CheckText("f", strings.Repeat("\n", 64), 64) != nil {
+		t.Error("text≤n length bound wrong")
+	}
+	if CheckStr("f", "a\nb", 64) == nil || CheckStr("f", "a\tb", 64) == nil {
+		t.Error("str≤n accepted LF or TAB")
+	}
+	if got := CRLFToLF("a\r\nb\rc\n\r\n"); got != "a\nb\rc\n\n" {
+		t.Errorf("CRLFToLF = %q", got)
+	}
+
+	multi := "line 1\n\tline 2\n"
+	h := testHost(fixedID(1), 1)
+	h.Description = multi
+	if err := ValidateHost(h); err != nil {
+		t.Errorf("multi-line host.description: %v", err)
+	}
+	h.Name = "a\nb"
+	if ValidateHost(h) == nil {
+		t.Error("LF in host.name (str≤64) accepted")
+	}
+	s := &model.Snippet{Header: hdr(model.TypeSnippet, 4), Name: "s", Command: "for h in a b; do\n\techo $h\ndone\n",
+		Params: []string{}, Description: multi}
+	if err := ValidateSnippet(s); err != nil {
+		t.Errorf("multi-line snippet: %v", err)
+	}
+	s.Command = "echo\r\n"
+	if ValidateSnippet(s) == nil {
+		t.Error("CR in snippet.command accepted")
+	}
+	s.Command = "ok"
+	s.Description = "x\r"
+	if ValidateSnippet(s) == nil {
+		t.Error("CR in snippet.description accepted")
+	}
 	k := testKey(2, model.ID{})
-	k.PrivateKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+	k.PublicKey = "ssh-ed25519 AAAA\n"
 	if ValidateKey(k) == nil {
-		t.Fatal("multi-line PEM accepted; update the SPEC GAP note in ValidateKey")
+		t.Error("LF in key.public_key (str≤8192) accepted")
 	}
 }
 

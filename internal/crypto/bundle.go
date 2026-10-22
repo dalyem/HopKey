@@ -162,12 +162,10 @@ func CheckGrantRecord(rec *model.Grant, items map[model.ID]Item) error {
 // B.expires_at come from the record (§8.7). The result is validated against
 // §8.3 before it is returned.
 //
-// SPEC GAP (§5.3 vs §8.3): the author must validate B "against §8.3", which
-// includes "expires_at is in the future", yet log rules treat an expired
-// grant as active and require a bundle_put for it whenever a listed item
-// changes. Applying the expiry check here would make such edits impossible,
-// so BuildBundle applies every §8.3 rule except expiry, which only the token
-// client (OpenBundle) checks against its clock.
+// The expires_at-in-the-future check is deliberately left out (§8.6): log
+// rules treat an expired but unrevoked grant as active and still require
+// current bundles for it. Only the token client (OpenBundle) enforces
+// expiry.
 func BuildBundle(rec *model.Grant, items map[model.ID]Item, accountID model.ID, akv uint32, bundleVersion uint64) (*Bundle, error) {
 	if err := CheckGrantRecord(rec, items); err != nil {
 		return nil, err
@@ -254,7 +252,13 @@ func validateBundle(b *Bundle) (map[model.ID]Item, error) {
 //	           pt = JCS({"v":1,"bundle":B,"sig":b64(S),"sig_pk":b64}))
 //
 // rec is the grant record the bundle belongs to; its grant_id, name and
-// expires_at must equal B's (§8.7), and token_kem_pk comes from it.
+// expires_at must equal B's (§8.7), and token_kem_pk comes from it. B's
+// contents must be exactly what BuildBundle produces from rec (§8.6): the
+// set of B.items is the set of the record's items and B.host_key_map equals
+// the record's, and the record's rules (§8.7 references, dedicated key) hold
+// for the plaintexts in B. Membership is never widened at signing time.
+// Whether each item is at its current version is the caller's to know; it
+// should build B with BuildBundle from verified state.
 func SealBundle(acct *AccountKeys, rec *model.Grant, b *Bundle) (HPKEEnvelope, error) {
 	if acct.AccountID != b.AccountID || acct.AKV != b.AKV {
 		return HPKEEnvelope{}, errors.New("crypto: bundle names a different account or akv than the signing key")
@@ -262,7 +266,11 @@ func SealBundle(acct *AccountKeys, rec *model.Grant, b *Bundle) (HPKEEnvelope, e
 	if rec.GrantID != b.GrantID || rec.Name != b.Name || rec.ExpiresAt != b.ExpiresAt {
 		return HPKEEnvelope{}, errors.New("crypto: bundle grant_id, name or expires_at differ from the grant record")
 	}
-	if _, err := validateBundle(b); err != nil {
+	items, err := validateBundle(b)
+	if err != nil {
+		return HPKEEnvelope{}, err
+	}
+	if err := checkBundleMatchesRecord(rec, b, items); err != nil {
 		return HPKEEnvelope{}, err
 	}
 	sig, err := Sign(acct.Sig, LabelGrantBundle, b)
@@ -276,6 +284,30 @@ func SealBundle(acct *AccountKeys, rec *model.Grant, b *Bundle) (HPKEEnvelope, e
 	}
 	defer clear(pt)
 	return SealHPKE(rec.TokenKEMPK, bundleInfo(b.GrantID, b.BundleVersion), nil, pt)
+}
+
+// checkBundleMatchesRecord requires B's membership and host_key_map to
+// equal the record's and the record's rules to hold for B's plaintexts.
+// items are B's decoded plaintexts.
+func checkBundleMatchesRecord(rec *model.Grant, b *Bundle, items map[model.ID]Item) error {
+	// CheckGrantRecord validates the record (items sorted and unique) and
+	// applies its §8.7 rules, including the dedicated-key rule, to the
+	// plaintexts B actually carries; it fails if B lacks a listed item.
+	if err := CheckGrantRecord(rec, items); err != nil {
+		return err
+	}
+	if len(items) != len(rec.Items) {
+		return fmt.Errorf("crypto: bundle has %d items, the grant record lists %d", len(items), len(rec.Items))
+	}
+	if len(b.HostKeyMap) != len(rec.HostKeyMap) {
+		return errors.New("crypto: bundle host_key_map differs from the grant record")
+	}
+	for h, k := range rec.HostKeyMap {
+		if got, ok := b.HostKeyMap[h]; !ok || got != k {
+			return errors.New("crypto: bundle host_key_map differs from the grant record")
+		}
+	}
+	return nil
 }
 
 // OpenedBundle is a bundle that passed every §8.3 check.

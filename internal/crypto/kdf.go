@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
@@ -45,25 +46,46 @@ func CheckKDFParams(p KDFParams) error {
 	return nil
 }
 
-// UnicodeVersion is the Unicode version of the NFKC tables compiled in.
-//
-// SPEC GAP (§4.1): the spec pins NFKC to Unicode 15.0.0 via
-// golang.org/x/text/unicode/norm. That combination does not exist for this
-// module: x/crypto v0.58.0 (and every version from v0.52.0, the spec's
-// minimum) requires x/text v0.37.0 or later, and those versions select their
-// Unicode 17.0.0 tables under Go 1.27 (build tag go1.27). The spec's own Go
-// minimum is 1.27. This code uses whatever norm provides and a test pins
-// the value to "17.0.0" so a silent change is caught. Normalization of
-// characters assigned in 15.0.0 is stable across versions; only passwords
-// containing code points first assigned in 16.0 or 17.0 can differ.
-const UnicodeVersion = norm.Version
+// UnicodeVersion is the Unicode version §4.1 pins for kdf_version 1. Both
+// the NFKC tables (golang.org/x/text/unicode/norm as built with Go 1.27)
+// and the assigned-code-point check (the standard library's unicode
+// tables) must be this version; a test pins norm.Version and
+// unicode.Version to it.
+const UnicodeVersion = "17.0.0"
+
+// ErrUnassignedCodePoint means the password holds a code point that is
+// unassigned (general category Cn) in Unicode 17.0.0 (§4.1).
+var ErrUnassignedCodePoint = errors.New("crypto: password contains a code point unassigned in Unicode " + UnicodeVersion)
+
+// errUnicodeTables means the binary was built with Unicode tables other
+// than 17.0.0. Deriving anyway could accept a code point that 17.0.0 leaves
+// unassigned, so kdf_version 1 refuses to run.
+var errUnicodeTables = fmt.Errorf("crypto: built with Unicode tables %s (unicode) and %s (norm); kdf_version 1 needs %s",
+	unicode.Version, norm.Version, UnicodeVersion)
+
+// isAssigned reports whether r is assigned, that is not in general
+// category Cn, in the standard library's Unicode tables.
+func isAssigned(r rune) bool { return !unicode.Is(unicode.Cn, r) }
 
 // NormalizePassword returns pw' = NFKC(password) after checking that the
-// input is valid UTF-8 and that the result is 8 to 1024 bytes. Nothing is
-// trimmed.
+// input is valid UTF-8 and that every code point is assigned in Unicode
+// 17.0.0, and that the result is 8 to 1024 bytes. Nothing is trimmed.
+//
+// Rejecting unassigned code points keeps the derivation stable: the NFKC
+// form of an assigned code point never changes in a later Unicode version.
 func NormalizePassword(password []byte) ([]byte, error) {
+	if unicode.Version != UnicodeVersion || norm.Version != UnicodeVersion {
+		return nil, errUnicodeTables
+	}
 	if !utf8.Valid(password) {
 		return nil, errors.New("crypto: password is not valid UTF-8")
+	}
+	for i := 0; i < len(password); {
+		r, n := utf8.DecodeRune(password[i:])
+		if !isAssigned(r) {
+			return nil, ErrUnassignedCodePoint
+		}
+		i += n
 	}
 	// norm returns its input unchanged when it is already normalized, so
 	// work on a copy: the caller's buffer is never aliased or cleared.

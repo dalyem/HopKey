@@ -3,7 +3,7 @@ package crypto
 import (
 	"crypto/rand"
 	"errors"
-	"strings"
+	"fmt"
 )
 
 // Secret Key text form (§12).
@@ -28,12 +28,22 @@ func (k *SecretKey) Zero() { clear(k.SK17[:]) }
 // ErrBadSecretKey means a Secret Key string failed to parse.
 var ErrBadSecretKey = errors.New("crypto: malformed Secret Key")
 
+// NewSecretKey returns a Secret Key with 130 random secret bits and a
+// random 6-symbol public hint (§12). This is what signup uses.
+func NewSecretKey() (SecretKey, error) {
+	var hint [secretKeyHintLen]byte
+	if _, err := rand.Read(hint[:]); err != nil {
+		return SecretKey{}, err
+	}
+	for i, b := range hint {
+		hint[i] = crockfordAlphabet[b&31]
+	}
+	return GenerateSecretKey(string(hint[:]))
+}
+
 // GenerateSecretKey returns a Secret Key with 130 random secret bits and
-// the given hint.
-//
-// SPEC GAP: §12 does not say what the six public-hint characters are, how
-// they are chosen, or which alphabet they use. This code requires the
-// caller to supply them and accepts Crockford base32 symbols only.
+// the given hint, which must be 6 Crockford base32 symbols. §12 draws the
+// hint at random at signup; NewSecretKey does that.
 func GenerateSecretKey(hint string) (SecretKey, error) {
 	h, ok := normalizeHint(hint)
 	if !ok {
@@ -68,7 +78,7 @@ func (k SecretKey) secretSymbols() string {
 }
 
 // checkSymbol is Crockford's mod-37 check symbol over the value of the
-// secret symbols (§12).
+// symbols vals, read as a base-32 number (§12).
 func checkSymbol(vals []int) byte {
 	m := 0
 	for _, v := range vals {
@@ -77,28 +87,31 @@ func checkSymbol(vals []int) byte {
 	return crockfordCheckSymbols[m]
 }
 
-// String returns the text form.
-//
-// SPEC GAP: §12 says the text is "grouped with hyphens" but not where the
-// hyphens go, and §4.3 has the user type back "the final group". This code
-// writes H1-HHHHHH-SSSSSS-SSSSS-SSSSS-SSSSS-SSSSSC (hint, then the secret
-// in groups of 6,5,5,5,5 with the check symbol ending the last group) until
-// the spec fixes a layout. Parsing ignores hyphens, so the choice does not
-// affect what is accepted.
-func (k SecretKey) String() string {
-	s := k.secretSymbols()
+// checkSymbolText returns the symbols of s followed by their check symbol.
+func checkSymbolText(s string) string {
 	vals := make([]int, len(s))
 	for i := range len(s) {
 		vals[i] = crockfordValue(s[i])
 	}
-	check := checkSymbol(vals)
-	return secretKeyPrefix + "-" + k.Hint + "-" + s[0:6] + "-" + s[6:11] + "-" + s[11:16] + "-" +
-		s[16:21] + "-" + s[21:26] + string(check)
+	return s + string(checkSymbol(vals))
 }
 
-// ParseSecretKey reads the text form: case-insensitive, hyphens ignored,
-// I and L read as 1, O as 0, and the check symbol verified.
-func ParseSecretKey(text string) (SecretKey, error) {
+// String returns the text form H1-HHHHHH-SSSSSS-SSSSS-SSSSS-SSSSS-SSSSSC
+// (§12): the hint, then the secret in groups of 6, 5, 5, 5 and 5, with the
+// check symbol ending the last group.
+func (k SecretKey) String() string {
+	s := checkSymbolText(k.secretSymbols())
+	return secretKeyPrefix + "-" + k.Hint + "-" + s[0:6] + "-" + s[6:11] + "-" + s[11:16] + "-" +
+		s[16:21] + "-" + s[21:]
+}
+
+// parseKitText applies the §12 parsing rules shared by the Secret Key and
+// the Recovery Key: hyphens are ignored, case does not matter, I and L
+// read as 1 and O as 0. The text must be prefix (a letter, then "1"),
+// then nPlain plain symbols, then nChecked symbols followed by their check
+// symbol. It returns the plain symbols in canonical form and the values of
+// the checked symbols. The caller clears vals.
+func parseKitText(text string, prefix byte, nPlain, nChecked int, bad error) (plain string, vals []int, err error) {
 	var b []byte
 	for i := 0; i < len(text); i++ {
 		if text[i] != '-' {
@@ -106,27 +119,31 @@ func ParseSecretKey(text string) (SecretKey, error) {
 		}
 	}
 	defer clear(b)
-	if len(b) != len(secretKeyPrefix)+secretKeyHintLen+secretKeySymbols+1 {
-		return SecretKey{}, ErrBadSecretKey
+	if len(b) != 2+nPlain+nChecked+1 {
+		return "", nil, bad
 	}
-	if !strings.EqualFold(string(b[0:1]), "H") || crockfordValue(b[1]) != 1 {
-		return SecretKey{}, ErrBadSecretKey
+	if c := b[0] &^ 0x20; c != prefix || crockfordValue(b[1]) != 1 {
+		return "", nil, bad
 	}
-	b = b[len(secretKeyPrefix):]
-	hint, ok := normalizeHint(string(b[:secretKeyHintLen]))
-	if !ok {
-		return SecretKey{}, ErrBadSecretKey
+	b = b[2:]
+	p := make([]byte, nPlain)
+	for i := range nPlain {
+		v := crockfordValue(b[i])
+		if v < 0 {
+			return "", nil, bad
+		}
+		p[i] = crockfordAlphabet[v]
 	}
-	b = b[secretKeyHintLen:]
-	vals := make([]int, secretKeySymbols)
-	defer clear(vals)
-	for i := range secretKeySymbols {
+	b = b[nPlain:]
+	vals = make([]int, nChecked)
+	for i := range nChecked {
 		vals[i] = crockfordValue(b[i])
 		if vals[i] < 0 {
-			return SecretKey{}, ErrBadSecretKey
+			clear(vals)
+			return "", nil, bad
 		}
 	}
-	c := b[secretKeySymbols]
+	c := b[nChecked]
 	if 'a' <= c && c <= 'z' {
 		c -= 'a' - 'A'
 	}
@@ -134,14 +151,27 @@ func ParseSecretKey(text string) (SecretKey, error) {
 		c = crockfordAlphabet[v]
 	}
 	if c != checkSymbol(vals) {
-		return SecretKey{}, errors.New("crypto: Secret Key check symbol does not match")
+		clear(vals)
+		return "", nil, fmt.Errorf("%w: check symbol does not match", bad)
 	}
+	return string(p), vals, nil
+}
+
+// ParseSecretKey reads the text form: case-insensitive, hyphens ignored,
+// I and L read as 1, O as 0, nonzero padding bits rejected and the check
+// symbol verified (§12).
+func ParseSecretKey(text string) (SecretKey, error) {
+	hint, vals, err := parseKitText(text, 'H', secretKeyHintLen, secretKeySymbols, ErrBadSecretKey)
+	if err != nil {
+		return SecretKey{}, err
+	}
+	defer clear(vals)
 	k := SecretKey{Hint: hint}
 	sk, overflow := crockfordDecode(vals, secretKeyTopZeros, secretKeyBytes)
+	defer clear(sk)
 	if overflow != 0 {
 		return SecretKey{}, ErrBadSecretKey
 	}
 	copy(k.SK17[:], sk)
-	clear(sk)
 	return k, nil
 }

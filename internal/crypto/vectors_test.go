@@ -239,10 +239,19 @@ func TestVectorsSecretKey(t *testing.T) {
 	v.hex("sk17", sk.SK17[:])
 	v["hint"] = sk.Hint
 	v["text"] = sk.String()
+	// §12 Recovery Key text form, for the RK of the account vectors.
+	var rk RecoveryKey
+	copy(rk[:], fixedBytes("vector RK", 32))
+	v.hex("rk", rk[:])
+	v["rk_text"] = rk.String()
 	want := compareVectors(t, "secretkey", v)
 	back, err := ParseSecretKey(want["text"])
 	if err != nil || !bytes.Equal(back.SK17[:], unhex(t, want, "sk17")) {
 		t.Errorf("stored text: %v", err)
+	}
+	rkBack, err := ParseRecoveryKey(want["rk_text"])
+	if err != nil || !bytes.Equal(rkBack[:], unhex(t, want, "rk")) {
+		t.Errorf("stored rk_text: %v", err)
 	}
 }
 
@@ -425,7 +434,7 @@ func TestVectorsEnroll(t *testing.T) {
 	o, ch, _ := enrollVector(t, cases["plain"])
 	th := TranscriptHash(Transcript(Commitment(o), ch, o))
 	cert := Cert{V: 1, AccountID: acct.AccountID, AKV: 1, DeviceID: fixedID(0x41), Name: o.Name,
-		KEMFp: FpKEM(o.KEMPK), SigFp: FpSig(o.SigPK), EnrollTranscript: OptHash(th), IssuedAt: ts(t, "2026-10-22T12:00:00Z")}
+		KEMFp: FpKEM(o.KEMPK), SigFp: FpSig(o.SigPK), EnrollTranscript: SomeHash(th), IssuedAt: ts(t, "2026-10-22T12:00:00Z")}
 	sig, _ := SignCert(acct, &cert)
 	seeded(t, 8)
 	unlock, err := SealUnlock(o.KEMPK, &cert, acct)

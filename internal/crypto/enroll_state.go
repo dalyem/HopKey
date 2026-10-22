@@ -1,10 +1,10 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/hpke"
 	"crypto/rand"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"slices"
@@ -38,7 +38,18 @@ var (
 	ErrCommitMismatch       = errors.New("crypto: open does not match the commitment")
 	ErrBudgetExhausted      = errors.New("crypto: approval budget exhausted (3 attempts per rolling hour)")
 	ErrChallengeOutstanding = errors.New("crypto: this device already has an outstanding approval")
+	ErrEnrollExpired        = errors.New("crypto: the enrollment deadline passed and the attempt failed")
 )
+
+// EnrollDeadline bounds an attempt (§7): 10 minutes from COMMITTED on D and
+// from CHALLENGED on A. When it passes, the attempt is a failure, its budget
+// slot stays spent, and A's outstanding-challenge slot is released.
+const EnrollDeadline = 10 * time.Minute
+
+// expired reports whether now is at or past deadline.
+func expired(now time.Time, deadline model.Timestamp) bool { return !now.Before(deadline.Time()) }
+
+func deadlineFrom(now time.Time) model.Timestamp { return model.TimestampOf(now.Add(EnrollDeadline)) }
 
 // --- the approving device's budget ---
 
@@ -51,6 +62,7 @@ type budgetRecord struct {
 	V            int               `json:"v"`
 	Reservations []model.Timestamp `json:"reservations"`
 	Outstanding  model.ID          `json:"outstanding"` // "" when none
+	Deadline     model.Timestamp   `json:"deadline"`    // when Outstanding is released; 0 when none
 }
 
 // ApprovalBudget is A's persistent approval budget (§7 step 2): at most 3
@@ -62,13 +74,16 @@ type budgetRecord struct {
 // A reservation whose time lies in the future (the clock moved back) keeps
 // counting until the clock passes it plus an hour.
 //
+// The outstanding challenge is released when its attempt ends or when its
+// deadline passes (§7), whichever comes first, so a device that never
+// answers blocks approvals for at most EnrollDeadline. The deadline starts
+// at the reservation and moves to CHALLENGED + EnrollDeadline when A sends
+// chal; the reservation itself is part of the attempt, so it is bounded the
+// same way.
+//
 // Methods are not safe for concurrent use, and two processes must not load
 // the same budget at once; the caller serializes approvals (for example
 // with internal/filelock).
-//
-// SPEC GAP (§7): nothing bounds how long a challenge stays outstanding. If
-// D never answers, the approving device stays blocked until the caller ends
-// the attempt (Approval.Abort). No timeout is invented here.
 type ApprovalBudget struct {
 	p   Persister
 	now Clock
@@ -101,12 +116,19 @@ func (b *ApprovalBudget) live(now time.Time) []model.Timestamp {
 	return out
 }
 
+// outstanding reports whether a challenge is outstanding at now: one is
+// recorded and its deadline has not passed.
+func (b *ApprovalBudget) outstanding(now time.Time) bool {
+	return !b.rec.Outstanding.IsZero() && !expired(now, b.rec.Deadline)
+}
+
 // Remaining reports how many attempts could be reserved now.
 func (b *ApprovalBudget) Remaining() int {
-	if !b.rec.Outstanding.IsZero() {
+	now := b.now()
+	if b.outstanding(now) {
 		return 0
 	}
-	return max(0, budgetAttempts-len(b.live(b.now())))
+	return max(0, budgetAttempts-len(b.live(now)))
 }
 
 // Reserve atomically reserves an attempt for enrollID and persists it.
@@ -115,14 +137,31 @@ func (b *ApprovalBudget) Reserve(enrollID model.ID) error {
 		return errors.New("crypto: zero enroll ID")
 	}
 	now := b.now()
-	if !b.rec.Outstanding.IsZero() {
+	if b.outstanding(now) {
 		return ErrChallengeOutstanding
 	}
 	live := b.live(now)
 	if len(live) >= budgetAttempts {
 		return ErrBudgetExhausted
 	}
-	next := budgetRecord{V: Version, Reservations: append(live, model.TimestampOf(now)), Outstanding: enrollID}
+	next := budgetRecord{V: Version, Reservations: append(live, model.TimestampOf(now)), Outstanding: enrollID,
+		Deadline: deadlineFrom(now)}
+	if err := b.persist(next); err != nil {
+		return err
+	}
+	b.rec = next
+	return nil
+}
+
+// challenged moves the outstanding deadline of enrollID to deadline, the
+// CHALLENGED time plus EnrollDeadline.
+func (b *ApprovalBudget) challenged(enrollID model.ID, deadline model.Timestamp) error {
+	if b.rec.Outstanding != enrollID {
+		return nil
+	}
+	next := b.rec
+	next.Reservations = slices.Clone(b.rec.Reservations)
+	next.Deadline = deadline
 	if err := b.persist(next); err != nil {
 		return err
 	}
@@ -160,6 +199,7 @@ const (
 	DeviceCommitted DeviceEnrollState = "committed"
 	DeviceRevealed  DeviceEnrollState = "revealed"
 	DeviceDone      DeviceEnrollState = "done"
+	DeviceFailed    DeviceEnrollState = "failed" // the deadline passed
 )
 
 type deviceRecord struct {
@@ -169,25 +209,39 @@ type deviceRecord struct {
 	SigSeed  []byte            `json:"sig_seed"`
 	ND       []byte            `json:"nD"`
 	Name     string            `json:"name"`
+	Deadline model.Timestamp   `json:"deadline"`  // COMMITTED + EnrollDeadline
 	EnrollID model.ID          `json:"enroll_id"` // "" until the server assigns it
 	Chal     *EnrollChal       `json:"chal"`
 	Cert     *Cert             `json:"cert"`
 	CertSig  []byte            `json:"cert_sig"`
+	Delivery *HPKEEnvelope     `json:"delivery"` // the verified delivery, once DONE
 }
 
 // DeviceEnrollment is D's side of §7. Every transition is persisted before
-// the method returns the message it produces.
+// the method returns the message it produces. Messages that fail their
+// checks are discarded with no change of state, so the real message can
+// still arrive before the deadline.
+//
+// Messages passed in and returned are copied; the caller may reuse or
+// change its buffers.
 type DeviceEnrollment struct {
 	p    Persister
+	now  Clock
 	rec  deviceRecord
 	kem  hpke.PrivateKey
 	sig  ed25519.PrivateKey
 	open EnrollOpen
 }
 
-// NewDeviceEnrollment generates D's keys and nD, persists them (state
-// COMMITTED) and returns the commit message to post.
+// NewDeviceEnrollment is NewDeviceEnrollmentWithClock with the system clock.
 func NewDeviceEnrollment(p Persister, name string) (*DeviceEnrollment, EnrollCommit, error) {
+	return NewDeviceEnrollmentWithClock(p, time.Now, name)
+}
+
+// NewDeviceEnrollmentWithClock generates D's keys and nD, persists them
+// (state COMMITTED, with the deadline now + EnrollDeadline) and returns the
+// commit message to post.
+func NewDeviceEnrollmentWithClock(p Persister, now Clock, name string) (*DeviceEnrollment, EnrollCommit, error) {
 	if err := CheckStr("name", name, 64); err != nil {
 		return nil, EnrollCommit{}, err
 	}
@@ -195,7 +249,7 @@ func NewDeviceEnrollment(p Persister, name string) (*DeviceEnrollment, EnrollCom
 	if err != nil {
 		return nil, EnrollCommit{}, err
 	}
-	kemSK, err := kem.Bytes()
+	kemSK, err := kemPrivateBytes(kem)
 	if err != nil {
 		return nil, EnrollCommit{}, err
 	}
@@ -207,8 +261,9 @@ func NewDeviceEnrollment(p Persister, name string) (*DeviceEnrollment, EnrollCom
 	if _, err := rand.Read(nD); err != nil {
 		return nil, EnrollCommit{}, err
 	}
-	rec := deviceRecord{V: Version, State: DeviceCommitted, KEMSK: kemSK, SigSeed: sig.Seed(), ND: nD, Name: name}
-	d, err := newDevice(p, rec)
+	rec := deviceRecord{V: Version, State: DeviceCommitted, KEMSK: kemSK, SigSeed: sig.Seed(), ND: nD, Name: name,
+		Deadline: deadlineFrom(now())}
+	d, err := newDevice(p, now, rec)
 	if err != nil {
 		return nil, EnrollCommit{}, err
 	}
@@ -218,8 +273,15 @@ func NewDeviceEnrollment(p Persister, name string) (*DeviceEnrollment, EnrollCom
 	return d, d.Commit(), nil
 }
 
-// RestoreDeviceEnrollment loads D's persisted state after a restart.
+// RestoreDeviceEnrollment is RestoreDeviceEnrollmentWithClock with the
+// system clock.
 func RestoreDeviceEnrollment(p Persister, state []byte) (*DeviceEnrollment, error) {
+	return RestoreDeviceEnrollmentWithClock(p, time.Now, state)
+}
+
+// RestoreDeviceEnrollmentWithClock loads D's persisted state after a
+// restart. An unfinished attempt whose deadline has passed is failed.
+func RestoreDeviceEnrollmentWithClock(p Persister, now Clock, state []byte) (*DeviceEnrollment, error) {
 	var rec deviceRecord
 	if err := canonjson.Unmarshal(state, &rec); err != nil {
 		return nil, err
@@ -228,17 +290,28 @@ func RestoreDeviceEnrollment(p Persister, state []byte) (*DeviceEnrollment, erro
 		return nil, ErrUnsupported
 	}
 	switch rec.State {
-	case DeviceCommitted, DeviceRevealed, DeviceDone:
+	case DeviceCommitted, DeviceRevealed, DeviceDone, DeviceFailed:
 	default:
 		return nil, fmt.Errorf("crypto: unknown enrollment state %q", rec.State)
 	}
-	if (rec.State != DeviceCommitted) != (rec.Chal != nil) || (rec.State == DeviceDone) != (rec.Cert != nil) {
+	inconsistent := (rec.State == DeviceDone) != (rec.Cert != nil) || (rec.State == DeviceDone) != (rec.Delivery != nil)
+	if rec.State != DeviceFailed && (rec.State != DeviceCommitted) != (rec.Chal != nil) {
+		inconsistent = true
+	}
+	if inconsistent {
 		return nil, errors.New("crypto: inconsistent enrollment state")
 	}
-	return newDevice(p, rec)
+	d, err := newDevice(p, now, rec)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.checkDeadline(); err != nil && !errors.Is(err, ErrEnrollExpired) {
+		return nil, err
+	}
+	return d, nil
 }
 
-func newDevice(p Persister, rec deviceRecord) (*DeviceEnrollment, error) {
+func newDevice(p Persister, now Clock, rec deviceRecord) (*DeviceEnrollment, error) {
 	kem, err := ParseKEMPrivateKey(rec.KEMSK)
 	if err != nil {
 		return nil, err
@@ -247,8 +320,9 @@ func newDevice(p Persister, rec deviceRecord) (*DeviceEnrollment, error) {
 		return nil, errors.New("crypto: corrupt enrollment state")
 	}
 	sig := ed25519.NewKeyFromSeed(rec.SigSeed)
-	d := &DeviceEnrollment{p: p, rec: rec, kem: kem, sig: sig}
-	d.open = EnrollOpen{V: Version, KEMPK: kem.PublicKey().Bytes(), SigPK: sig.Public().(ed25519.PublicKey), ND: rec.ND, Name: rec.Name}
+	d := &DeviceEnrollment{p: p, now: now, rec: rec, kem: kem, sig: sig}
+	d.open = EnrollOpen{V: Version, KEMPK: kem.PublicKey().Bytes(), SigPK: sig.Public().(ed25519.PublicKey),
+		ND: bytes.Clone(rec.ND), Name: rec.Name}
 	return d, nil
 }
 
@@ -265,8 +339,31 @@ func (d *DeviceEnrollment) save(rec deviceRecord) error {
 	return nil
 }
 
+// checkDeadline fails an unfinished attempt whose deadline has passed and
+// returns ErrEnrollExpired for a failed one.
+func (d *DeviceEnrollment) checkDeadline() error {
+	switch d.rec.State {
+	case DeviceDone:
+		return nil
+	case DeviceFailed:
+		return ErrEnrollExpired
+	}
+	if !expired(d.now(), d.rec.Deadline) {
+		return nil
+	}
+	rec := d.rec
+	rec.State = DeviceFailed
+	if err := d.save(rec); err != nil {
+		return err
+	}
+	return ErrEnrollExpired
+}
+
 // State returns D's current state.
 func (d *DeviceEnrollment) State() DeviceEnrollState { return d.rec.State }
+
+// Deadline returns the time at which an unfinished attempt fails.
+func (d *DeviceEnrollment) Deadline() time.Time { return d.rec.Deadline.Time() }
 
 // Commit returns the commit message. It is the same after a restart, so an
 // uncertain post can be repeated.
@@ -279,6 +376,9 @@ func (d *DeviceEnrollment) Commit() EnrollCommit {
 func (d *DeviceEnrollment) SetEnrollID(id model.ID) error {
 	if id.IsZero() {
 		return errors.New("crypto: zero enroll ID")
+	}
+	if err := d.checkDeadline(); err != nil {
+		return err
 	}
 	if d.rec.State != DeviceCommitted {
 		return ErrEnrollState
@@ -297,7 +397,10 @@ func (d *DeviceEnrollment) SetEnrollID(id model.ID) error {
 // HandleChal accepts exactly one chal, whose enroll_id must equal the
 // persisted session ID, persists it (REVEALED) and returns open. Any chal
 // after that is rejected. A chal that fails validation changes nothing.
-func (d *DeviceEnrollment) HandleChal(ch *EnrollChal) (EnrollOpen, error) {
+func (d *DeviceEnrollment) HandleChal(in *EnrollChal) (EnrollOpen, error) {
+	if err := d.checkDeadline(); err != nil {
+		return EnrollOpen{}, err
+	}
 	switch d.rec.State {
 	case DeviceCommitted:
 	case DeviceRevealed, DeviceDone:
@@ -308,6 +411,7 @@ func (d *DeviceEnrollment) HandleChal(ch *EnrollChal) (EnrollOpen, error) {
 	if d.rec.EnrollID.IsZero() {
 		return EnrollOpen{}, ErrEnrollState
 	}
+	ch := in.clone()
 	if err := ch.Validate(); err != nil {
 		return EnrollOpen{}, err
 	}
@@ -316,22 +420,23 @@ func (d *DeviceEnrollment) HandleChal(ch *EnrollChal) (EnrollOpen, error) {
 	}
 	rec := d.rec
 	rec.State = DeviceRevealed
-	c := *ch
-	c.NA = slices.Clone(ch.NA)
-	rec.Chal = &c
+	rec.Chal = ch
 	if err := d.save(rec); err != nil {
 		return EnrollOpen{}, err
 	}
-	return d.open, nil
+	return *d.open.clone(), nil
 }
 
 // Open returns the open message once REVEALED, for re-sending after a
 // restart.
 func (d *DeviceEnrollment) Open() (EnrollOpen, error) {
+	if err := d.checkDeadline(); err != nil {
+		return EnrollOpen{}, err
+	}
 	if d.rec.State != DeviceRevealed {
 		return EnrollOpen{}, ErrEnrollState
 	}
-	return d.open, nil
+	return *d.open.clone(), nil
 }
 
 func (d *DeviceEnrollment) transcript() []byte {
@@ -340,22 +445,55 @@ func (d *DeviceEnrollment) transcript() []byte {
 
 // SAS returns the 8-digit code D shows once REVEALED.
 func (d *DeviceEnrollment) SAS() (string, error) {
+	if err := d.checkDeadline(); err != nil {
+		return "", err
+	}
 	if d.rec.Chal == nil {
 		return "", ErrEnrollState
 	}
 	return SAS(d.transcript())
 }
 
-// HandleDelivery verifies A's delivery (VerifyDelivery) and persists DONE.
-// A delivery that fails verification changes nothing. The caller then runs
-// the anchor algorithm from AnchorSeq/AnchorH and the transitions, and
-// requires the result to contain this device's device_add with the
-// delivered certificate.
-func (d *DeviceEnrollment) HandleDelivery(e HPKEEnvelope) (*VerifiedDelivery, error) {
+func (d *DeviceEnrollment) verify(e HPKEEnvelope) (*VerifiedDelivery, error) {
+	return verifyDelivery(d.kem, d.open.SigPK, d.rec.Chal, d.open.Name, TranscriptHash(d.transcript()), e)
+}
+
+// HandleDelivery verifies A's delivery (§7 step 6, including Cert.name =
+// open.name) and persists DONE together with the delivery itself, so the
+// result can be recovered after a crash (Delivered). A delivery that fails
+// verification changes nothing. Once DONE, handing in the same delivery
+// again returns the same result; any other delivery is rejected.
+//
+// The caller then runs the anchor algorithm from AnchorSeq/AnchorH and the
+// transitions, and requires the result to contain this device's
+// device_add with the delivered certificate.
+//
+// SPEC GAP (§7): only A records the user's SAS comparison. D's chal is
+// "SAS-authenticated" only if the user saw matching codes, but D is never
+// told the outcome. A relay can send D a chal naming its own acct_sig_fp
+// (the codes then differ and the user rejects on A) and afterwards a
+// delivery sealed under its own account keys, which passes every step 6
+// check. D then finishes enrolled in the relay's account. This code
+// follows the spec as written; a fix needs the spec to add a user
+// confirmation on D (or an equivalent) before a delivery is accepted.
+// TestDeviceAcceptsRelayDeliveryAfterMismatch records the behavior.
+func (d *DeviceEnrollment) HandleDelivery(in HPKEEnvelope) (*VerifiedDelivery, error) {
+	e := in.clone()
+	if d.rec.State == DeviceDone {
+		got, err1 := e.Digest()
+		have, err2 := d.rec.Delivery.Digest()
+		if err1 != nil || err2 != nil || !got.Equal(have) {
+			return nil, ErrEnrollState
+		}
+		return d.Delivered()
+	}
+	if err := d.checkDeadline(); err != nil {
+		return nil, err
+	}
 	if d.rec.State != DeviceRevealed {
 		return nil, ErrEnrollState
 	}
-	v, err := VerifyDelivery(d.kem, d.open.SigPK, d.rec.Chal, d.transcript(), e)
+	v, err := d.verify(e)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +501,8 @@ func (d *DeviceEnrollment) HandleDelivery(e HPKEEnvelope) (*VerifiedDelivery, er
 	rec.State = DeviceDone
 	cert := v.Cert
 	rec.Cert = &cert
-	rec.CertSig = v.CertSig
+	rec.CertSig = bytes.Clone(v.CertSig)
+	rec.Delivery = &e
 	if err := d.save(rec); err != nil {
 		v.Account.Zero()
 		return nil, err
@@ -371,8 +510,24 @@ func (d *DeviceEnrollment) HandleDelivery(e HPKEEnvelope) (*VerifiedDelivery, er
 	return v, nil
 }
 
-// DeviceKeys returns D's new device keys.
-func (d *DeviceEnrollment) DeviceKeys() (hpke.PrivateKey, ed25519.PrivateKey) { return d.kem, d.sig }
+// Delivered returns the verified delivery once DONE, re-opening the
+// persisted delivery. It gives the same certificate, account keys and
+// anchor coordinates after a restart as HandleDelivery did.
+func (d *DeviceEnrollment) Delivered() (*VerifiedDelivery, error) {
+	if d.rec.State != DeviceDone {
+		return nil, ErrEnrollState
+	}
+	v, err := d.verify(*d.rec.Delivery)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: persisted delivery no longer verifies: %w", err)
+	}
+	return v, nil
+}
+
+// DeviceKeys returns D's new device keys. The signing key is a copy.
+func (d *DeviceEnrollment) DeviceKeys() (hpke.PrivateKey, ed25519.PrivateKey) {
+	return d.kem, ed25519.PrivateKey(bytes.Clone(d.sig))
+}
 
 // --- A: the approving device ---
 
@@ -390,24 +545,33 @@ const (
 )
 
 type approvalRecord struct {
-	V        int           `json:"v"`
-	State    ApprovalState `json:"state"`
-	EnrollID model.ID      `json:"enroll_id"`
-	Approver model.ID      `json:"approver_device_id"`
-	Account  model.ID      `json:"account_id"`
-	AKV      uint32        `json:"akv"`
-	SigFp    Hash          `json:"acct_sig_fp"`
-	Commit   *EnrollCommit `json:"commit"`
-	Chal     *EnrollChal   `json:"chal"`
-	Open     *EnrollOpen   `json:"open"`
-	Cert     *Cert         `json:"cert"`
-	CertSig  []byte        `json:"cert_sig"`
-	Unlock   *HPKEEnvelope `json:"unlock"`
-	Delivery *HPKEEnvelope `json:"delivery"`
+	V        int             `json:"v"`
+	State    ApprovalState   `json:"state"`
+	EnrollID model.ID        `json:"enroll_id"`
+	Approver model.ID        `json:"approver_device_id"`
+	Account  model.ID        `json:"account_id"`
+	AKV      uint32          `json:"akv"`
+	SigFp    Hash            `json:"acct_sig_fp"`
+	Deadline model.Timestamp `json:"deadline"` // reservation, then CHALLENGED, + EnrollDeadline
+	Commit   *EnrollCommit   `json:"commit"`
+	Chal     *EnrollChal     `json:"chal"`
+	Open     *EnrollOpen     `json:"open"`
+	Cert     *Cert           `json:"cert"`
+	CertSig  []byte          `json:"cert_sig"`
+	Unlock   *HPKEEnvelope   `json:"unlock"`
+	Delivery *HPKEEnvelope   `json:"delivery"`
 }
 
 // Approval is A's side of §7. Every transition is persisted before the
-// method returns the message it produces.
+// method returns the message it produces. Messages that fail their checks
+// are discarded with no change of state, so the real message can still
+// arrive before the deadline. Once the deadline passes (EnrollDeadline from
+// CHALLENGED), every method fails the attempt and returns
+// ErrEnrollExpired; the slot stays spent and the outstanding challenge is
+// released.
+//
+// Messages and material passed in and returned are copied; the caller may
+// reuse or change its buffers.
 type Approval struct {
 	p      Persister
 	budget *ApprovalBudget
@@ -426,7 +590,7 @@ func StartApproval(budget *ApprovalBudget, p Persister, enrollID model.ID, pin A
 	}
 	a := &Approval{p: p, budget: budget}
 	rec := approvalRecord{V: Version, State: ApprovalReserved, EnrollID: enrollID, Approver: approver,
-		Account: pin.AccountID, AKV: pin.AKV, SigFp: pin.FpSig}
+		Account: pin.AccountID, AKV: pin.AKV, SigFp: pin.FpSig, Deadline: budget.rec.Deadline}
 	if err := a.save(rec); err != nil {
 		// The slot stays spent; the attempt is over.
 		_ = budget.finish(enrollID)
@@ -435,7 +599,8 @@ func StartApproval(budget *ApprovalBudget, p Persister, enrollID model.ID, pin A
 	return a, nil
 }
 
-// RestoreApproval loads A's persisted attempt after a restart.
+// RestoreApproval loads A's persisted attempt after a restart. An
+// unfinished attempt whose deadline has passed is failed.
 func RestoreApproval(budget *ApprovalBudget, p Persister, state []byte) (*Approval, error) {
 	var rec approvalRecord
 	if err := canonjson.Unmarshal(state, &rec); err != nil {
@@ -457,6 +622,10 @@ func RestoreApproval(budget *ApprovalBudget, p Persister, state []byte) (*Approv
 		if err := budget.finish(rec.EnrollID); err != nil {
 			return nil, err
 		}
+		return a, nil
+	}
+	if err := a.checkDeadline(); err != nil && !errors.Is(err, ErrEnrollExpired) {
+		return nil, err
 	}
 	return a, nil
 }
@@ -473,58 +642,97 @@ func (a *Approval) save(rec approvalRecord) error {
 	return nil
 }
 
+// checkDeadline fails an unfinished attempt whose deadline has passed.
+func (a *Approval) checkDeadline() error {
+	switch a.rec.State {
+	case ApprovalDelivered:
+		return nil
+	case ApprovalFailed:
+		return ErrEnrollState
+	}
+	if !expired(a.budget.now(), a.rec.Deadline) {
+		return nil
+	}
+	if err := a.fail(); err != nil {
+		return err
+	}
+	return ErrEnrollExpired
+}
+
 // State returns A's current state.
 func (a *Approval) State() ApprovalState { return a.rec.State }
 
 // EnrollID returns the attempt's enroll_id.
 func (a *Approval) EnrollID() model.ID { return a.rec.EnrollID }
 
+// Deadline returns the time at which an unfinished attempt fails.
+func (a *Approval) Deadline() time.Time { return a.rec.Deadline.Time() }
+
 // HandleCommit accepts exactly one commit for the attempt, persists it with
-// a fresh nA and returns chal.
+// a fresh nA and returns chal. The deadline restarts at CHALLENGED.
 func (a *Approval) HandleCommit(c *EnrollCommit) (EnrollChal, error) {
+	if err := a.checkDeadline(); err != nil {
+		return EnrollChal{}, err
+	}
 	if a.rec.State != ApprovalReserved {
 		return EnrollChal{}, ErrEnrollState
 	}
-	if err := c.Validate(); err != nil {
+	cm := *c // EnrollCommit holds no slices
+	if err := cm.Validate(); err != nil {
 		return EnrollChal{}, err
 	}
 	nA := make([]byte, EnrollNonceSize)
 	if _, err := rand.Read(nA); err != nil {
 		return EnrollChal{}, err
 	}
-	ch := EnrollChal{V: Version, EnrollID: a.rec.EnrollID, NA: nA, AccountID: a.rec.Account,
+	ch := &EnrollChal{V: Version, EnrollID: a.rec.EnrollID, NA: nA, AccountID: a.rec.Account,
 		ApproverDeviceID: a.rec.Approver, AcctSigFp: a.rec.SigFp, AKV: a.rec.AKV}
-	cm := *c
+	deadline := deadlineFrom(a.budget.now())
+	// The budget's deadline moves first: a crash in between leaves the
+	// outstanding mark held longer than the attempt, never shorter.
+	if err := a.budget.challenged(a.rec.EnrollID, deadline); err != nil {
+		return EnrollChal{}, err
+	}
 	rec := a.rec
 	rec.State = ApprovalChallenged
+	rec.Deadline = deadline
 	rec.Commit = &cm
-	rec.Chal = &ch
+	rec.Chal = ch
 	if err := a.save(rec); err != nil {
 		return EnrollChal{}, err
 	}
-	return ch, nil
+	return *ch.clone(), nil
 }
 
 // Chal returns the persisted chal for re-sending.
 func (a *Approval) Chal() (EnrollChal, error) {
+	if err := a.checkDeadline(); err != nil {
+		return EnrollChal{}, err
+	}
 	if a.rec.Chal == nil || a.rec.State != ApprovalChallenged {
 		return EnrollChal{}, ErrEnrollState
 	}
-	return *a.rec.Chal, nil
+	return *a.rec.Chal.clone(), nil
 }
 
 // HandleOpen checks that open matches c, persists it and returns the SAS
 // and device name for the user to compare. An open that does not match
 // changes nothing. If the SAS derivation aborts, the attempt fails.
-func (a *Approval) HandleOpen(o *EnrollOpen) (sas, name string, err error) {
+func (a *Approval) HandleOpen(in *EnrollOpen) (sas, name string, err error) {
+	if err := a.checkDeadline(); err != nil {
+		return "", "", err
+	}
 	if a.rec.State != ApprovalChallenged {
 		return "", "", ErrEnrollState
 	}
+	// Work on a copy, so a caller changing its buffers after the SAS is
+	// shown cannot change what Prepare certifies.
+	o := in.clone()
 	if err := o.Validate(); err != nil {
 		return "", "", err
 	}
 	c := Commitment(o)
-	if subtle.ConstantTimeCompare(c[:], a.rec.Commit.C[:]) != 1 {
+	if !c.Equal(a.rec.Commit.C) {
 		return "", "", ErrCommitMismatch
 	}
 	sas, err = SAS(Transcript(c, a.rec.Chal, o))
@@ -534,10 +742,9 @@ func (a *Approval) HandleOpen(o *EnrollOpen) (sas, name string, err error) {
 		}
 		return "", "", err
 	}
-	om := *o
 	rec := a.rec
 	rec.State = ApprovalOpened
-	rec.Open = &om
+	rec.Open = o
 	if err := a.save(rec); err != nil {
 		return "", "", err
 	}
@@ -546,6 +753,9 @@ func (a *Approval) HandleOpen(o *EnrollOpen) (sas, name string, err error) {
 
 // SAS returns the code again once OPENED, for showing after a restart.
 func (a *Approval) SAS() (sas, name string, err error) {
+	if err := a.checkDeadline(); err != nil {
+		return "", "", err
+	}
 	if a.rec.Open == nil {
 		return "", "", ErrEnrollState
 	}
@@ -560,6 +770,9 @@ func (a *Approval) transcript() []byte {
 // Confirm records the user's comparison. A mismatch ends the attempt as a
 // failure, and its budget slot stays spent.
 func (a *Approval) Confirm(match bool) error {
+	if err := a.checkDeadline(); err != nil {
+		return err
+	}
 	if a.rec.State != ApprovalOpened {
 		return ErrEnrollState
 	}
@@ -584,6 +797,9 @@ type PreparedDevice struct {
 // it and seals the unlock blob to D's KEM key, then persists them. acct
 // must be the pinned account the challenge named.
 func (a *Approval) Prepare(acct *AccountKeys, deviceID model.ID, issuedAt model.Timestamp) (*PreparedDevice, error) {
+	if err := a.checkDeadline(); err != nil {
+		return nil, err
+	}
 	if a.rec.State != ApprovalConfirmed {
 		return nil, ErrEnrollState
 	}
@@ -594,7 +810,7 @@ func (a *Approval) Prepare(acct *AccountKeys, deviceID model.ID, issuedAt model.
 	o := a.rec.Open
 	th := TranscriptHash(a.transcript())
 	cert := Cert{V: Version, AccountID: a.rec.Account, AKV: a.rec.AKV, DeviceID: deviceID, Name: o.Name,
-		KEMFp: FpKEM(o.KEMPK), SigFp: FpSig(o.SigPK), EnrollTranscript: OptHash(th), IssuedAt: issuedAt}
+		KEMFp: FpKEM(o.KEMPK), SigFp: FpSig(o.SigPK), EnrollTranscript: SomeHash(th), IssuedAt: issuedAt}
 	sig, err := SignCert(acct, &cert)
 	if err != nil {
 		return nil, err
@@ -614,24 +830,31 @@ func (a *Approval) Prepare(acct *AccountKeys, deviceID model.ID, issuedAt model.
 	return a.Prepared()
 }
 
-// Prepared returns the persisted device_add material.
+// Prepared returns the persisted device_add material. Before delivery it
+// fails once the deadline has passed, so a late device_add is not written.
 func (a *Approval) Prepared() (*PreparedDevice, error) {
+	if err := a.checkDeadline(); err != nil {
+		return nil, err
+	}
 	if a.rec.Cert == nil {
 		return nil, ErrEnrollState
 	}
-	return &PreparedDevice{Cert: *a.rec.Cert, CertSig: a.rec.CertSig, KEMPK: a.rec.Open.KEMPK,
-		SigPK: a.rec.Open.SigPK, Unlock: *a.rec.Unlock}, nil
+	return &PreparedDevice{Cert: *a.rec.Cert, CertSig: bytes.Clone(a.rec.CertSig), KEMPK: bytes.Clone(a.rec.Open.KEMPK),
+		SigPK: bytes.Clone(a.rec.Open.SigPK), Unlock: a.rec.Unlock.clone()}, nil
 }
 
 // Deliver seals the delivery to D and persists it, ending the attempt. Call
 // it only after the normal entry carrying the device_add has committed.
 // anchorSeq and anchorH identify the genesis or checkpoint entry for the
-// current akv.
+// current akv. After delivery it returns the persisted envelope again.
 func (a *Approval) Deliver(anchorSeq uint64, anchorH Hash) (HPKEEnvelope, error) {
+	if err := a.checkDeadline(); err != nil {
+		return HPKEEnvelope{}, err
+	}
 	switch a.rec.State {
 	case ApprovalPrepared:
 	case ApprovalDelivered:
-		return *a.rec.Delivery, nil
+		return a.rec.Delivery.clone(), nil
 	default:
 		return HPKEEnvelope{}, ErrEnrollState
 	}
@@ -650,7 +873,7 @@ func (a *Approval) Deliver(anchorSeq uint64, anchorH Hash) (HPKEEnvelope, error)
 	if err := a.budget.finish(a.rec.EnrollID); err != nil {
 		return HPKEEnvelope{}, err
 	}
-	return env, nil
+	return env.clone(), nil
 }
 
 // Abort ends an unfinished attempt as a failure. The slot stays spent. If
