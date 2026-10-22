@@ -1,0 +1,6 @@
+{
+  "Version": "1.78.1",
+  "BackendState": "NeedsLogin",
+  "AuthURL": "https://login.tailscale.com/a/0000000000",
+  "Self": {"ID": "", "HostName": "laptop", "DNSName": "", "TailscaleIPs": null, "Online": false}
+}

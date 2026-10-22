@@ -279,6 +279,11 @@ func (s *Server) untrack(c net.Conn) {
 	c.Close()
 }
 
+// RequireSameUID is the check Listen applies to every connection: the peer
+// must run as this process's uid. It is exported so the daemon's control
+// socket applies the same rule.
+func RequireSameUID(c *net.UnixConn) error { return requireSameUID(c) }
+
 func requireSameUID(c *net.UnixConn) error {
 	uid, err := peerUID(c)
 	if err != nil {

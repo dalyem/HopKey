@@ -1,0 +1,397 @@
+package daemon
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/resolve"
+	"github.com/dalyem/hopkey/internal/sshagent"
+	"github.com/dalyem/hopkey/internal/sshconfig"
+	"github.com/dalyem/hopkey/internal/sshkeys"
+)
+
+const (
+	maxRequest     = 4 << 20 // bytes in one request line
+	requestTimeout = 30 * time.Second
+	idleTimeout    = 2 * time.Minute
+)
+
+func (d *Daemon) serveControl() {
+	l := d.control
+	for {
+		c, err := l.ln.AcceptUnix()
+		if err != nil {
+			l.mu.Lock()
+			closed := l.closed
+			l.mu.Unlock()
+			if !closed {
+				d.logf("control socket: %v", err)
+			}
+			return
+		}
+		if err := sshagent.RequireSameUID(c); err != nil {
+			d.logf("control socket: rejected connection: %v", err)
+			c.Close()
+			continue
+		}
+		if !l.track(c) {
+			c.Close()
+			return
+		}
+		go d.serveConn(c)
+	}
+}
+
+func (d *Daemon) serveConn(c net.Conn) {
+	defer d.control.untrack(c)
+	sc := bufio.NewScanner(c)
+	sc.Buffer(make([]byte, 0, 64<<10), maxRequest)
+	enc := json.NewEncoder(c)
+	for {
+		c.SetReadDeadline(time.Now().Add(idleTimeout))
+		if !sc.Scan() {
+			return
+		}
+		var req Request
+		var resp Response
+		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+			resp = errorResponse(invalidf("malformed request: %v", err))
+		} else {
+			resp = d.handle(req)
+		}
+		c.SetWriteDeadline(time.Now().Add(requestTimeout))
+		if err := enc.Encode(resp); err != nil {
+			return
+		}
+		if req.Op == OpShutdown && resp.OK {
+			// Close waits for this handler, so it runs on its own.
+			go d.Close()
+			return
+		}
+	}
+}
+
+func errorResponse(err error) Response {
+	var e *Error
+	if !errors.As(err, &e) {
+		switch {
+		case errors.Is(err, model.ErrNotFound):
+			e = &Error{Code: CodeNotFound, Message: err.Error()}
+		case errors.Is(err, model.ErrLocked):
+			e = &Error{Code: CodeLocked, Message: err.Error()}
+		default:
+			e = &Error{Code: CodeInternal, Message: err.Error()}
+		}
+	}
+	return Response{Error: e}
+}
+
+func (d *Daemon) handle(req Request) Response {
+	ctx, cancel := context.WithTimeout(d.ctx, requestTimeout)
+	defer cancel()
+	result, err := d.dispatch(ctx, req)
+	if err != nil {
+		return errorResponse(err)
+	}
+	var raw json.RawMessage
+	if result != nil {
+		b, err := json.Marshal(result)
+		if err != nil {
+			return errorResponse(err)
+		}
+		raw = b
+	}
+	return Response{OK: true, Result: raw}
+}
+
+func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
+	decode := func(v any) error {
+		if err := json.Unmarshal(req.Params, v); err != nil {
+			return invalidf("bad params for %s: %v", req.Op, err)
+		}
+		return nil
+	}
+	switch req.Op {
+	case OpStatus:
+		return d.opStatus(ctx)
+	case OpList:
+		return d.opList(ctx)
+	case OpResolve:
+		var p ResolveParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return d.opResolve(ctx, p)
+	case OpTailscale:
+		return d.tsStatus(ctx), nil
+	case OpPutHost:
+		var p PutHostParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return d.opPutHost(ctx, p)
+	case OpPutKey:
+		var p PutKeyParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return d.opPutKey(ctx, p)
+	case OpDelete:
+		var p DeleteParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return nil, d.opDelete(ctx, p)
+	case OpReload:
+		return nil, d.reload(ctx)
+	case OpShutdown:
+		return nil, nil
+	}
+	return nil, invalidf("unknown op %q", req.Op)
+}
+
+func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
+	snap, st, err := d.fresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ts := d.tsStatus(ctx)
+	out := &StatusResult{
+		Version: d.opts.Version, PID: pid(), StartedAt: d.started,
+		ConfigDir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path(), ControlSocket: d.control.path,
+		Hosts: len(snap.Hosts), Keys: len(snap.Keys), KeysInAgent: st.keysInAgent, SSHHosts: st.sshHosts,
+		Warnings: slices.Clone(st.warnings), LoadedAt: st.loadedAt, LastError: st.lastError,
+	}
+	out.Tailscale.Available, out.Tailscale.Reason = ts.Available, ts.Reason
+	return out, nil
+}
+
+func keyInfo(k model.Key) KeyInfo {
+	info := KeyInfo{ID: k.ItemID.String(), Name: k.Name, KeyType: k.KeyType, PublicKey: k.PublicKey, ItemVersion: k.ItemVersion}
+	if pub, err := sshkeys.ParsePublic(k.PublicKey); err == nil {
+		info.Fingerprint = sshkeys.Fingerprint(pub)
+	}
+	if !k.DedicatedGrant.IsZero() {
+		info.DedicatedGrant = k.DedicatedGrant.String()
+	}
+	return info
+}
+
+func (d *Daemon) opList(ctx context.Context) (*ListResult, error) {
+	snap, st, err := d.fresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := &ListResult{
+		Hosts: snap.Hosts, Snippets: snap.Snippets, SSH: st.ssh, Tailscale: d.tsStatus(ctx),
+		Keys: []KeyInfo{}, Credentials: []CredentialInfo{},
+	}
+	if out.Hosts == nil {
+		out.Hosts = []model.Host{}
+	}
+	if out.Snippets == nil {
+		out.Snippets = []model.Snippet{}
+	}
+	for _, k := range snap.Keys {
+		out.Keys = append(out.Keys, keyInfo(k))
+	}
+	for _, c := range snap.Credentials {
+		out.Credentials = append(out.Credentials, CredentialInfo{ID: c.ItemID.String(), Name: c.Name, Username: c.Username})
+	}
+	return out, nil
+}
+
+func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult, error) {
+	snap, st, err := d.fresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ts := d.tsStatus(ctx)
+	res, err := resolve.Resolve(ctx, resolve.Input{Target: p.Target, Hosts: snap.Hosts, Tailscale: ts, Interactive: p.Interactive})
+	if err != nil {
+		return nil, invalidf("%v", err)
+	}
+	out := &ResolveResult{Result: res}
+	if res.Host != nil {
+		h := *res.Host
+		out.Host = &h
+		route, err := resolve.ChooseRoute(h, ts)
+		switch {
+		case err != nil:
+			out.RouteError = err.Error()
+		case !sshconfig.ValidHostName(route.Address) || (route.Fallback != "" && !sshconfig.ValidHostName(route.Fallback)):
+			// The CLI hands these to ssh and to net.Dial; the store is not
+			// the only thing standing between it and a strange string.
+			out.RouteError = fmt.Sprintf("address %q is not usable", route.Address)
+		default:
+			out.Route = &route
+		}
+		info := st.ssh[h.ItemID.String()]
+		out.SSHAlias, out.SSHProblem = info.Alias, info.Problem
+	}
+	return out, nil
+}
+
+// checkHostInput fills defaults and refuses a host the ssh config could not
+// represent or that would share a name with another host.
+func checkHostInput(h model.Host, all []model.Host) (model.Host, error) {
+	if h.Route == "" {
+		h.Route = resolve.RouteAuto
+	}
+	if h.AgentAccess == "" {
+		h.AgentAccess = "allow"
+	}
+	if h.Port == 0 {
+		h.Port = 22
+	}
+	if h.Name == "" {
+		return h, invalidf("a host needs a name")
+	}
+	seen := map[string]bool{}
+	for _, n := range resolve.Names(h) {
+		if !sshconfig.ValidAlias(n) {
+			return h, invalidf("%q is not a valid host name or alias: use letters, digits, '.', '_' and '-', starting with a letter or digit, up to 64 characters", n)
+		}
+		l := strings.ToLower(n)
+		if seen[l] {
+			return h, invalidf("%q is listed twice for this host", n)
+		}
+		seen[l] = true
+	}
+	for _, other := range all {
+		if other.ItemID == h.ItemID {
+			continue
+		}
+		for _, n := range resolve.Names(other) {
+			if seen[strings.ToLower(n)] {
+				return h, invalidf("%q is already a name or alias of host %q", n, other.Name)
+			}
+		}
+	}
+	if len(h.Addresses) == 0 {
+		return h, invalidf("a host needs at least one address")
+	}
+	for _, a := range h.Addresses {
+		if !sshconfig.ValidHostName(a) {
+			return h, invalidf("address %q is not usable (letters, digits, '.', ':', '_' and '-' only)", a)
+		}
+	}
+	if h.User != "" && !sshconfig.ValidUser(h.User) {
+		return h, invalidf("user %q is not usable in an ssh config", h.User)
+	}
+	if h.Port > 65535 {
+		return h, invalidf("port %d is out of range", h.Port)
+	}
+	switch h.Route {
+	case resolve.RouteAuto, resolve.RouteTailnet, resolve.RouteDirect:
+	default:
+		return h, invalidf("route must be auto, tailnet or direct, not %q", h.Route)
+	}
+	if h.AgentAccess != "allow" && h.AgentAccess != "deny" {
+		return h, invalidf("agent_access must be allow or deny, not %q", h.AgentAccess)
+	}
+	for _, line := range h.HostKeys {
+		if _, err := sshkeys.ParsePublic(line); err != nil {
+			return h, invalidf("host key %q: %v", line, err)
+		}
+	}
+	return h, nil
+}
+
+func (d *Daemon) opPutHost(ctx context.Context, p PutHostParams) (*model.Host, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	snap, err := d.store.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h, err := checkHostInput(p.Host, snap.Hosts)
+	if err != nil {
+		return nil, err
+	}
+	saved, err := d.store.PutHost(ctx, h)
+	if err != nil {
+		return nil, storeError(err)
+	}
+	if _, err := d.reloadLocked(ctx); err != nil {
+		return nil, fmt.Errorf("saved, but reloading failed: %w", err)
+	}
+	return &saved, nil
+}
+
+func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error) {
+	name := strings.TrimSpace(p.Name)
+	if name == "" {
+		return nil, invalidf("a key needs a name")
+	}
+	priv, err := sshkeys.Parse([]byte(p.PrivateKey))
+	if errors.Is(err, sshkeys.ErrPassphrase) {
+		return nil, invalidf("the key is passphrase-protected; give hop the passphrase or remove it first")
+	}
+	if err != nil {
+		return nil, invalidf("%v", err)
+	}
+	pem, err := priv.MarshalPrivate(name)
+	if err != nil {
+		return nil, invalidf("%v", err)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	snap, err := d.store.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, k := range snap.Keys {
+		if strings.EqualFold(k.Name, name) {
+			return nil, invalidf("a key named %q already exists", k.Name)
+		}
+		if pub, err := sshkeys.ParsePublic(k.PublicKey); err == nil && slices.Equal(pub.Marshal(), priv.Public.Marshal()) {
+			return nil, invalidf("this key is already in the vault as %q", k.Name)
+		}
+	}
+	saved, err := d.store.PutKey(ctx, model.Key{
+		Name: name, KeyType: priv.Type, PrivateKey: pem, PublicKey: sshkeys.Line(priv.Public),
+	})
+	if err != nil {
+		return nil, storeError(err)
+	}
+	if _, err := d.reloadLocked(ctx); err != nil {
+		return nil, fmt.Errorf("saved, but reloading failed: %w", err)
+	}
+	info := keyInfo(saved)
+	return &info, nil
+}
+
+func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {
+	id, err := model.ParseID(p.ID)
+	if err != nil {
+		return invalidf("%v", err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.store.Delete(ctx, id); err != nil {
+		return storeError(err)
+	}
+	if _, err := d.reloadLocked(ctx); err != nil {
+		return fmt.Errorf("deleted, but reloading failed: %w", err)
+	}
+	return nil
+}
+
+// storeError passes the store's own sentinel errors through and presents any
+// other refusal (reference integrity, a stale version) as invalid input.
+func storeError(err error) error {
+	if errors.Is(err, model.ErrNotFound) || errors.Is(err, model.ErrLocked) {
+		return err
+	}
+	return invalidf("%v", err)
+}

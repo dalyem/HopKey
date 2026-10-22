@@ -38,6 +38,7 @@ type Host struct {
 	HostName  string          // address to connect to
 	Port      int             // 0 means 22
 	User      string          // empty leaves ssh's own default
+	ProxyJump string          // alias of another Host in the same Write; empty means a direct connection
 	PublicKey ssh.PublicKey   // selects the agent key; the private half never leaves the agent
 	HostKeys  []ssh.PublicKey // pinned server keys; none means ssh refuses the host
 }
@@ -200,11 +201,20 @@ func contentID(data []byte) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// ValidAlias reports whether s can be used as Host.Alias.
+func ValidAlias(s string) bool { return aliasRe.MatchString(s) }
+
+// ValidHostName reports whether s can be used as Host.HostName.
+func ValidHostName(s string) bool { return hostNameRe.MatchString(s) }
+
+// ValidUser reports whether s can be used as Host.User.
+func ValidUser(s string) bool { return userRe.MatchString(s) }
+
 // checkHosts validates hosts and returns them sorted by alias.
 func checkHosts(hosts []Host) ([]Host, error) {
 	hosts = slices.Clone(hosts)
 	slices.SortFunc(hosts, func(a, b Host) int { return strings.Compare(a.Alias, b.Alias) })
-	seen := make(map[string]bool, len(hosts))
+	byAlias := make(map[string]Host, len(hosts))
 	for _, h := range hosts {
 		if err := h.validate(); err != nil {
 			return nil, err
@@ -212,10 +222,25 @@ func checkHosts(hosts []Host) ([]Host, error) {
 		// Case-insensitive: ssh matches the alias that way, and the
 		// pins are keyed by the lower-cased alias.
 		lower := strings.ToLower(h.Alias)
-		if seen[lower] {
+		if _, dup := byAlias[lower]; dup {
 			return nil, fmt.Errorf("sshconfig: duplicate alias %q", h.Alias)
 		}
-		seen[lower] = true
+		byAlias[lower] = h
+	}
+	// A jump must name a Host written in the same config, and the chain of
+	// jumps must end: ssh would otherwise recurse until it ran out of processes.
+	for _, h := range hosts {
+		hops := 0
+		for cur := h; cur.ProxyJump != ""; hops++ {
+			next, ok := byAlias[strings.ToLower(cur.ProxyJump)]
+			if !ok {
+				return nil, fmt.Errorf("sshconfig: host %q: ProxyJump %q is not a host in this config", cur.Alias, cur.ProxyJump)
+			}
+			if hops >= len(hosts) {
+				return nil, fmt.Errorf("sshconfig: host %q: ProxyJump chain loops", h.Alias)
+			}
+			cur = next
+		}
 	}
 	return hosts, nil
 }
@@ -272,6 +297,9 @@ func render(opts Options, hosts []Host) (*files, error) {
 		if h.User != "" {
 			fmt.Fprintf(&config, "  User %s\n", h.User)
 		}
+		if h.ProxyJump != "" {
+			fmt.Fprintf(&config, "  ProxyJump %s\n", h.ProxyJump)
+		}
 		fmt.Fprintf(&config, "  IdentityAgent %s\n", agentSock)
 		fmt.Fprintf(&config, "  IdentityFile %s\n", pubPath)
 		config.WriteString("  IdentitiesOnly yes\n")
@@ -309,6 +337,8 @@ func (h Host) validate() error {
 		return fmt.Errorf("sshconfig: host %q: invalid port %d", h.Alias, h.Port)
 	case h.User != "" && !userRe.MatchString(h.User):
 		return fmt.Errorf("sshconfig: host %q: invalid user %q", h.Alias, h.User)
+	case h.ProxyJump != "" && !aliasRe.MatchString(h.ProxyJump):
+		return fmt.Errorf("sshconfig: host %q: invalid ProxyJump %q", h.Alias, h.ProxyJump)
 	case h.PublicKey == nil:
 		return fmt.Errorf("sshconfig: host %q: no public key", h.Alias)
 	}
