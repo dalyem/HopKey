@@ -13,8 +13,9 @@ package cli
 //
 // Sanitizing at the point of insertion matters because the finished message
 // has line breaks of its own (layout), and a filter over the finished message
-// cannot tell those from injected ones. reportError still runs displaySafe
-// over what it prints, as a last line of defence.
+// cannot tell those from injected ones. reportError is the last line of
+// defence: it flattens every error to one line unless the error is a
+// composed exitError (failMsg), whose layout is deliberate.
 //
 // JSON output has the same control-character policy through escapeJSONControls.
 // Text that is meant to be a live terminal session (the output of ssh from
@@ -23,6 +24,7 @@ package cli
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"unicode"
 )
@@ -79,24 +81,51 @@ func printable(s string) string {
 }
 
 // safef is fmt.Sprintf for a message that quotes untrusted values: string,
-// error and []string arguments are made single-line safe before they are
-// formatted. The format itself must be constant text, whose own line breaks
-// (if any) are layout.
+// error, fmt.Stringer, fmt.Formatter, named string and string slice
+// arguments are made single-line safe before they are formatted. The format
+// itself must be constant text, whose own line breaks (if any) are layout.
+// A Stringer or Formatter is formatted with its default verb, so pass numbers
+// that have a String method with an explicit conversion if %d is wanted.
 func safef(format string, args ...any) string {
 	clean := make([]any, len(args))
 	for i, a := range args {
-		switch v := a.(type) {
-		case string:
-			clean[i] = oneLine(v)
-		case error:
-			clean[i] = oneLine(v.Error())
-		case []string:
-			clean[i] = oneLines(v)
-		default:
-			clean[i] = a
-		}
+		clean[i] = cleanArg(a)
 	}
 	return fmt.Sprintf(format, clean...)
+}
+
+func cleanArg(a any) any {
+	switch v := a.(type) {
+	case nil:
+		return a
+	case string:
+		return oneLine(v)
+	case error:
+		return oneLine(v.Error())
+	case []string:
+		return oneLines(v)
+	}
+	rv := reflect.ValueOf(a)
+	switch a.(type) {
+	case fmt.Stringer, fmt.Formatter:
+		if rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return a
+		}
+		return oneLine(fmt.Sprintf("%v", a))
+	}
+	switch rv.Kind() {
+	case reflect.String:
+		return oneLine(rv.String())
+	case reflect.Slice:
+		if rv.Type().Elem().Kind() == reflect.String {
+			out := make([]string, rv.Len())
+			for i := range out {
+				out[i] = oneLine(rv.Index(i).String())
+			}
+			return out
+		}
+	}
+	return a
 }
 
 // cleanError is err with a display-safe message. It still unwraps to err, so

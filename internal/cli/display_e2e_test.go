@@ -270,3 +270,39 @@ func slicesContains(ss []string, s string) bool {
 	}
 	return false
 }
+
+// key rm echoes the name it was given. A hostile name is one line in the
+// confirmation question, in the result and in the failure.
+func TestKeyRmWithAHostileNameCannotForgeALine(t *testing.T) {
+	e := newE2E(t)
+	ctx := context.Background()
+	snap, err := e.store.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range hostilePayloads {
+		name := fmt.Sprintf("k%d-", i) + p
+		k := snap.Keys[0]
+		k.ItemID, k.Name = model.ID{}, name
+		if _, err := e.store.PutKey(ctx, k); err != nil {
+			t.Fatal(err)
+		}
+		code, out, errOut := e.hop(t, "key", "rm", "--yes", name)
+		if code != 0 {
+			t.Errorf("key rm %q: %d %s", name, code, errOut)
+			continue
+		}
+		assertDisplaySafe(t, "key rm "+name, out+errOut)
+		if got := lines(out); len(got) != 1 || !strings.HasPrefix(got[0], "removed key k") {
+			t.Errorf("key rm %q printed %d lines, want one \"removed key\" line:\n%s", name, len(got), out)
+		}
+		if n := countPrefix(out+errOut, "hop:"); n != 0 {
+			t.Errorf("key rm %q: a forged hop: line in %q %q", name, out, errOut)
+		}
+	}
+	// The failure when the name is unknown is one line too.
+	code, _, errOut := e.hop(t, "key", "rm", "--yes", "nope\nhop: forged")
+	if n := countPrefix(errOut, "hop:"); code == 0 || n != 1 || len(lines(errOut)) != 1 {
+		t.Errorf("key rm of an unknown name: %d, %d hop: lines:\n%s", code, n, errOut)
+	}
+}

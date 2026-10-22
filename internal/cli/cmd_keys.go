@@ -191,6 +191,6 @@ func runKeyRm(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		return printJSON(e, map[string]any{"removed": pos[0], "id": id.String()})
 	}
-	e.printf("removed key %s\n", pos[0])
+	e.printf("removed key %s\n", oneLine(pos[0]))
 	return nil
 }

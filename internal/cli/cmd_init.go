@@ -92,7 +92,7 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 	if err := s.Close(); err != nil {
 		return failf("closing the vault: %v", err)
 	}
-	e.printf("\nVault created in %s.\nDevice key: %s.\n", oneLine(cfg.DataDir), p.DeviceStore())
+	e.printf("\nVault created in %s.\nDevice key: %s.\n", oneLine(cfg.DataDir), oneLine(p.DeviceStore()))
 	return nil
 }
 

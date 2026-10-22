@@ -84,8 +84,14 @@ func vaultWarnings(ctx context.Context, e *Env, c *daemon.Client) {
 	if err := c.Call(ctx, daemon.OpStatus, nil, &st); err != nil || st.Vault == nil {
 		return
 	}
-	for _, w := range st.Vault.Warnings {
-		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", w)
+	printWarnings(e, st.Vault.Warnings)
+}
+
+// printWarnings writes each warning as one line. They come from the vault's
+// own errors, which can quote a path.
+func printWarnings(e *Env, warnings []string) {
+	for _, w := range warnings {
+		fmt.Fprintf(e.Stderr, "hop: warning: %s\n", oneLine(w))
 	}
 }
 
@@ -110,17 +116,17 @@ func printVaultStatus(e *Env, v *store.Info) {
 	} else {
 		e.printf("vault:        unlocked\n")
 	}
-	e.printf("device key:   %s\n", v.DeviceStore)
+	e.printf("device key:   %s\n", oneLine(v.DeviceStore))
 	if v.Head != nil {
 		e.printf("log head:     seq %s\n", v.Head.Short())
 	}
 	if v.LockReason != "" {
-		e.printf("unlock error: %s\n", v.LockReason)
+		e.printf("unlock error: %s\n", oneLine(v.LockReason))
 	}
 	if v.KitPending {
 		e.printf("warning:      a new Emergency Kit is waiting to be confirmed; run hop passwd\n")
 	}
 	for _, w := range v.Warnings {
-		e.printf("warning:      %s\n", w)
+		e.printf("warning:      %s\n", oneLine(w))
 	}
 }

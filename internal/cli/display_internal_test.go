@@ -145,7 +145,7 @@ func TestJSONEscapesControlsAndRoundTrips(t *testing.T) {
 	}
 	// Errors in JSON mode get the same treatment.
 	var errOut bytes.Buffer
-	reportError(&Env{Stderr: &errOut}, "bad \x7f \u009b name", []string{"--json"})
+	reportError(&Env{Stderr: &errOut}, errors.New("bad \x7f \u009b name"), []string{"--json"})
 	if c, bad := unsafeIn(errOut.String()); bad || !strings.Contains(errOut.String(), `\u007f`) || !strings.Contains(errOut.String(), `\u009b`) {
 		t.Errorf("JSON error = %q (%U)", errOut.String(), c)
 	}
