@@ -140,8 +140,14 @@ func checkPrivateKey(keyType, privateKey string, pubBlob []byte) error {
 	// One OpenSSH PEM block and nothing else: pem.Decode would skip text
 	// before it, and ssh.ParseRawPrivateKey also takes PKCS#1, PKCS#8 and
 	// SEC 1 keys.
-	if !strings.HasPrefix(privateKey, "-----BEGIN "+opensshPEMType+"-----") {
-		return bad("is not an OpenSSH PEM block")
+	// Exactly one frame, starting at byte 0 and ending the text: with one
+	// BEGIN and one END delimiter, pem.Decode cannot skip a malformed block
+	// and return a later valid one (rev 13).
+	begin, end := "-----BEGIN "+opensshPEMType+"-----", "-----END "+opensshPEMType+"-----"
+	if !strings.HasPrefix(privateKey, begin) ||
+		!strings.HasSuffix(strings.TrimRight(privateKey, "\n"), end) ||
+		strings.Count(privateKey, "-----BEGIN ") != 1 || strings.Count(privateKey, "-----END ") != 1 {
+		return bad("is not a single OpenSSH PEM block")
 	}
 	raw := []byte(privateKey)
 	defer clear(raw)

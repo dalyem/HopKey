@@ -749,7 +749,15 @@ func (c *Candidate) checkHistory() error {
 			return fail(RuleHistoryExtend, "history is not the pre-state history plus one account row and one VK row")
 		}
 	}
-	return checkFreshAccount(h.Accounts[:len(h.Accounts)-1], last.FpKEM, last.FpSig)
+	// Every row against every earlier row, not only the last: an anchor
+	// imports rows no transition on this client checked (rev 13).
+	for i := 1; i < len(h.Accounts); i++ {
+		r := h.Accounts[i]
+		if err := checkFreshAccount(h.Accounts[:i], r.FpKEM, r.FpSig); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *State) deployOp(id model.ID) (DeployOp, bool) {

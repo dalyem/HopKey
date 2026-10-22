@@ -175,17 +175,21 @@ func (c *Candidate) CheckPlaintext(sec *Secrets, dev DeviceKey) (*State, *Secret
 	return post, next, nil
 }
 
-// checkVKCommits requires vk to match the last row of rows and to differ
-// from the VK of every earlier row (rev 12).
+// checkVKCommits requires vk to match the last row of rows and every row's
+// commitment to differ from every other row's (rev 12, rev 13).
 func checkVKCommits(rows []VKRow, vk *crypto.SymKey) error {
 	commit := crypto.VKCommit(vk)
 	last := rows[len(rows)-1]
 	if !commit.Equal(last.Commit) {
 		return fail(RuleHistoryVKCommit, "VK[%d] does not match its history row", last.KV)
 	}
-	for _, r := range rows[:len(rows)-1] {
-		if commit.Equal(r.Commit) {
-			return fail(RuleCheckpointFreshVK, "VK[%d] reuses VK[%d]", last.KV, r.KV)
+	// Pairwise over every row: an anchor imports rows no transition on
+	// this client checked (rev 13).
+	for i, a := range rows {
+		for _, b := range rows[:i] {
+			if a.Commit.Equal(b.Commit) {
+				return fail(RuleCheckpointFreshVK, "VK[%d] reuses VK[%d]", a.KV, b.KV)
+			}
 		}
 	}
 	return nil

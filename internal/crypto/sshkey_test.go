@@ -299,6 +299,7 @@ func TestPrivateKeyRule(t *testing.T) {
 		"ecdsa-p384 as ecdsa-p256":    {"ecdsa-p256", p384PEM, p384Line},
 		"text before the PEM":         {"ed25519", "comment\n" + testKeyPEM, testKeyLine},
 		"second PEM block":            {"ed25519", testKeyPEM + gen["ed25519"][0], testKeyLine},
+		"malformed block before":      {"ed25519", "-----BEGIN OPENSSH PRIVATE KEY-----\n!!notbase64!!\n-----END OPENSSH PRIVATE KEY-----\n" + testKeyPEM, testKeyLine},
 		"text after the PEM":          {"ed25519", testKeyPEM + "trailing\n", testKeyLine},
 		"forged Ed25519 public half":  {"ed25519", opensshEd25519Raw(forged, ""), sshLineOfPub(t, other.Public())},
 		"PEM header":                  {"ed25519", strings.Replace(testKeyPEM, "-----\n", "-----\nX-Note: 1\n\n", 1), testKeyLine},

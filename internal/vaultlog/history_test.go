@@ -256,5 +256,28 @@ func TestHistoryFreshClientRejectsOldKeys(t *testing.T) {
 		}
 		fresh.apply(t, wire, w.archive)
 		sameView(t, &client{name: "A", st: st3, sec: sec3}, fresh)
+
+		// An anchor at akv 3 imports rows 1 and 2, which no transition on
+		// that client checked: duplicates confined to them are refused too.
+		w.record(wire)
+		anchor := func(wr *Wire) error {
+			_, _, _, err := Anchor(na.Pin(), na, wr, w.archive, nil)
+			return err
+		}
+		signers := map[Role]signer{RoleDevice: devSigner(w.devA()), RoleAccountOld: acctSigner(p2.NewAccount), RoleAccountNew: acctSigner(na)}
+		runMutations(t, anchor, wire, signers, []mutation{
+			{"checkpoint.fresh-keys: historical rows share a KEM key", RuleCheckpointFreshKeys, func(e *Entry, _ *Wire) {
+				h := historyOf(e)
+				h.Accounts[0].FpKEM = h.Accounts[1].FpKEM
+			}},
+			{"checkpoint.fresh-keys: historical rows share a signing key", RuleCheckpointFreshKeys, func(e *Entry, _ *Wire) {
+				h := historyOf(e)
+				h.Accounts[0].FpSig = h.Accounts[1].FpSig
+			}},
+			{"checkpoint.fresh-vk: historical rows share a VK commit", RuleCheckpointFreshVK, func(e *Entry, _ *Wire) {
+				h := historyOf(e)
+				h.VKCommits[0].Commit = h.VKCommits[1].Commit
+			}},
+		})
 	})
 }
