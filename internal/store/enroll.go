@@ -784,8 +784,14 @@ func (e *Enrollment) Install(ctx context.Context, r EnrollRemote, delivery *cryp
 	revoked := errors.As(err, &rev)
 	if !accepted {
 		if err != nil && !revoked {
-			// The delivery failed a check: nothing changes (§7).
-			return nil, errors.Join(err, e.unstage())
+			// The delivery failed a check: nothing changes (§7). If undoing
+			// the staged delivery fails, that is an operational error and
+			// takes precedence: it must not read as ErrDeliveryInvalid, or
+			// a caller would discard it and keep waiting.
+			if uerr := e.unstage(); uerr != nil {
+				return nil, fmt.Errorf("store: undoing a refused delivery failed: %w (it was refused: %v)", uerr, err)
+			}
+			return nil, err
 		}
 		// Every check passed (a revocation is met in verified history):
 		// the delivery is accepted, and the install owns the data
@@ -897,7 +903,10 @@ func (e *Enrollment) accept() error {
 func (e *Enrollment) unstage() error {
 	var err error
 	if e.staged != nil {
-		if err = e.save(e.state, nil); err == nil {
+		if err = e.s.hook("enroll:unstage"); err == nil {
+			err = e.save(e.state, nil)
+		}
+		if err == nil {
 			e.staged = nil
 		}
 	}

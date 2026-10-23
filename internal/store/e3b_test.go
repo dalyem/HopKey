@@ -525,3 +525,44 @@ func TestEnrollmentSentinels(t *testing.T) {
 	track(t, x.cfg, s)
 	x.installed(t, s)
 }
+
+// A delivery that fails a check, whose staging then can't be undone, is an
+// operational failure: the error must not match ErrDeliveryInvalid, so a
+// caller does not discard it as a bad message and keep waiting.
+func TestRefusedDeliveryWhoseUndoFailsIsNotInvalidInput(t *testing.T) {
+	ctx := context.Background()
+	x := newEnrollFix(t)
+	e, commit := x.begin(t)
+	x.reveal(t, e, commit)
+	if err := e.ConfirmSAS(); err != nil {
+		t.Fatal(err)
+	}
+	if err := x.a.s.ApproveConfirm(true); err != nil {
+		t.Fatal(err)
+	}
+	x.a.s.testHook = crashAt("approve:deliver")
+	if _, err := x.a.s.ApproveFinish(ctx, x.r); !errors.Is(err, errCrash) {
+		t.Fatalf("finish: %v", err)
+	}
+	x.a.s.testHook = nil
+	h, err := x.a.s.entryHash(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h[0] ^= 1 // a wrong anchor_h: the delivery fails a check
+	env := x.rawDelivery(t, 0, h)
+	e.s.testHook = crashAt("enroll:unstage") // undoing the staging fails
+	_, err = e.Install(ctx, laxReader{x.srv}, &env)
+	if err == nil {
+		t.Fatal("install of a refused delivery succeeded")
+	}
+	if errors.Is(err, ErrDeliveryInvalid) {
+		t.Errorf("install: %v; a failed undo must not read as an invalid delivery", err)
+	}
+	if !errors.Is(err, errCrash) {
+		t.Errorf("install: %v; want the undo's failure", err)
+	}
+	if exists, _ := (layout{data: x.cfg.DataDir}).exists(); exists {
+		t.Error("a refused delivery installed a vault")
+	}
+}
