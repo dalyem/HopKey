@@ -376,7 +376,7 @@ func TestLockWaitDeadlineIsBusy(t *testing.T) {
 
 	g.release()
 	waitResp(t, read)
-	if n := e.srv.accounts.refsOf(v.accountID()); n != 0 {
-		t.Errorf("%d references to the account lock left", n)
-	}
+	// The client can have its response before the handler's deferred
+	// unlock runs, so wait for the references to drain.
+	waitFor(t, "references to the account lock left", func() bool { return e.srv.accounts.refsOf(v.accountID()) == 0 })
 }
