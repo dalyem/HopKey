@@ -254,10 +254,13 @@ type sessionRequest struct {
 type sessionResponse struct {
 	AccessToken string          `json:"access_token"`
 	ExpiresAt   model.Timestamp `json:"expires_at"`
+	VaultID     model.ID        `json:"vault_id"`
 }
 
 // authSession: POST /v1/auth/session {account_id, device_id, challenge, sig}
-// → {access_token, expires_at}. In one write transaction, serialized with
+// → {access_token, expires_at, vault_id}. vault_id is the vault the session
+// is bound to, which a device that enrolled by approval has no other way to
+// learn (R1). In one write transaction, serialized with
 // every commit (R2): the challenge must be a device challenge for operation
 // "session", bound to this account and device and to the configured
 // origin, and unexpired; the device must be active; the signature must
@@ -321,7 +324,7 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request, c *call) er
 			return err
 		}
 		exp := now.Add(SessionTTL)
-		resp = sessionResponse{AccessToken: tok, ExpiresAt: model.TimestampOf(exp)}
+		resp = sessionResponse{AccessToken: tok, ExpiresAt: model.TimestampOf(exp), VaultID: a.VaultID}
 		return tx.InsertSession(&Session{
 			TokenHash: tokHash, AccountID: a.ID, VaultID: a.VaultID, DeviceID: d.DeviceID,
 			ExpiresAt: model.TimestampOf(exp).Time(),

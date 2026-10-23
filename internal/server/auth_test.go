@@ -440,3 +440,37 @@ func TestSessionRateLimitChangesNothing(t *testing.T) {
 	r, _ := e.readLog(v, sr.AccessToken, "")
 	wantStatus(t, r, 200, "the session issued after the refusal")
 }
+
+// The session response names the vault the session is bound to, so a
+// device that enrolled by approval, which has no vault ID, can learn it
+// (R1). Another account's vault on the same server is not named.
+func TestSessionResponseCarriesBoundVault(t *testing.T) {
+	e := newEnv(t, withRates(*unlimitedRates()))
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	other := newVault(t, "b@example.com")
+	e.publish(other)
+	if v.vaultID() == other.vaultID() {
+		t.Fatal("the two test vaults share an ID")
+	}
+	B, wb := v.bootstrap("dev-b")
+	e.mustPost(v, e.login(v), wb)
+
+	for _, dev := range []model.ID{v.dev(0), B} {
+		var cr challengeResponse
+		e.must(e.challenge(v, dev, "session"), 200, &cr)
+		r := e.do("POST", "/v1/auth/session", "", sessionRequest{v.accountID(), dev, cr.Challenge,
+			e.signAuth(v, dev, "session", testOrigin, cr.Challenge)})
+		var sr sessionResponse
+		e.must(r, 200, &sr)
+		if sr.VaultID != v.vaultID() {
+			t.Errorf("device %v: session bound to vault %v; want %v", dev, sr.VaultID, v.vaultID())
+		}
+		if !bytes.Contains(r.body, []byte(`"vault_id":"`+v.vaultID().String()+`"`)) {
+			t.Errorf("response %s has no vault_id member", r.body)
+		}
+		if got, _ := e.readLog(v, sr.AccessToken, ""); got.status != 200 {
+			t.Errorf("the session cannot read the vault it names: %s", got)
+		}
+	}
+}
