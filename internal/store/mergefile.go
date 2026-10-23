@@ -729,6 +729,20 @@ func (p *SignInParams) serverFor(f serverFile, st *vaultlog.State) serverFile {
 	return f
 }
 
+// secretKeyGen is what device.json records for the Secret Key of id, the
+// sign-in's device record, once its destination st is verified. The
+// record's Secret Key opened the credentials of the sign-in's account
+// keys: the current ones, unless a checkpoint replaced them meanwhile. A
+// recovery never checked it. Either of those leaves generation 0: not
+// known to be current.
+func (p *SignInParams) secretKeyGen(id model.ID, st *vaultlog.State) secretKeyGen {
+	g := secretKeyGen{DeviceID: id}
+	if p.Method != SignInRecovery && p.Account.AKV == st.Account.AKV {
+		g.Gen = st.Creds.Gen
+	}
+	return g
+}
+
 // signInSecrets are the secrets a sign-in holds until it installs them:
 // the account keys, the new device record, the device keys decoded from it
 // and the verified destination. Exactly one owner zeroes them: the sign-in
@@ -1208,7 +1222,7 @@ func (s *Store) MergeSignIn(ctx context.Context, r SignInRemote, p SignInParams)
 	if err != nil {
 		return MergeStatus{}, err
 	}
-	return s.dropSource(gen, o, p.serverFor(sf, o.d.st))
+	return s.dropSource(gen, o, p.serverFor(sf, o.d.st), p.secretKeyGen(next.DeviceID, o.d.st))
 }
 
 // mergeNextDevice checks that a sealed merge is waiting for its sign-in and
@@ -1462,7 +1476,7 @@ func (s *Store) signInCall(ctx context.Context, gen uint64, f func(ctx context.C
 // goes and device.json names the destination (promoteNext); then the store
 // takes o's secrets over and is the destination's, unlocked, and the
 // imports are enqueued. Until it takes them, o owns them.
-func (s *Store) dropSource(gen uint64, o *signInSecrets, sf serverFile) (MergeStatus, error) {
+func (s *Store) dropSource(gen uint64, o *signInSecrets, sf serverFile, skGen secretKeyGen) (MergeStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.gen.Load() != gen || s.state == nil {
@@ -1494,6 +1508,15 @@ func (s *Store) dropSource(gen uint64, o *signInSecrets, sf serverFile) (MergeSt
 	} else if g.isRevoked(cfg.Next.AccountID, next.DeviceID) {
 		return MergeStatus{}, s.stillRevoked(s.nextStore(cfg), next.DeviceID,
 			fmt.Errorf("%w (device %v, recorded in %s)", ErrSignInRevoked, next.DeviceID, s.l.ledgerFile()))
+	}
+	// The destination record's Secret Key generation is recorded before
+	// the drop commits, so the promotion carries it to device.json, after
+	// a crash too.
+	if cfg.Next.SecretKeyGen != skGen {
+		cfg.Next.SecretKeyGen = skGen
+		if err := s.writeDeviceConfig(cfg); err != nil {
+			return MergeStatus{}, err
+		}
 	}
 	// The source's files, listed before the destination's objects are
 	// written next to them.
@@ -1695,6 +1718,9 @@ func (s *Store) promoteNextLocked(cfg deviceConfig) (deviceConfig, error) {
 	// the active ones, and hop passwd revokes them.
 	next := deviceConfig{V: 1, Store: cfg.Store, Sealed: cfg.Sealed, AccountID: cfg.Next.AccountID, DeviceID: cfg.Next.DeviceID,
 		StaleDevices: slices.Clone(cfg.Next.Stale)}
+	if cfg.Next.SecretKeyGen.DeviceID == cfg.Next.DeviceID {
+		next.SecretKeyGen = cfg.Next.SecretKeyGen
+	}
 	if err := s.writeDeviceConfig(next); err != nil {
 		return cfg, err
 	}

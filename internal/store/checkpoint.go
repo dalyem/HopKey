@@ -97,6 +97,13 @@ var (
 	// checkpoint due.
 	ErrNoRecoveryDue = errors.New("store: no recovery checkpoint is due")
 
+	// ErrContradictsJournal means a password change's Keep or Exclude
+	// contradicts the decisions its journal already holds (a device it
+	// revokes kept now, or one it keeps excluded now), or names a device in
+	// both. It is refused before anything is posted, a live candidate
+	// included: run it again with the journaled answer.
+	ErrContradictsJournal = errors.New("store: the answer contradicts the pending password change")
+
 	errExcludeOnlyPasswd = errors.New("store: only a password change takes Exclude, to answer the devices that appeared during it")
 	errPasswdKeep        = errors.New("store: a password change keeps every device; use rotate to choose survivors")
 )
@@ -887,11 +894,9 @@ func (s *Store) sameCheckpoint(j *ckptJournal, req *ckptRequest) error {
 	}
 	if j.Kind == CheckpointPasswd {
 		// Its Keep and Exclude answer new devices (decideNewDevices); each
-		// must still name a device.
-		if _, err := s.resolveJournaled(j, j.Survivors, req.keep); err != nil {
-			return err
-		}
-		_, err := s.resolveJournaled(j, j.Targets, req.exclude)
+		// must still name a device, and none may contradict the journal:
+		// a live candidate is posted again as it is.
+		_, _, err := s.passwdAnswers(j, req)
 		return err
 	}
 	keep, err := s.resolveJournaled(j, j.Survivors, req.keep)
@@ -957,8 +962,9 @@ func (s *Store) activeOf(ids []model.ID) []model.ID {
 // journal already holds (the same command, run again after another device
 // appeared, in the same call or after a restart) is accepted as it is, and
 // only the devices still undecided are asked about again. An answer that
-// contradicts the journal, or names a device that is neither new nor
-// decided, is refused. The caller holds s.mu.
+// contradicts the journal is ErrContradictsJournal (passwdAnswers), and
+// one that names no active device is ErrUnknownDevice. The caller holds
+// s.mu.
 func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
 	var fresh []model.ID
 	for id := range s.state.Devices {
@@ -967,27 +973,9 @@ func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
 		}
 	}
 	fresh = sortIDs(fresh)
-	keep, err := s.resolveJournaled(j, j.Survivors, req.keep)
+	keep, exclude, err := s.passwdAnswers(j, req)
 	if err != nil {
 		return err
-	}
-	exclude, err := s.resolveJournaled(j, j.Targets, req.exclude)
-	if err != nil {
-		return err
-	}
-	for _, id := range append(slices.Clone(keep), exclude...) {
-		kept, excluded := slices.Contains(keep, id), slices.Contains(exclude, id)
-		switch {
-		case kept && excluded:
-			return fmt.Errorf("store: device %v is both kept and excluded", id)
-		case slices.Contains(fresh, id):
-		case kept && slices.Contains(j.Survivors, id), excluded && slices.Contains(j.Targets, id):
-			// Already decided so: the same answer again.
-		case kept && slices.Contains(j.Targets, id):
-			return fmt.Errorf("store: device %v was already excluded from this password change; it can't be kept now", id)
-		case excluded && slices.Contains(j.Survivors, id):
-			return fmt.Errorf("store: device %v is kept by this password change; Exclude names only the devices that appeared during it", id)
-		}
 	}
 	var missing []model.ID
 	for _, id := range fresh {
@@ -1004,6 +992,34 @@ func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
 	j.Targets = sortIDs(append(j.Targets, exclude...))
 	j.addNames(s.state, fresh)
 	return nil
+}
+
+// passwdAnswers resolves the Keep and Exclude of req, a password change's
+// answer, against its journal j, and refuses one that contradicts it
+// (ErrContradictsJournal): a device named in both, a device j revokes that
+// Keep names, or a device j keeps that Exclude names. Naming a device as j
+// already decided it is the same answer again. The caller holds s.mu.
+func (s *Store) passwdAnswers(j *ckptJournal, req *ckptRequest) (keep, exclude []model.ID, err error) {
+	if keep, err = s.resolveJournaled(j, j.Survivors, req.keep); err != nil {
+		return nil, nil, err
+	}
+	if exclude, err = s.resolveJournaled(j, j.Targets, req.exclude); err != nil {
+		return nil, nil, err
+	}
+	for _, id := range keep {
+		switch {
+		case slices.Contains(exclude, id):
+			return nil, nil, fmt.Errorf("%w: device %v is both kept and excluded", ErrContradictsJournal, id)
+		case slices.Contains(j.Targets, id):
+			return nil, nil, fmt.Errorf("%w: device %v was already excluded from this password change; it can't be kept now", ErrContradictsJournal, id)
+		}
+	}
+	for _, id := range exclude {
+		if slices.Contains(j.Survivors, id) {
+			return nil, nil, fmt.Errorf("%w: device %v is kept by this password change; Exclude names only the devices that appeared during it", ErrContradictsJournal, id)
+		}
+	}
+	return keep, exclude, nil
 }
 
 // verifyCheckpointPassword checks req's current password against the

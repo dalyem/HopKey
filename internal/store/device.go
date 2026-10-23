@@ -115,10 +115,15 @@ func (c deviceConfig) secretKeyStale(id model.ID, gen uint32) bool {
 // have committed for any of them, so they become stale devices of the
 // destination account when it is installed, and hop passwd revokes the
 // ones that are active.
+//
+// SecretKeyGen is the destination record's, recorded once the destination
+// is verified and before it is installed: the promotion makes it
+// device.json's secret_key_gen.
 type nextDevice struct {
-	AccountID model.ID   `json:"account_id"`
-	DeviceID  model.ID   `json:"device_id"`
-	Stale     []model.ID `json:"stale,omitempty"`
+	AccountID    model.ID     `json:"account_id"`
+	DeviceID     model.ID     `json:"device_id"`
+	Stale        []model.ID   `json:"stale,omitempty"`
+	SecretKeyGen secretKeyGen `json:"secret_key_gen,omitzero"`
 }
 
 // pendingDevice is device.json's pending member: {"device_id":id}.

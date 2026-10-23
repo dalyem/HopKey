@@ -168,6 +168,17 @@ type Enrollment struct {
 	// it: the delivery is not accepted until its checks are over.
 	hold bool
 	held []byte
+	// stale means restore failed: d may still be the DONE state that was
+	// held, not the state the record holds. Install restores again before
+	// it reads d.
+	stale bool
+}
+
+// unsettled reports whether d may not be the state the record holds: a
+// restore failed, or d is a DONE state the record does not hold (held,
+// never persisted).
+func (e *Enrollment) unsettled() bool {
+	return e.stale || (e.d.State() == crypto.DeviceDone) != enrollDone(e.state)
 }
 
 // enrollPersister persists D's state into the enrollment record, durably,
@@ -191,13 +202,19 @@ func (p enrollPersister) Persist(state []byte) error {
 	return nil
 }
 
-// enrollDone reports whether the persisted D state is DONE. Only the state
-// is read: crypto.DeviceEnrollment owns the record's schema.
-func enrollDone(state []byte) bool {
+// enrollDone reports whether the persisted D state is DONE.
+func enrollDone(state []byte) bool { return recordState(state) == crypto.DeviceDone }
+
+// recordState is the state a persisted D state holds, or "". Only the
+// state is read: crypto.DeviceEnrollment owns the record's schema.
+func recordState(state []byte) crypto.DeviceEnrollState {
 	var rec struct {
 		State crypto.DeviceEnrollState `json:"state"`
 	}
-	return json.Unmarshal(state, &rec) == nil && rec.State == crypto.DeviceDone
+	if json.Unmarshal(state, &rec) != nil {
+		return ""
+	}
+	return rec.State
 }
 
 // save stores the enrollment record with D's state and the staged
@@ -597,8 +614,14 @@ func DiscardEnrollment(cfg Config) error {
 	return s.removeEnrollConfig()
 }
 
-// State returns D's §7 state.
-func (e *Enrollment) State() crypto.DeviceEnrollState { return e.d.State() }
+// State returns D's §7 state: the one the record holds, after a failed
+// restore.
+func (e *Enrollment) State() crypto.DeviceEnrollState {
+	if e.unsettled() {
+		return recordState(e.state)
+	}
+	return e.d.State()
+}
 
 // Commit returns the commit message, the same after a restart.
 func (e *Enrollment) Commit() crypto.EnrollCommit { return e.d.Commit() }
@@ -656,7 +679,16 @@ func (e *Enrollment) Install(ctx context.Context, r EnrollRemote, delivery *cryp
 		return nil, ErrClosed
 	}
 	s := e.s
-	accepted := e.d.State() == crypto.DeviceDone
+	// Only a DONE the record holds is an accepted delivery. D may hold one
+	// that was held and never persisted (a restore failed): restore it
+	// from the record first, which also fails an attempt whose deadline
+	// has passed. Until a restore succeeds, nothing is installed.
+	if e.unsettled() {
+		if err := e.restore(); err != nil {
+			return nil, err
+		}
+	}
+	accepted := enrollDone(e.state)
 	var v *crypto.VerifiedDelivery
 	var err error
 	switch {
@@ -827,14 +859,17 @@ func (e *Enrollment) unstage() error {
 }
 
 // restore reloads D from the state the record holds, dropping a held DONE.
+// If it fails (failing an expired attempt may not persist), D is stale
+// until a restore succeeds.
 func (e *Enrollment) restore() error {
 	clear(e.held)
 	e.held = nil
 	d, err := crypto.RestoreDeviceEnrollmentWithClock(enrollPersister{e}, e.s.clock, e.state)
 	if err != nil {
+		e.stale = true
 		return fmt.Errorf("%w: the enrollment state: %v", ErrDeviceKey, err)
 	}
-	e.d = d
+	e.d, e.stale = d, false
 	return nil
 }
 
