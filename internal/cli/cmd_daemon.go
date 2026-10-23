@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -110,31 +109,16 @@ func dialExisting(ctx context.Context, e *Env) (*daemon.Client, error) {
 }
 
 func stopDaemon(ctx context.Context, e *Env) error {
-	c, err := dialExisting(ctx, e)
+	running, err := shutdownDaemon(ctx, e)
 	if err != nil {
 		return err
 	}
-	if c == nil {
+	if !running {
 		e.printf("hop daemon is not running\n")
 		return nil
 	}
-	defer c.Close()
-	if err := c.Call(ctx, daemon.OpShutdown, nil, nil); err != nil {
-		return err
-	}
-	// The daemon answers before it finishes closing. Wait for its sockets to
-	// go, so a command that follows does not find a daemon on its way out.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		_, ctlErr := os.Lstat(e.Paths.ControlSocket())
-		_, agentErr := os.Lstat(e.Paths.AgentSocket())
-		if os.IsNotExist(ctlErr) && os.IsNotExist(agentErr) {
-			e.printf("hop daemon stopped\n")
-			return nil
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	return failf("asked the hop daemon to stop, but its sockets are still there after 5s")
+	e.printf("hop daemon stopped\n")
+	return nil
 }
 
 func runStatus(ctx context.Context, e *Env, args []string) error {

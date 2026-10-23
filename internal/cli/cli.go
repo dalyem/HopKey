@@ -24,6 +24,7 @@ import (
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/syncclient"
 	"github.com/dalyem/hopkey/internal/version"
 )
 
@@ -89,6 +90,10 @@ type Env struct {
 	// RunCommand runs systemctl or launchctl for hop setup --service and
 	// returns its combined output. Nil means os/exec. Tests replace it.
 	RunCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
+	// SyncClient configures hop auth's connections to the server: a
+	// private CA, say. Zero means the system's trusted roots.
+	// HOP_DEV_INSECURE=1 also sets DevInsecure, as it does for the daemon.
+	SyncClient syncclient.Options
 
 	// warned holds the warnings already printed in this run, so a command
 	// that makes many changes says each one once.
@@ -171,9 +176,9 @@ func init() {
 		"init":    {runInit, "hop init [--device-key-store keychain|file] [--kit-file PATH]"},
 		"lock":    {runLock, "hop lock"},
 		"unlock":  {runUnlock, "hop unlock [--password]"},
-		"passwd":  {runPasswd, "hop passwd [--kit-file PATH]"},
+		"passwd":  {runPasswd, "hop passwd [--kit-file PATH] (on a server: the flags of hop auth passwd)"},
 		"sync":    {runSync, "hop sync [--json] | hop sync resolve [N] [--keep-mine [--confirm TOKEN] | --edit --set FIELD=VALUE... [--confirm TOKEN] | --take-theirs [--yes] | --retry] [--json]"},
-		"auth":    {runAuth, "hop auth <devices|login|signup|approve|logout|rotate|passwd|merge|status> [--json]"},
+		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|logout|rotate|passwd|merge|resume> [--json]"},
 		"login":   {runLogin, "hop login [flags of hop auth login]"},
 		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
 	}
@@ -186,7 +191,9 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop key add|ls|rm | import ssh-config | ts import|link
        hop setup [--service] | status | daemon
        hop init | lock | unlock [--password] | passwd
-       hop sync [resolve] | auth devices
+       hop sync [resolve]
+       hop auth signup|login|approve|status|devices|logout|rotate|passwd|merge|resume
+       hop login | logout       aliases of hop auth login and hop auth logout
 
 Every command takes --json. Run "hop <command> -h" for its flags.
 `

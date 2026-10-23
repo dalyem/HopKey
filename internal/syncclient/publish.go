@@ -72,8 +72,19 @@ type signupRequest struct {
 // identical upload again with no challenge and no pop_sig: a consumed
 // capability answers it with the original acknowledgment, even after
 // expiry and later appends, and refuses any other publication with
-// ErrRegistrationConflict. Any other capability still fails with 401.
+// ErrRegistrationConflict. Any other capability still fails with 401,
+// which Signup returns matching both store.ErrRegistrationRefused (what
+// the store needs to tell a refusal from an uncertain outcome) and
+// ErrUnauthorized.
 func (p *Publisher) Signup(ctx context.Context, req *store.SignupRequest) (vaultlog.Head, error) {
+	h, err := p.signup(ctx, req)
+	if errors.Is(err, ErrUnauthorized) {
+		err = fmt.Errorf("%w: %w", store.ErrRegistrationRefused, err)
+	}
+	return h, err
+}
+
+func (p *Publisher) signup(ctx context.Context, req *store.SignupRequest) (vaultlog.Head, error) {
 	if o, err := crypto.CanonicalOrigin(req.Server); err != nil || o != p.c.origin {
 		return vaultlog.Head{}, fmt.Errorf("syncclient: the publication is for %q, not %s", req.Server, p.c.origin)
 	}
