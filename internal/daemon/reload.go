@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -37,7 +38,18 @@ type state struct {
 	hasHead bool
 	// outboxGen is the daemon's outboxGen when snap was read.
 	outboxGen uint64
+	// configErr says why the ssh config could not be written from snap.
+	// The keyring came from snap all the same; the config is retried
+	// (retryConfig).
+	configErr string
 }
+
+// configRetryInterval is how often a config that could not be written is
+// tried again, whatever sync is doing.
+const configRetryInterval = 30 * time.Second
+
+// errConfigWrite marks a reload whose ssh config could not be written.
+var errConfigWrite = errors.New("writing the ssh config")
 
 // fingerprint identifies a snapshot by the IDs and versions of its items.
 // Every change to an item bumps its version, so this changes whenever the
@@ -75,7 +87,9 @@ func (d *Daemon) reload(ctx context.Context) error {
 
 // reloadLocked reads a fresh snapshot, rebuilds everything from it and
 // returns it. On failure the previous keyring and config stay in place and
-// the failure is recorded in the state.
+// the failure is recorded in the state, except when only the ssh config
+// could not be written (errConfigWrite): the keyring and the state are the
+// snapshot's then, and it is returned with the error.
 func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
 	// The generation is read before the snapshot: if the store locks or
 	// unlocks in between, the keyring is fenced off until the next reload.
@@ -89,13 +103,18 @@ func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
 		return model.Snapshot{}, err
 	}
 	next, err := d.apply(ctx, snap, gen)
-	if err != nil {
+	if next == nil {
 		d.noteError(err)
 		return model.Snapshot{}, err
 	}
 	next.snap, next.head, next.hasHead, next.outboxGen = snap, head, hasHead, outboxGen
+	if err != nil {
+		// The keyring is snap's; only the ssh config lags behind it.
+		d.logf("reload failed: %v", err)
+		next.lastError = err.Error()
+	}
 	d.state.Store(next)
-	return snap, nil
+	return snap, err
 }
 
 func (d *Daemon) noteError(err error) {
@@ -123,27 +142,30 @@ func (d *Daemon) fresh(ctx context.Context) (model.Snapshot, *state, error) {
 		d.mu.Unlock()
 		return model.Snapshot{}, nil, err
 	}
-	if cur := d.state.Load(); cur != nil && cur.fingerprint == fingerprint(snap) && !d.live.stale() {
+	if cur := d.state.Load(); cur != nil && cur.fingerprint == fingerprint(snap) && cur.configErr == "" && !d.live.stale() {
 		return snap, cur, nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	snap, err = d.reloadLocked(ctx)
-	if err != nil {
+	if err != nil && !errors.Is(err, errConfigWrite) {
 		return model.Snapshot{}, nil, err
 	}
+	// A config that could not be written is a warning in the state.
 	return snap, d.state.Load(), nil
 }
 
 // current returns the last reload's state when it still matches the
-// store: the same head, the same outbox and the same store generation.
+// store: the same head, the same outbox and the same store generation,
+// with the ssh config written. One whose config could not be written is
+// never current, so the next reload tries again.
 func (d *Daemon) current() (*state, bool) {
 	h, ok := d.storeHead()
 	if !ok {
 		return nil, false
 	}
 	cur := d.state.Load()
-	if cur == nil || !cur.hasHead || cur.head != h || cur.outboxGen != d.outboxGen.Load() || d.live.stale() {
+	if cur == nil || !cur.hasHead || cur.head != h || cur.outboxGen != d.outboxGen.Load() || cur.configErr != "" || d.live.stale() {
 		return nil, false
 	}
 	return cur, true
@@ -203,7 +225,11 @@ type plan struct {
 }
 
 // apply builds the keyring and ssh config from snap, read in store
-// generation gen, and installs them.
+// generation gen, and installs them: the keyring first, since serving
+// exactly the keys snap has is always right, then the config. When the
+// config can't be written it returns the state with configErr set and the
+// error; the agent no longer serves a key snap deleted, whatever happens
+// to the config. Any other failure returns a nil state.
 func (d *Daemon) apply(ctx context.Context, snap model.Snapshot, gen uint64) (*state, error) {
 	st := &state{fingerprint: fingerprint(snap), loadedAt: time.Now(), ssh: map[string]HostSSH{}}
 	warn := func(format string, args ...any) {
@@ -262,15 +288,60 @@ func (d *Daemon) apply(ctx context.Context, snap model.Snapshot, gen uint64) (*s
 			})
 		}
 	}
-	err := sshconfig.Write(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, hosts)
-	if err != nil {
-		return nil, fmt.Errorf("writing the ssh config: %w", err)
-	}
-
-	slices.Sort(st.warnings)
 	old := d.live.swap(kr, gen)
 	old.RemoveAll() // best effort: drop the old key material
-	return st, nil
+
+	err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, hosts)
+	if err != nil {
+		err = fmt.Errorf("%w: %w", errConfigWrite, err)
+		st.configErr = err.Error()
+		warn("%s", d.configWarning(st.configErr))
+	}
+	slices.Sort(st.warnings)
+	return st, err
+}
+
+// configWarning tells the user that the ssh config could not be written.
+func (d *Daemon) configWarning(why string) string {
+	return fmt.Sprintf("the ssh config in %s is out of date (%s): the agent already serves only the vault's current keys, "+
+		"but ssh may still see hosts as they were; the daemon tries again on each sync and unlock, and every %v",
+		d.opts.Paths.ConfigDir, why, d.configRetry())
+}
+
+func (d *Daemon) configRetry() time.Duration {
+	if d.opts.configRetry > 0 {
+		return d.opts.configRetry
+	}
+	return configRetryInterval
+}
+
+// retryConfig rebuilds from the store while the last reload could not
+// write the ssh config, on a timer of its own, so a sync loop that is
+// halted or idle does not leave the config stale. Each reload, unlock and
+// reconcile tries again too, since such a state is never current.
+func (d *Daemon) retryConfig() {
+	dirty := func() bool { cur := d.state.Load(); return cur != nil && cur.configErr != "" }
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		t := time.NewTicker(d.configRetry())
+		defer t.Stop()
+		for {
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-t.C:
+			}
+			if !dirty() {
+				continue
+			}
+			d.mu.Lock()
+			if dirty() && d.ctx.Err() == nil {
+				d.reloadLocked(d.ctx) // a failure is recorded and logged
+			}
+			d.mu.Unlock()
+		}
+	}()
 }
 
 // plan decides, for each host, whether it gets Host blocks and what they say.

@@ -177,7 +177,12 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 	}
 
 	if r := out.ServerRetirement; r != nil {
-		warn("server-reported, unverified: the server says this device was %s from the account at seq %d, so the vault was locked and sync stopped; if that is right, sign in again with hop auth login", r.How, r.Seq)
+		warn("server-reported, unverified: the server says this device was %s from the account at seq %d, so the vault was locked and sync stopped. "+
+			"If that is right, sign in again with hop auth login. If it is wrong, hop unlock brings the keys back, but sync stays stopped "+
+			"until the daemon restarts: run hop daemon stop, and the next hop command starts the daemon again, which asks the server again", r.How, r.Seq)
+	}
+	if cur := d.state.Load(); cur != nil && cur.configErr != "" {
+		warn("%s", d.configWarning(cur.configErr))
 	}
 	switch {
 	case out.Equivocation:

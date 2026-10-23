@@ -143,7 +143,7 @@ func (d *Daemon) dropKeysLocked(revoked bool) {
 	st.revoked = revoked
 	d.state.Store(st)
 	if revoked {
-		if err := sshconfig.Write(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, nil); err != nil {
+		if err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, nil); err != nil {
 			d.logf("clearing the ssh config of a revoked device: %v", err)
 		}
 	}

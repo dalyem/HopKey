@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
@@ -49,29 +51,7 @@ func TestPartialPullFailureStillDropsADeletedKey(t *testing.T) {
 	// The desk's long-poll ends, so the next log read is the laptop's.
 	x.n1.pause(true)
 
-	var tampered atomic.Bool
-	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
-		if req.Method != http.MethodGet || !strings.HasSuffix(req.URL.Path, "/log") || !tampered.CompareAndSwap(false, true) {
-			return false
-		}
-		rec := httptest.NewRecorder()
-		next.ServeHTTP(rec, req)
-		body := rec.Body.Bytes()
-		var page map[string]json.RawMessage
-		var head map[string]json.RawMessage
-		if rec.Code != http.StatusOK || json.Unmarshal(body, &page) != nil || json.Unmarshal(page["head"], &head) != nil ||
-			string(page["entries"]) == "[]" {
-			t.Errorf("the laptop's log read: %d %s", rec.Code, body)
-		} else {
-			head["h"] = json.RawMessage(`"` + strings.Repeat("ab", 32) + `"`)
-			page["head"], _ = json.Marshal(head)
-			body, _ = json.Marshal(page)
-		}
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(rec.Code)
-		rw.Write(body)
-		return true
-	})
+	tampered := tamperNextLogHead(t, x.w)
 	x.n2.pause(false)
 
 	// Read in process: a control read could reload on its own.
@@ -91,6 +71,110 @@ func TestPartialPullFailureStillDropsADeletedKey(t *testing.T) {
 	}
 	if st := x.n2.d.sync.status(); st.State != SyncHalted || !st.Equivocation {
 		t.Errorf("the failure is not kept: %+v", st)
+	}
+}
+
+// tamperNextLogHead makes the server's next log read, which must serve
+// entries, end on a head that contradicts them: an equivocation, found
+// after the entries before it are committed. It reports whether it ran.
+func tamperNextLogHead(t *testing.T, w *syncWorld) *atomic.Bool {
+	t.Helper()
+	var tampered atomic.Bool
+	w.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		if req.Method != http.MethodGet || !strings.HasSuffix(req.URL.Path, "/log") || !tampered.CompareAndSwap(false, true) {
+			return false
+		}
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, req)
+		body := rec.Body.Bytes()
+		var page map[string]json.RawMessage
+		var head map[string]json.RawMessage
+		if rec.Code != http.StatusOK || json.Unmarshal(body, &page) != nil || json.Unmarshal(page["head"], &head) != nil ||
+			string(page["entries"]) == "[]" {
+			t.Errorf("the log read: %d %s", rec.Code, body)
+		} else {
+			head["h"] = json.RawMessage(`"` + strings.Repeat("ab", 32) + `"`)
+			page["head"], _ = json.Marshal(head)
+			body, _ = json.Marshal(page)
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(rec.Code)
+		rw.Write(body)
+		return true
+	})
+	return &tampered
+}
+
+// The same partial pull with the ssh config impossible to write: the
+// deleted key still leaves the agent, sync.status says the config is out
+// of date, and once the config can be written again the daemon rewrites it
+// on its own, though sync stays stopped.
+func TestPartialPullFailureDropsADeletedKeyWhenTheConfigCannotBeWritten(t *testing.T) {
+	x := newSyncSetup(t)
+	var failWrites atomic.Bool
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.w.startWith(x.n2, x.n2.st, Options{
+		writeConfig: func(o sshconfig.Options, hosts []sshconfig.Host) error {
+			if failWrites.Load() {
+				return errors.New("the directory is read-only")
+			}
+			return sshconfig.Write(o, hosts)
+		},
+		configRetry: 50 * time.Millisecond,
+	})
+	web := x.n1.putHost(webHost("web1", x.keyID, "203.0.113.10"))
+	eventually(t, 10*time.Second, "the laptop's ssh config has web1", func() bool { return strings.Contains(x.n2.config(), "Host web1\n") })
+	if got := x.n2.agentKeys(); got != 1 {
+		t.Fatalf("the laptop's agent holds %d keys; want 1", got)
+	}
+
+	x.n2.pause(true)
+	failWrites.Store(true)
+	x.n1.must(OpDelete, DeleteParams{ID: web.ItemID.String()}, nil)
+	x.n1.must(OpDelete, DeleteParams{ID: x.keyID.String()}, nil)
+	eventually(t, 5*time.Second, "the desk pushes the deletions", func() bool { return x.n1.status().Pending == 0 })
+	x.n1.pause(true)
+	tampered := tamperNextLogHead(t, x.w)
+	x.n2.pause(false)
+
+	eventually(t, 10*time.Second, "the laptop's sync halts", func() bool { return x.n2.d.sync.status().Halted != "" })
+	if !tampered.Load() {
+		t.Fatal("the log read was not tampered with")
+	}
+	snap, err := x.n2.st.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Keys) != 0 || len(snap.Hosts) != 0 {
+		t.Fatalf("the store did not commit the deletions before the failure: %d keys, %d hosts", len(snap.Keys), len(snap.Hosts))
+	}
+	if got := x.n2.agentKeys(); got != 0 {
+		t.Errorf("the laptop's agent still holds %d keys the vault deleted", got)
+	}
+	if !strings.Contains(x.n2.config(), "Host web1\n") {
+		t.Error("the ssh config changed though it could not be written")
+	}
+	outOfDate := func(ws []string) bool {
+		return slices.ContainsFunc(ws, func(w string) bool { return strings.Contains(w, "ssh config") && strings.Contains(w, "out of date") })
+	}
+	if st := x.n2.status(); !outOfDate(st.Warnings) || st.State != SyncHalted {
+		t.Errorf("sync.status while the config can't be written: %s %q", st.State, st.Warnings)
+	}
+	// hop status works, and says so too.
+	var status StatusResult
+	x.n2.must(OpStatus, nil, &status)
+	if !outOfDate(status.Warnings) || status.KeysInAgent != 0 {
+		t.Errorf("status while the config can't be written: %d keys, %q", status.KeysInAgent, status.Warnings)
+	}
+
+	failWrites.Store(false)
+	eventually(t, 5*time.Second, "the laptop's ssh config drops web1", func() bool { return !strings.Contains(x.n2.config(), "Host web1\n") })
+	eventually(t, 5*time.Second, "the warning goes", func() bool { return !outOfDate(x.n2.status().Warnings) })
+	if st := x.n2.status(); st.State != SyncHalted || !st.Equivocation {
+		t.Errorf("sync restarted after the config was written: %+v", st)
+	}
+	if got := x.n2.agentKeys(); got != 0 {
+		t.Errorf("the agent holds %d keys after the config was written", got)
 	}
 }
 
@@ -392,5 +476,62 @@ func TestServerRetirementChecksTheReceiptAndTheSession(t *testing.T) {
 	}
 	if r := x.n2.status().ServerRetirement; r == nil || !r.Unverified {
 		t.Errorf("server retirement %+v", r)
+	}
+}
+
+// After the server's unverified word that this device left the account,
+// hop unlock brings the keys back, but sync stays stopped until the daemon
+// restarts, and sync.status says how to restart it or sign in again.
+func TestUnlockAfterAnUnverifiedRetirementKeepsSyncStopped(t *testing.T) {
+	x := newSyncSetup(t)
+	ender := &sessionEnder{Store: x.n2.st}
+	x.w.start(x.n2, ender, SyncOptions{minBackoff: 10 * time.Millisecond, maxBackoff: 20 * time.Millisecond})
+	x.n2.must(OpSyncNow, nil, nil)
+	laptop, err := model.ParseID(x.n2.st.Info().DeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, _ http.Handler) bool {
+		if req.URL.Path != "/v1/retire-status" {
+			return false
+		}
+		io.Copy(io.Discard, req.Body)
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Write(retireStatusBody(t, laptop, "retired", 7))
+		return true
+	})
+	ender.end.Store(true)
+	x.n2.d.sync.wake()
+	eventually(t, 10*time.Second, "the laptop stops on the receipt", func() bool { return x.n2.status().State == SyncRevoked })
+	if !x.n2.st.Info().Locked || x.n2.agentKeys() != 0 {
+		t.Fatal("the receipt did not lock the vault and empty the agent")
+	}
+
+	// The server would serve this device again; only a restart asks.
+	ender.end.Store(false)
+	x.n2.must(OpUnlock, UnlockParams{}, nil)
+	if x.n2.st.Info().Locked {
+		t.Fatal("the vault is still locked")
+	}
+	if got := x.n2.agentKeys(); got != 1 {
+		t.Errorf("the agent holds %d keys after the unlock; want 1", got)
+	}
+	// The unlock woke the loop; give it time to (not) start again.
+	time.Sleep(200 * time.Millisecond)
+	if err := x.n2.call(OpSyncNow, nil, nil); !IsCode(err, CodeRevoked) {
+		t.Errorf("sync.now after the unlock: %v", err)
+	}
+	st := x.n2.status()
+	if st.State != SyncRevoked || st.ServerRetirement == nil || !st.ServerRetirement.Unverified {
+		t.Errorf("sync.status after the unlock: %+v", st)
+	}
+	i := slices.IndexFunc(st.Warnings, func(w string) bool { return strings.Contains(w, "server-reported, unverified") })
+	if i < 0 {
+		t.Fatalf("warnings %q", st.Warnings)
+	}
+	for _, want := range []string{"hop auth login", "hop unlock", "until the daemon restarts", "hop daemon stop"} {
+		if !strings.Contains(st.Warnings[i], want) {
+			t.Errorf("the warning %q does not say %q", st.Warnings[i], want)
+		}
 	}
 }

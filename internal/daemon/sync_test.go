@@ -125,16 +125,22 @@ type node struct {
 
 // start runs a daemon for n over ms (n.st, or a wrapper of it).
 func (w *syncWorld) start(n *node, ms model.Store, opts SyncOptions) {
+	n.t.Helper()
+	w.startWith(n, ms, Options{Sync: opts})
+}
+
+// startWith is start with the daemon's other options (its test hooks);
+// the paths, store, tailnet and log are filled in.
+func (w *syncWorld) startWith(n *node, ms model.Store, o Options) {
 	t := n.t
 	t.Helper()
 	base := shortDir(t)
 	n.paths = Paths{RunDir: filepath.Join(base, "run"), ConfigDir: filepath.Join(base, "cfg"), StateDir: filepath.Join(base, "state")}
-	opts.Client.RootCAs = w.pool
+	o.Sync.Client.RootCAs = w.pool
 	name := n.name
-	d, err := Start(Options{
-		Paths: n.paths, Store: ms, Version: "test", Tailscale: fakeTS{}, Sync: opts,
-		Logf: func(format string, args ...any) { t.Logf(name+": "+format, args...) },
-	})
+	o.Paths, o.Store, o.Version, o.Tailscale = n.paths, ms, "test", fakeTS{}
+	o.Logf = func(format string, args ...any) { t.Logf(name+": "+format, args...) }
+	d, err := Start(o)
 	if err != nil {
 		t.Fatal(err)
 	}

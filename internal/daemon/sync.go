@@ -415,6 +415,10 @@ func (e *syncer) reconcile(ctx context.Context, gen uint64, before *store.SyncSt
 	if ctx.Err() != nil || e.st.Generation() != gen {
 		return
 	}
+	// A change to the outbox is seen only through its Pending and Held
+	// counts, and one to the log through the verified head (current). A
+	// failed push that changed the outbox without moving either count or
+	// the head goes unnoticed until something moves one of them.
 	if after, err := e.st.Status(); err == nil && before != nil && (after.Pending != before.Pending || after.Held != before.Held) {
 		e.d.outboxGen.Add(1)
 	}
