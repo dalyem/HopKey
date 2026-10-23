@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
@@ -24,10 +25,15 @@ import (
 // Survivors are chosen by device ID when the checkpoint starts (§10.1,
 // "Choosing survivors (rev 16)"): a password change keeps every active
 // device (except the stale devices this machine's password unlocks left
-// behind, which it revokes as phase 1 does); a rotation, a revocation and
-// a recovery's follow-up keep only this device and the devices named in
-// CheckpointOptions.Keep. The chosen IDs are journaled and reused on every
-// rebuild, so a device that first appears during a rebuild is revoked.
+// behind, which it revokes as phase 1 does, journaled as its targets); a
+// rotation, a revocation and a recovery's follow-up keep only this device
+// and the devices named in CheckpointOptions.Keep. The chosen IDs are
+// journaled and reused on every rebuild, and only the ones still active
+// count: a survivor or target retired meanwhile is simply gone. A device
+// that first appears during a rebuild is revoked by a rotation, a
+// revocation or a recovery. A password change does not decide for the
+// user: it refuses to rebuild (NewDevicesError) until the call names each
+// new device in CheckpointOptions.Keep or Exclude, and journals the answer.
 //
 // The journal is vault/checkpoint.json:
 //
@@ -86,7 +92,31 @@ var (
 	// ErrNoRecoveryDue means RecoveryCheckpoint was called with no recovery
 	// checkpoint due.
 	ErrNoRecoveryDue = errors.New("store: no recovery checkpoint is due")
+
+	errExcludeOnlyPasswd = errors.New("store: only a password change takes Exclude, to answer the devices that appeared during it")
+	errPasswdKeep        = errors.New("store: a password change keeps every device; use rotate to choose survivors")
 )
+
+// NewDevicesError means a password change must be rebuilt, and devices
+// that were not active when it started are active now (§10.1: a device
+// that first appears during a rebuild is not kept without the user's
+// choice). Run it again naming each of Devices in CheckpointOptions.Keep
+// (it survives) or Exclude (it is revoked). It matches
+// ErrCheckpointRebuild.
+type NewDevicesError struct {
+	Devices []model.ID
+}
+
+func (e *NewDevicesError) Error() string {
+	ids := make([]string, len(e.Devices))
+	for i, id := range e.Devices {
+		ids[i] = id.String()
+	}
+	return fmt.Sprintf("store: the password change must be rebuilt, and %d device(s) appeared since it started (%s); "+
+		"run it again keeping or excluding each of them", len(ids), strings.Join(ids, ", "))
+}
+
+func (e *NewDevicesError) Is(target error) bool { return target == ErrCheckpointRebuild }
 
 // CheckpointPendingError means another kind of checkpoint is journaled, or
 // the same kind with other survivors: it must finish first. It matches
@@ -106,8 +136,13 @@ type CheckpointOptions struct {
 	// Keep are the survivors besides this device (§10.1), each a device ID
 	// or a name exactly one active device has. A rotation, a revocation
 	// and a recovery's follow-up revoke every other active device. A
-	// password change keeps every device and refuses Keep.
+	// password change keeps every device; it takes Keep, with Exclude,
+	// only to answer a NewDevicesError.
 	Keep []string
+	// Exclude answers a password change's NewDevicesError: the new devices
+	// it names are revoked. Every new device must be in Keep or Exclude.
+	// Only a password change takes it.
+	Exclude []string
 	// SecretKey is the account's current Secret Key, for a device that
 	// stores none (enrolled by approval, §11 addendum). "" uses the stored
 	// one; a device without one then fails with ErrNeedSecretKey.
@@ -123,11 +158,14 @@ type CheckpointOptions struct {
 // Called again after an interrupted attempt, it finishes the journaled
 // password change (reposting it, or rebuilding it with fresh secrets and
 // the same survivors), and returns the kit once it is verified.
+//
+// A rebuild that would revoke a device which appeared after the change
+// started stops with a NewDevicesError: the call then names each such
+// device in opts.Keep or opts.Exclude. Otherwise Keep and Exclude are
+// refused.
 func (s *Store) ChangePasswordRemote(ctx context.Context, r Remote, current, next []byte, opts CheckpointOptions) (Kit, error) {
-	if len(opts.Keep) > 0 {
-		return Kit{}, errors.New("store: a password change keeps every device; use rotate to choose survivors")
-	}
-	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointPasswd, verify: current, password: next, sk: opts.SecretKey})
+	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointPasswd, verify: current, password: next, sk: opts.SecretKey,
+		keep: opts.Keep, exclude: opts.Exclude})
 }
 
 // Rotate is hop auth rotate (§10.1, §5.3 device_retire): a checkpoint that
@@ -135,6 +173,9 @@ func (s *Store) ChangePasswordRemote(ctx context.Context, r Remote, current, nex
 // active device but this one and opts.Keep. password is the current master
 // password, which the new credentials keep.
 func (s *Store) Rotate(ctx context.Context, r Remote, password []byte, opts CheckpointOptions) (Kit, error) {
+	if len(opts.Exclude) > 0 {
+		return Kit{}, errExcludeOnlyPasswd
+	}
 	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointRotate, verify: password, password: password, sk: opts.SecretKey, keep: opts.Keep})
 }
 
@@ -148,6 +189,9 @@ func (s *Store) RevokeDevices(ctx context.Context, r Remote, password []byte, id
 	if len(ids) == 0 {
 		return Kit{}, errors.New("store: name at least one device to revoke")
 	}
+	if len(opts.Exclude) > 0 {
+		return Kit{}, errExcludeOnlyPasswd
+	}
 	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointRevoke, verify: password, password: password, sk: opts.SecretKey, keep: opts.Keep, targets: ids})
 }
 
@@ -156,6 +200,9 @@ func (s *Store) RevokeDevices(ctx context.Context, r Remote, password []byte, id
 // opts.Keep. It is the only checkpoint allowed while
 // ServerInfo.CheckpointDue, and the commit that installs it ends that.
 func (s *Store) RecoveryCheckpoint(ctx context.Context, r Remote, next []byte, opts CheckpointOptions) (Kit, error) {
+	if len(opts.Exclude) > 0 {
+		return Kit{}, errExcludeOnlyPasswd
+	}
 	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointRecovery, password: next, keep: opts.Keep})
 }
 
@@ -450,13 +497,20 @@ func (s *Store) commitCandidate(t *txn, j *ckptJournal, w *vaultlog.Wire, st *va
 // recoverServerJournal makes the kit of a committed journaled checkpoint
 // pending (§10.1: shown only once verified), and drops a journal whose
 // committed checkpoint a later one superseded: its Secret Key no longer
-// opens anything. A live candidate at a seq verified history has passed
-// is settled here as the commit would have (a crash in an older build).
-// The caller holds the file lock, and the store is unlocked.
+// opens anything. A pending server kit goes with that journal, so nothing
+// shows or stores superseded credentials; with no journal left, a pending
+// server kit goes too. A live candidate at a seq verified history has
+// passed is settled here as the commit would have (a crash in an older
+// build). Pull runs it whenever verified history advances. The caller
+// holds the file lock, and the store is unlocked.
 func (s *Store) recoverServerJournal() error {
 	j, err := s.readCheckpointJournal(s.rec, s.state.VaultID)
-	if err != nil || j == nil {
+	if err != nil {
 		return err
+	}
+	if j == nil {
+		s.dropServerKit()
+		return nil
 	}
 	defer j.zero()
 	if c := j.live(); c != nil && c.Seq <= s.state.Head.Seq {
@@ -514,10 +568,17 @@ func (s *Store) recoverServerJournal() error {
 	}
 	if gen != s.state.Creds.Gen {
 		// A later checkpoint set other credentials: this kit would install
-		// a Secret Key that no longer works.
+		// a Secret Key that no longer works. The kit in memory goes with
+		// the journal, whether or not the removal commits: a journal left
+		// behind is dropped by the next pull or unlock.
+		s.dropServerKit()
 		t := &txn{}
 		t.remove(checkpointRel)
 		return s.commitTxn(t)
+	}
+	if s.kit != nil && s.kitServer && s.kitSeq == c.Seq && s.kit.SecretKey == c.SecretKey {
+		// Already pending: persistKitSK has run (a failure is in skErr).
+		return nil
 	}
 	s.kit = &Kit{AccountID: s.state.Account.AccountID.String(), SecretKey: c.SecretKey, RecoveryKey: c.RecoveryKey, Created: c.Created.Time()}
 	s.kitSeq, s.kitServer, s.kitKind = c.Seq, true, j.Kind
@@ -526,14 +587,26 @@ func (s *Store) recoverServerJournal() error {
 	return nil
 }
 
+// dropServerKit forgets a pending server-backed checkpoint's kit (not a
+// local password change's), and why its Secret Key was not stored.
+func (s *Store) dropServerKit() {
+	if s.kit == nil || !s.kitServer {
+		return
+	}
+	s.kit.SecretKey, s.kit.RecoveryKey = "", ""
+	s.kit, s.kitServer, s.kitKind, s.kitSeq = nil, false, "", 0
+	s.skErr, s.kitSKDurable = nil, false
+}
+
 // ckptRequest is one call's checkpoint. kind "" resumes whatever is
 // journaled, without a password.
 type ckptRequest struct {
 	kind     string
-	verify   []byte // the current password, checked first; nil for a recovery
+	verify   []byte // the current password, checked first; a recovery has none
 	password []byte // the password of the new credentials
 	sk       string // the current Secret Key, when the device stores none
 	keep     []string
+	exclude  []string // a password change's answer to NewDevicesError
 	targets  []string
 	verified bool
 	// matched means the journal was started, or found to be req's, earlier
@@ -654,6 +727,11 @@ func (s *Store) prepareCheckpoint(gen uint64, req *ckptRequest, mayBuild bool) (
 	if !mayBuild {
 		return Kit{}, nil, fmt.Errorf("store: the checkpoint did not commit after %d attempts; another device keeps writing first", maxPushAttempts)
 	}
+	if j.Kind == CheckpointPasswd {
+		if err := s.decideNewDevices(j, req); err != nil {
+			return Kit{}, nil, err
+		}
+	}
 	if err := s.verifyCheckpointPassword(req); err != nil {
 		return Kit{}, nil, err
 	}
@@ -688,6 +766,9 @@ func (s *Store) newCheckpointJournal(req *ckptRequest) (*ckptJournal, error) {
 		return nil, ErrRecoveryDue
 	case !due && req.kind == CheckpointRecovery:
 		return nil, ErrNoRecoveryDue
+	case req.kind == CheckpointPasswd && len(req.keep)+len(req.exclude) > 0:
+		// Nothing has appeared since it started: there is nothing to answer.
+		return nil, errPasswdKeep
 	}
 	// The stale devices come from device.json, as phase 1's password change
 	// reads them.
@@ -714,9 +795,13 @@ func (s *Store) chooseSurvivors(req *ckptRequest) (survivors, targets []model.ID
 	}
 	switch req.kind {
 	case CheckpointPasswd:
+		// The stale devices are its targets: decided, so a rebuild does not
+		// take them for new ones.
 		stale := s.staleActive(s.devCfg)
 		for id := range s.state.Devices {
-			if !slices.Contains(stale, id) {
+			if slices.Contains(stale, id) {
+				targets = append(targets, id)
+			} else {
 				survivors = append(survivors, id)
 			}
 		}
@@ -742,39 +827,134 @@ func (s *Store) chooseSurvivors(req *ckptRequest) (survivors, targets []model.ID
 // sameCheckpoint checks that req is the journaled checkpoint j, with the
 // survivors chosen when it started: the journaled choice is reused on a
 // rebuild (§10.1), and a call that asks for another must not be finished
-// with it. The caller holds s.mu.
+// with it. Only the devices still active are compared: one the journal
+// names that retired since is gone, and the same command, run again, must
+// still finish the checkpoint (a device ID that is no longer active is
+// accepted, and a name no active device has is passed over). The caller
+// holds s.mu.
 func (s *Store) sameCheckpoint(j *ckptJournal, req *ckptRequest) error {
 	if req.kind != j.Kind || j.Author != s.dev.ID {
 		return &CheckpointPendingError{Kind: j.Kind}
 	}
 	if j.Kind == CheckpointPasswd {
+		// Its Keep and Exclude answer new devices (decideNewDevices).
 		return nil
 	}
-	keep, err := s.resolveDevices(req.keep)
+	keep, err := s.resolveJournaled(req.keep)
 	if err != nil {
 		return err
 	}
-	want := sortIDs(append([]model.ID{s.dev.ID}, keep...))
-	if !slices.Equal(want, j.Survivors) {
+	want := s.activeOf(append([]model.ID{s.dev.ID}, keep...))
+	if !slices.Equal(want, s.activeOf(j.Survivors)) {
 		return &CheckpointPendingError{Kind: j.Kind}
 	}
 	if j.Kind == CheckpointRevoke {
-		targets, err := s.resolveDevices(req.targets)
+		targets, err := s.resolveJournaled(req.targets)
 		if err != nil {
 			return err
 		}
-		if !slices.Equal(sortIDs(targets), j.Targets) {
+		if !slices.Equal(s.activeOf(targets), s.activeOf(j.Targets)) {
 			return &CheckpointPendingError{Kind: j.Kind}
 		}
 	}
 	return nil
 }
 
+// resolveJournaled resolves device references against a journaled
+// checkpoint: as resolveDevices, except that a device ID needs not be
+// active and a name no active device has is passed over (its device may
+// have retired since the checkpoint started). The caller holds s.mu.
+func (s *Store) resolveJournaled(refs []string) ([]model.ID, error) {
+	var out []model.ID
+	for _, ref := range refs {
+		if id, err := model.ParseID(ref); err == nil {
+			out = append(out, id)
+			continue
+		}
+		id, err := s.resolveDevice(ref)
+		if errors.Is(err, ErrUnknownDevice) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return sortIDs(out), nil
+}
+
+// activeOf returns the devices of ids that are active in the verified
+// state, sorted. The caller holds s.mu.
+func (s *Store) activeOf(ids []model.ID) []model.ID {
+	var out []model.ID
+	for _, id := range ids {
+		if _, ok := s.state.Devices[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return sortIDs(out)
+}
+
+// decideNewDevices settles, before a password change's candidate is built,
+// the devices active now that it neither keeps nor revokes: devices that
+// appeared since it started (§10.1). Without req's answer it refuses with
+// a NewDevicesError naming them; with one (each in req.keep or
+// req.exclude), the answer goes into j, journaled with the candidate. Keep
+// and Exclude with nothing to answer are refused. The caller holds s.mu.
+func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
+	var fresh []model.ID
+	for id := range s.state.Devices {
+		if !slices.Contains(j.Survivors, id) && !slices.Contains(j.Targets, id) {
+			fresh = append(fresh, id)
+		}
+	}
+	fresh = sortIDs(fresh)
+	if len(req.keep)+len(req.exclude) == 0 {
+		if len(fresh) > 0 {
+			return &NewDevicesError{Devices: fresh}
+		}
+		return nil
+	}
+	if len(fresh) == 0 {
+		return errPasswdKeep
+	}
+	keep, err := s.resolveDevices(req.keep)
+	if err != nil {
+		return err
+	}
+	exclude, err := s.resolveDevices(req.exclude)
+	if err != nil {
+		return err
+	}
+	for _, id := range append(slices.Clone(keep), exclude...) {
+		if !slices.Contains(fresh, id) {
+			return fmt.Errorf("store: device %v did not appear during the password change; Keep and Exclude name only the devices that did", id)
+		}
+		if slices.Contains(keep, id) && slices.Contains(exclude, id) {
+			return fmt.Errorf("store: device %v is both kept and excluded", id)
+		}
+	}
+	var missing []model.ID
+	for _, id := range fresh {
+		if !slices.Contains(keep, id) && !slices.Contains(exclude, id) {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		return &NewDevicesError{Devices: missing}
+	}
+	j.Survivors = sortIDs(append(j.Survivors, keep...))
+	j.Targets = sortIDs(append(j.Targets, exclude...))
+	return nil
+}
+
 // verifyCheckpointPassword checks req's current password against the
-// account once per call (§10.1: a checkpoint needs the master password).
-// The caller holds s.mu.
+// account once per call (§10.1: a checkpoint needs the master password,
+// and the Secret Key with it, which an enrolled device must be given).
+// Only a recovery's follow-up has none to check: the recovery sign-in
+// proved the Recovery Key. The caller holds s.mu.
 func (s *Store) verifyCheckpointPassword(req *ckptRequest) error {
-	if req.verified || req.verify == nil {
+	if req.verified || req.kind == CheckpointRecovery {
 		return nil
 	}
 	sk, err := s.currentSecretKey(req.sk)
@@ -951,6 +1131,11 @@ type DeviceListing struct {
 	// unlocks left behind, which the next password change revokes.
 	This  bool `json:"this,omitempty"`
 	Stale bool `json:"stale,omitempty"`
+	// Undelivered is a device an approval on this device added that never
+	// received its delivery (the attempt ended first, or has not
+	// delivered yet): it can't be used, and unless that approval is still
+	// running, it should be revoked.
+	Undelivered bool `json:"undelivered,omitempty"`
 }
 
 // Devices lists the active devices of the verified state, oldest first,
@@ -969,8 +1154,15 @@ func (s *Store) Devices() ([]DeviceListing, error) {
 	defer unlock()
 	byID := map[model.ID]*DeviceListing{}
 	stale := s.staleActive(s.devCfg)
+	var undelivered []model.ID
+	if s.server {
+		if undelivered, _, err = s.undelivered(); err != nil {
+			return nil, err
+		}
+	}
 	for id, d := range s.state.Devices {
-		byID[id] = &DeviceListing{ID: id, Name: d.Cert.Name, This: id == s.dev.ID, Stale: slices.Contains(stale, id)}
+		byID[id] = &DeviceListing{ID: id, Name: d.Cert.Name, This: id == s.dev.ID, Stale: slices.Contains(stale, id),
+			Undelivered: slices.Contains(undelivered, id)}
 	}
 	added := map[model.ID]bool{}
 	for seq := uint64(0); seq <= s.state.Head.Seq; seq++ {

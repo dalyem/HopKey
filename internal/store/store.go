@@ -1097,6 +1097,33 @@ func (s *Store) Info() Info {
 		info.Warnings = append(info.Warnings, fmt.Sprintf("%d queued change(s), pending or held, were lost when hop unlock --password "+
 			"replaced an unreadable device key; make them again", m.Lost))
 	}
+	if lost, err := s.readLostJournals(); err == nil && lost.Checkpoint {
+		info.Warnings = append(info.Warnings, "a checkpoint (hop passwd, hop auth rotate or revoke) was in progress when hop unlock --password "+
+			"replaced an unreadable device key, and its journal was lost. If it committed, the account's new Emergency Kit can't be "+
+			"recovered: run hop auth rotate to make a new one. If it did not, run it again")
+	}
+	if lost, err := s.readLostJournals(); err == nil && lost.Approval {
+		info.Warnings = append(info.Warnings, "an approval of a new device was in progress when hop unlock --password replaced an "+
+			"unreadable device key, and its journal was lost. If its device was added, it never received its delivery: "+
+			"check hop auth devices and revoke a device you don't recognize")
+	}
+	if s.state != nil && s.server {
+		if devs, unsettled, err := s.undelivered(); err == nil {
+			if len(devs) > 0 {
+				ids := make([]string, len(devs))
+				for i, id := range devs {
+					ids[i] = id.String()
+				}
+				info.Warnings = append(info.Warnings, fmt.Sprintf("%d device(s) were added by an approval on this device but never received "+
+					"their delivery (%s); unless that approval is still running, revoke them with hop auth devices revoke",
+					len(devs), strings.Join(ids, ", ")))
+			}
+			if unsettled > 0 {
+				info.Warnings = append(info.Warnings, "an approval on this device ended, and its device may still be added; "+
+					"sync, then check hop auth devices")
+			}
+		}
+	}
 	if s.syncHalt != nil {
 		info.Warnings = append(info.Warnings, s.syncHalt.Error())
 	}

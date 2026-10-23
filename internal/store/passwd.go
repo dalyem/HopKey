@@ -400,24 +400,38 @@ func (s *Store) outside(fl *fileHold, gen uint64, f func() error) error {
 // device record can open, and adds their number to the count LostIntents
 // reports, in one commit (§11). The caller holds the file lock.
 //
-// The other files sealed under that local_key go in the same commit: a
-// server-backed checkpoint's journal (checkpoint.go), whose kit is then
-// lost (the next checkpoint makes a new one), and an approval in progress
-// (approve.go), which then fails on the approving side.
+// The other files sealed under that local_key go in the same commit, and
+// the loss is recorded with them (LostJournals) until AckLostJournals: a
+// server-backed checkpoint's journal (checkpoint.go), whose candidate may
+// still have committed with a kit no one can read, and an approval's
+// journal (approve.go), whose device_add may have committed for a device
+// that was never delivered.
 func (s *Store) dropLostRecords() error {
 	ns, err := s.l.outboxNumbers()
 	if err != nil {
 		return err
 	}
 	t := &txn{}
+	lost, err := s.readLostJournals()
+	if err != nil {
+		return err
+	}
+	dropped := false
 	for _, f := range []struct {
 		rel    string
 		exists func() (bool, error)
-	}{{checkpointRel, s.l.checkpointExists}, {approvalRel, s.l.approvalExists}} {
+		flag   *bool
+	}{{checkpointRel, s.l.checkpointExists, &lost.Checkpoint}, {approvalRel, s.l.approvalExists, &lost.Approval}} {
 		if ok, err := f.exists(); err != nil {
 			return err
 		} else if ok {
 			t.remove(f.rel)
+			*f.flag, dropped = true, true
+		}
+	}
+	if dropped {
+		if err := putLostJournals(t, lost); err != nil {
+			return err
 		}
 	}
 	if len(ns) > 0 {

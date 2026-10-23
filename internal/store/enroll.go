@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -28,7 +29,8 @@ import (
 //	SetEnrollID              the enroll_id the server assigned
 //	HandleChal               REVEALED → open (exactly one chal is accepted)
 //	SAS, ConfirmSAS/RejectSAS CONFIRMED, or REJECTED (terminal: keys wiped)
-//	Install                  the delivery, accepted only in CONFIRMED → the vault
+//	Install                  the delivery, staged in CONFIRMED, accepted (DONE)
+//	                         once every step-6 check passed → the vault
 //
 // Files:
 //
@@ -36,7 +38,8 @@ import (
 //	              JCS({"v":1, "store":"keychain"|"file", "sealed":bool, "ref":id, "server":str, "email":str})
 //	the record    in the device key store, as §11 stores device keys: the keychain entry
 //	              "enroll:<ref>", or enroll.key
-//	              record   = JCS({"v":1, "ref":id, "local_key":b64(32), "state":<crypto.DeviceEnrollment state>})
+//	              record   = JCS({"v":1, "ref":id, "local_key":b64(32), "state":<crypto.DeviceEnrollment state>,
+//	                             "staged":<the delivery being checked> | null})
 //	              enroll.key = JCS({"v":1, "kdf_version":u32, "ref":id, "salt":b64,
 //	                             "key":AEAD(pk, record, aad = lp("hopkey/v1/enroll-key-file") || lp(ref_bytes)) | record})
 //
@@ -45,15 +48,24 @@ import (
 // salt). ref is a local ID: the device ID is chosen by the approving device
 // and arrives in the delivered certificate.
 //
-// Install is the sign-in's path (signin.go) with the delivery's anchor:
-// device.json names the delivered device as pending and its record (the
-// enrollment keys, "secret_key":"" (§11 addendum), and the enrollment's
-// local_key) is made durable; the log is read with device authentication,
-// anchored at the delivery's (anchor_seq, anchor_h), a trusted H, and
-// verified by transitions as the new device; the result must contain its
-// device_add with the delivered certificate; and one durable commit
-// installs it, server-backed. A revocation met on the way is terminal for
-// the data directory (the sign-in ledger, then a tombstone).
+// Install is the sign-in's path (signin.go) with the delivery's anchor. The
+// delivery is accepted only once every check of §7 step 6 has passed, its
+// anchor and the log included, since input that fails them changes no
+// state: crypto.DeviceEnrollment opens and checks it, but the DONE state it
+// produces is held in memory, and the record keeps CONFIRMED with the
+// delivery staged beside it (so a crash during the checks can retry it,
+// and a delivery that fails them leaves the record as it was, the real one
+// still accepted, DiscardEnrollment still allowed). The log is read with
+// device authentication, anchored at the delivery's (anchor_seq,
+// anchor_h), a trusted H, and verified by transitions as the new device;
+// the result must contain its device_add with the delivered certificate.
+// Then DONE is persisted (the delivery is accepted), device.json names the
+// delivered device as pending and its record (the enrollment keys,
+// "secret_key":"" (§11 addendum), and the enrollment's local_key) is made
+// durable, and one durable commit installs the vault, server-backed. After
+// a crash once DONE is durable, Install takes the steps again from the
+// persisted delivery. A revocation met on the way is terminal for the data
+// directory (the sign-in ledger, then a tombstone).
 
 const (
 	enrollRel          = "enroll.json"
@@ -107,10 +119,11 @@ type enrollConfig struct {
 }
 
 type enrollRecord struct {
-	V        int           `json:"v"`
-	Ref      model.ID      `json:"ref"`
-	LocalKey []byte        `json:"local_key"`
-	State    canonjson.Raw `json:"state"`
+	V        int                  `json:"v"`
+	Ref      model.ID             `json:"ref"`
+	LocalKey []byte               `json:"local_key"`
+	State    canonjson.Raw        `json:"state"`
+	Staged   *crypto.HPKEEnvelope `json:"staged"`
 }
 
 type enrollKeyFile struct {
@@ -147,22 +160,60 @@ type Enrollment struct {
 	ec       enrollConfig
 	localKey []byte
 	d        *crypto.DeviceEnrollment
+	// state is D's state as the record holds it, and staged the delivery
+	// staged beside it, if any.
+	state  []byte
+	staged *crypto.HPKEEnvelope
+	// hold makes Persist keep a DONE state in held instead of persisting
+	// it: the delivery is not accepted until its checks are over.
+	hold bool
+	held []byte
 }
 
-// enrollPersister persists D's state into the enrollment record, durably.
+// enrollPersister persists D's state into the enrollment record, durably,
+// with no staged delivery; a DONE state is held while e.hold.
 type enrollPersister struct{ e *Enrollment }
 
 func (p enrollPersister) Persist(state []byte) error {
 	e := p.e
+	if e.hold && enrollDone(state) {
+		e.held = bytes.Clone(state)
+		return nil
+	}
 	if err := e.s.hook("enroll:persist"); err != nil {
 		return err
 	}
-	b, err := canonjson.Marshal(enrollRecord{V: enrollVersion, Ref: e.ec.Ref, LocalKey: e.localKey, State: canonjson.Raw(state)})
+	if err := e.save(state, nil); err != nil {
+		return err
+	}
+	e.setState(state)
+	e.staged = nil
+	return nil
+}
+
+// enrollDone reports whether the persisted D state is DONE. Only the state
+// is read: crypto.DeviceEnrollment owns the record's schema.
+func enrollDone(state []byte) bool {
+	var rec struct {
+		State crypto.DeviceEnrollState `json:"state"`
+	}
+	return json.Unmarshal(state, &rec) == nil && rec.State == crypto.DeviceDone
+}
+
+// save stores the enrollment record with D's state and the staged
+// delivery, durably.
+func (e *Enrollment) save(state []byte, staged *crypto.HPKEEnvelope) error {
+	b, err := canonjson.Marshal(enrollRecord{V: enrollVersion, Ref: e.ec.Ref, LocalKey: e.localKey, State: canonjson.Raw(state), Staged: staged})
 	if err != nil {
 		return err
 	}
 	defer clear(b)
 	return e.s.saveEnroll(e.ec, b)
+}
+
+func (e *Enrollment) setState(state []byte) {
+	clear(e.state)
+	e.state = bytes.Clone(state)
 }
 
 // BeginEnrollment starts enrolling this machine by approval (§7 step 1) in
@@ -333,13 +384,18 @@ func resumeEnrollment(cfg Config, hook func(string) error) (_ *Enrollment, err e
 		clear(rec.LocalKey)
 		return nil, fmt.Errorf("%w: the enrollment record does not parse", ErrDeviceKey)
 	}
-	e := &Enrollment{s: s, ec: ec, localKey: rec.LocalKey}
+	e := &Enrollment{s: s, ec: ec, localKey: rec.LocalKey, state: bytes.Clone(rec.State)}
 	d, err := crypto.RestoreDeviceEnrollmentWithClock(enrollPersister{e}, s.clock, rec.State)
 	if err != nil {
 		clear(rec.LocalKey)
+		clear(e.state)
 		return nil, fmt.Errorf("%w: the enrollment state: %v", ErrDeviceKey, err)
 	}
 	e.d = d
+	if d.State() == crypto.DeviceConfirmed {
+		// A delivery staged before a crash: Install(nil) checks it again.
+		e.staged = rec.Staged
+	}
 	return e, nil
 }
 
@@ -573,6 +629,8 @@ func (e *Enrollment) RejectSAS() error { return e.d.RejectSAS() }
 // Close gives up the data directory without changing the enrollment.
 func (e *Enrollment) Close() error {
 	clear(e.localKey)
+	clear(e.state)
+	clear(e.held)
 	if e.s == nil {
 		return nil
 	}
@@ -584,10 +642,12 @@ func (e *Enrollment) Close() error {
 // Install accepts the approving device's delivery (§7 step 6) and installs
 // the vault (see above). It returns the store, unlocked, server-backed and
 // owning the vault; the Enrollment no longer owns the data directory. A
-// delivery is accepted only in CONFIRMED: one that arrives earlier, or
-// after RejectSAS, or that fails its checks (a substituted one included) is
-// discarded with no change of state, and the real one can still be handed
-// in. delivery nil uses the one an earlier Install accepted.
+// delivery is accepted only in CONFIRMED, and only once every check of
+// step 6 has passed, its anchor and the verified log included: one that
+// arrives earlier, or after RejectSAS, or that fails a check (a
+// substituted one, or one naming another anchor) is discarded with no
+// change of state, and the real one can still be handed in. delivery nil
+// uses the one an earlier Install accepted, or staged before a crash.
 //
 // Every failure after the delivery is accepted leaves a state the next
 // Install finishes (InstallEnrolled after a restart).
@@ -596,35 +656,43 @@ func (e *Enrollment) Install(ctx context.Context, r EnrollRemote, delivery *cryp
 		return nil, ErrClosed
 	}
 	s := e.s
+	accepted := e.d.State() == crypto.DeviceDone
 	var v *crypto.VerifiedDelivery
 	var err error
-	if delivery != nil {
+	switch {
+	case accepted && delivery != nil:
 		v, err = e.d.HandleDelivery(*delivery)
-	} else {
+	case accepted:
 		v, err = e.d.Delivered()
+	default:
+		v, err = e.stage(delivery)
 	}
 	if err != nil {
 		return nil, err
 	}
 	o := &signInSecrets{acct: v.Account}
 	defer o.zero()
-	if err := s.hook("enroll:delivered"); err != nil {
-		return nil, err
-	}
 	rec, err := e.deviceRecord(v)
 	if err != nil {
+		if !accepted {
+			err = errors.Join(err, e.unstage())
+		}
 		return nil, err
-	}
-	dcfg, installed, err := s.enrolledDevice(e.ec, rec)
-	if err != nil {
-		rec.zero()
-		return nil, err
-	}
-	if installed {
-		rec.zero()
-		return e.reopen(ctx)
 	}
 	o.rec = rec
+	var dcfg deviceConfig
+	if accepted {
+		if err := s.hook("enroll:delivered"); err != nil {
+			return nil, err
+		}
+		var installed bool
+		if dcfg, installed, err = s.enrolledDevice(e.ec, rec); err != nil {
+			return nil, err
+		}
+		if installed {
+			return e.reopen(ctx)
+		}
+	}
 	self, err := rec.device()
 	if err != nil {
 		return nil, err
@@ -634,7 +702,34 @@ func (e *Enrollment) Install(ctx context.Context, r EnrollRemote, delivery *cryp
 	defer auth.close()
 	rr := enrollReader{r: r, auth: auth.auth(rec.AccountID, rec.DeviceID)}
 	err = enrolledDestination(ctx, rr, o, self, v, s.hook)
-	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+	rev := (*vaultlog.RevokedError)(nil)
+	revoked := errors.As(err, &rev)
+	if !accepted {
+		if err != nil && !revoked {
+			// The delivery failed a check: nothing changes (§7).
+			return nil, errors.Join(err, e.unstage())
+		}
+		// Every check passed (a revocation is met in verified history):
+		// the delivery is accepted, and the install owns the data
+		// directory from here.
+		if aerr := e.accept(); aerr != nil {
+			return nil, aerr
+		}
+		if herr := s.hook("enroll:delivered"); herr != nil {
+			return nil, herr
+		}
+		var installed bool
+		if dcfg, installed, err = s.enrolledDevice(e.ec, rec); err != nil {
+			return nil, err
+		}
+		if installed {
+			return nil, fmt.Errorf("%w: a vault was installed while this delivery was checked", ErrVaultExists)
+		}
+		if revoked {
+			err = rev
+		}
+	}
+	if revoked {
 		return nil, s.revokePending(dcfg, rec.DeviceID, err)
 	}
 	if err != nil {
@@ -646,6 +741,87 @@ func (e *Enrollment) Install(ctx context.Context, r EnrollRemote, delivery *cryp
 	e.s = nil
 	e.cleanup(s)
 	return s, nil
+}
+
+// stage runs D's own checks of §7 step 6 on delivery (nil: the staged one)
+// without accepting it: crypto.DeviceEnrollment opens and verifies it, and
+// its DONE state is held, not persisted; the record keeps CONFIRMED and
+// gets the delivery staged beside it, durably, so a crash during the
+// remaining checks can retry it. A delivery that fails here changes
+// nothing (one past the deadline fails the enrollment, as it would
+// anyway). Install then accepts it (accept) or unstages it (unstage).
+func (e *Enrollment) stage(delivery *crypto.HPKEEnvelope) (*crypto.VerifiedDelivery, error) {
+	if delivery == nil {
+		if e.staged == nil || e.d.State() != crypto.DeviceConfirmed {
+			// The state's own error: ErrEnrollState, ErrSASRejected, ...
+			return e.d.Delivered()
+		}
+		delivery = e.staged
+	}
+	env := *delivery
+	env.Enc, env.CT = bytes.Clone(env.Enc), bytes.Clone(env.CT)
+	e.hold, e.held = true, nil
+	v, err := e.d.HandleDelivery(env)
+	e.hold = false
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*crypto.VerifiedDelivery, error) {
+		v.Account.Zero()
+		return nil, errors.Join(err, e.restore())
+	}
+	if e.held == nil {
+		return fail(fmt.Errorf("%w: the delivery was accepted without its state", crypto.ErrEnrollState))
+	}
+	if err := e.save(e.state, &env); err != nil {
+		return fail(err)
+	}
+	e.staged = &env
+	if err := e.s.hook("enroll:staged"); err != nil {
+		return fail(err)
+	}
+	return v, nil
+}
+
+// accept persists the held DONE state, which drops the staged delivery:
+// the delivery is accepted. If it fails, the enrollment is CONFIRMED again
+// with the delivery staged, and Install(nil) checks it again.
+func (e *Enrollment) accept() error {
+	if err := e.s.hook("enroll:accept"); err != nil {
+		return errors.Join(err, e.restore())
+	}
+	if err := e.save(e.held, nil); err != nil {
+		return errors.Join(err, e.restore())
+	}
+	e.setState(e.held)
+	clear(e.held)
+	e.held, e.staged = nil, nil
+	return nil
+}
+
+// unstage drops the staged delivery, durably, and returns D to the state
+// the record holds (CONFIRMED): a delivery that failed a check changes no
+// state.
+func (e *Enrollment) unstage() error {
+	var err error
+	if e.staged != nil {
+		if err = e.save(e.state, nil); err == nil {
+			e.staged = nil
+		}
+	}
+	return errors.Join(err, e.restore())
+}
+
+// restore reloads D from the state the record holds, dropping a held DONE.
+func (e *Enrollment) restore() error {
+	clear(e.held)
+	e.held = nil
+	d, err := crypto.RestoreDeviceEnrollmentWithClock(enrollPersister{e}, e.s.clock, e.state)
+	if err != nil {
+		return fmt.Errorf("%w: the enrollment state: %v", ErrDeviceKey, err)
+	}
+	e.d = d
+	return nil
 }
 
 // InstallEnrolled is ResumeEnrollment and Install, for a restart.

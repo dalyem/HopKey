@@ -210,8 +210,10 @@ func (s *Store) applyPulled(gen uint64, entries []Committed, head vaultlog.Head)
 	// applyEntries returned are then nobody's.
 	if s.current(gen) == nil && st != s.state {
 		s.state, s.sec = st, sec
-		// A journaled checkpoint this pull committed shows its kit now.
-		if s.kit == nil {
+		// A journaled checkpoint this pull committed shows its kit now, and
+		// a pending one a later checkpoint superseded goes, with its
+		// journal (recoverServerJournal).
+		if s.kit == nil || s.kitServer {
 			if rerr := s.recoverServerJournal(); rerr != nil && err == nil {
 				err = rerr
 			}

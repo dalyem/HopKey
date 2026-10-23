@@ -3,10 +3,12 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
@@ -29,14 +31,14 @@ import (
 //	ApproveFinish(ctx, r)    post the device_add, verify it from the server's log, → the delivery
 //	ApproveAbort()           end an unfinished attempt as a failure
 //
-// Files, both under vault/:
+// Files, all under vault/:
 //
-//	approval-budget.json = JCS({"v":1, "budget":<crypto.ApprovalBudget state>})
-//	approval.json        = JCS({"v":1, "vault_id":id, "sealed":AEAD(local_key, journal,
-//	                           aad = lp("hopkey/v1/approval-journal") || lp(vault_id_bytes))})
-//	journal              = JCS({"v":1, "attempt":<crypto.Approval state>,
-//	                           "candidates":[{"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead"}],
-//	                           "wires":[wire]})
+//	approval-budget.json  = JCS({"v":1, "budget":<crypto.ApprovalBudget state>})
+//	approval.json         = JCS({"v":1, "vault_id":id, "sealed":AEAD(local_key, journal,
+//	                            aad = lp("hopkey/v1/approval-journal") || lp(vault_id_bytes))})
+//	journal               = JCS({"v":1, "attempt":<crypto.Approval state>, "candidates":[candidate], "wires":[wire]})
+//	candidate             = {"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead", "device_id":id}
+//	approval-orphans.json = JCS({"v":1, "candidates":[candidate]})
 //
 // The budget (3 attempts per rolling hour, one outstanding challenge) holds
 // no secret; it survives restarts, locks and new approvals. The journal is
@@ -45,12 +47,22 @@ import (
 // candidates follow the outbox's rules (§5.4): the exact wire is journaled
 // before it is posted, only verified history settles it, a live one is
 // posted again identically, and a dead one is rebuilt against the new head
-// with the same prepared device_add.
+// with the same certificate and a freshly sealed unlock blob, which the
+// delivery then carries.
+//
+// Ending an attempt (an abort, a rejected SAS, the deadline, the account
+// keys changing) does not settle its candidates: a posted device_add may
+// still commit, and nothing delivers it after the deadline. The candidates
+// of an attempt that failed move to approval-orphans.json, in one commit
+// with the journal, before anything replaces the journal. A device whose
+// candidate there is verified as committed, and that is still active, is
+// reported (Devices, Info) for revocation. The file holds no secret.
 
 const (
 	labelApprovalJournal = "hopkey/v1/approval-journal"
 	approvalRel          = "approval.json"
 	approvalBudgetRel    = "approval-budget.json"
+	approvalOrphansRel   = "approval-orphans.json"
 	approvalVersion      = 1
 )
 
@@ -62,8 +74,9 @@ var (
 	ErrApprovalPending = errors.New("store: another approval is in progress; finish or abort it first")
 )
 
-func (l layout) approvalFile() string       { return filepath.Join(l.vault(), approvalRel) }
-func (l layout) approvalBudgetFile() string { return filepath.Join(l.vault(), approvalBudgetRel) }
+func (l layout) approvalFile() string        { return filepath.Join(l.vault(), approvalRel) }
+func (l layout) approvalBudgetFile() string  { return filepath.Join(l.vault(), approvalBudgetRel) }
+func (l layout) approvalOrphansFile() string { return filepath.Join(l.vault(), approvalOrphansRel) }
 
 // approvalExists reports whether vault/approval.json exists.
 func (l layout) approvalExists() (bool, error) {
@@ -75,10 +88,26 @@ func (l layout) approvalExists() (bool, error) {
 }
 
 type approvalJournal struct {
-	V          int             `json:"v"`
-	Attempt    canonjson.Raw   `json:"attempt"`
-	Candidates []candidate     `json:"candidates"`
-	Wires      []canonjson.Raw `json:"wires"`
+	V          int                 `json:"v"`
+	Attempt    canonjson.Raw       `json:"attempt"`
+	Candidates []approvalCandidate `json:"candidates"`
+	Wires      []canonjson.Raw     `json:"wires"`
+}
+
+// approvalCandidate is a journaled device_add candidate and the device it
+// adds, so the device can be named if the candidate commits after its
+// attempt ended.
+type approvalCandidate struct {
+	Seq      uint64      `json:"seq,string"`
+	Prev     crypto.Hash `json:"prev"`
+	H        crypto.Hash `json:"h"`
+	Status   string      `json:"status"`
+	DeviceID model.ID    `json:"device_id"`
+}
+
+type orphansFileJSON struct {
+	V          int                 `json:"v"`
+	Candidates []approvalCandidate `json:"candidates"`
 }
 
 type approvalFileJSON struct {
@@ -96,7 +125,7 @@ func approvalAAD(vaultID model.ID) []byte {
 	return append(crypto.LP([]byte(labelApprovalJournal)), crypto.LP(vaultID[:])...)
 }
 
-func (j *approvalJournal) live() *candidate {
+func (j *approvalJournal) live() *approvalCandidate {
 	for i := range j.Candidates {
 		if j.Candidates[i].Status == statusLive {
 			return &j.Candidates[i]
@@ -149,6 +178,15 @@ func (p budgetPersister) Persist(state []byte) error {
 
 // writeApproval writes the journal, sealed under local_key, durably.
 func (s *Store) writeApproval(j *approvalJournal) error {
+	t := &txn{}
+	if err := s.putApproval(t, j); err != nil {
+		return err
+	}
+	return s.commitTxn(t)
+}
+
+// putApproval adds the journal, sealed under local_key, to t.
+func (s *Store) putApproval(t *txn, j *approvalJournal) error {
 	if err := s.hook("approve:journal"); err != nil {
 		return err
 	}
@@ -159,7 +197,7 @@ func (s *Store) writeApproval(j *approvalJournal) error {
 	defer key.Zero()
 	j.V = approvalVersion
 	if j.Candidates == nil {
-		j.Candidates = []candidate{}
+		j.Candidates = []approvalCandidate{}
 	}
 	if j.Wires == nil {
 		j.Wires = []canonjson.Raw{}
@@ -177,9 +215,8 @@ func (s *Store) writeApproval(j *approvalJournal) error {
 	if err != nil {
 		return err
 	}
-	t := &txn{}
 	t.put(approvalRel, b)
-	return s.commitTxn(t)
+	return nil
 }
 
 // readApproval opens the journal, or returns nil when there is none.
@@ -210,20 +247,201 @@ func (s *Store) readApproval() (*approvalJournal, error) {
 	if canonjson.Unmarshal(pt, &j) != nil || j.V != approvalVersion {
 		return nil, bad
 	}
+	if !validCandidates(j.Candidates) {
+		return nil, bad
+	}
+	return &j, nil
+}
+
+// validCandidates checks journaled candidates: known statuses, at most one
+// live, and a device for each.
+func validCandidates(cs []approvalCandidate) bool {
 	live := 0
-	for _, c := range j.Candidates {
+	for _, c := range cs {
 		switch c.Status {
 		case statusLive:
 			live++
 		case statusCommitted, statusDead:
 		default:
-			return nil, bad
+			return false
+		}
+		if c.DeviceID.IsZero() {
+			return false
 		}
 	}
-	if live > 1 {
-		return nil, bad
+	return live <= 1
+}
+
+// readOrphans reads approval-orphans.json, empty when there is none.
+func (s *Store) readOrphans() ([]approvalCandidate, error) {
+	b, err := os.ReadFile(s.l.approvalOrphansFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
 	}
-	return &j, nil
+	if err != nil {
+		return nil, err
+	}
+	var f orphansFileJSON
+	if canonjson.Unmarshal(b, &f) != nil || f.V != approvalVersion {
+		return nil, fmt.Errorf("%w: %s does not parse", ErrCorrupt, s.l.approvalOrphansFile())
+	}
+	for _, c := range f.Candidates {
+		if c.DeviceID.IsZero() || (c.Status != statusLive && c.Status != statusCommitted) {
+			return nil, fmt.Errorf("%w: %s does not parse", ErrCorrupt, s.l.approvalOrphansFile())
+		}
+	}
+	return f.Candidates, nil
+}
+
+// putOrphans adds approval-orphans.json with cs to t, or its removal when
+// cs is empty.
+func putOrphans(t *txn, cs []approvalCandidate) error {
+	if len(cs) == 0 {
+		t.remove(approvalOrphansRel)
+		return nil
+	}
+	b, err := canonjson.Marshal(orphansFileJSON{V: approvalVersion, Candidates: cs})
+	if err != nil {
+		return err
+	}
+	t.put(approvalOrphansRel, b)
+	return nil
+}
+
+// settleCandidates marks every live candidate at a seq the verified head
+// has reached: committed if the verified entry there has its H, dead
+// otherwise (§5.4). It reports whether any changed. The caller holds the
+// file lock.
+func (s *Store) settleCandidates(cs []approvalCandidate) (bool, error) {
+	changed := false
+	for i := range cs {
+		c := &cs[i]
+		if c.Status != statusLive || c.Seq > s.state.Head.Seq {
+			continue
+		}
+		h, err := s.entryHash(c.Seq)
+		if err != nil {
+			return false, err
+		}
+		if h.Equal(c.H) {
+			c.Status = statusCommitted
+		} else {
+			c.Status = statusDead
+		}
+		changed = true
+	}
+	return changed, nil
+}
+
+// retireCandidates moves the candidates of an attempt that ended without
+// its delivery out of its journal into approval-orphans.json, in one
+// commit, settled as far as verified history goes: a dead one is dropped,
+// and so is a committed one whose device is no longer active. The caller
+// holds s.mu and the file lock.
+func (s *Store) retireCandidates(a *crypto.Approval, j *approvalJournal) error {
+	if a == nil || j == nil || a.State() != crypto.ApprovalFailed || len(j.Candidates) == 0 {
+		return nil
+	}
+	orphans, err := s.readOrphans()
+	if err != nil {
+		return err
+	}
+	orphans = append(slices.Clone(orphans), j.Candidates...)
+	if _, err := s.settleCandidates(orphans); err != nil {
+		return err
+	}
+	orphans = slices.DeleteFunc(orphans, func(c approvalCandidate) bool {
+		_, active := s.state.Devices[c.DeviceID]
+		return c.Status == statusDead || (c.Status == statusCommitted && !active)
+	})
+	next := *j
+	next.Candidates, next.Wires = []approvalCandidate{}, []canonjson.Raw{}
+	t := &txn{}
+	if err := s.putApproval(t, &next); err != nil {
+		return err
+	}
+	if err := putOrphans(t, orphans); err != nil {
+		return err
+	}
+	if err := s.hook("approve:orphans"); err != nil {
+		return err
+	}
+	if err := s.commitTxn(t); err != nil {
+		return err
+	}
+	*j = next
+	return nil
+}
+
+// undelivered returns the devices an approval on this device added that
+// never received their delivery, still active (the candidates in
+// approval-orphans.json, and those of an attempt in the journal that has
+// not delivered), and how many candidates of attempts that ended verified
+// history has not settled yet. The caller holds s.mu, on an unlocked
+// store.
+func (s *Store) undelivered() ([]model.ID, int, error) {
+	cs, err := s.readOrphans()
+	if err != nil {
+		return nil, 0, err
+	}
+	ended := len(cs)
+	if j, err := s.readApproval(); err == nil && j != nil {
+		// The attempt in the journal, until it delivers: one that failed
+		// and was not loaded since, or whose deadline passed unnoticed.
+		if st, err := attemptState(j.Attempt); err == nil && st != crypto.ApprovalDelivered {
+			cs = append(cs, j.Candidates...)
+		}
+	}
+	var devs []model.ID
+	unsettled := 0
+	for i, c := range cs {
+		switch {
+		case c.Status == statusDead:
+		case c.Seq > s.state.Head.Seq:
+			if i < ended {
+				unsettled++
+			}
+		default:
+			h, err := s.entryHash(c.Seq)
+			if err != nil {
+				return nil, 0, err
+			}
+			if _, active := s.state.Devices[c.DeviceID]; active && h.Equal(c.H) && !slices.Contains(devs, c.DeviceID) {
+				devs = append(devs, c.DeviceID)
+			}
+		}
+	}
+	return sortIDs(devs), unsettled, nil
+}
+
+// attemptState reads the state of a persisted crypto.Approval. Only the
+// state is read: crypto.RestoreApproval owns the record's schema.
+func attemptState(raw canonjson.Raw) (crypto.ApprovalState, error) {
+	var rec struct {
+		State crypto.ApprovalState `json:"state"`
+	}
+	err := json.Unmarshal(raw, &rec)
+	return rec.State, err
+}
+
+// withUnlock returns the persisted crypto.Approval raw with its unlock
+// blob replaced by unlock, for a rebuilt candidate (§5.4: a rebuild
+// regenerates its envelopes). Every other member is kept as it is.
+func withUnlock(raw canonjson.Raw, unlock crypto.HPKEEnvelope) (canonjson.Raw, error) {
+	var m map[string]canonjson.Raw
+	if err := canonjson.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	if _, ok := m["unlock"]; !ok {
+		return nil, fmt.Errorf("%w: the approval has no unlock blob", crypto.ErrEnrollState)
+	}
+	b, err := canonjson.Marshal(&unlock)
+	if err != nil {
+		return nil, err
+	}
+	m["unlock"] = canonjson.Raw(b)
+	out, err := canonjson.Marshal(m)
+	return canonjson.Raw(out), err
 }
 
 // loadBudget reads the approval budget, empty when there is none.
@@ -249,8 +467,10 @@ func (s *Store) loadBudget() (*crypto.ApprovalBudget, error) {
 }
 
 // loadApproval loads the budget and the attempt in the journal, if any.
-// Restoring an attempt whose deadline passed fails it (persisted). The
-// caller holds s.mu and the file lock, on an unlocked server-backed store.
+// Restoring an attempt whose deadline passed fails it (persisted), and a
+// failed attempt's candidates move to approval-orphans.json
+// (retireCandidates). The caller holds s.mu and the file lock, on an
+// unlocked server-backed store.
 func (s *Store) loadApproval() (*crypto.ApprovalBudget, *crypto.Approval, *approvalJournal, error) {
 	budget, err := s.loadBudget()
 	if err != nil {
@@ -263,6 +483,11 @@ func (s *Store) loadApproval() (*crypto.ApprovalBudget, *crypto.Approval, *appro
 	a, err := crypto.RestoreApproval(budget, &approvalPersister{s: s, j: j}, j.Attempt)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: %s: %v", ErrCorrupt, s.l.approvalFile(), err)
+	}
+	// An attempt that ended (the deadline included, just now) gives up its
+	// candidates before anything can replace its journal.
+	if err := s.retireCandidates(a, j); err != nil {
+		return nil, nil, nil, err
 	}
 	return budget, a, j, nil
 }
@@ -287,7 +512,11 @@ func (s *Store) withApproval(f func(a *crypto.Approval, j *approvalJournal) erro
 	if a == nil {
 		return ErrNoApproval
 	}
-	return f(a, j)
+	err = f(a, j)
+	if rerr := s.retireCandidates(a, j); rerr != nil && err == nil {
+		err = rerr
+	}
+	return err
 }
 
 func approvalDone(st crypto.ApprovalState) bool {
@@ -298,8 +527,9 @@ func approvalDone(st crypto.ApprovalState) bool {
 // relays as enrollID (hop auth approve CODE): it reserves an attempt in the
 // persistent approval budget (3 per rolling hour, one outstanding
 // challenge, crypto.ErrBudgetExhausted and crypto.ErrChallengeOutstanding)
-// and persists the attempt. A finished attempt is replaced; an unfinished
-// one is ErrApprovalPending.
+// and persists the attempt. A finished attempt is replaced, once a failed
+// one's candidates are kept in approval-orphans.json (loadApproval); an
+// unfinished one is ErrApprovalPending.
 func (s *Store) ApproveStart(enrollID model.ID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -370,8 +600,8 @@ func (s *Store) ApproveConfirm(match bool) error {
 }
 
 // ApproveAbort ends an unfinished attempt as a failure. If its device_add
-// already committed, the device stays in the log until a checkpoint
-// revokes it.
+// already committed, or commits later, the device stays in the log until a
+// checkpoint revokes it: Devices and Info report it.
 func (s *Store) ApproveAbort() error {
 	return s.withApproval(func(a *crypto.Approval, _ *approvalJournal) error { return a.Abort() })
 }
@@ -470,8 +700,10 @@ func (s *Store) ApproveFinish(ctx context.Context, r Remote) (crypto.HPKEEnvelop
 
 // prepareApproval decides the next step after a pull: the delivery once
 // the device_add is verified as committed, or the wire to post, journaled
-// first. The caller holds syncMu.
-func (s *Store) prepareApproval(gen uint64, mayBuild bool) (crypto.HPKEEnvelope, *vaultlog.Wire, error) {
+// first. An attempt that fails here (its deadline, the account keys
+// changing) gives up its candidates (retireCandidates). The caller holds
+// syncMu.
+func (s *Store) prepareApproval(gen uint64, mayBuild bool) (_ crypto.HPKEEnvelope, _ *vaultlog.Wire, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.current(gen); err != nil {
@@ -489,6 +721,11 @@ func (s *Store) prepareApproval(gen uint64, mayBuild bool) (crypto.HPKEEnvelope,
 	if a == nil {
 		return crypto.HPKEEnvelope{}, nil, ErrNoApproval
 	}
+	defer func() {
+		if rerr := s.retireCandidates(a, j); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
 	switch a.State() {
 	case crypto.ApprovalDelivered:
 		env, err := a.Deliver(0, crypto.Hash{})
@@ -498,7 +735,14 @@ func (s *Store) prepareApproval(gen uint64, mayBuild bool) (crypto.HPKEEnvelope,
 		if err != nil {
 			return crypto.HPKEEnvelope{}, nil, err
 		}
-		if _, err := a.Prepare(s.sec.Account, id, s.now()); err != nil {
+		if _, err := a.Prepare(s.sec.Account, id, s.now()); errors.Is(err, crypto.ErrAccountMismatch) {
+			// The verified account keys are no longer the ones the user
+			// confirmed: the attempt can't finish.
+			if aerr := a.Abort(); aerr != nil {
+				return crypto.HPKEEnvelope{}, nil, aerr
+			}
+			return crypto.HPKEEnvelope{}, nil, fmt.Errorf("%w: the account keys changed during the approval; start it again on the new device", err)
+		} else if err != nil {
 			return crypto.HPKEEnvelope{}, nil, err
 		}
 	case crypto.ApprovalPrepared:
@@ -511,22 +755,11 @@ func (s *Store) prepareApproval(gen uint64, mayBuild bool) (crypto.HPKEEnvelope,
 	}
 	head := s.state.Head
 	// Only verified history settles the candidate.
-	if c := j.live(); c != nil && c.Seq <= head.Seq {
-		h, err := s.entryHash(c.Seq)
-		if err != nil {
-			return crypto.HPKEEnvelope{}, nil, err
-		}
-		next := *j
-		next.Candidates = append([]candidate(nil), j.Candidates...)
-		for i := range next.Candidates {
-			if next.Candidates[i].Status == statusLive {
-				if h.Equal(c.H) {
-					next.Candidates[i].Status = statusCommitted
-				} else {
-					next.Candidates[i].Status = statusDead
-				}
-			}
-		}
+	next := *j
+	next.Candidates = slices.Clone(j.Candidates)
+	if changed, err := s.settleCandidates(next.Candidates); err != nil {
+		return crypto.HPKEEnvelope{}, nil, err
+	} else if changed {
 		next.Wires = []canonjson.Raw{}
 		if err := s.writeApproval(&next); err != nil {
 			return crypto.HPKEEnvelope{}, nil, err
@@ -569,7 +802,21 @@ func (s *Store) prepareApproval(gen uint64, mayBuild bool) (crypto.HPKEEnvelope,
 		if err := a.Abort(); err != nil {
 			return crypto.HPKEEnvelope{}, nil, err
 		}
-		return crypto.HPKEEnvelope{}, nil, errors.New("store: the account keys changed during the approval; start it again on the new device")
+		return crypto.HPKEEnvelope{}, nil, fmt.Errorf("%w: the account keys changed during the approval; start it again on the new device", crypto.ErrAccountMismatch)
+	}
+	attempt := j.Attempt
+	if len(j.Candidates) > 0 {
+		// A rebuild regenerates its envelopes (§5.4): the unlock blob is
+		// sealed again, to the same device for the same certificate, and
+		// journaled with the candidate; the delivery carries the new one.
+		u, err := crypto.SealUnlock(pd.KEMPK, &pd.Cert, s.sec.Account)
+		if err != nil {
+			return crypto.HPKEEnvelope{}, nil, err
+		}
+		if attempt, err = withUnlock(j.Attempt, u); err != nil {
+			return crypto.HPKEEnvelope{}, nil, err
+		}
+		pd.Unlock = u
 	}
 	w, _, nsec, err := vaultlog.BuildNormal(s.state, s.sec, s.dev, vaultlog.Changes{Enrolled: []vaultlog.EnrolledDevice{{
 		Cert: pd.Cert, CertSig: pd.CertSig, KEMPK: pd.KEMPK, SigPK: pd.SigPK, Unlock: pd.Unlock,
@@ -588,8 +835,9 @@ func (s *Store) prepareApproval(gen uint64, mayBuild bool) (crypto.HPKEEnvelope,
 		return crypto.HPKEEnvelope{}, nil, err
 	}
 	prev, _ := w.Entry.Prev.Get()
-	next := *j
-	next.Candidates = append(append([]candidate(nil), j.Candidates...), candidate{Seq: w.Entry.Seq, Prev: prev, H: h, Status: statusLive})
+	next = *j
+	next.Attempt = attempt
+	next.Candidates = append(slices.Clone(j.Candidates), approvalCandidate{Seq: w.Entry.Seq, Prev: prev, H: h, Status: statusLive, DeviceID: pd.Cert.DeviceID})
 	next.Wires = []canonjson.Raw{raw}
 	if err := s.writeApproval(&next); err != nil {
 		return crypto.HPKEEnvelope{}, nil, err
