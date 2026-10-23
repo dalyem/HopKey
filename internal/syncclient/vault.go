@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -203,10 +205,21 @@ type TokenRemote struct {
 
 var _ store.SignInRemote = (*TokenRemote)(nil)
 
-// String names the remote without its token.
-func (r *TokenRemote) String() string {
+// String names the remote without its token. A TokenRemote, value or
+// pointer, prints as its String with every verb, %#v included, and logs
+// as it with slog: no formatting reaches the token.
+func (r TokenRemote) String() string {
 	return "syncclient.TokenRemote{vault " + r.VaultID.String() + "}"
 }
+
+// GoString is String, for %#v.
+func (r TokenRemote) GoString() string { return r.String() }
+
+// Format writes String for every verb.
+func (r TokenRemote) Format(f fmt.State, _ rune) { io.WriteString(f, r.String()) }
+
+// LogValue is String, for slog.
+func (r TokenRemote) LogValue() slog.Value { return slog.StringValue(r.String()) }
 
 // EntryAt is store.SignInRemote.EntryAt.
 func (r *TokenRemote) EntryAt(ctx context.Context, seq uint64) (store.Committed, error) {

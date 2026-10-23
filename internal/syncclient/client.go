@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -46,7 +47,7 @@ const (
 	// Every other response, error responses included.
 	maxSmallResponse = 64 << 10
 	maxHeaderBytes   = 64 << 10
-	maxRedirects     = 3
+	maxRedirects     = 3 // followed; a fourth is refused
 )
 
 // MaxWait is the longest long-poll the server accepts (R12, the log
@@ -149,6 +150,21 @@ func New(serverURL string, opts Options) (*Client, error) {
 	return c, nil
 }
 
+// String names the client by its server. A *Client prints as its String
+// with every verb, %#v included, and logs as it with slog, so no
+// formatting reaches its cached session tokens. (A bad verb makes fmt
+// print a pointer's target, which would otherwise reach a session.)
+func (c *Client) String() string { return "syncclient.Client{" + c.origin + "}" }
+
+// GoString is String, for %#v.
+func (c *Client) GoString() string { return c.String() }
+
+// Format writes String for every verb.
+func (c *Client) Format(f fmt.State, _ rune) { io.WriteString(f, c.String()) }
+
+// LogValue is String, for slog.
+func (c *Client) LogValue() slog.Value { return slog.StringValue(c.String()) }
+
 // Origin is the server's canonical origin: the base of every request, and
 // the origin the client signs in device-auth and signup proofs.
 func (c *Client) Origin() string { return c.origin }
@@ -182,7 +198,7 @@ func loopbackOnly(network, address string, _ syscall.RawConn) error {
 // also keeps the scheme, and never with the Authorization header (R10).
 func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	req.Header.Del("Authorization")
-	if len(via) >= maxRedirects {
+	if len(via) > maxRedirects {
 		return fmt.Errorf("%w: more than %d redirects", ErrRedirect, maxRedirects)
 	}
 	if o, err := crypto.CanonicalOrigin(req.URL.Scheme + "://" + req.URL.Host); err != nil || o != c.origin {

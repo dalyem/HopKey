@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -35,13 +37,21 @@ type Mailbox struct {
 	Token string
 }
 
-// String describes the mailbox without its token.
+// String describes the mailbox without its token. A Mailbox, value or
+// pointer, prints as its String with every verb, %#v included, and logs
+// as it with slog: no formatting reaches the token.
 func (m Mailbox) String() string {
 	return "syncclient.Mailbox{" + m.EnrollID.String() + "}"
 }
 
-// GoString describes the mailbox without its token, for %#v.
+// GoString is String, for %#v.
 func (m Mailbox) GoString() string { return m.String() }
+
+// Format writes String for every verb.
+func (m Mailbox) Format(f fmt.State, _ rune) { io.WriteString(f, m.String()) }
+
+// LogValue is String, for slog.
+func (m Mailbox) LogValue() slog.Value { return slog.StringValue(m.String()) }
 
 type enrollRequest struct {
 	Commit crypto.EnrollCommit `json:"commit"`
@@ -138,6 +148,26 @@ type Relay struct {
 	token    string  // D
 	dev      *Device // A
 }
+
+// String describes the relay without its credential. A Relay, value or
+// pointer, prints as its String with every verb, %#v included, and logs
+// as it with slog.
+func (r Relay) String() string {
+	party := "device"
+	if r.dev != nil {
+		party = "approver"
+	}
+	return "syncclient.Relay{" + r.enrollID.String() + " " + party + "}"
+}
+
+// GoString is String, for %#v.
+func (r Relay) GoString() string { return r.String() }
+
+// Format writes String for every verb.
+func (r Relay) Format(f fmt.State, _ rune) { io.WriteString(f, r.String()) }
+
+// LogValue is String, for slog.
+func (r Relay) LogValue() slog.Value { return slog.StringValue(r.String()) }
 
 // DeviceRelay is D's access to its mailbox.
 func (c *Client) DeviceRelay(m *Mailbox) *Relay {

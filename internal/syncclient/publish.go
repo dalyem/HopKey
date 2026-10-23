@@ -65,6 +65,14 @@ type signupRequest struct {
 // over this server's origin, then POST /v1/signup with the whole upload.
 // The publication must be journaled for this server. A conflict with an
 // existing registration is an *APIError matching ErrRegistrationConflict.
+//
+// A capability whose publication committed gets no challenge, even when
+// the commit's response was lost (R3). The server's refusal is the same
+// 401 as for an unknown or expired one, so on that 401 Signup posts the
+// identical upload again with no challenge and no pop_sig: a consumed
+// capability answers it with the original acknowledgment, even after
+// expiry and later appends, and refuses any other publication with
+// ErrRegistrationConflict. Any other capability still fails with 401.
 func (p *Publisher) Signup(ctx context.Context, req *store.SignupRequest) (vaultlog.Head, error) {
 	if o, err := crypto.CanonicalOrigin(req.Server); err != nil || o != p.c.origin {
 		return vaultlog.Head{}, fmt.Errorf("syncclient: the publication is for %q, not %s", req.Server, p.c.origin)
@@ -85,6 +93,9 @@ func (p *Publisher) Signup(ctx context.Context, req *store.SignupRequest) (vault
 		method: http.MethodPost, path: "/v1/signup/challenge",
 		body: signupChallengeRequest{Email: req.Email, RegistrationCode: req.RegistrationCode},
 	}, &ch)
+	if errors.Is(err, ErrUnauthorized) {
+		return p.post(ctx, signupRequest{Email: req.Email, RegistrationCode: req.RegistrationCode, Wires: wires})
+	}
 	if err != nil {
 		return vaultlog.Head{}, err
 	}
@@ -95,14 +106,16 @@ func (p *Publisher) Signup(ctx context.Context, req *store.SignupRequest) (vault
 	if err != nil {
 		return vaultlog.Head{}, err
 	}
+	return p.post(ctx, signupRequest{
+		Challenge: ch.Challenge, Email: req.Email, PopSig: pop,
+		RegistrationCode: req.RegistrationCode, Wires: wires,
+	})
+}
+
+// post is POST /v1/signup.
+func (p *Publisher) post(ctx context.Context, body signupRequest) (vaultlog.Head, error) {
 	var head vaultlog.Head
-	err = p.c.do(ctx, &call{
-		method: http.MethodPost, path: "/v1/signup", maxBody: maxSignupBody,
-		body: signupRequest{
-			Challenge: ch.Challenge, Email: req.Email, PopSig: pop,
-			RegistrationCode: req.RegistrationCode, Wires: wires,
-		},
-	}, &head)
+	err := p.c.do(ctx, &call{method: http.MethodPost, path: "/v1/signup", maxBody: maxSignupBody, body: body}, &head)
 	return head, err
 }
 

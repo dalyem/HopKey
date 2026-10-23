@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -178,7 +179,28 @@ func TestRedirects(t *testing.T) {
 	mux.HandleFunc("/v1/loop", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/v1/loop", http.StatusFound)
 	})
+	// /v1/chain/n redirects n times before it answers.
+	mux.HandleFunc("/v1/chain/{n}", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("n"))
+		if n == 0 {
+			healthy(w, r)
+			return
+		}
+		http.Redirect(w, r, "/v1/chain/"+strconv.Itoa(n-1), http.StatusFound)
+	})
 	c, _ := tlsServer(t, mux, Options{})
+
+	// At most maxRedirects are followed.
+	for n := 0; n <= maxRedirects+1; n++ {
+		var h healthResponse
+		err := c.do(bg, &call{method: "GET", path: "/v1/chain/" + strconv.Itoa(n)}, &h)
+		if n <= maxRedirects && (err != nil || !h.OK) {
+			t.Errorf("%d redirects: %v", n, err)
+		}
+		if n > maxRedirects && !errors.Is(err, ErrRedirect) {
+			t.Errorf("%d redirects: %v; want ErrRedirect", n, err)
+		}
+	}
 
 	var h healthResponse
 	if err := c.do(bg, &call{method: "POST", path: "/v1/same", token: "secret-token", body: struct{}{}}, &h); err != nil {
@@ -582,6 +604,69 @@ func TestErrorMapping(t *testing.T) {
 	cancel()
 	if _, err := cl.Health(ctx); !errors.Is(err, context.Canceled) || Retryable(err) {
 		t.Errorf("cancelled: %v", err)
+	}
+}
+
+// No standard formatting of a value that holds a bearer credential prints
+// it: every verb, on the value and on the pointer, and slog's text and
+// JSON handlers.
+func TestCredentialsNeverPrinted(t *testing.T) {
+	const secret = "secret-token-xyz"
+	c, err := New("https://hop.example", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := Device{AccountID: model.ID{1}, DeviceID: model.ID{2}}
+	c.session(dev).token = secret // a cached session
+	tr := &TokenRemote{c: c, token: secret, AccountID: model.ID{1}, VaultID: model.ID{5}}
+	mb := &Mailbox{EnrollID: model.ID{6}, RoutingCode: "ABCDEFGHJK", Token: secret}
+	d, a := c.DeviceRelay(mb), c.ApproverRelay(model.ID{6}, dev)
+	cases := []struct {
+		name string
+		v    any
+		want string // what the description names
+	}{
+		{"*TokenRemote", tr, model.ID{5}.String()},
+		{"TokenRemote", *tr, model.ID{5}.String()},
+		{"*Mailbox", mb, model.ID{6}.String()},
+		{"Mailbox", *mb, model.ID{6}.String()},
+		{"D's *Relay", d, model.ID{6}.String()},
+		{"D's Relay", *d, model.ID{6}.String()},
+		{"A's *Relay", a, model.ID{6}.String()},
+		{"A's Relay", *a, model.ID{6}.String()},
+		{"*Client", c, "hop.example"},
+	}
+	// Values that hold the client hold its sessions too.
+	rm, pb, rt := c.Remote(model.ID{5}, dev), c.Publisher(model.ID{5}), c.Retirer(model.ID{5})
+	cases = append(cases, []struct {
+		name string
+		v    any
+		want string
+	}{
+		{"*Remote", rm, ""}, {"Remote", *rm, ""},
+		{"*Publisher", pb, ""},
+		{"*Retirer", rt, ""}, {"Retirer", *rt, ""},
+	}...)
+	leaks := func(s string) bool {
+		return strings.Contains(s, secret) || strings.Contains(strings.ToLower(s), fmt.Sprintf("%x", secret))
+	}
+	for _, k := range cases {
+		for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d"} {
+			s := fmt.Sprintf(verb, k.v)
+			if leaks(s) {
+				t.Errorf("%s with %s prints the token: %s", k.name, verb, s)
+			}
+			if verb != "%x" && verb != "%X" && !strings.Contains(s, k.want) {
+				t.Errorf("%s with %s is %s; want it to name %s", k.name, verb, s, k.want)
+			}
+		}
+		var buf strings.Builder
+		slog.New(slog.NewTextHandler(&buf, nil)).Info("m", "v", k.v)
+		slog.New(slog.NewJSONHandler(&buf, nil)).Info("m", "v", k.v)
+		slog.New(slog.NewJSONHandler(&buf, nil)).Info("m", slog.Group("g", "v", k.v))
+		if leaks(buf.String()) || !strings.Contains(buf.String(), k.want) {
+			t.Errorf("%s in slog: %s", k.name, buf.String())
+		}
 	}
 }
 

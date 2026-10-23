@@ -64,15 +64,18 @@ func (r *memRing) Delete(service, user string) error {
 }
 
 // world is a real hop-server on SQLite behind an httptest TLS server,
-// whose certificate the clients trust.
+// whose certificate the clients trust. The server's clock runs skew
+// ahead of the real one.
 type world struct {
 	st     *server.SQLite
 	origin string
 	pool   *x509.CertPool
+	skew   atomic.Int64 // a time.Duration
 }
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
+	w := &world{}
 	ts := httptest.NewUnstartedServer(nil)
 	origin := "https://" + ts.Listener.Addr().String()
 	st, err := server.OpenSQLite(filepath.Join(t.TempDir(), "hop.db"))
@@ -85,6 +88,7 @@ func newWorld(t *testing.T) *world {
 	srv, err := server.New(context.Background(), server.Config{
 		Origin: origin, Store: st, Rates: &rates,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:    func() time.Time { return time.Now().Add(time.Duration(w.skew.Load())) },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +102,8 @@ func newWorld(t *testing.T) *world {
 	})
 	pool := x509.NewCertPool()
 	pool.AddCert(ts.Certificate())
-	return &world{st: st, origin: origin, pool: pool}
+	w.st, w.origin, w.pool = st, origin, pool
+	return w
 }
 
 func (w *world) client(t *testing.T) *syncclient.Client {
@@ -204,6 +209,44 @@ func readLog(t *testing.T, r *syncclient.TokenRemote) []*vaultlog.Wire {
 // pw_blob (fetched from the object endpoint) opens with the encKey.
 func openAccount(t *testing.T, r *syncclient.TokenRemote, keys *crypto.LoginKeys) *crypto.AccountKeys {
 	t.Helper()
+	creds, akv := latestCreds(t, r)
+	ak, err := crypto.OpenPwBlob(&keys.EncKey, object(t, r, creds.PwBlobSHA256), r.AccountID, akv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ak
+}
+
+// openRecovery is the recovery method of §4.5 over the API: rk_blob of
+// the latest creds opens with the Recovery Key's rkKey.
+func openRecovery(t *testing.T, r *syncclient.TokenRemote, rkKey *crypto.SymKey) *crypto.AccountKeys {
+	t.Helper()
+	creds, akv := latestCreds(t, r)
+	ak, err := crypto.OpenRkBlob(rkKey, object(t, r, creds.RkBlobSHA256), r.AccountID, akv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ak
+}
+
+// object fetches an AEAD envelope from the object endpoint.
+func object(t *testing.T, r *syncclient.TokenRemote, h crypto.Hash) crypto.AEADEnvelope {
+	t.Helper()
+	blob, err := r.Object(context.Background(), h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := crypto.ParseAEADEnvelope(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// latestCreds is the creds op in effect at the head, and the account's
+// akv, from the public state of the log read with the token.
+func latestCreds(t *testing.T, r *syncclient.TokenRemote) (vaultlog.CredsOp, uint32) {
+	t.Helper()
 	objs := vaultlog.ObjectMap{}
 	var pub *vaultlog.PublicState
 	for _, w := range readLog(t, r) {
@@ -217,19 +260,7 @@ func openAccount(t *testing.T, r *syncclient.TokenRemote, keys *crypto.LoginKeys
 	}
 	creds, _ := pub.Creds()
 	acct, _ := pub.Account()
-	blob, err := r.Object(context.Background(), creds.PwBlobSHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	env, err := crypto.ParseAEADEnvelope(blob)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ak, err := crypto.OpenPwBlob(&keys.EncKey, env, r.AccountID, acct.AKV)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return ak
+	return creds, acct.AKV
 }
 
 // racing is a Remote whose first Post lets another device commit first,
@@ -295,6 +326,25 @@ func publish(t *testing.T, w *world, c *syncclient.Client, s *store.Store) store
 func signIn(t *testing.T, w *world, c *syncclient.Client, kit store.Kit, pub store.Publication) (*store.Store, *syncclient.TokenRemote) {
 	t.Helper()
 	ctx := context.Background()
+	tr, acct := login(t, c, kit, pub)
+	s, res, err := store.SignIn(ctx, storeConfig(t, "laptop"), tr, store.SignInParams{
+		ServerURL: w.origin, Email: e2eEmail, Account: acct, SecretKey: kit.SecretKey, DeviceName: "laptop",
+	})
+	if err != nil {
+		t.Fatalf("sign-in: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if res.CheckpointDue || !s.ServerBacked() {
+		t.Errorf("after the sign-in: %+v, server-backed %v", res, s.ServerBacked())
+	}
+	return s, tr
+}
+
+// login is the API part of the password method: prelogin, the §4.1 keys,
+// login, and the account keys from pw_blob.
+func login(t *testing.T, c *syncclient.Client, kit store.Kit, pub store.Publication) (*syncclient.TokenRemote, *crypto.AccountKeys) {
+	t.Helper()
+	ctx := context.Background()
 	pre, err := c.Prelogin(ctx, " "+e2eEmail)
 	if err != nil {
 		t.Fatal(err)
@@ -319,17 +369,7 @@ func signIn(t *testing.T, w *world, c *syncclient.Client, kit store.Kit, pub sto
 	}
 	acct := openAccount(t, tr, keys)
 	keys.Zero()
-	s, res, err := store.SignIn(ctx, storeConfig(t, "laptop"), tr, store.SignInParams{
-		ServerURL: w.origin, Email: e2eEmail, Account: acct, SecretKey: kit.SecretKey, DeviceName: "laptop",
-	})
-	if err != nil {
-		t.Fatalf("sign-in: %v", err)
-	}
-	t.Cleanup(func() { s.Close() })
-	if res.CheckpointDue || !s.ServerBacked() {
-		t.Errorf("after the sign-in: %+v, server-backed %v", res, s.ServerBacked())
-	}
-	return s, tr
+	return tr, acct
 }
 
 // Two devices through the real server: publication, password sign-in,
@@ -676,4 +716,329 @@ func relay(t *testing.T, w *world, cA *syncclient.Client, devA syncclient.Device
 	if _, err := cD.Claim(ctx, syncclient.Device{AccountID: accountID, DeviceID: model.ID{9}, Signer: devA.Signer}, mb.RoutingCode); err == nil {
 		t.Error("a claim by an unknown device succeeded")
 	}
+}
+
+// lostAck is a Publisher whose first Signup commits and loses its
+// response. It keeps the upload and the acknowledgment it lost.
+type lostAck struct {
+	*syncclient.Publisher
+	once sync.Once
+	req  *store.SignupRequest // without its proof
+	ack  vaultlog.Head
+}
+
+func (p *lostAck) Signup(ctx context.Context, req *store.SignupRequest) (vaultlog.Head, error) {
+	first := false
+	p.once.Do(func() { first = true })
+	h, err := p.Publisher.Signup(ctx, req)
+	if !first || err != nil {
+		return h, err
+	}
+	p.req = &store.SignupRequest{
+		Server: req.Server, Email: req.Email, RegistrationCode: req.RegistrationCode, AccountID: req.AccountID,
+		VaultID: req.VaultID, UploadSeq: req.UploadSeq, UploadH: req.UploadH, Wires: req.Wires,
+	}
+	p.ack = h
+	return vaultlog.Head{}, errLost
+}
+
+// R3: the identical publication, posted again after its commit, gets the
+// original acknowledgment back, after later appends and after the
+// capability expired, with no challenge (the server issues none for a
+// consumed capability) and no proof. Any other publication is refused.
+func TestSignupRetryGetsTheAcknowledgment(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+	s1, _ := localVault(t)
+	c1 := w.client(t)
+	code, err := server.CreateInvite(ctx, w.st, e2eEmail, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lost := &lostAck{Publisher: c1.Publisher(model.ID{})}
+	pub, err := s1.Publish(ctx, lost, store.PublishOptions{Server: w.origin, Email: e2eEmail, RegistrationCode: code})
+	if err != nil {
+		t.Fatalf("publish with a lost acknowledgment: %v", err)
+	}
+	if lost.req == nil || lost.ack.Seq != pub.Upload.Seq || lost.ack.H.String() != pub.Upload.H {
+		t.Fatalf("the lost acknowledgment %+v; want the upload %+v", lost.ack, pub.Upload)
+	}
+	if len(lost.req.Wires) < 2 {
+		t.Fatalf("the upload has %d entries; the test needs 2", len(lost.req.Wires))
+	}
+	if _, err := lost.req.Prove(w.origin, make([]byte, crypto.ChallengeSize)); err == nil {
+		t.Fatal("the kept request can still prove")
+	}
+
+	// The retry goes through a new client, as after a restart.
+	retry := func(when string) {
+		t.Helper()
+		h, err := w.client(t).Publisher(model.ID{}).Signup(ctx, lost.req)
+		if err != nil || h != lost.ack {
+			t.Errorf("the identical publication %s: %+v %v; want %+v", when, h, err, lost.ack)
+		}
+	}
+	retry("after its commit")
+
+	// Another publication under the consumed capability: a prefix of it.
+	other := *lost.req
+	other.Wires = other.Wires[:len(other.Wires)-1]
+	other.UploadSeq--
+	if _, err := w.client(t).Publisher(model.ID{}).Signup(ctx, &other); !errors.Is(err, syncclient.ErrRegistrationConflict) {
+		t.Errorf("another publication: %v; want ErrRegistrationConflict", err)
+	}
+	// And another code is still refused.
+	bad := *lost.req
+	bad.RegistrationCode = "not-a-registration-code"
+	if _, err := w.client(t).Publisher(model.ID{}).Signup(ctx, &bad); !errors.Is(err, syncclient.ErrUnauthorized) {
+		t.Errorf("a wrong registration code: %v; want ErrUnauthorized", err)
+	}
+
+	dev1, err := syncclient.StoreDevice(s1.DeviceAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snippet(t, s1, "later")
+	pushAll(t, s1, c1.Remote(pub.VaultID, dev1))
+	retry("after a later append")
+
+	w.skew.Store(int64(2 * time.Hour))
+	retry("after the capability expired")
+}
+
+// R6, §4.5: a recovery token from the Recovery Key opens rk_blob and
+// bootstraps a new device, whose recovery leaves the checkpoint due.
+func TestRecoverySignIn(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+	s1, kit := localVault(t)
+	pub := publish(t, w, w.client(t), s1)
+
+	c := w.client(t)
+	rk, err := crypto.ParseRecoveryKey(kit.RecoveryKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rkKey, rAuth, err := crypto.RecoveryKeys(rk[:], pub.AccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Recover(ctx, pub.AccountID, random(t, len(rAuth))); !errors.Is(err, syncclient.ErrUnauthorized) {
+		t.Errorf("recovery with a wrong r_auth: %v", err)
+	}
+	tr, err := c.Recover(ctx, pub.AccountID, rAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.VaultID != pub.VaultID || tr.AccountID != pub.AccountID {
+		t.Fatalf("recovery token for %v/%v; want %v/%v", tr.AccountID, tr.VaultID, pub.AccountID, pub.VaultID)
+	}
+	acct := openRecovery(t, tr, &rkKey)
+	s, res, err := store.SignIn(ctx, storeConfig(t, "spare"), tr, store.SignInParams{
+		ServerURL: w.origin, Email: e2eEmail, Account: acct, SecretKey: kit.SecretKey,
+		DeviceName: "spare", Method: store.SignInRecovery,
+	})
+	if err != nil {
+		t.Fatalf("recovery sign-in: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if !res.CheckpointDue || !s.ServerBacked() {
+		t.Errorf("after the recovery: %+v, server-backed %v; want the checkpoint due", res, s.ServerBacked())
+	}
+	if si, err := s.ServerInfo(); err != nil || !si.CheckpointDue || si.Server != w.origin {
+		t.Errorf("server info %+v %v; want the checkpoint due", si, err)
+	}
+	wantSnippets(t, s, "the recovered device", "deploy")
+}
+
+// deviceAuthObject is the device-auth object of §4.6 that a device signs
+// for a session.
+type deviceAuthObject struct {
+	V         int      `json:"v"`
+	Origin    string   `json:"origin"`
+	AccountID model.ID `json:"account_id"`
+	DeviceID  model.ID `json:"device_id"`
+	Operation string   `json:"operation"`
+	Challenge []byte   `json:"challenge"`
+}
+
+// localSigner signs device auth with a device key the test holds.
+type localSigner struct {
+	account model.ID
+	dev     *vaultlog.LocalDevice
+}
+
+func (s localSigner) Sign(origin, operation string, challenge []byte) ([]byte, error) {
+	return crypto.Sign(s.dev.Sig, crypto.LabelDeviceAuth, &deviceAuthObject{
+		V: 1, Origin: origin, AccountID: s.account, DeviceID: s.dev.ID, Operation: operation, Challenge: challenge,
+	})
+}
+
+// replay verifies the log read with a login token from its genesis with
+// the account keys, as a reader that is no device.
+func replay(t *testing.T, r *syncclient.TokenRemote, acct *crypto.AccountKeys) (*vaultlog.State, *vaultlog.Secrets) {
+	t.Helper()
+	objs := vaultlog.ObjectMap{}
+	var st *vaultlog.State
+	var sec *vaultlog.Secrets
+	for i, w := range readLog(t, r) {
+		for _, o := range w.Objects {
+			objs[o.SHA256] = o.Body
+		}
+		var err error
+		if i == 0 {
+			st, sec, _, err = vaultlog.Anchor(acct.Pin(), acct, w, objs, nil)
+		} else {
+			st, sec, err = vaultlog.Transition(st, sec, nil, w, objs)
+		}
+		if err != nil {
+			t.Fatalf("entry %d: %v", i, err)
+		}
+	}
+	return st, sec
+}
+
+// newCreds derives a creds op's content for new account keys (§4.2).
+func newCreds(t *testing.T, acct *crypto.AccountKeys) vaultlog.CredsInput {
+	t.Helper()
+	sk, err := crypto.NewSecretKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk, err := crypto.NewRecoveryKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt := random(t, crypto.SaltSize)
+	lk, err := crypto.DeriveLoginKeys([]byte(e2ePassword), salt, &sk, acct.AccountID, crypto.KDFv1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lk.Zero()
+	pw, err := crypto.SealPwBlob(&lk.EncKey, acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rkKey, rAuth, err := crypto.RecoveryKeys(rk[:], acct.AccountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rkBlob, err := crypto.SealRkBlob(&rkKey, acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vaultlog.CredsInput{
+		KDFVersion: crypto.KDFv1.Version, Salt: salt, AuthSHA256: lk.AuthHash(),
+		RAuthSHA256: crypto.SHA256(rAuth), PwBlob: pw, RkBlob: rkBlob,
+	}
+}
+
+// A checkpoint ends every session (§10.1). A surviving device's cached
+// session is refused once, authenticated again without its caller seeing
+// it, and its Pull crosses the checkpoint.
+//
+// The store can't author a checkpoint for a server-backed vault on this
+// branch, so a device the test holds does: it joins with a bootstrap
+// under a login token, and posts a checkpoint built with vaultlog under
+// its own session.
+func TestCheckpointReauthenticates(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+	s1, kit := localVault(t)
+	c1 := w.client(t)
+	pub := publish(t, w, c1, s1)
+	c2 := w.client(t)
+	s2, _ := signIn(t, w, c2, kit, pub)
+
+	auth2, err := syncclient.StoreDevice(s2.DeviceAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signs atomic.Int32
+	dev2 := auth2
+	dev2.Signer = func() (syncclient.Signer, error) {
+		signs.Add(1)
+		return auth2.Signer()
+	}
+	r2 := c2.Remote(pub.VaultID, dev2)
+	if err := s2.Pull(ctx, r2); err != nil {
+		t.Fatal(err)
+	}
+	if n := signs.Load(); n != 1 {
+		t.Fatalf("%d authentications before the checkpoint; want 1", n)
+	}
+
+	// The checkpoint's author.
+	cG := w.client(t)
+	tr, acct := login(t, cG, kit, pub)
+	st, sec := replay(t, tr, acct)
+	kem, err := crypto.GenerateKEMKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigPK, sigSK, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghost := &vaultlog.LocalDevice{ID: model.ID(random(t, len(model.ID{}))), KEM: kem, Sig: sigSK}
+	now := model.TimestampOf(time.Now())
+	bw, st, sec, err := vaultlog.BuildBootstrap(st, sec, vaultlog.DeviceInfo{
+		ID: ghost.ID, Name: "ghost", KEMPK: kem.PublicKey().Bytes(), SigPK: sigPK,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Post(ctx, bw); err != nil {
+		t.Fatalf("the author's bootstrap: %v", err)
+	}
+	next, err := crypto.GenerateAccountKeys(pub.AccountID, st.Account.AKV+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vk, err := crypto.NewSymKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cw, _, _, err := vaultlog.BuildCheckpoint(st, sec, ghost, vaultlog.CheckpointParams{
+		NewAccount: next, NewVK: vk, Creds: newCreds(t, next), Time: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gdev := syncclient.Device{AccountID: pub.AccountID, DeviceID: ghost.ID, Signer: func() (syncclient.Signer, error) {
+		return localSigner{pub.AccountID, ghost}, nil
+	}}
+	head, err := cG.Remote(pub.VaultID, gdev).Post(ctx, cw)
+	if err != nil {
+		t.Fatalf("the checkpoint: %v", err)
+	}
+	if head.Seq != cw.Entry.Seq {
+		t.Fatalf("the checkpoint committed at %d; want %d", head.Seq, cw.Entry.Seq)
+	}
+
+	// Device 2's session ended; its pull authenticates once more and
+	// crosses the checkpoint.
+	if err := s2.Pull(ctx, r2); err != nil {
+		t.Fatalf("pull across the checkpoint: %v", err)
+	}
+	if n := signs.Load(); n != 2 {
+		t.Errorf("%d authentications after the checkpoint; want 2", n)
+	}
+	if h, err := s2.Head(); err != nil || h.Seq != head.Seq || h.H != head.H.String() {
+		t.Errorf("device 2 at %+v %v; want %+v", h, err, head)
+	}
+	wantSnippets(t, s2, "device 2", "deploy")
+
+	// Both survivors write under the new keys.
+	snippet(t, s2, "after")
+	pushAll(t, s2, r2)
+	dev1, err := syncclient.StoreDevice(s1.DeviceAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1 := c1.Remote(pub.VaultID, dev1)
+	if err := s1.Pull(ctx, r1); err != nil {
+		t.Fatalf("device 1 across the checkpoint: %v", err)
+	}
+	wantSnippets(t, s1, "device 1", "deploy", "after")
 }
