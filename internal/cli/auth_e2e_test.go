@@ -35,13 +35,15 @@ import (
 const authEmail = "me@example.com"
 
 // authWorld is the server. down makes it look stopped: every request's
-// connection is closed unanswered.
+// connection is closed unanswered. hook, when set, sees each request
+// first, and takes it by returning true.
 type authWorld struct {
 	st     *server.SQLite
 	origin string
 	pool   *x509.CertPool
 	ts     *httptest.Server
 	down   atomic.Bool
+	hook   atomic.Pointer[func(http.ResponseWriter, *http.Request) bool]
 }
 
 func newAuthWorld(t *testing.T) *authWorld {
@@ -68,6 +70,9 @@ func newAuthWorld(t *testing.T) *authWorld {
 			if c, _, err := rw.(http.Hijacker).Hijack(); err == nil {
 				c.Close()
 			}
+			return
+		}
+		if hook := w.hook.Load(); hook != nil && (*hook)(rw, r) {
 			return
 		}
 		h.ServeHTTP(rw, r)
@@ -200,6 +205,8 @@ type session struct {
 	answer func(prompt string) string
 	// wrongTypeBack types back something else than the kit.
 	wrongTypeBack bool
+	// ctx, when set, is the context the command runs under.
+	ctx context.Context
 
 	stdout, stderr syncBuffer
 }
@@ -289,7 +296,11 @@ func (m *machine) hop(t *testing.T, s *session, args ...string) int {
 			return nil, errors.New("no answer")
 		},
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	parent := s.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
 	defer cancel()
 	code := cli.Run(ctx, args, env)
 	t.Logf("%s: hop %s: exit %d\nstdout: %s\nstderr: %s", m.name, strings.Join(args, " "), code, redactKit(s.stdout.String()), redactKit(s.stderr.String()))
@@ -815,4 +826,49 @@ func TestMergeDiscardShowsOnlyTheToken(t *testing.T) {
 	if decodeJSON(t, m6.must(t, nil, "auth", "merge", "--json"), &left); left["merge"] != nil {
 		t.Errorf("a merge is left after the discard: %v", left)
 	}
+}
+
+// SIGINT while a hop auth flow waits on the server: the request is cut
+// short, the flow fails and returns, its release starts the daemon again,
+// and hop exits 130 rather than with the flow's failure.
+func TestInterruptedRequestExits130(t *testing.T) {
+	w := newAuthWorld(t)
+	m := newMachine(t, w, "solo")
+	initS := &session{secrets: map[string]string{"Master password: ": resolvePassword, "Repeat it: ": resolvePassword}}
+	if code := m.hop(t, initS, "init"); code != 0 {
+		t.Fatalf("init: exit %d: %s", code, initS.stderr.String())
+	}
+	m.must(t, nil, "auth", "signup", "--server", w.origin, "--email", authEmail, "--code", w.invite(t), "--json")
+
+	ctx, interrupt := context.WithCancelCause(context.Background())
+	var claims atomic.Int32
+	hook := func(rw http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/v1/enroll/claim" {
+			return false
+		}
+		claims.Add(1)
+		// Read to the end, so the server notices when the client hangs up.
+		io.Copy(io.Discard, r.Body)
+		interrupt(cli.ErrInterrupted) // the signal, while the request waits
+		select {
+		case <-r.Context().Done(): // the client gave up on it
+		case <-time.After(10 * time.Second):
+		}
+		return true
+	}
+	w.hook.Store(&hook)
+	s := &session{ctx: ctx}
+	code := m.hop(t, s, "auth", "approve", "ABCD-EFGH", "--sas", "12345678")
+	w.hook.Store(nil)
+	if code != cli.ExitInterrupted {
+		t.Errorf("exit %d, want %d: %s", code, cli.ExitInterrupted, s.stderr.String())
+	}
+	if claims.Load() == 0 {
+		t.Fatalf("%d claims reached the server; the test did not interrupt a request", claims.Load())
+	}
+	c, err := daemon.Dial(context.Background(), m.paths.ControlSocket())
+	if err != nil {
+		t.Fatalf("the daemon did not start again: %v", err)
+	}
+	c.Close()
 }

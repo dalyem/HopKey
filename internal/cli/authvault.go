@@ -27,27 +27,49 @@ import (
 // shutdownDaemon asks a running daemon to exit and waits until its
 // sockets are gone. It reports whether one was running. It prints
 // nothing, so a --json command's stdout keeps its shape.
+//
+// Only a refusal from the daemon means it is still running. Any other
+// failure leaves the outcome unknown: a signal that cancels ctx can cut
+// the read short after the daemon accepted the request. So the wait for
+// its sockets runs on its own bounded context, whatever became of ctx,
+// and the caller learns from daemonGone whether the daemon stopped.
 func shutdownDaemon(ctx context.Context, e *Env) (bool, error) {
 	c, err := dialExisting(ctx, e)
 	if err != nil || c == nil {
 		return false, err
 	}
 	defer c.Close()
-	if err := c.Call(ctx, daemon.OpShutdown, nil, nil); err != nil {
-		return true, cleanErr(err)
+	callErr := c.Call(ctx, daemon.OpShutdown, nil, nil)
+	var refused *daemon.Error
+	if errors.As(callErr, &refused) {
+		return true, cleanErr(callErr)
 	}
 	// The daemon answers before it finishes closing. Wait for its sockets to
 	// go, so a command that follows does not find a daemon on its way out.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		_, ctlErr := os.Lstat(e.Paths.ControlSocket())
-		_, agentErr := os.Lstat(e.Paths.AgentSocket())
-		if os.IsNotExist(ctlErr) && os.IsNotExist(agentErr) {
-			return true, nil
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownWait)
+	defer cancel()
+	for !e.daemonGone() {
+		select {
+		case <-wctx.Done():
+			if callErr != nil {
+				return true, cleanErr(callErr)
+			}
+			return true, failf("asked the hop daemon to stop, but its sockets are still there after %s", shutdownWait)
+		case <-time.After(25 * time.Millisecond):
 		}
-		time.Sleep(25 * time.Millisecond)
 	}
-	return true, failf("asked the hop daemon to stop, but its sockets are still there after 5s")
+	return true, cleanErr(callErr)
+}
+
+// shutdownWait bounds how long shutdownDaemon waits for the daemon's
+// sockets to go.
+const shutdownWait = 5 * time.Second
+
+// daemonGone reports whether both of the daemon's sockets are gone.
+func (e *Env) daemonGone() bool {
+	_, ctlErr := os.Lstat(e.Paths.ControlSocket())
+	_, agentErr := os.Lstat(e.Paths.AgentSocket())
+	return os.IsNotExist(ctlErr) && os.IsNotExist(agentErr)
 }
 
 // vaultHold is one hop auth command's hold of the vault.
@@ -69,6 +91,7 @@ func shutdownDaemon(ctx context.Context, e *Env) (bool, error) {
 type vaultHold struct {
 	e      *Env
 	cfg    store.Config
+	asJSON bool // the command's output mode, for the warnings of release and abandon
 	marker string
 	once   sync.Once // the daemon's restart, by release or abandon
 }
@@ -188,17 +211,24 @@ func (h *vaultHold) unmark() {
 	h.marker = ""
 }
 
-// holdVault stops the daemon so this process can own the vault.
-func holdVault(ctx context.Context, e *Env) (*vaultHold, error) {
-	h := &vaultHold{e: e, cfg: e.storeConfig()}
+// holdVault stops the daemon so this process can own the vault. asJSON
+// is the command's output mode.
+func holdVault(ctx context.Context, e *Env, asJSON bool) (*vaultHold, error) {
+	h := &vaultHold{e: e, cfg: e.storeConfig(), asJSON: asJSON}
 	if err := h.mark(); err != nil {
 		return nil, err
 	}
 	e.setHold(h)
 	if _, err := shutdownDaemon(ctx, e); err != nil {
-		// The daemon was not stopped, so nothing is handed back.
-		h.once.Do(h.unmark)
-		e.setHold(nil)
+		if e.daemonGone() {
+			// The daemon stopped although the request failed (a signal
+			// cut its answer short): start it again.
+			h.release(ctx)
+		} else {
+			// The daemon was not stopped, so nothing is handed back.
+			h.once.Do(h.unmark)
+			e.setHold(nil)
+		}
 		return nil, err
 	}
 	return h, nil
@@ -255,7 +285,7 @@ func (h *vaultHold) open(ctx context.Context) (*store.Store, error) {
 // daemon that does not come up is a warning: the command itself is done,
 // and the next hop command starts it. The command has closed its stores
 // by now (each is closed by a defer that runs first).
-func (h *vaultHold) release(ctx context.Context, asJSON bool) {
+func (h *vaultHold) release(ctx context.Context) {
 	h.once.Do(func() {
 		h.unmark()
 		exists, err := store.Exists(h.cfg.DataDir)
@@ -263,7 +293,7 @@ func (h *vaultHold) release(ctx context.Context, asJSON bool) {
 			return
 		}
 		if err := startDaemon(context.WithoutCancel(ctx), h.e); err != nil {
-			warn(h.e, asJSON, "the hop daemon did not start again, so nothing syncs until it does (any hop command starts it): "+err.Error())
+			warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (any hop command starts it): "+err.Error())
 		}
 	})
 	h.e.setHold(nil)
@@ -289,7 +319,9 @@ func (h *vaultHold) abandon() {
 			launch = func() error { return launchDaemon(h.e) }
 		}
 		if err := launch(); err != nil {
-			fmt.Fprintf(h.e.Stderr, "hop: the hop daemon did not start again (any hop command starts it): %s\n", oneLine(err.Error()))
+			// Not warn: this runs on Run's signal watcher, beside the
+			// command, so it leaves the command's warned map alone.
+			printWarning(h.e, h.asJSON, "the hop daemon did not start again (any hop command starts it): "+err.Error())
 		}
 	})
 }

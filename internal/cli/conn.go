@@ -234,6 +234,11 @@ func warn(e *Env, asJSON bool, msg string) {
 		e.warned = map[string]bool{}
 	}
 	e.warned[msg] = true
+	printWarning(e, asJSON, msg)
+}
+
+// printWarning is warn without the once-per-run check.
+func printWarning(e *Env, asJSON bool, msg string) {
 	if asJSON {
 		b, _ := json.Marshal(map[string]string{"warning": msg})
 		fmt.Fprintln(e.Stderr, string(escapeJSONControls(b)))

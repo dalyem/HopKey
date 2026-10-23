@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,7 +64,7 @@ func noSecrets(t *testing.T, what string, environ []string) {
 
 // Every process hop starts gets the caller's environment without the hop
 // auth secrets: the daemon (started for real), ssh, and systemctl or
-// launchctl (run for real).
+// launchctl (run for real). Only the daemon keeps the device passphrase.
 func TestChildProcessesGetNoAuthSecrets(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {
@@ -121,7 +124,11 @@ func TestChildProcessesGetNoAuthSecrets(t *testing.T) {
 	if _, err := e.runCommand(context.Background(), []string{self, "dump"}); err != nil {
 		t.Fatal(err)
 	}
-	noSecrets(t, "systemctl", readDump("the service command"))
+	svc := readDump("the service command")
+	noSecrets(t, "systemctl", svc)
+	if hasVar(svc, store.PassphraseEnv) {
+		t.Errorf("systemctl gets the device passphrase: %q", svc)
+	}
 }
 
 // interruptEnv is an Env with a vault, whose daemon start and exit are
@@ -181,7 +188,7 @@ func interrupted() (context.Context, context.CancelCauseFunc) {
 func TestInterruptAbandonsAStuckFlow(t *testing.T) {
 	x := newInterruptEnv(t)
 	ctx, cancel := interrupted()
-	h, err := holdVault(ctx, x.e)
+	h, err := holdVault(ctx, x.e, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +196,7 @@ func TestInterruptAbandonsAStuckFlow(t *testing.T) {
 		t.Fatalf("marker %q, %v", b, err)
 	}
 	done := make(chan struct{})
-	go x.e.watchInterrupt(ctx, done)
+	go x.e.watchInterrupt(ctx, done, false)
 	cancel(ErrInterrupted)
 	select {
 	case code := <-x.exits:
@@ -203,7 +210,7 @@ func TestInterruptAbandonsAStuckFlow(t *testing.T) {
 	if got := x.started(); len(got) != 1 || got[0] != want {
 		t.Fatalf("daemon starts %q; want one, with the marker %q", got, want)
 	}
-	h.release(ctx, false)
+	h.release(ctx)
 	close(done)
 	if got := x.started(); len(got) != 1 {
 		t.Errorf("release after abandon started the daemon again: %q", got)
@@ -216,16 +223,16 @@ func TestInterruptLetsAReturningFlowRelease(t *testing.T) {
 	x := newInterruptEnv(t)
 	x.e.InterruptGrace = 2 * time.Second
 	ctx, cancel := interrupted()
-	h, err := holdVault(ctx, x.e)
+	h, err := holdVault(ctx, x.e, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
 	watched := make(chan struct{})
-	go func() { x.e.watchInterrupt(ctx, done); close(watched) }()
+	go func() { x.e.watchInterrupt(ctx, done, false); close(watched) }()
 	cancel(ErrInterrupted)
 	<-ctx.Done()
-	h.release(ctx, false)
+	h.release(ctx)
 	close(done)
 	<-watched
 	if got := x.started(); len(got) != 1 || got[0] != "" {
@@ -244,7 +251,7 @@ func TestInterruptLetsAReturningFlowRelease(t *testing.T) {
 func TestInterruptWithoutAHold(t *testing.T) {
 	x := newInterruptEnv(t)
 	ctx, cancel := interrupted()
-	go x.e.watchInterrupt(ctx, make(chan struct{}))
+	go x.e.watchInterrupt(ctx, make(chan struct{}), false)
 	cancel(ErrInterrupted)
 	select {
 	case code := <-x.exits:
@@ -255,18 +262,16 @@ func TestInterruptWithoutAHold(t *testing.T) {
 		t.Fatal("no exit")
 	}
 
-	x.e.ctxAware = true
 	ctx, cancel = interrupted()
 	watched := make(chan struct{})
-	go func() { x.e.watchInterrupt(ctx, make(chan struct{})); close(watched) }()
+	go func() { x.e.watchInterrupt(ctx, make(chan struct{}), true); close(watched) }()
 	cancel(ErrInterrupted)
 	<-watched
-	x.e.ctxAware = false
 
 	dctx, dcancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer dcancel()
 	watched = make(chan struct{})
-	go func() { x.e.watchInterrupt(dctx, make(chan struct{})); close(watched) }()
+	go func() { x.e.watchInterrupt(dctx, make(chan struct{}), false); close(watched) }()
 	<-watched
 	select {
 	case code := <-x.exits:
@@ -298,7 +303,7 @@ func TestHoldMarkerKeepsOtherDaemonsOut(t *testing.T) {
 	if err := runDaemon(ctx, x.e, nil); err == nil || !strings.Contains(err.Error(), want) || opened {
 		t.Errorf("hop daemon during a hold: %v (opened the vault: %v)", err, opened)
 	}
-	if _, err := holdVault(ctx, x.e); err == nil || !strings.Contains(err.Error(), want) {
+	if _, err := holdVault(ctx, x.e, false); err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("a second hold: %v", err)
 	}
 	if got := x.started(); len(got) != 0 {
@@ -319,11 +324,11 @@ func TestHoldMarkerKeepsOtherDaemonsOut(t *testing.T) {
 	if got := x.started(); len(got) != 1 {
 		t.Errorf("autostart with a stale marker did not start the daemon: %q", got)
 	}
-	h, err := holdVault(ctx, x.e)
+	h, err := holdVault(ctx, x.e, false)
 	if err != nil {
 		t.Fatalf("hold with a stale marker: %v", err)
 	}
-	h.release(ctx, false)
+	h.release(ctx)
 	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("release left the marker: %v", err)
 	}
@@ -386,5 +391,118 @@ func TestDaemonWaitsForAHandback(t *testing.T) {
 	cancel()
 	if err := <-ran; err != nil {
 		t.Errorf("runDaemon: %v", err)
+	}
+}
+
+// fakeShutdown listens on the control socket and takes one request, then
+// does what answer says with the connection and the listener.
+func fakeShutdown(t *testing.T, e *Env, answer func(c net.Conn, ln net.Listener)) {
+	t.Helper()
+	if err := os.MkdirAll(e.Paths.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", e.Paths.ControlSocket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, err := bufio.NewReader(c).ReadString('\n'); err != nil {
+			return
+		}
+		answer(c, ln)
+	}()
+}
+
+// A signal that lands after the daemon took the shutdown request, before
+// its answer is read: the daemon stops all the same, so hop auth starts
+// it again rather than leave the device without one.
+func TestInterruptedShutdownRestartsTheDaemon(t *testing.T) {
+	x := newInterruptEnv(t)
+	ctx, cancel := interrupted()
+	fakeShutdown(t, x.e, func(c net.Conn, ln net.Listener) {
+		cancel(ErrInterrupted)
+		time.Sleep(100 * time.Millisecond) // the client gives up on the answer
+		ln.Close()                         // the daemon exits; its socket goes
+	})
+	if _, err := holdVault(ctx, x.e, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("hold: %v", err)
+	}
+	if got := x.started(); len(got) != 1 || got[0] != "" {
+		t.Errorf("daemon starts %q; want one, after the marker is gone", got)
+	}
+	if _, err := os.Lstat(x.e.holdMarker()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the marker is left: %v", err)
+	}
+	if x.e.currentHold() != nil {
+		t.Error("the hold is left")
+	}
+}
+
+// A daemon that refuses to stop keeps running: nothing is started, and
+// the marker goes.
+func TestRefusedShutdownStartsNothing(t *testing.T) {
+	x := newInterruptEnv(t)
+	fakeShutdown(t, x.e, func(c net.Conn, _ net.Listener) {
+		json.NewEncoder(c).Encode(daemon.Response{Error: &daemon.Error{Code: "busy", Message: "not now"}})
+	})
+	if _, err := holdVault(context.Background(), x.e, false); err == nil || !strings.Contains(err.Error(), "not now") {
+		t.Fatalf("hold: %v", err)
+	}
+	if got := x.started(); len(got) != 0 {
+		t.Errorf("a running daemon was started again: %q", got)
+	}
+	if _, err := os.Lstat(x.e.holdMarker()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the marker is left: %v", err)
+	}
+}
+
+// A signal while hop daemon starts, in the order the process meets them:
+// Run's watcher already runs when dispatch reaches runDaemon. The watcher
+// knows from the arguments that hop daemon handles the signal, so it
+// neither races dispatch (go test -race) nor exits, and the daemon,
+// closing on the signal, exits 0.
+func TestSignalDuringDaemonStart(t *testing.T) {
+	x := newInterruptEnv(t)
+	x.e.OpenStore = func() (model.Store, error) { return modeltest.New(), nil }
+	ctx, cancel := interrupted()
+	cancel(ErrInterrupted)
+	if code := Run(ctx, []string{"daemon"}, x.e); code != 0 {
+		t.Errorf("hop daemon: exit %d: %s", code, x.e.Stderr)
+	}
+	select {
+	case code := <-x.exits:
+		t.Errorf("the watcher exited %d under hop daemon", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A --json flow abandoned on a signal, whose daemon does not start,
+// warns in JSON like the rest of its stderr.
+func TestAbandonWarnsInJSON(t *testing.T) {
+	x := newInterruptEnv(t)
+	x.e.StartDaemon = func() error { return errors.New("no daemon here") }
+	ctx, cancel := interrupted()
+	if _, err := holdVault(ctx, x.e, true); err != nil {
+		t.Fatal(err)
+	}
+	go x.e.watchInterrupt(ctx, make(chan struct{}), false)
+	cancel(ErrInterrupted)
+	select {
+	case <-x.exits:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no exit after the interrupt")
+	}
+	out := x.e.Stderr.(*strings.Builder).String()
+	var w struct {
+		Warning string `json:"warning"`
+	}
+	if err := json.Unmarshal([]byte(out), &w); err != nil || !strings.Contains(w.Warning, "no daemon here") {
+		t.Errorf("stderr %q is not one JSON warning: %v", out, err)
 	}
 }

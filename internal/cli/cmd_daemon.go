@@ -29,7 +29,6 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	if e.OpenStore == nil {
 		return failf("this build has no vault store")
 	}
-	e.ctxAware = true // it closes cleanly when a signal cancels ctx
 	if pid, ok := e.authHolder(); ok {
 		return errHeld(pid)
 	}

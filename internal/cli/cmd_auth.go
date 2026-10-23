@@ -235,11 +235,11 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 			return failf("%s", errSignupNeedsTerminal)
 		}
 	}
-	h, err := holdVault(ctx, e)
+	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
-	defer h.release(ctx, o.asJSON)
+	defer h.release(ctx)
 	s, err := h.open(ctx)
 	if err != nil {
 		return err
@@ -401,11 +401,11 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	defer c.CloseIdleConnections()
-	h, err := holdVault(ctx, e)
+	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
-	defer h.release(ctx, o.asJSON)
+	defer h.release(ctx)
 	env := h.flowEnv(c, u)
 
 	var res *authflow.LoginResult
@@ -553,11 +553,11 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 	}
 	u := o.ui(e)
 	u.role, u.sas = roleApprove, *sas
-	h, err := holdVault(ctx, e)
+	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
-	defer h.release(ctx, o.asJSON)
+	defer h.release(ctx)
 	s, v, err := h.signedIn(ctx)
 	if err != nil {
 		return err
@@ -808,11 +808,11 @@ func runCheckpoint(ctx context.Context, e *Env, name string, args []string, extr
 		return err
 	}
 	u := o.ui(e)
-	h, err := holdVault(ctx, e)
+	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
-	defer h.release(ctx, o.asJSON)
+	defer h.release(ctx)
 	s, v, err := h.signedIn(ctx)
 	if err != nil {
 		return err
@@ -894,11 +894,11 @@ func runAuthResume(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	u := o.ui(e)
-	h, err := holdVault(ctx, e)
+	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
-	defer h.release(ctx, o.asJSON)
+	defer h.release(ctx)
 	s, err := h.open(ctx)
 	if err != nil {
 		return err
@@ -980,11 +980,11 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 			return failf("not logged out")
 		}
 	}
-	h, err := holdVault(ctx, e)
+	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
-	defer h.release(ctx, o.asJSON)
+	defer h.release(ctx)
 	s, err := h.open(ctx)
 	if err != nil {
 		return err
@@ -1067,11 +1067,11 @@ func runAuthMerge(ctx context.Context, e *Env, args []string) error {
 		return failf("--confirm goes with --discard")
 	}
 	u := o.ui(e)
-	h, err := holdVault(ctx, e)
+	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
-	defer h.release(ctx, o.asJSON)
+	defer h.release(ctx)
 	s, v, err := h.signedIn(ctx)
 	if err != nil {
 		return err

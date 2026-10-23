@@ -113,9 +113,6 @@ type Env struct {
 	// hold is the hop auth command's hold of the vault while it lasts.
 	holdMu sync.Mutex
 	hold   *vaultHold
-	// ctxAware marks a command that returns on its own once the context
-	// is cancelled (hop daemon), so a signal never cuts it short.
-	ctxAware bool
 }
 
 // ExitInterrupted is the exit status after SIGINT or SIGTERM, as a shell
@@ -129,8 +126,9 @@ const ExitInterrupted = 130
 // reading the terminal) is abandoned: the daemon is launched to take the
 // vault once this process is gone, and the process exits. A command that
 // holds nothing exits at once, as it did when the signal killed it,
-// unless it handles the context itself (hop daemon).
-func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}) {
+// unless it handles the context itself (ctxAware, decided before the
+// command starts: see handlesInterrupt).
+func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware bool) {
 	if e.Exit == nil {
 		return
 	}
@@ -142,7 +140,7 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}) {
 	if !errors.Is(context.Cause(ctx), ErrInterrupted) {
 		return // a deadline, not a signal
 	}
-	if e.ctxAware {
+	if ctxAware {
 		return
 	}
 	if h := e.currentHold(); h != nil {
@@ -165,6 +163,14 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}) {
 	default:
 	}
 	e.Exit(ExitInterrupted)
+}
+
+// handlesInterrupt reports whether the command args runs returns on its
+// own once a signal cancels the context, and so is never cut short:
+// hop daemon, which closes cleanly. It is decided from the arguments
+// alone, before the command and Run's signal watcher start.
+func handlesInterrupt(args []string) bool {
+	return len(args) == 1 && args[0] == "daemon"
 }
 
 // ErrInterrupted is the cause cmd/hop gives the context it cancels on
@@ -275,16 +281,33 @@ func Run(ctx context.Context, args []string, e *Env) int {
 	if e.Getenv == nil {
 		e.Getenv = os.Getenv
 	}
+	ctxAware := handlesInterrupt(args)
 	done := make(chan struct{})
-	go e.watchInterrupt(ctx, done)
+	go e.watchInterrupt(ctx, done, ctxAware)
 	err := dispatch(ctx, e, args)
 	close(done)
+	// After a signal hop exits 130, however the command ended: with the
+	// failure its cancelled context caused, or with success when it
+	// finished as the signal came. hop daemon keeps its own status: it
+	// stops on a signal by design, and a service manager reads 0 as a
+	// clean stop.
+	if !ctxAware && errors.Is(context.Cause(ctx), ErrInterrupted) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, flag.ErrHelp) {
+			report(e, err, args)
+		}
+		return ExitInterrupted
+	}
 	if err == nil {
 		return 0
 	}
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
+	return report(e, err, args)
+}
+
+// report prints err (see reportError) and returns its exit status.
+func report(e *Env, err error, args []string) int {
 	// Only an exitError that is itself the error returned may keep its layout.
 	// One found inside a wrapper supplies the exit status, but the wrapper's
 	// text is not covered by its mark.
