@@ -502,12 +502,18 @@ type ServerInfo struct {
 	// included, does not: the credentials it sets are not the ones this
 	// recovery chose.
 	CheckpointDue bool `json:"checkpoint_due,omitempty"`
+	// VaultID and AccountID name the vault on the server and its account.
+	// While the vault is locked they come from the stored state
+	// (state.json), which is public and not verified until the next
+	// unlock: enough to address the server, never to trust what it says.
+	VaultID   model.ID `json:"vault_id,omitzero"`
+	AccountID model.ID `json:"account_id,omitzero"`
 }
 
-// ServerInfo returns the server a server-backed vault syncs with, and
-// whether a recovery's checkpoint is due. It fails with
-// ErrNotServerBacked for a local-only vault. It works while the vault is
-// locked.
+// ServerInfo returns the server a server-backed vault syncs with, the
+// vault and account it holds there, and whether a recovery's checkpoint is
+// due. It fails with ErrNotServerBacked for a local-only vault. It works
+// while the vault is locked.
 func (s *Store) ServerInfo() (ServerInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -518,7 +524,19 @@ func (s *Store) ServerInfo() (ServerInfo, error) {
 	if f == nil {
 		return ServerInfo{}, ErrNotServerBacked
 	}
-	return s.serverInfoOf(f), nil
+	info := s.serverInfoOf(f)
+	if s.state != nil {
+		info.VaultID, info.AccountID = s.state.VaultID, s.state.Account.AccountID
+		return info, nil
+	}
+	stored, _, err := s.readStoredState()
+	if err != nil {
+		return ServerInfo{}, err
+	}
+	if stored != nil {
+		info.VaultID, info.AccountID = stored.VaultID, stored.Account.AccountID
+	}
+	return info, nil
 }
 
 // serverInfoOf is f as ServerInfo.

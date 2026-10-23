@@ -23,6 +23,7 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/safepath"
 	"github.com/dalyem/hopkey/internal/sshagent"
+	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/tailscale"
 )
@@ -75,8 +76,16 @@ type Options struct {
 
 	// Tailscale defaults to the real command line client.
 	Tailscale TailscaleSource
+	// Sync configures automatic sync, which runs for a server-backed
+	// encrypted store (sync.go).
+	Sync SyncOptions
 	// Logf receives log lines. Nil discards them.
 	Logf func(format string, args ...any)
+
+	// Test hooks: writeConfig replaces sshconfig.Write, and configRetry
+	// configRetryInterval.
+	writeConfig func(sshconfig.Options, []sshconfig.Host) error
+	configRetry time.Duration
 }
 
 // Daemon is a running daemon.
@@ -91,10 +100,22 @@ type Daemon struct {
 	agent   *sshagent.Server
 	control *controlListener
 
+	// writeConfig writes the ssh config (sshconfig.Write).
+	writeConfig func(sshconfig.Options, []sshconfig.Host) error
+
 	// mu serializes changes to the vault and reloads, so the keyring and the
 	// ssh config always come from one snapshot, newest last.
 	mu    sync.Mutex
 	state atomic.Pointer[state]
+	// outboxGen moves whenever the outbox changes without the verified
+	// head moving (a queued write, a hold, a resolution), so the next
+	// request rebuilds from the overlay.
+	outboxGen atomic.Uint64
+	// clearErr says why a revoked device's ssh config could not be
+	// emptied; nil when nothing is pending (clearConfigLocked).
+	clearErr atomic.Pointer[string]
+
+	sync *syncer // nil for a store that does not sync
 
 	tsMu     sync.Mutex
 	tsCached *tailscale.Status
@@ -154,6 +175,10 @@ func Start(opts Options) (*Daemon, error) {
 		opts: opts, store: opts.Store, ts: opts.Tailscale, logf: logf,
 		started: time.Now(), live: live, agent: agentSrv, control: control,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		writeConfig: opts.writeConfig,
+	}
+	if d.writeConfig == nil {
+		d.writeConfig = sshconfig.Write
 	}
 	if err := d.reload(ctx); (errors.Is(err, model.ErrLocked) || errors.Is(err, store.ErrDeviceRevoked)) && d.canUnlock() {
 		// A locked vault (its device key unreadable, say) still gets a
@@ -163,11 +188,14 @@ func Start(opts Options) (*Daemon, error) {
 			d.state.Store(lockedState())
 		}
 		logf("the vault is locked: %v", err)
-	} else if err != nil {
+	} else if err != nil && !errors.Is(err, errConfigWrite) {
+		// A config that could not be written is retried (retryConfig).
 		d.shutdown()
 		return nil, fmt.Errorf("daemon: loading the vault: %w", err)
 	}
 	d.watchRevoked()
+	d.startSync()
+	d.retryConfig()
 
 	d.wg.Add(2)
 	go func() {

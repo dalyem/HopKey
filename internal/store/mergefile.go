@@ -696,7 +696,7 @@ func (p *SignInParams) check() (serverFile, error) {
 	if p.ServerURL == "" || crypto.CheckStr("server", p.ServerURL, 256) != nil {
 		return serverFile{}, errors.New("store: the server's origin must be 1 to 256 characters")
 	}
-	email, err := NormalizeEmail(p.Email)
+	email, err := normalizeEmail(p.Email)
 	if err != nil {
 		return serverFile{}, err
 	}
