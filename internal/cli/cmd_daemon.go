@@ -177,7 +177,7 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 				return err
 			}
 		} else {
-			e.printf("hop daemon is not running; any hop command starts it\n")
+			e.printf("hop daemon is not running; hop sync starts it\n")
 		}
 		return silent(ExitFailure)
 	}

@@ -283,8 +283,9 @@ func (h *vaultHold) open(ctx context.Context) (*store.Store, error) {
 
 // release starts the daemon again when a vault is left, so it syncs. A
 // daemon that does not come up is a warning: the command itself is done,
-// and the next hop command starts it. The command has closed its stores
-// by now (each is closed by a defer that runs first).
+// and hop sync, or the next command that needs the daemon, starts it. The
+// command has closed its stores by now (each is closed by a defer that
+// runs first).
 //
 // The old daemon removes its sockets before it closes its store, so it
 // can still own the vault here: when a signal cut its shutdown answer
@@ -301,11 +302,11 @@ func (h *vaultHold) release(ctx context.Context) {
 		free := waitVaultFree(h.cfg.DataDir)
 		h.unmark()
 		if !free {
-			warn(h.e, h.asJSON, fmt.Sprintf("the old hop daemon still had the vault after %s, so it was not started again, and nothing syncs until it is (any hop command starts it)", releaseBusyWait))
+			warn(h.e, h.asJSON, fmt.Sprintf("the old hop daemon still had the vault after %s, so it was not started again, and nothing syncs until it is (hop sync starts it)", releaseBusyWait))
 			return
 		}
 		if err := startDaemon(context.WithoutCancel(ctx), h.e); err != nil {
-			warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (any hop command starts it): "+err.Error())
+			warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (hop sync starts it): "+err.Error())
 		}
 	})
 	h.e.setHold(nil)
@@ -359,7 +360,7 @@ func (h *vaultHold) abandon() {
 		if err := launch(); err != nil {
 			// Not warn: this runs on Run's signal watcher, beside the
 			// command, so it leaves the command's warned map alone.
-			printWarning(h.e, h.asJSON, "the hop daemon did not start again (any hop command starts it): "+err.Error())
+			printWarning(h.e, h.asJSON, "the hop daemon did not start again (hop sync starts it): "+err.Error())
 		}
 	})
 }
