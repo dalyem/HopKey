@@ -3,6 +3,7 @@ package syncclient
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -619,7 +620,7 @@ func TestCredentialsNeverPrinted(t *testing.T) {
 	dev := Device{AccountID: model.ID{1}, DeviceID: model.ID{2}}
 	c.session(dev).token = secret // a cached session
 	tr := &TokenRemote{c: c, token: secret, AccountID: model.ID{1}, VaultID: model.ID{5}}
-	mb := &Mailbox{EnrollID: model.ID{6}, RoutingCode: "ABCDEFGHJK", Token: secret}
+	mb := NewMailbox(model.ID{6}, "ABCDEFGHJK", secret)
 	d, a := c.DeviceRelay(mb), c.ApproverRelay(model.ID{6}, dev)
 	cases := []struct {
 		name string
@@ -666,6 +667,19 @@ func TestCredentialsNeverPrinted(t *testing.T) {
 		slog.New(slog.NewJSONHandler(&buf, nil)).Info("m", slog.Group("g", "v", k.v))
 		if leaks(buf.String()) || !strings.Contains(buf.String(), k.want) {
 			t.Errorf("%s in slog: %s", k.name, buf.String())
+		}
+		// encoding/json, directly and nested where slog's JSON handler
+		// does not call LogValue: in a map, a slice and a struct.
+		var nested strings.Builder
+		slog.New(slog.NewJSONHandler(&nested, nil)).Info("m", "state", map[string]any{"v": k.v})
+		for _, v := range []any{k.v, map[string]any{"v": k.v}, []any{k.v}, struct{ V any }{k.v}} {
+			b, err := json.Marshal(v)
+			if err == nil && leaks(string(b)) {
+				t.Errorf("%s through encoding/json: %s", k.name, b)
+			}
+		}
+		if leaks(nested.String()) {
+			t.Errorf("%s nested in a slog JSON map: %s", k.name, nested.String())
 		}
 	}
 }
@@ -777,7 +791,7 @@ func objectCall(c *Client) error {
 }
 
 func mailboxCall(c *Client) error {
-	_, err := c.DeviceRelay(&Mailbox{EnrollID: model.ID{1}, Token: "t"}).Messages(bg, 0, 0)
+	_, err := c.DeviceRelay(NewMailbox(model.ID{1}, "", "t")).Messages(bg, 0, 0)
 	return err
 }
 

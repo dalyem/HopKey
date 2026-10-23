@@ -2,6 +2,7 @@ package syncclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,9 +33,27 @@ const (
 type Mailbox struct {
 	EnrollID    model.ID
 	RoutingCode string // 10 Crockford symbols, for the user to carry to A
-	// Token is D's bearer credential for the mailbox. It is a secret:
-	// never log or print it.
-	Token string
+	// token is D's bearer credential for the mailbox. It is a secret, so
+	// it is unexported: no formatter, logger or JSON encoder reaches it.
+	token string
+}
+
+// NewMailbox rebuilds a mailbox from its parts, for a new device resuming
+// an enrollment within the mailbox's lifetime.
+func NewMailbox(enrollID model.ID, routingCode, token string) *Mailbox {
+	return &Mailbox{EnrollID: enrollID, RoutingCode: routingCode, token: token}
+}
+
+// Token returns D's bearer credential, for storing it sealed. Never log
+// or print it.
+func (m *Mailbox) Token() string { return m.token }
+
+// MarshalJSON writes the mailbox without its token.
+func (m Mailbox) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		EnrollID    model.ID `json:"enroll_id"`
+		RoutingCode string   `json:"routing_code"`
+	}{m.EnrollID, m.RoutingCode})
 }
 
 // String describes the mailbox without its token. A Mailbox, value or
@@ -73,7 +92,7 @@ func (c *Client) CreateMailbox(ctx context.Context, commit crypto.EnrollCommit) 
 	if resp.EnrollID.IsZero() || resp.MailboxToken == "" || len(resp.RoutingCode) != 10 {
 		return nil, fmt.Errorf("%w: enroll", ErrMalformedResponse)
 	}
-	return &Mailbox{EnrollID: resp.EnrollID, RoutingCode: resp.RoutingCode, Token: resp.MailboxToken}, nil
+	return &Mailbox{EnrollID: resp.EnrollID, RoutingCode: resp.RoutingCode, token: resp.MailboxToken}, nil
 }
 
 type claimRequest struct {
@@ -171,7 +190,7 @@ func (r Relay) LogValue() slog.Value { return slog.StringValue(r.String()) }
 
 // DeviceRelay is D's access to its mailbox.
 func (c *Client) DeviceRelay(m *Mailbox) *Relay {
-	return &Relay{c: c, enrollID: m.EnrollID, token: m.Token}
+	return &Relay{c: c, enrollID: m.EnrollID, token: m.token}
 }
 
 // ApproverRelay is A's access to a mailbox it claimed, under dev's
