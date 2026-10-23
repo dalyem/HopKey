@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"os/exec"
 	"syscall"
 )
@@ -18,4 +19,11 @@ func detach(cmd *exec.Cmd) {
 // execReplace replaces the current process with path.
 func execReplace(path string, argv, environ []string) error {
 	return syscall.Exec(path, argv, environ)
+}
+
+// processAlive reports whether a process with this pid exists (one of
+// another user's counts too).
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }

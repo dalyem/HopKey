@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/store"
@@ -14,7 +15,12 @@ import (
 // too, every item is re-keyed and every token is revoked. The new kit is
 // printed only once the change is committed, and stays pending until it is
 // typed back. If one is already pending, hop passwd shows that one instead.
+// For a vault on a server it is hop auth passwd, which changes the
+// password through the server.
 func runPasswd(ctx context.Context, e *Env, args []string) error {
+	if !slices.ContainsFunc(args, func(a string) bool { return a == "-h" || a == "-help" || a == "--help" }) && serverBacked(ctx, e) {
+		return runAuthPasswd(ctx, e, args)
+	}
 	fs := newFlags(e, "passwd", commands["passwd"].usage)
 	kitFile := fs.String("kit-file", "", "also write the new Emergency Kit to this new file (mode 0600)")
 	pos, _, err := parseFlags(fs, args)
@@ -88,4 +94,16 @@ func confirmKit(ctx context.Context, e *Env, c *daemon.Client, kit store.Kit, ki
 	}
 	e.printf("Emergency Kit confirmed.\n")
 	return nil
+}
+
+// serverBacked reports whether the daemon's vault syncs with a server. A
+// daemon that can't be reached says no; the local path then reports why.
+func serverBacked(ctx context.Context, e *Env) bool {
+	c, err := connect(ctx, e)
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	var st daemon.StatusResult
+	return c.Call(ctx, daemon.OpStatus, nil, &st) == nil && st.Sync != nil && st.Sync.State != daemon.SyncOff
 }

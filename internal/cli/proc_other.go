@@ -28,3 +28,7 @@ func execReplace(path string, argv, environ []string) error {
 	}
 	return err
 }
+
+// processAlive can't tell here, so a marker counts until it is old
+// (holdMarkerMaxAge).
+func processAlive(pid int) bool { return true }

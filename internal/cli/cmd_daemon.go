@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,7 +29,21 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	if e.OpenStore == nil {
 		return failf("this build has no vault store")
 	}
+	if pid, ok := e.authHolder(); ok {
+		return errHeld(pid)
+	}
 	vault, err := e.OpenStore()
+	if errors.Is(err, store.ErrVaultBusy) {
+		if pid, ok := e.handbackFrom(); ok {
+			// An interrupted hop auth command launched this daemon as it
+			// exits: the vault is free once it is gone.
+			waitGone(ctx, pid, handbackWait)
+			vault, err = e.OpenStore()
+		}
+	}
+	if err == nil {
+		e.clearHandback()
+	}
 	if errors.Is(err, store.ErrVaultBusy) {
 		// Another process owns the vault. Only a daemon that answers on the
 		// control socket makes this one redundant; anything else (hop init,
@@ -67,6 +82,30 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 		return d.Close()
 	case <-d.Done():
 		return nil
+	}
+}
+
+// handbackWait bounds how long a daemon waits for an interrupted hop auth
+// command to exit and free the vault.
+const handbackWait = 15 * time.Second
+
+// waitGone waits until process pid has exited, for at most d.
+func waitGone(ctx context.Context, pid int, d time.Duration) {
+	deadline := time.Now().Add(d)
+	for processAlive(pid) && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+// clearHandback removes a handback marker once the daemon has the vault.
+func (e *Env) clearHandback() {
+	path := e.holdMarker()
+	if b, err := os.ReadFile(path); err == nil && strings.HasSuffix(strings.TrimSpace(string(b)), " handback") {
+		os.Remove(path)
 	}
 }
 
@@ -110,31 +149,16 @@ func dialExisting(ctx context.Context, e *Env) (*daemon.Client, error) {
 }
 
 func stopDaemon(ctx context.Context, e *Env) error {
-	c, err := dialExisting(ctx, e)
+	running, err := shutdownDaemon(ctx, e)
 	if err != nil {
 		return err
 	}
-	if c == nil {
+	if !running {
 		e.printf("hop daemon is not running\n")
 		return nil
 	}
-	defer c.Close()
-	if err := c.Call(ctx, daemon.OpShutdown, nil, nil); err != nil {
-		return err
-	}
-	// The daemon answers before it finishes closing. Wait for its sockets to
-	// go, so a command that follows does not find a daemon on its way out.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		_, ctlErr := os.Lstat(e.Paths.ControlSocket())
-		_, agentErr := os.Lstat(e.Paths.AgentSocket())
-		if os.IsNotExist(ctlErr) && os.IsNotExist(agentErr) {
-			e.printf("hop daemon stopped\n")
-			return nil
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	return failf("asked the hop daemon to stop, but its sockets are still there after 5s")
+	e.printf("hop daemon stopped\n")
+	return nil
 }
 
 func runStatus(ctx context.Context, e *Env, args []string) error {
@@ -153,7 +177,7 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 				return err
 			}
 		} else {
-			e.printf("hop daemon is not running; any hop command starts it\n")
+			e.printf("hop daemon is not running; hop sync starts it\n")
 		}
 		return silent(ExitFailure)
 	}

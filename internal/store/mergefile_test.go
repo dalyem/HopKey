@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -828,8 +829,8 @@ func TestLoginMergePauseResumeDiscard(t *testing.T) {
 	}
 	slices.Reverse(rows)
 	want, err := merge.MergeDiscardDigest(ms.VaultID, ms.TxnID, rows)
-	if err != nil || !want.Equal(p.Digest) {
-		t.Errorf("proposal digest %v; want %v (%v)", p.Digest, want, err)
+	if err != nil || !want.Equal(p.digest) {
+		t.Errorf("proposal digest %v; want %v (%v)", p.digest, want, err)
 	}
 	if len(p.Items) != 5-imported || !slices.IsSortedFunc(p.Items, func(a, b MergeItem) int { return bytes.Compare(a.ItemID[:], b.ItemID[:]) }) {
 		t.Errorf("proposal items %+v", p.Items)
@@ -840,7 +841,10 @@ func TestLoginMergePauseResumeDiscard(t *testing.T) {
 	if !mergeFileExists(t, m.src.cfg) {
 		t.Fatal("a refused discard deleted the file")
 	}
-	if _, err := s.MergeDiscard(p.Digest); err != nil {
+	if _, err := s.MergeDiscard(p.digest); !errors.Is(err, ErrStaleConfirm) {
+		t.Errorf("discard confirmed by the raw digest: %v", err)
+	}
+	if _, err := s.MergeDiscard(p.Token); err != nil {
 		t.Fatal(err)
 	}
 	if mergeFileExists(t, m.src.cfg) {
@@ -1069,5 +1073,98 @@ func TestImportOrder(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte{5, 3, 2, 1, 4}) {
 		t.Errorf("order %v; want the credential, hosts 3, 2, 1, then the snippet", got)
+	}
+}
+
+// The discard confirmation is a token keyed by local_key, never the
+// digest c: it differs from c, encodes without c, is the same in another
+// process on the same device, differs on another device, and a token for
+// an earlier state of the merge no longer confirms it.
+func TestMergeDiscardToken(t *testing.T) {
+	ctx := context.Background()
+	m, _ := heldMerge(t)
+	s := m.src.s
+	if _, err := s.MergePause(ctx, m.r); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.MergeDiscardProposal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Token == (crypto.Hash{}) || p.Token.Equal(p.digest) {
+		t.Fatalf("token %v, digest %v: the token must be set and differ from the digest", p.Token, p.digest)
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), p.digest.String()) || !strings.Contains(string(b), p.Token.String()) {
+		t.Errorf("the proposal encodes as %s", b)
+	}
+	if _, err := s.MergeDiscard(p.digest); !errors.Is(err, ErrStaleConfirm) {
+		t.Errorf("the raw digest confirmed a discard: %v", err)
+	}
+
+	// Another process on this device: the same token.
+	s2, err := tryOpen(t, m.src.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := s2.MergeDiscardProposal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p2.Token.Equal(p.Token) || !p2.digest.Equal(p.digest) {
+		t.Errorf("token after reopening %v; want %v", p2.Token, p.Token)
+	}
+
+	// Another device: the same digest gives another token.
+	other := newVault(t, testConfig(t))
+	other.s.mu.Lock()
+	t2, err := discardToken(other.s.rec, p.digest)
+	other.s.mu.Unlock()
+	if err != nil || t2.Equal(p.Token) {
+		t.Errorf("another device's token for the same digest: %v %v", t2, err)
+	}
+
+	// The state changes (a receipt goes, so one more item is left): the
+	// old token is stale and deletes nothing.
+	s2.mu.Lock()
+	unlock, err := s2.lockFile()
+	if err != nil {
+		s2.mu.Unlock()
+		t.Fatal(err)
+	}
+	om, err := s2.readMerge(s2.rec)
+	if err == nil {
+		om.j.Receipts = om.j.Receipts[1:]
+		tx := &txn{}
+		if err = putMerge(tx, s2.rec, om); err == nil {
+			err = s2.commitTxn(tx)
+		}
+	}
+	unlock()
+	s2.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.MergeDiscard(p.Token); !errors.Is(err, ErrStaleConfirm) {
+		t.Fatalf("a token of an earlier state: %v; want ErrStaleConfirm", err)
+	}
+	if !mergeFileExists(t, m.src.cfg) {
+		t.Fatal("a stale token deleted the merge")
+	}
+	p3, err := s2.MergeDiscardProposal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p3.Token.Equal(p.Token) || len(p3.Items) != len(p.Items)+1 {
+		t.Errorf("the proposal after the change: %d items, token %v", len(p3.Items), p3.Token)
+	}
+	if _, err := s2.MergeDiscard(p3.Token); err != nil {
+		t.Fatal(err)
+	}
+	if mergeFileExists(t, m.src.cfg) {
+		t.Error("discard left the file")
 	}
 }

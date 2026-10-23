@@ -924,29 +924,131 @@ func TestAuthDevices(t *testing.T) {
 	}
 }
 
-func TestAuthSubcommandsNotYetAvailable(t *testing.T) {
+// Without a terminal every prompt needs its flag, and a command that
+// lacks one fails naming it before it stops the daemon or reaches a
+// server.
+func TestAuthNeedsItsFlagsWithoutATerminal(t *testing.T) {
 	f := newFakeDaemon(t)
-	for _, args := range [][]string{
-		{"auth", "login"}, {"auth", "signup"}, {"auth", "approve"}, {"auth", "logout"}, {"auth", "rotate"},
-		{"auth", "passwd"}, {"auth", "merge"}, {"auth", "status"}, {"auth", "devices", "revoke", "phone"},
-		{"login", "--server", "https://x"}, {"logout"},
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"auth", "login"}, "--server"},
+		{[]string{"login"}, "--server"},
+		{[]string{"auth", "login", "--method", "password", "--server", "https://hop.example"}, "--email"},
+		{[]string{"auth", "login", "--method", "bogus"}, "approve, password or recovery"},
+		{[]string{"auth", "login", "--merge", "--server", "https://hop.example"}, "--method password or recovery"},
+		{[]string{"auth", "login", "--with-token"}, "not available yet"},
+		// The new device confirms the check code only on a terminal.
+		{[]string{"auth", "login", "--server", "https://hop.example", "--yes"}, "--method password"},
+		// A new account needs a person at a terminal for its kit.
+		{[]string{"auth", "signup", "--server", "https://hop.example", "--email", "a@example.com", "--code", "c"}, "needs a person at a terminal"},
+		{[]string{"auth", "signup", "--json"}, "Publishing a vault this device already has works without a terminal"},
+		{[]string{"login", "--server", "https://hop.example", "--yes", "--json"}, "--method recovery"},
+		{[]string{"login", "--with-token", "--server", "https://hop.example"}, "not available yet"},
+		{[]string{"auth", "logout"}, "--yes"},
+		{[]string{"logout", "--local-only"}, "--yes"},
+		{[]string{"auth", "logout", "--json"}, "--yes"},
+		{[]string{"auth", "merge", "--pause", "--resume"}, "choose one"},
+		{[]string{"auth", "merge", "--confirm", "abc"}, "--confirm goes with --discard"},
+		{[]string{"auth", "approve", "--abort", "ABCDE-FGHJK"}, "--abort takes no code"},
 	} {
-		code, _, errOut := f.hop(t, args...)
-		if code != 255 || !strings.Contains(errOut, "not available yet") {
-			t.Errorf("%q: exit %d, %q", args, code, errOut)
+		code, _, errOut := f.hop(t, c.args...)
+		if code != 255 || !strings.Contains(errOut, c.want) {
+			t.Errorf("%q: exit %d, %q; want it to name %q", c.args, code, errOut, c.want)
 		}
 	}
-	if code, _, errOut := f.hop(t, "auth"); code != 255 || !strings.Contains(errOut, "hop auth devices") {
+	if code, _, errOut := f.hop(t, "auth"); code != 255 || !strings.Contains(errOut, "hop auth devices") || !strings.Contains(errOut, "hop auth approve") {
 		t.Errorf("bare auth: exit %d, %q", code, errOut)
 	}
 	if code, _, errOut := f.hop(t, "auth", "nope"); code != 255 || !strings.Contains(errOut, "unknown auth subcommand") {
 		t.Errorf("unknown: exit %d, %q", code, errOut)
 	}
+	if code, out, _ := f.hop(t, "auth", "help"); code != 0 || !strings.Contains(out, "HOP_PASSWORD") || !strings.Contains(out, "never flags") ||
+		!strings.Contains(out, "need a person at a terminal") {
+		t.Errorf("auth help: exit %d, %q", code, out)
+	}
+	if code, _, errOut := f.hop(t, "auth", "signup", "-h"); code != 0 || !strings.Contains(errOut, "needs a person at a terminal") {
+		t.Errorf("auth signup -h: exit %d, %q", code, errOut)
+	}
+	if _, _, errOut := f.hop(t, "auth", "signup", "--bogus"); strings.Contains(errOut, "needs a person") {
+		t.Errorf("a parse error printed the help note: %q", errOut)
+	}
 	f.mu.Lock()
 	n := len(f.calls)
 	f.mu.Unlock()
 	if n != 0 {
-		t.Errorf("the stubs made %d daemon calls", n)
+		t.Errorf("the refused commands made %d daemon calls", n)
+	}
+}
+
+// No secret is ever a flag: every subcommand refuses the flag names a
+// secret would have.
+func TestAuthTakesNoSecretFlags(t *testing.T) {
+	f := newFakeDaemon(t)
+	subs := [][]string{
+		{"auth", "signup"}, {"auth", "login"}, {"login"}, {"auth", "approve"}, {"auth", "rotate"},
+		{"auth", "passwd"}, {"auth", "devices", "revoke", "x"}, {"auth", "resume"}, {"auth", "logout"}, {"logout"}, {"auth", "merge"},
+	}
+	for _, sub := range subs {
+		for _, flag := range []string{"--password", "--new-password", "--secret-key", "--recovery-key", "--kit-confirm", "--sk", "--rk"} {
+			args := append(append([]string{}, sub...), flag, "hunter2-secret")
+			code, out, errOut := f.hop(t, args...)
+			if code != 255 || !strings.Contains(errOut, "flag provided but not defined") {
+				t.Errorf("%q: exit %d, %q", args, code, errOut)
+			}
+			if strings.Contains(out+errOut, "hunter2-secret") {
+				t.Errorf("%q echoed the value: %q %q", args, out, errOut)
+			}
+		}
+	}
+	if n := len(f.called(daemon.OpShutdown)); n != 0 {
+		t.Errorf("a refused flag stopped the daemon %d times", n)
+	}
+}
+
+func TestAuthStatus(t *testing.T) {
+	f := newFakeDaemon(t)
+	synced := f.now.Add(-time.Minute)
+	f.reply(daemon.OpStatus, daemon.StatusResult{
+		Vault: &store.Info{DeviceStore: "keychain", DeviceID: model.ID{7}.String(), Head: &store.Head{Seq: 4, H: strings.Repeat("ab", 32)}},
+		Sync: &daemon.SyncStatusResult{
+			State: daemon.SyncOnline, Server: "https://hop.example", Email: "me@example.com" + hostile, VaultID: model.ID{9}.String(),
+			SyncedAt: &synced, CheckpointDue: true, SecretKeyStale: true,
+			Warnings: []string{"this device signed in with the Recovery Key: set a new password", "the Secret Key stored on this device is out of date" + hostile},
+		},
+	})
+	f.reply(daemon.OpDevicesList, daemon.DevicesResult{Devices: []store.DeviceListing{
+		{ID: model.ID{6}, Name: "other"}, {ID: model.ID{7}, Name: "desk" + hostile, This: true},
+	}})
+	code, out, errOut := f.hop(t, "auth", "status")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	assertNoForgery(t, "auth status", out)
+	for _, want := range []string{"signed in:    yes", "https://hop.example", model.ID{7}.String(), "desk", "device key:   keychain", "vault:        unlocked", "Recovery Key", "out of date", "last sync"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("auth status lacks %q:\n%s", want, out)
+		}
+	}
+	code, out, _ = f.hop(t, "auth", "status", "--json")
+	var a cli.AuthStatus
+	decodeJSON(t, out, &a)
+	if code != 0 || !a.SignedIn || !a.RecoveryDue || !a.SecretKeyStale || a.DeviceName != "desk"+hostile || a.Server != "https://hop.example" || a.Sync == nil {
+		t.Errorf("--json: exit %d: %+v", code, a)
+	}
+	if n := len(f.called(daemon.OpShutdown)); n != 0 {
+		t.Errorf("auth status stopped the daemon")
+	}
+
+	// A local-only vault, locked.
+	f.reply(daemon.OpStatus, daemon.StatusResult{
+		Vault: &store.Info{Locked: true, DeviceStore: "file"},
+		Sync:  &daemon.SyncStatusResult{State: daemon.SyncOff},
+	})
+	code, out, _ = f.hop(t, "auth", "status")
+	if code != 0 || !strings.Contains(out, "signed in:    no") || !strings.Contains(out, "local-only") || !strings.Contains(out, "locked") {
+		t.Errorf("local-only: exit %d:\n%s", code, out)
 	}
 }
 

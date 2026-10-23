@@ -784,14 +784,14 @@ func TestSignupRetryGetsTheAcknowledgment(t *testing.T) {
 	other := *lost.req
 	other.Wires = other.Wires[:len(other.Wires)-1]
 	other.UploadSeq--
-	if _, err := w.client(t).Publisher(model.ID{}).Signup(ctx, &other); !errors.Is(err, syncclient.ErrRegistrationConflict) {
-		t.Errorf("another publication: %v; want ErrRegistrationConflict", err)
+	if _, err := w.client(t).Publisher(model.ID{}).Signup(ctx, &other); !errors.Is(err, syncclient.ErrRegistrationConflict) || errors.Is(err, store.ErrRegistrationRefused) {
+		t.Errorf("another publication: %v; want ErrRegistrationConflict, not a refusal", err)
 	}
 	// And another code is still refused.
 	bad := *lost.req
 	bad.RegistrationCode = "not-a-registration-code"
-	if _, err := w.client(t).Publisher(model.ID{}).Signup(ctx, &bad); !errors.Is(err, syncclient.ErrUnauthorized) {
-		t.Errorf("a wrong registration code: %v; want ErrUnauthorized", err)
+	if _, err := w.client(t).Publisher(model.ID{}).Signup(ctx, &bad); !errors.Is(err, syncclient.ErrUnauthorized) || !errors.Is(err, store.ErrRegistrationRefused) {
+		t.Errorf("a wrong registration code: %v; want ErrUnauthorized and store.ErrRegistrationRefused", err)
 	}
 
 	dev1, err := syncclient.StoreDevice(s1.DeviceAuth)

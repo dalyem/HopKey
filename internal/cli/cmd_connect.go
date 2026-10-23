@@ -16,6 +16,7 @@ import (
 	"github.com/dalyem/hopkey/internal/resolve"
 	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/sshkeys"
+	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
@@ -150,7 +151,8 @@ func plainSSH(ctx context.Context, e *Env, res *resolve.Result) error {
 	// The session's streams are not sanitized, on purpose: this is the user's
 	// own terminal session with ssh, not output hop composes.
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = e.Stdin, e.Stdout, e.Stderr
-	cmd.Env = e.environ()
+	// The user's own agent stays: this is their ssh setup, not hop's.
+	cmd.Env = withoutEnv(e.environ(), store.PassphraseEnv)
 	err := cmd.Run()
 	var ee *exec.ExitError
 	switch {

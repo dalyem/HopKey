@@ -8,7 +8,6 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/syncclient"
-	"github.com/dalyem/hopkey/internal/vaultlog"
 )
 
 // SignupOptions are hop auth signup's inputs.
@@ -152,22 +151,11 @@ func replaceCode(ctx context.Context, env *Env, s *store.Store) (store.Publicati
 	return pub, err
 }
 
-// publisher is the client's store.Publisher with the refusal of a
-// registration code (the server's 401, on the identical repost too) marked
-// as store.ErrRegistrationRefused, which the store needs to tell it from an
-// uncertain outcome.
-type publisher struct{ *syncclient.Publisher }
-
-func publisherOf(c *syncclient.Client, vaultID model.ID) publisher {
-	return publisher{c.Publisher(vaultID)}
-}
-
-func (p publisher) Signup(ctx context.Context, req *store.SignupRequest) (vaultlog.Head, error) {
-	h, err := p.Publisher.Signup(ctx, req)
-	if errors.Is(err, syncclient.ErrUnauthorized) {
-		err = fmt.Errorf("%w: %w", store.ErrRegistrationRefused, err)
-	}
-	return h, err
+// publisherOf is the client's store.Publisher for vaultID. It reports the
+// server's refusal of a registration code as store.ErrRegistrationRefused
+// itself (syncclient.Publisher.Signup).
+func publisherOf(c *syncclient.Client, vaultID model.ID) *syncclient.Publisher {
+	return c.Publisher(vaultID)
 }
 
 // initVault creates a local vault, as hop init does: a new master

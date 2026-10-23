@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/dalyem/hopkey/internal/safepath"
+	"github.com/dalyem/hopkey/internal/store"
 )
 
 // hop setup --service installs a user service that runs hop daemon from
@@ -94,7 +95,11 @@ func (e *Env) runCommand(ctx context.Context, argv []string) ([]byte, error) {
 	if e.RunCommand != nil {
 		return e.RunCommand(ctx, argv[0], argv[1:]...)
 	}
-	return exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	// The device key file's passphrase is for hop and its daemon only;
+	// the service manager gets its environment from the unit, not here.
+	cmd.Env = withoutEnv(e.environ(), store.PassphraseEnv)
+	return cmd.CombinedOutput()
 }
 
 // serviceFor builds the unit or agent for this system.

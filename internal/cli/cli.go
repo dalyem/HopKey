@@ -18,12 +18,14 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/syncclient"
 	"github.com/dalyem/hopkey/internal/version"
 )
 
@@ -65,7 +67,9 @@ type Env struct {
 	SSHBinary string
 	// ExecSSH replaces the process with ssh (hop <target>). Tests replace it.
 	ExecSSH func(path string, argv, environ []string) error
-	// Environ is the environment given to ssh. Nil means os.Environ().
+	// Environ is the environment hop's child processes (ssh, the daemon)
+	// start from, before the hop auth secrets are removed. Nil means
+	// os.Environ().
 	Environ []string
 	// SSHProbeEnv is added to the otherwise bare environment (HOME, PATH) of
 	// the ssh -G runs of `hop import ssh-config`. Tests use it for the passwd
@@ -89,11 +93,89 @@ type Env struct {
 	// RunCommand runs systemctl or launchctl for hop setup --service and
 	// returns its combined output. Nil means os/exec. Tests replace it.
 	RunCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
+	// SyncClient configures hop auth's connections to the server: a
+	// private CA, say. Zero means the system's trusted roots.
+	// HOP_DEV_INSECURE=1 also sets DevInsecure, as it does for the daemon.
+	SyncClient syncclient.Options
+
+	// Exit ends the process when Run's context is cancelled by a signal
+	// and the command does not return on its own (see watchInterrupt). Nil
+	// means a cancelled context is all that happens, as in tests.
+	Exit func(code int)
+	// InterruptGrace is how long a command that holds the vault gets to
+	// return after its context is cancelled. Zero means 3 seconds.
+	InterruptGrace time.Duration
 
 	// warned holds the warnings already printed in this run, so a command
 	// that makes many changes says each one once.
 	warned map[string]bool
+
+	// hold is the hop auth command's hold of the vault while it lasts.
+	holdMu sync.Mutex
+	hold   *vaultHold
 }
+
+// ExitInterrupted is the exit status after SIGINT or SIGTERM, as a shell
+// reports a command killed by SIGINT.
+const ExitInterrupted = 130
+
+// watchInterrupt runs while a command does. cmd/hop cancels Run's context
+// with ErrInterrupted on SIGINT and SIGTERM. A command that holds the vault for a hop auth
+// flow gets InterruptGrace to return, and its deferred release starts the
+// daemon again; one stuck where the context does not reach (a prompt
+// reading the terminal) is abandoned: the daemon is launched to take the
+// vault once this process is gone, and the process exits. A command that
+// holds nothing exits at once, as it did when the signal killed it,
+// unless it handles the context itself (ctxAware, decided before the
+// command starts: see handlesInterrupt).
+func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware bool) {
+	if e.Exit == nil {
+		return
+	}
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+	}
+	if !errors.Is(context.Cause(ctx), ErrInterrupted) {
+		return // a deadline, not a signal
+	}
+	if ctxAware {
+		return
+	}
+	if h := e.currentHold(); h != nil {
+		grace := e.InterruptGrace
+		if grace <= 0 {
+			grace = 3 * time.Second
+		}
+		select {
+		case <-done:
+			return
+		case <-time.After(grace):
+		}
+		if h := e.currentHold(); h != nil {
+			h.abandon()
+		}
+	}
+	select {
+	case <-done:
+		return
+	default:
+	}
+	e.Exit(ExitInterrupted)
+}
+
+// handlesInterrupt reports whether the command args runs returns on its
+// own once a signal cancels the context, and so is never cut short:
+// hop daemon, which closes cleanly. It is decided from the arguments
+// alone, before the command and Run's signal watcher start.
+func handlesInterrupt(args []string) bool {
+	return len(args) == 1 && args[0] == "daemon"
+}
+
+// ErrInterrupted is the cause cmd/hop gives the context it cancels on
+// SIGINT or SIGTERM (context.WithCancelCause).
+var ErrInterrupted = errors.New("interrupted")
 
 func (e *Env) now() time.Time {
 	if e.Now != nil {
@@ -171,9 +253,9 @@ func init() {
 		"init":    {runInit, "hop init [--device-key-store keychain|file] [--kit-file PATH]"},
 		"lock":    {runLock, "hop lock"},
 		"unlock":  {runUnlock, "hop unlock [--password]"},
-		"passwd":  {runPasswd, "hop passwd [--kit-file PATH]"},
+		"passwd":  {runPasswd, "hop passwd [--kit-file PATH] (on a server: the flags of hop auth passwd)"},
 		"sync":    {runSync, "hop sync [--json] | hop sync resolve [N] [--keep-mine [--confirm TOKEN] | --edit --set FIELD=VALUE... [--confirm TOKEN] | --take-theirs [--yes] | --retry] [--json]"},
-		"auth":    {runAuth, "hop auth <devices|login|signup|approve|logout|rotate|passwd|merge|status> [--json]"},
+		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|logout|rotate|passwd|merge|resume> [--json]"},
 		"login":   {runLogin, "hop login [flags of hop auth login]"},
 		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
 	}
@@ -186,7 +268,9 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop key add|ls|rm | import ssh-config | ts import|link
        hop setup [--service] | status | daemon
        hop init | lock | unlock [--password] | passwd
-       hop sync [resolve] | auth devices
+       hop sync [resolve]
+       hop auth signup|login|approve|status|devices|logout|rotate|passwd|merge|resume
+       hop login | logout       aliases of hop auth login and hop auth logout
 
 Every command takes --json. Run "hop <command> -h" for its flags.
 `
@@ -197,13 +281,33 @@ func Run(ctx context.Context, args []string, e *Env) int {
 	if e.Getenv == nil {
 		e.Getenv = os.Getenv
 	}
+	ctxAware := handlesInterrupt(args)
+	done := make(chan struct{})
+	go e.watchInterrupt(ctx, done, ctxAware)
 	err := dispatch(ctx, e, args)
+	close(done)
+	// After a signal hop exits 130, however the command ended: with the
+	// failure its cancelled context caused, or with success when it
+	// finished as the signal came. hop daemon keeps its own status: it
+	// stops on a signal by design, and a service manager reads 0 as a
+	// clean stop.
+	if !ctxAware && errors.Is(context.Cause(ctx), ErrInterrupted) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, flag.ErrHelp) {
+			report(e, err, args)
+		}
+		return ExitInterrupted
+	}
 	if err == nil {
 		return 0
 	}
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
+	return report(e, err, args)
+}
+
+// report prints err (see reportError) and returns its exit status.
+func report(e *Env, err error, args []string) int {
 	// Only an exitError that is itself the error returned may keep its layout.
 	// One found inside a wrapper supplies the exit status, but the wrapper's
 	// text is not covered by its mark.
@@ -356,6 +460,19 @@ func newFlags(e *Env, name, usage string) *flag.FlagSet {
 		fs.SetOutput(out)
 	}
 	return fs
+}
+
+// helpNote adds text after the flags that -h prints, and not after a
+// parse error.
+func helpNote(e *Env, fs *flag.FlagSet, note string) {
+	base := fs.Usage
+	fs.Usage = func() {
+		base()
+		if out, ok := fs.Output().(*flagOut); ok && out.Len() > 0 {
+			return
+		}
+		fmt.Fprint(e.Stderr, note)
+	}
 }
 
 // parseFlags parses args allowing flags and positional arguments in any
