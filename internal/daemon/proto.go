@@ -51,8 +51,8 @@ const (
 	CodeUnreachable  = "unreachable"   // the server could not be reached, or is busy; it is retried
 	CodeNotHeld      = "not_held"      // no held change, or not the one named
 	CodeStillHeld    = "still_held"    // a retry found the change still held
-	CodeStaleConfirm = "stale_confirm" // the confirmation digest no longer matches the proposal
-	CodeConfirm      = "confirm"       // keep-mine and edit need the proposal's digest
+	CodeStaleConfirm = "stale_confirm" // the confirmation token no longer matches the proposal
+	CodeConfirm      = "confirm"       // keep-mine and edit need the proposal's confirmation token
 )
 
 // Request is one control call.
@@ -227,6 +227,11 @@ type SyncStatusResult struct {
 	// server showing two different entries at one position (§5.6).
 	Halted       string `json:"halted,omitempty"`
 	Equivocation bool   `json:"equivocation,omitempty"`
+	// ServerRetirement is set when the server refused this device a
+	// session and its retire-status said the device left the account.
+	// That is server-reported and unverified: the vault was locked and
+	// the agent emptied in memory only, and nothing on disk was changed.
+	ServerRetirement *ServerRetirement `json:"server_retirement,omitempty"`
 	// What still needs the user, each also a sentence in Warnings.
 	LostIntents        uint64                  `json:"lost_intents,omitempty"`
 	LostJournals       *store.LostJournals     `json:"lost_journals,omitempty"`
@@ -238,6 +243,14 @@ type SyncStatusResult struct {
 	Publishing         bool                    `json:"publishing,omitempty"`
 	Merge              string                  `json:"merge,omitempty"`
 	Warnings           []string                `json:"warnings,omitempty"`
+}
+
+// ServerRetirement is the server's unverified report that this device
+// left the account (SyncStatusResult.ServerRetirement).
+type ServerRetirement struct {
+	How        string `json:"how"`        // "retired" or "revoked"
+	Seq        uint64 `json:"seq"`        // the entry the server says removed it
+	Unverified bool   `json:"unverified"` // always true: the log can't show it to a device that left
 }
 
 // SyncBackoff is the retry schedule after a failure.
@@ -270,24 +283,28 @@ type HeldChange struct {
 	// Choices are the resolutions on offer: keep-mine, edit, take-theirs
 	// and retry, less what the hold refuses.
 	Choices []string `json:"choices"`
-	// KeepMine is what keep-mine would write, with its digest, or nil
+	// KeepMine is what keep-mine would write, with its token, or nil
 	// when keep-mine is refused (KeepMineRefused says why).
 	KeepMine        *Proposal `json:"keep_mine,omitempty"`
 	KeepMineRefused string    `json:"keep_mine_refused,omitempty"`
 }
 
 // Proposal is the replacement a keep-mine or edit resolution writes, and
-// the digest that confirms it (§5.4).
+// the token that confirms it. Confirm is opaque: a MAC, under a key only
+// this daemon process holds, of the proposal's §5.4 digest, which covers
+// the secrets left out of Seen and Want. It reveals nothing about them,
+// and it no longer confirms once the daemon restarts or anything in the
+// replacement changes, secrets included.
 type Proposal struct {
-	N      uint64          `json:"n"`
-	Choice string          `json:"choice"`
-	Action merge.Action    `json:"action"`
-	ItemID string          `json:"item_id"`
-	Type   model.Type      `json:"type"`
-	Seen   json.RawMessage `json:"seen"`
-	Want   json.RawMessage `json:"want"`
-	NewID  string          `json:"new_id,omitempty"` // pass back in SyncResolveParams
-	Digest string          `json:"digest"`           // pass back as Confirm
+	N       uint64          `json:"n"`
+	Choice  string          `json:"choice"`
+	Action  merge.Action    `json:"action"`
+	ItemID  string          `json:"item_id"`
+	Type    model.Type      `json:"type"`
+	Seen    json.RawMessage `json:"seen"`
+	Want    json.RawMessage `json:"want"`
+	NewID   string          `json:"new_id,omitempty"` // pass back in SyncResolveParams
+	Confirm string          `json:"confirm"`          // pass back as SyncResolveParams.Confirm
 }
 
 // Resolution choices.
@@ -300,7 +317,7 @@ const (
 
 // SyncResolveParams is the request for OpSyncResolve. N names the held
 // record (HeldChange.N). keep-mine and edit write only with Confirm, the
-// digest of the proposal (from HeldChange.KeepMine, or from a Propose
+// token of the proposal (from HeldChange.KeepMine, or from a Propose
 // call for edit); with Propose they return the proposal and write
 // nothing. Edited is the edited item's plaintext JSON, for edit only, and
 // only for hosts and snippets: a key's or credential's secret never

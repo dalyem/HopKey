@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -66,6 +67,7 @@ type syncStore interface {
 	ServerInfo() (store.ServerInfo, error)
 	DeviceAuth() (store.DeviceAuth, error)
 	Status() (store.SyncStatus, error)
+	RequestContext(ctx context.Context) (context.Context, uint64, func(), error)
 	Pull(ctx context.Context, r store.Remote) error
 	PushHead(ctx context.Context, r store.Remote) (store.PushResult, error)
 	Lock()
@@ -156,6 +158,13 @@ type syncer struct {
 	halted    string
 	equivoc   bool
 	notes     []string // from the startup work: things that need the user
+	// retired is the server's unverified word that this device left the
+	// account (sessionEnded).
+	retired *ServerRetirement
+
+	// confirmKey keys the confirmation tokens of resolution proposals
+	// (confirmToken). It is random per daemon process.
+	confirmKey [32]byte
 }
 
 func newSyncer(d *Daemon, st syncStore, opts SyncOptions) *syncer {
@@ -180,12 +189,14 @@ func newSyncer(d *Daemon, st syncStore, opts SyncOptions) *syncer {
 	if syncclient.DevInsecureFromEnv(os.Getenv) {
 		opts.Client.DevInsecure = true
 	}
-	return &syncer{
+	e := &syncer{
 		d: d, st: st, opts: opts,
 		bo:     backoff{min: opts.minBackoff, max: opts.maxBackoff, rand: rand.Float64},
 		wakeCh: make(chan struct{}, 1),
 		phase:  SyncStarting, clients: map[string]*syncclient.Client{},
 	}
+	crand.Read(e.confirmKey[:])
+	return e
 }
 
 // startSync starts the engine for a store that can sync.
@@ -334,6 +345,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 	if st.Held == 0 && st.Pending > 0 {
 		res, err := e.st.PushHead(ctx, r)
 		if err != nil {
+			e.reconcile(ctx, gen, &st)
 			return e.fail(ctx, err)
 		}
 		e.pushed(ctx, gen, res)
@@ -358,8 +370,11 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 	woken := pctx.Err() != nil
 	e.set(func() { e.pollStop = nil })
 	cancel()
+	if err != nil {
+		e.reconcile(ctx, gen, &st)
+	}
 	if err != nil && woken && ctx.Err() == nil && e.st.Generation() == gen {
-		// Cut short by a wake: nothing was applied.
+		// Cut short by a wake.
 		return stepNow
 	}
 	if err != nil {
@@ -385,6 +400,25 @@ func (e *syncer) pulled(ctx context.Context, gen uint64) {
 	if e.st.Generation() == gen {
 		e.d.refreshAfterSync(ctx)
 	}
+}
+
+// reconcile follows the store after a pull or push that failed or was
+// cut short, keeping the failure for the caller to record. The store
+// commits verified entries one at a time, so a pull that stopped on a bad
+// entry may have committed a deletion before it, and a push may have
+// changed the outbox before it failed: the agent and the ssh config are
+// rebuilt if the verified head or the outbox moved. before is the outbox
+// as it was, if it was read. Nothing is rebuilt once the store has left
+// generation gen (a lock fences the old keyring off already) or the
+// daemon is closing.
+func (e *syncer) reconcile(ctx context.Context, gen uint64, before *store.SyncStatus) {
+	if ctx.Err() != nil || e.st.Generation() != gen {
+		return
+	}
+	if after, err := e.st.Status(); err == nil && before != nil && (after.Pending != before.Pending || after.Held != before.Held) {
+		e.d.outboxGen.Add(1)
+	}
+	e.d.refreshAfterSync(ctx)
 }
 
 // pushed records a push that worked: PushHead pulled first, and the outbox
@@ -470,7 +504,10 @@ func (e *syncer) revoked(err error) {
 // log; retire-status says how it left (§9). If it did, sync stops, and
 // the vault is locked and the agent emptied, as for a verified
 // revocation, but not durably: the store is not marked revoked on the
-// server's word. It reports whether sync stopped.
+// server's word, and sync.status labels it server-reported and
+// unverified. A lock or a close cancels the request, and an answer counts
+// only in the unlocked session it was asked in. It reports whether sync
+// stopped.
 func (e *syncer) sessionEnded(ctx context.Context) bool {
 	info, err := e.st.ServerInfo()
 	if err != nil {
@@ -484,20 +521,46 @@ func (e *syncer) sessionEnded(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	rs, err := c.Retirer(info.VaultID).RetireStatus(ctx, auth, crypto.Hash{})
+	rctx, gen, done, err := e.st.RequestContext(ctx)
+	if err != nil {
+		return false
+	}
+	rs, err := c.Retirer(info.VaultID).RetireStatus(rctx, auth, crypto.Hash{})
+	done()
 	if err != nil || rs.Receipt == nil {
 		return false
 	}
-	why := fmt.Errorf("the server reports this device %s from the account at seq %d", rs.Receipt.How, rs.Receipt.Seq)
-	e.set(func() {
-		e.phase, e.lastErr, e.lastErrAt = SyncRevoked, why.Error(), time.Now()
-		e.notes = append(e.notes, why.Error()+"; it can't sync again (sign in again with hop auth login)")
-	})
+	return e.serverRetired(gen, info, auth, *rs.Receipt)
+}
+
+// serverRetired acts on the receipt retire-status returned for a request
+// made in store generation gen, if it is this device's and says it was
+// retired or revoked, and the store is still unlocked in gen. It reports
+// whether it acted.
+func (e *syncer) serverRetired(gen uint64, info store.ServerInfo, auth store.DeviceAuth, rc store.DeviceReceipt) bool {
+	if rc.How != "retired" && rc.How != "revoked" {
+		e.d.logf("sync: ignoring a retire-status receipt that says %q", rc.How)
+		return false
+	}
+	if info.AccountID.IsZero() || auth.AccountID != info.AccountID || auth.DeviceID.IsZero() || rc.DeviceID != auth.DeviceID {
+		e.d.logf("sync: ignoring a retire-status receipt for another device or account")
+		return false
+	}
 	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	// Lock and unlock take d.mu, so the store can't reach another
+	// unlocked session between this check and the lock below.
+	if e.st.Generation() != gen || e.st.Info().Locked {
+		return false
+	}
+	ret := &ServerRetirement{How: rc.How, Seq: rc.Seq, Unverified: true}
+	why := fmt.Sprintf("the server reports this device %s from the account at seq %d (server-reported, unverified)", rc.How, rc.Seq)
+	e.set(func() {
+		e.phase, e.lastErr, e.lastErrAt, e.retired = SyncRevoked, why, time.Now(), ret
+	})
 	e.st.Lock()
 	e.d.dropKeysLocked(true)
-	e.d.mu.Unlock()
-	e.d.logf("sync stopped: %v", why)
+	e.d.logf("sync stopped: %s", why)
 	return true
 }
 
@@ -543,6 +606,11 @@ func (e *syncer) resumeLogout(ctx context.Context) time.Duration {
 // for the daemon to finish: a publication, then a server-backed
 // checkpoint whose candidate may have committed. done is false while it
 // still has to run; d then says when to try again.
+//
+// An interrupted device approval is not resumed here, though the store
+// could (Approval, ApproveFinish): finishing one means comparing the SAS
+// with the new device's user, so it is hop auth approve's job, through
+// authflow. sync.status warns about an approval whose journal was lost.
 func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duration, done bool) {
 	e.mu.Lock()
 	finished := e.resumedOK && e.resumed == gen
@@ -570,6 +638,9 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 		c, err := e.client(p.Server)
 		if err == nil {
 			_, err = e.st.ResumePublish(ctx, c.Publisher(p.VaultID))
+		}
+		if err != nil {
+			e.reconcile(ctx, gen, nil)
 		}
 		var eq *vaultlog.EquivocationError
 		switch {
@@ -600,6 +671,9 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 		}
 		if r != nil {
 			_, err := e.st.ResumeCheckpoint(ctx, r)
+			if err != nil {
+				e.reconcile(ctx, gen, nil)
+			}
 			switch {
 			case errors.Is(err, store.ErrNoCheckpoint):
 			case err != nil && retry(err):
@@ -731,6 +805,10 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 	if r == nil {
 		return store.ErrNotServerBacked
 	}
+	var before *store.SyncStatus
+	if st, err := e.st.Status(); err == nil {
+		before = &st
+	}
 	err = e.st.Pull(rctx, r)
 	if err == nil && req.kind == reqSyncNow {
 		for range maxSyncNowPushes {
@@ -747,6 +825,7 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 		}
 	}
 	if err != nil {
+		e.reconcile(ctx, gen, before)
 		var eq *vaultlog.EquivocationError
 		switch {
 		case errors.Is(err, store.ErrDeviceRevoked):
@@ -792,6 +871,10 @@ func (e *syncer) status() SyncStatusResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := SyncStatusResult{State: e.phase, LastError: e.lastErr, Halted: e.halted, Equivocation: e.equivoc}
+	if e.retired != nil {
+		r := *e.retired
+		out.ServerRetirement = &r
+	}
 	if !e.syncedAt.IsZero() {
 		t := e.syncedAt
 		out.SyncedAt = &t

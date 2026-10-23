@@ -39,12 +39,17 @@ const (
 // syncWorld is a real hop-server on SQLite behind an httptest TLS server
 // whose certificate the daemons trust. While down is set it answers every
 // request 503, as a server that is down or overloaded behind a proxy.
+// intercept, when set, sees each request first and answers it instead of
+// the server if it returns true.
 type syncWorld struct {
-	st     *server.SQLite
-	origin string
-	pool   *x509.CertPool
-	down   atomic.Bool
+	st        *server.SQLite
+	origin    string
+	pool      *x509.CertPool
+	down      atomic.Bool
+	intercept atomic.Pointer[interceptor]
 }
+
+type interceptor func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool
 
 func newSyncWorld(t *testing.T) *syncWorld {
 	t.Helper()
@@ -68,6 +73,9 @@ func newSyncWorld(t *testing.T) *syncWorld {
 	ts.Config.Handler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if w.down.Load() {
 			http.Error(rw, "down for maintenance", http.StatusServiceUnavailable)
+			return
+		}
+		if f := w.intercept.Load(); f != nil && (*f)(rw, req, h) {
 			return
 		}
 		h.ServeHTTP(rw, req)
@@ -714,7 +722,7 @@ func TestHeldConflictResolvesThroughSyncResolve(t *testing.T) {
 	}
 	hc := held.Held[0]
 	if hc.ItemID != h.ItemID.String() || hc.Type != model.TypeHost || hc.Hold == nil || hc.Hold.Cause != merge.CauseGuardedConflict ||
-		hc.KeepMine == nil || hc.KeepMine.Digest == "" || !slices.Contains(hc.Choices, ChoiceKeepMine) || !slices.Contains(hc.Choices, ChoiceEdit) ||
+		hc.KeepMine == nil || hc.KeepMine.Confirm == "" || !slices.Contains(hc.Choices, ChoiceKeepMine) || !slices.Contains(hc.Choices, ChoiceEdit) ||
 		!strings.Contains(string(hc.Current), "203.0.113.21") || !strings.Contains(string(hc.Want), "203.0.113.31") {
 		t.Fatalf("held change %+v keep mine %+v", hc, hc.KeepMine)
 	}
@@ -749,10 +757,10 @@ func TestHeldConflictResolvesThroughSyncResolve(t *testing.T) {
 	}
 	var prop SyncResolveResult
 	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceKeepMine, Propose: true}, &prop)
-	if prop.Proposal == nil || prop.Proposal.Digest != hc.KeepMine.Digest {
+	if prop.Proposal == nil || prop.Proposal.Confirm != hc.KeepMine.Confirm {
 		t.Fatalf("proposal %+v; sync.held had %+v", prop.Proposal, hc.KeepMine)
 	}
-	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceKeepMine, Confirm: hc.KeepMine.Digest, NewID: hc.KeepMine.NewID}, &res)
+	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceKeepMine, Confirm: hc.KeepMine.Confirm, NewID: hc.KeepMine.NewID}, &res)
 	eventually(t, 5*time.Second, "keep mine reaches the desk", func() bool {
 		got := x.n1.host("shared")
 		return got != nil && got.Addresses[0] == "203.0.113.32"
@@ -786,7 +794,7 @@ func TestHeldConflictResolvesThroughSyncResolve(t *testing.T) {
 	if prop.Proposal == nil || !strings.Contains(string(prop.Proposal.Want), "203.0.113.43") {
 		t.Fatalf("edit proposal %+v", prop.Proposal)
 	}
-	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceEdit, Edited: raw, Confirm: prop.Proposal.Digest, NewID: prop.Proposal.NewID}, &res)
+	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceEdit, Edited: raw, Confirm: prop.Proposal.Confirm, NewID: prop.Proposal.NewID}, &res)
 	eventually(t, 5*time.Second, "the edit reaches the desk", func() bool {
 		got := x.n1.host("shared")
 		return got != nil && got.Addresses[0] == "203.0.113.43"

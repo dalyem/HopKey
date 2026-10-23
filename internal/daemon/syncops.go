@@ -3,6 +3,9 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -173,6 +176,9 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 		}
 	}
 
+	if r := out.ServerRetirement; r != nil {
+		warn("server-reported, unverified: the server says this device was %s from the account at seq %d, so the vault was locked and sync stopped; if that is right, sign in again with hop auth login", r.How, r.Seq)
+	}
 	switch {
 	case out.Equivocation:
 		warn("the server showed two different histories of the vault (an equivocation): sync is stopped; compare hop status on your devices and contact the server's operator")
@@ -235,7 +241,7 @@ func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 	}
 	if !h.Import {
 		if p, err := st.Propose(store.Resolution{Choice: merge.ChoiceKeepMine}); err == nil {
-			hc.KeepMine = proposalOf(p)
+			hc.KeepMine = d.sync.proposalOf(p)
 		} else {
 			hc.KeepMineRefused = err.Error()
 		}
@@ -255,14 +261,32 @@ func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 // socket: keys and credentials hold secrets that never cross it.
 func editable(t model.Type) bool { return t == model.TypeHost || t == model.TypeSnippet }
 
-func proposalOf(p store.Proposal) *Proposal {
+// proposalOf is the control form of a store proposal: redacted, and with
+// a confirmation token in place of the store's digest.
+func (e *syncer) proposalOf(p store.Proposal) *Proposal {
 	out := &Proposal{
 		N: p.N, Choice: choiceName(p.Choice), Action: p.Action, ItemID: p.ItemID.String(), Type: p.Type,
-		Seen: redacted(p.Type, p.Seen), Want: redacted(p.Type, p.Want), Digest: p.Digest.String(),
+		Seen: redacted(p.Type, p.Seen), Want: redacted(p.Type, p.Want), Confirm: e.confirmToken(p).String(),
 	}
 	if !p.NewID.IsZero() {
 		out.NewID = p.NewID.String()
 	}
+	return out
+}
+
+// confirmToken is the token that confirms p: HMAC-SHA256, keyed with
+// this daemon's random confirmKey, of n and the store's digest c (§5.4).
+// c hashes the full replacement, a credential's password and a key's
+// private key included, so on its own it would let anyone holding the
+// redacted proposal test guesses at them; the token is useless without
+// the key, and it still changes whenever c does.
+func (e *syncer) confirmToken(p store.Proposal) crypto.Hash {
+	m := hmac.New(sha256.New, e.confirmKey[:])
+	m.Write([]byte("hopkey/daemon/resolve-confirm\x00"))
+	m.Write(binary.BigEndian.AppendUint64(nil, p.N))
+	m.Write(p.Digest[:])
+	var out crypto.Hash
+	copy(out[:], m.Sum(nil))
 	return out
 }
 
@@ -354,8 +378,9 @@ func (d *Daemon) opSyncResolve(ctx context.Context, p SyncResolveParams) (*SyncR
 			return nil, invalidf("new_id: %v", err)
 		}
 	}
+	var token crypto.Hash
 	if p.Confirm != "" {
-		if err := r.Confirm.UnmarshalText([]byte(strings.TrimSpace(p.Confirm))); err != nil {
+		if err := token.UnmarshalText([]byte(strings.TrimSpace(p.Confirm))); err != nil {
 			return nil, invalidf("confirm: %v", err)
 		}
 	}
@@ -391,10 +416,24 @@ func (d *Daemon) opSyncResolve(ctx context.Context, p SyncResolveParams) (*SyncR
 		if err != nil {
 			return nil, syncError(err)
 		}
-		return &SyncResolveResult{Proposal: proposalOf(prop)}, nil
+		return &SyncResolveResult{Proposal: d.sync.proposalOf(prop)}, nil
 	}
-	if needsConfirm && p.Confirm == "" {
-		return nil, &Error{Code: CodeConfirm, Message: fmt.Sprintf("%s needs the digest of its proposal as confirm", p.Choice)}
+	if needsConfirm {
+		if p.Confirm == "" {
+			return nil, &Error{Code: CodeConfirm, Message: fmt.Sprintf("%s needs the confirmation token of its proposal as confirm", p.Choice)}
+		}
+		// The token is checked against the full proposal as it stands
+		// now, never the redacted one the user saw: a change to a secret
+		// since then makes it stale too. Resolve checks the digest again
+		// under the store's lock.
+		prop, err := st.Propose(r)
+		if err != nil {
+			return nil, syncError(err)
+		}
+		if want := d.sync.confirmToken(prop); prop.N != p.N || !hmac.Equal(want[:], token[:]) {
+			return nil, syncError(store.ErrStaleConfirm)
+		}
+		r.Confirm = prop.Digest
 	}
 	if err := st.Resolve(r); err != nil {
 		return nil, syncError(err)
