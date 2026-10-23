@@ -201,8 +201,8 @@ func checkpoint(ctx context.Context, env *Env, v *Vault, kind string, targets []
 }
 
 // choose asks for the survivors (§10.1): a password change keeps every
-// device and shows them; the others keep only this device and the ones
-// the user chooses. Every reference, a revocation's targets included, is
+// device it shows (store.CheckpointOptions.Shown); the others keep only
+// this device and the ones the user chooses. Every reference, a revocation's targets included, is
 // resolved here, once, against the list the user was shown, and only
 // device IDs go to the store: a name resolved again after a later pull
 // could pick a device that joined meanwhile under the same name.
@@ -216,6 +216,13 @@ func choose(ctx context.Context, env *Env, v *Vault, k *ckpt, self string) error
 		return err
 	}
 	if k.kind == store.CheckpointPasswd {
+		// The change keeps the devices shown; one that joins while the
+		// passwords are typed is asked about (answerNewDevices), never
+		// kept silently.
+		k.opts.Shown = make([]model.ID, len(devices))
+		for i, d := range devices {
+			k.opts.Shown[i] = d.ID
+		}
 		return env.UI.ShowDevices(ctx, devices)
 	}
 	var targets []model.ID

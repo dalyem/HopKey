@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
@@ -11,6 +12,7 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/syncclient"
+	"github.com/dalyem/hopkey/internal/vaultlog"
 )
 
 // EnrollOptions are hop auth login --method approve's inputs, on the new
@@ -25,8 +27,11 @@ type EnrollOptions struct {
 	// DeviceStore is where this device's key goes (store.DeviceStoreKeychain,
 	// the default, or store.DeviceStoreFile).
 	DeviceStore string
-	// VaultID is the account's vault. The API gives the new device no way
-	// to learn it before it is installed (gap G1), so the caller must.
+	// VaultID, when set, is the account's vault, which the new device reads
+	// the log of. Zero learns it from the server once the approving device
+	// has added this one: the server binds the new device's session to its
+	// account's vault (syncclient.Client.SessionVault). Either way the
+	// installed vault's verified state names it.
 	VaultID model.ID
 	// Mailbox resumes an enrollment this process started, within the
 	// mailbox's lifetime (EnrollInterruptedError.Mailbox).
@@ -46,8 +51,9 @@ const relayWait = syncclient.MaxWait
 // compare, and installs the vault once the confirmed delivery verifies.
 //
 // A chal or a delivery that fails its schema or its checks (a substituted
-// one, say) is discarded with no change of state, and LoginApprove keeps
-// waiting for the real one (§7, invalid input). A rejected SAS is
+// one, say: store.ErrChalInvalid, store.ErrDeliveryInvalid) is discarded
+// with no change of state, and LoginApprove keeps waiting for the real one
+// (§7, invalid input). Any other failure to handle one is operational. A rejected SAS is
 // terminal: the enrollment is discarded, nothing is installed, and the
 // error matches crypto.ErrSASRejected. An attempt past its deadline, or
 // whose mailbox the server no longer has, matches crypto.ErrEnrollExpired
@@ -58,10 +64,10 @@ const relayWait = syncclient.MaxWait
 // is installed by the next call even without the mailbox.
 func LoginApprove(ctx context.Context, env *Env, opts EnrollOptions) (*LoginResult, error) {
 	cfg, c := env.Config, env.Client
-	if opts.VaultID.IsZero() {
-		return nil, ErrNeedVaultID
+	var reader store.EnrollRemote = &sessionReader{c: c}
+	if !opts.VaultID.IsZero() {
+		reader = c.Publisher(opts.VaultID)
 	}
-	reader := c.Publisher(opts.VaultID)
 	e, err := store.ResumeEnrollment(cfg)
 	switch {
 	case errors.Is(err, store.ErrNoEnrollment):
@@ -79,7 +85,7 @@ func LoginApprove(ctx context.Context, env *Env, opts EnrollOptions) (*LoginResu
 			if err != nil {
 				return nil, err
 			}
-			return enrolled(s, c, opts.VaultID)
+			return enrolled(s, c)
 		case st == crypto.DeviceRejected || st == crypto.DeviceFailed || mb == nil:
 			if !opts.Restart {
 				e.Close()
@@ -127,7 +133,53 @@ func LoginApprove(ctx context.Context, env *Env, opts EnrollOptions) (*LoginResu
 	if err != nil {
 		return nil, err
 	}
-	return enrolled(s, c, opts.VaultID)
+	return enrolled(s, c)
+}
+
+// sessionReader is the log as the new device reads it before it knows its
+// vault (store.EnrollRemote): its first read learns the vault its session
+// is bound to (syncclient.Client.SessionVault), which works once the
+// approving device's device_add committed, as it has before any delivery
+// is sent. Nothing it returns is trusted: the store verifies the log from
+// the delivered anchor.
+type sessionReader struct {
+	c   *syncclient.Client
+	mu  sync.Mutex
+	pub *syncclient.Publisher
+}
+
+func (r *sessionReader) publisher(ctx context.Context, auth store.DeviceAuth) (*syncclient.Publisher, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pub != nil {
+		return r.pub, nil
+	}
+	dev, err := syncclient.StoreDevice(func() (store.DeviceAuth, error) { return auth, nil })
+	if err != nil {
+		return nil, err
+	}
+	id, err := r.c.SessionVault(ctx, dev)
+	if err != nil {
+		return nil, fmt.Errorf("authflow: learning the account's vault: %w", err)
+	}
+	r.pub = r.c.Publisher(id)
+	return r.pub, nil
+}
+
+func (r *sessionReader) EntryAt(ctx context.Context, auth store.DeviceAuth, seq uint64) (store.Committed, error) {
+	p, err := r.publisher(ctx, auth)
+	if err != nil {
+		return store.Committed{}, err
+	}
+	return p.EntryAt(ctx, auth, seq)
+}
+
+func (r *sessionReader) Since(ctx context.Context, auth store.DeviceAuth, after uint64) ([]store.Committed, vaultlog.Head, error) {
+	p, err := r.publisher(ctx, auth)
+	if err != nil {
+		return nil, vaultlog.Head{}, err
+	}
+	return p.Since(ctx, auth, after)
 }
 
 // existingVault is the error for enrolling into a data directory that
@@ -144,8 +196,18 @@ func existingVault(ctx context.Context, cfg store.Config) error {
 	return ErrLocalVault
 }
 
-func enrolled(s *store.Store, c *syncclient.Client, vaultID model.ID) (*LoginResult, error) {
-	v, err := newVault(s, c, vaultID)
+// enrolled is the installed store s as a signed-in vault, named by its
+// verified state.
+func enrolled(s *store.Store, c *syncclient.Client) (*LoginResult, error) {
+	si, err := s.ServerInfo()
+	if err == nil && si.VaultID.IsZero() {
+		err = fmt.Errorf("%w: the installed vault has no vault ID", store.ErrCorrupt)
+	}
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	v, err := newVault(s, c, si.VaultID)
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -197,13 +259,9 @@ func (d *deviceSide) gone(err error) error {
 
 func (d *deviceSide) run(ctx context.Context) (*store.Store, error) {
 	ui := d.env.UI
-	// TODO(store round): poll against the enrollment's persisted deadline.
-	// store.Enrollment does not expose it (crypto.DeviceEnrollment.Deadline
-	// is not reachable), so a resumed attempt waits from now. The store
-	// still refuses a chal or a delivery past the real deadline, and the
-	// server refuses the mailbox once it expires, so this only bounds the
-	// wait, never what is accepted.
-	deadline := time.Now().Add(crypto.EnrollDeadline)
+	// The attempt's persisted deadline: a resumed attempt waits no longer
+	// than the first did.
+	deadline := d.e.Deadline()
 	if d.e.State() == crypto.DeviceCommitted {
 		if err := ui.ShowRoutingCode(ctx, d.mb.RoutingCode); err != nil {
 			return nil, d.interrupted(err)
@@ -259,10 +317,10 @@ func (d *deviceSide) run(ctx context.Context) (*store.Store, error) {
 
 // handle acts on one relay message: a chal in COMMITTED, a delivery in
 // CONFIRMED; anything else is skipped. A chal or a delivery that fails its
-// schema or its checks is errDiscarded, with no change of state (§7,
-// invalid input). The deadline and a rejection end the attempt; an
-// operational failure interrupts it, and the same process resumes it with
-// the mailbox.
+// schema or its checks (store.ErrChalInvalid, store.ErrDeliveryInvalid) is
+// errDiscarded, with no change of state (§7, invalid input). The deadline
+// and a rejection end the attempt; any other failure is operational and
+// interrupts it, and the same process resumes it with the mailbox.
 func (d *deviceSide) handle(ctx context.Context, m syncclient.Message) (*store.Store, error) {
 	switch {
 	case m.Type == syncclient.MsgChal && d.e.State() == crypto.DeviceCommitted:
@@ -271,10 +329,13 @@ func (d *deviceSide) handle(ctx context.Context, m syncclient.Message) (*store.S
 			return nil, fmt.Errorf("%w: the chal is malformed: %w", errDiscarded, err)
 		}
 		if _, err := d.e.HandleChal(&ch); err != nil {
-			if errors.Is(err, crypto.ErrEnrollExpired) {
+			switch {
+			case errors.Is(err, crypto.ErrEnrollExpired), errors.Is(err, crypto.ErrSASRejected):
 				return nil, d.gone(err)
+			case errors.Is(err, store.ErrChalInvalid):
+				return nil, fmt.Errorf("%w: %w", errDiscarded, err)
 			}
-			return nil, fmt.Errorf("%w: %w", errDiscarded, err)
+			return nil, d.interrupted(fmt.Errorf("authflow: handling the chal: %w", err))
 		}
 		return nil, d.reveal(ctx)
 	case m.Type == syncclient.MsgDeliver && d.e.State() == crypto.DeviceConfirmed:
@@ -300,14 +361,15 @@ func (d *deviceSide) handle(ctx context.Context, m syncclient.Message) (*store.S
 			return nil, d.interrupted(fmt.Errorf("authflow: installing the approved device: %w", err))
 		case st == crypto.DeviceFailed || st == crypto.DeviceRejected || errors.Is(err, crypto.ErrEnrollExpired):
 			return nil, d.gone(err)
-		case ctx.Err() != nil || syncclient.Retryable(err):
-			// The log could not be read: the delivery stays in the
-			// mailbox, and the same process checks it again.
-			return nil, d.interrupted(fmt.Errorf("authflow: checking the delivery: %w", err))
+		case errors.Is(err, store.ErrDeliveryInvalid) && ctx.Err() == nil:
+			// A delivery that fails a check of step 6 (a substituted one,
+			// or one naming another anchor) changed nothing.
+			return nil, fmt.Errorf("%w: %w", errDiscarded, err)
 		}
-		// A delivery that fails a check of step 6 (a substituted one, or
-		// one naming another anchor) changed nothing.
-		return nil, fmt.Errorf("%w: %w", errDiscarded, err)
+		// The log could not be read or verified, or the state not saved:
+		// the delivery stays in the mailbox, and the same process checks
+		// it again.
+		return nil, d.interrupted(fmt.Errorf("authflow: checking the delivery: %w", err))
 	}
 	return nil, nil
 }

@@ -673,6 +673,10 @@ type SignInParams struct {
 	// (SignInRecovery).
 	Account *crypto.AccountKeys
 	// SecretKey is the account's Secret Key, which the device record keeps.
+	// A recovery (SignInRecovery) may leave it "": the Recovery Key opened
+	// the account without it, and the recovery's checkpoint stores the new
+	// one before it is posted (§11, the "Enrolled devices" addendum). Until
+	// then the record holds none.
 	SecretKey string
 	// DeviceName names the new device in the log. Empty means
 	// Config.DeviceName, then the host name.
@@ -690,8 +694,10 @@ func (p *SignInParams) check() (serverFile, error) {
 	if p.Account == nil {
 		return serverFile{}, errors.New("store: a sign-in needs the account keys")
 	}
-	if _, err := crypto.ParseSecretKey(p.SecretKey); err != nil {
-		return serverFile{}, fmt.Errorf("store: that is not a Secret Key: %w", err)
+	if p.SecretKey != "" || p.Method != SignInRecovery {
+		if _, err := crypto.ParseSecretKey(p.SecretKey); err != nil {
+			return serverFile{}, fmt.Errorf("store: that is not a Secret Key: %w", err)
+		}
 	}
 	if p.ServerURL == "" || crypto.CheckStr("server", p.ServerURL, 256) != nil {
 		return serverFile{}, errors.New("store: the server's origin must be 1 to 256 characters")
@@ -1309,7 +1315,7 @@ func (s *Store) mergeNextDevice(p SignInParams) (*deviceRecord, uint64, error) {
 				return nil, 0, fmt.Errorf("%w: the destination device record does not carry this vault's local key", ErrCorrupt)
 			}
 			// A record found on disk is made durable again before it is
-			// used, with this sign-in's Secret Key.
+			// used, with this sign-in's Secret Key, if it has one.
 			if err := s.nextStore(cfg).upgradeRecord(rec); err != nil {
 				rec.zero()
 				return nil, 0, err

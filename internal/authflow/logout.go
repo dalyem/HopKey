@@ -3,6 +3,7 @@ package authflow
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/dalyem/hopkey/internal/store"
 )
@@ -36,15 +37,23 @@ func Logout(ctx context.Context, env *Env, s *store.Store, opts store.LogoutOpti
 	}
 	var r store.Retirer
 	if env.Client != nil {
-		id, err := vaultIDOf(env.Config.DataDir)
+		// The vault to retire from: the verified state's while the vault is
+		// unlocked; once RETIRING has locked it, the stored state's
+		// (state.json), which only addresses the server: the resolution
+		// checks the retirement journal's vault, taken from verified state,
+		// against its own verified copy.
+		si, err := s.ServerInfo()
+		if err == nil && si.VaultID.IsZero() {
+			err = fmt.Errorf("%w: the vault has no vault ID", store.ErrCorrupt)
+		}
 		if err != nil && !opts.LocalOnly {
 			return store.LogoutResult{}, err
 		}
 		if err == nil {
-			if si, err := s.ServerInfo(); err == nil && si.Server != "" && si.Server != env.Client.Origin() {
+			if si.Server != "" && si.Server != env.Client.Origin() {
 				return store.LogoutResult{}, ErrServerMismatch
 			}
-			r = env.Client.Retirer(id)
+			r = env.Client.Retirer(si.VaultID)
 		}
 	} else if !opts.LocalOnly {
 		return store.LogoutResult{}, errors.New("authflow: a logout needs the server unless it is local-only")

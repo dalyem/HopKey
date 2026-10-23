@@ -50,8 +50,9 @@ func LoginPassword(ctx context.Context, env *Env, opts LoginOptions) (*LoginResu
 	return login(ctx, env, opts, store.SignInPassword)
 }
 
-// LoginRecovery signs this machine in with the Recovery Key (§4.5), then
-// runs the checkpoint a recovery must: new credentials under a new
+// LoginRecovery signs this machine in with the Recovery Key alone (§4.5):
+// it does not ask for the Secret Key, which the user may have lost too.
+// It then runs the checkpoint a recovery must: new credentials under a new
 // password, keeping only the survivors the user chooses (only this device
 // by default), and a new Emergency Kit the user types back. It returns
 // with no error only once that checkpoint committed and its kit is
@@ -109,12 +110,10 @@ func login(ctx context.Context, env *Env, opts LoginOptions, method store.SignIn
 	var acct *crypto.AccountKeys
 	var sk string
 	if method == store.SignInRecovery {
+		// The Recovery Key alone recovers (§4.5): the device record holds
+		// no Secret Key until the recovery's checkpoint stores the new one
+		// (§11 addendum).
 		tr, acct, err = openRecovery(ctx, env, pre)
-		if err == nil {
-			// The device record keeps a Secret Key (§11); the recovery's
-			// checkpoint replaces it.
-			sk, err = env.UI.SecretKey(ctx, ReasonLogin, false)
-		}
 	} else {
 		tr, acct, sk, err = openPassword(ctx, env, pre)
 	}

@@ -169,6 +169,8 @@ type scriptUI struct {
 	newPassword string
 	secretKey   string
 	recoveryKey string
+	// codes answer RegistrationCode, in order.
+	codes []string
 	// failNew fails NewPassword, as a UI with no way to ask would.
 	failNew error
 	// onPassword runs once, when Password is first asked.
@@ -187,13 +189,14 @@ type scriptUI struct {
 	typeBack func(attempt int) authflow.KitTypeBack
 
 	// What the UI was asked and shown.
-	kits       []store.Kit
-	staleSK    int // SecretKey prompts for a stale one
-	skPrompts  int
-	choices    []authflow.SurvivorChoice
-	newDevices [][]store.DeviceListing
-	shown      [][]store.DeviceListing
-	sasShown   []string
+	kits        []store.Kit
+	staleSK     int // SecretKey prompts for a stale one
+	skPrompts   int
+	codePrompts int
+	choices     []authflow.SurvivorChoice
+	newDevices  [][]store.DeviceListing
+	shown       [][]store.DeviceListing
+	sasShown    []string
 }
 
 var errNoAnswer = errors.New("scriptUI: no answer scripted")
@@ -246,6 +249,18 @@ func (u *scriptUI) RecoveryKey(context.Context) (string, error) {
 		return "", errNoAnswer
 	}
 	return u.recoveryKey, nil
+}
+
+func (u *scriptUI) RegistrationCode(context.Context) (string, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.codePrompts++
+	if len(u.codes) == 0 {
+		return "", errNoAnswer
+	}
+	c := u.codes[0]
+	u.codes = u.codes[1:]
+	return c, nil
 }
 
 func (u *scriptUI) ShowRoutingCode(_ context.Context, code string) error {
@@ -543,10 +558,17 @@ type enrollOutcome struct {
 // routing code.
 func startEnroll(t *testing.T, ctx context.Context, w *world, vA *authflow.Vault, sasD func(sas, name string) bool) *enrollRun {
 	t.Helper()
+	return startEnrollIn(t, ctx, w, vA.VaultID, sasD)
+}
+
+// startEnrollIn is startEnroll with the vault ID D is given: zero has D
+// learn it from the server.
+func startEnrollIn(t *testing.T, ctx context.Context, w *world, vaultID model.ID, sasD func(sas, name string) bool) *enrollRun {
+	t.Helper()
 	routing := make(chan string, 1)
 	ui := &scriptUI{routing: routing, sas: sasD}
 	r := &enrollRun{env: w.env(t, "phone", ui), ui: ui, done: make(chan enrollOutcome, 1)}
-	r.resume(ctx, authflow.EnrollOptions{Email: email, DeviceName: "phone", VaultID: vA.VaultID})
+	r.resume(ctx, authflow.EnrollOptions{Email: email, DeviceName: "phone", VaultID: vaultID})
 	select {
 	case r.code = <-routing:
 	case o := <-r.done:
@@ -730,7 +752,8 @@ func TestRecoveryLogin(t *testing.T) {
 	_, v2 := loggedIn(t, w, "laptop", password, kit.SecretKey)
 	id1, id2 := deviceID(t, v1), deviceID(t, v2)
 
-	uiR := &scriptUI{recoveryKey: kit.RecoveryKey, secretKey: kit.SecretKey, password: "whatever",
+	// The Recovery Key alone: no Secret Key is scripted, and none is asked.
+	uiR := &scriptUI{recoveryKey: kit.RecoveryKey, password: "whatever",
 		failNew: errors.New("no terminal to ask on"),
 		keep:    func(authflow.SurvivorChoice) []string { return []string{id2.String()} }}
 	envR := w.env(t, "spare", uiR)
@@ -761,6 +784,9 @@ func TestRecoveryLogin(t *testing.T) {
 	if res.Recovery == nil || res.Recovery.Kind != store.CheckpointRecovery {
 		t.Fatalf("recovery %+v", res.Recovery)
 	}
+	if uiR.skPrompts != 0 {
+		t.Errorf("the recovery asked for the Secret Key %d times", uiR.skPrompts)
+	}
 	if si, err := vR.Store.ServerInfo(); err != nil || si.CheckpointDue || vR.Store.PendingKit() != nil {
 		t.Errorf("after the checkpoint: %+v %v, kit pending %v", si, err, vR.Store.PendingKit() != nil)
 	}
@@ -786,6 +812,18 @@ func TestRecoveryLogin(t *testing.T) {
 	old := w.env(t, "old", &scriptUI{password: password, secretKey: kit.SecretKey})
 	if _, err := authflow.LoginPassword(ctx, old, authflow.LoginOptions{Email: email}); !errors.Is(err, authflow.ErrLoginFailed) {
 		t.Errorf("the old credentials: %v; want ErrLoginFailed", err)
+	}
+
+	// A later password check on the recovered device uses the Secret Key
+	// its recovery stored: nothing asks for it.
+	uiR.mu.Lock()
+	uiR.password, uiR.newPassword = newPassword, "a third password, for later"
+	uiR.mu.Unlock()
+	if _, err := authflow.ChangePassword(ctx, envR, vR); err != nil {
+		t.Fatalf("passwd on the recovered device: %v", err)
+	}
+	if uiR.skPrompts != 0 {
+		t.Errorf("passwd on the recovered device asked for the Secret Key %d times", uiR.skPrompts)
 	}
 }
 

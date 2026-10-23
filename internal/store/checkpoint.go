@@ -34,6 +34,10 @@ import (
 // revocation or a recovery. A password change does not decide for the
 // user: it refuses to rebuild (NewDevicesError) until the call names each
 // new device in CheckpointOptions.Keep or Exclude, and journals the answer.
+// A password change that names the devices the user was shown
+// (CheckpointOptions.Shown) treats every other active device as new from
+// the start: one that joined while the user typed the passwords is asked
+// about before the first journal, never kept silently.
 // The name each chosen device had is journaled with its ID, so that the
 // same command, run again, may name a chosen device that has retired since
 // (and is passed over), while a name or ID that no chosen device ever had
@@ -43,14 +47,16 @@ import (
 //
 //	file    = JCS({"v":1, "vault_id":id, "sealed":AEAD(local_key, journal,
 //	              aad = lp("hopkey/v1/checkpoint-journal") || lp(vault_id_bytes))})
-//	journal = JCS({"v":1, "kind":"passwd"|"rotate"|"revoke"|"recovery", "author":id,
-//	              "survivors":[id], "targets":[id], "names":[{"id":id, "name":str}],
+//	journal = JCS({"v":2, "kind":"passwd"|"rotate"|"revoke"|"recovery", "author":id,
+//	              "survivors":[id], "targets":[id], "shown":[id], "names":[{"id":id, "name":str}],
 //	              "candidates":[{"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead",
 //	                             "wire":wire, "secret_key":str, "recovery_key":str, "created":ts}]})
 //
 // A candidate holds the exact wire and the new kit secrets, and is written,
 // durably, before it is posted. It is rewritten under a fresh nonce on
-// every change. Only verified history settles a candidate (commitVerified):
+// every change. shown is a password change's CheckpointOptions.Shown, and
+// [] otherwise; a v 1 journal, from before it, reads with none. Only
+// verified history settles a candidate (commitVerified):
 // the entry at its seq has its H (committed) or another (dead). A dead
 // candidate is kept until one commits; the commit that installs the
 // committed one also drops the others, and, for a recovery's follow-up,
@@ -75,7 +81,10 @@ const (
 const (
 	labelCheckpointJournal = "hopkey/v1/checkpoint-journal"
 	checkpointRel          = "checkpoint.json"
-	checkpointVersion      = 1
+	// checkpointVersion is the file's v, and checkpointJournalVersion the
+	// sealed journal's.
+	checkpointVersion        = 1
+	checkpointJournalVersion = 2
 )
 
 var (
@@ -105,15 +114,17 @@ var (
 	ErrContradictsJournal = errors.New("store: the answer contradicts the pending password change")
 
 	errExcludeOnlyPasswd = errors.New("store: only a password change takes Exclude, to answer the devices that appeared during it")
+	errShownOnlyPasswd   = errors.New("store: only a password change takes Shown, the devices it keeps")
 	errPasswdKeep        = errors.New("store: a password change keeps every device; use rotate to choose survivors")
 )
 
 // NewDevicesError means a password change must be rebuilt, and devices
 // that were not active when it started are active now (§10.1: a device
 // that first appears during a rebuild is not kept without the user's
-// choice). Run it again naming each of Devices in CheckpointOptions.Keep
-// (it survives) or Exclude (it is revoked). It matches
-// ErrCheckpointRebuild.
+// choice); or, before its first journal, that devices the user was not
+// shown (CheckpointOptions.Shown) are active. Run it again naming each of
+// Devices in CheckpointOptions.Keep (it survives) or Exclude (it is
+// revoked). It matches ErrCheckpointRebuild.
 type NewDevicesError struct {
 	Devices []model.ID
 }
@@ -154,6 +165,13 @@ type CheckpointOptions struct {
 	// it names are revoked. Every new device must be in Keep or Exclude.
 	// Only a password change takes it.
 	Exclude []string
+	// Shown are the active devices the user was shown before a password
+	// change (§10.1), which it keeps. Every other active device is new: the
+	// change refuses with a NewDevicesError, before anything is journaled,
+	// until Keep or Exclude names it. It is journaled with the change. Nil
+	// keeps every device active when the change starts. Only a password
+	// change takes it.
+	Shown []model.ID
 	// SecretKey is the account's current Secret Key, for a device that
 	// stores none (enrolled by approval, §11 addendum). "" uses the stored
 	// one; a device without one then fails with ErrNeedSecretKey.
@@ -171,12 +189,13 @@ type CheckpointOptions struct {
 // the same survivors), and returns the kit once it is verified.
 //
 // A rebuild that would revoke a device which appeared after the change
-// started stops with a NewDevicesError: the call then names each such
-// device in opts.Keep or opts.Exclude. Otherwise Keep and Exclude are
-// refused.
+// started stops with a NewDevicesError, and so does a first attempt that
+// finds an active device outside opts.Shown, when that is set: the call
+// then names each such device in opts.Keep or opts.Exclude. Otherwise Keep
+// and Exclude are refused.
 func (s *Store) ChangePasswordRemote(ctx context.Context, r Remote, current, next []byte, opts CheckpointOptions) (Kit, error) {
 	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointPasswd, verify: current, password: next, sk: opts.SecretKey,
-		keep: opts.Keep, exclude: opts.Exclude})
+		keep: opts.Keep, exclude: opts.Exclude, shown: opts.Shown})
 }
 
 // Rotate is hop auth rotate (§10.1, §5.3 device_retire): a checkpoint that
@@ -184,8 +203,8 @@ func (s *Store) ChangePasswordRemote(ctx context.Context, r Remote, current, nex
 // active device but this one and opts.Keep. password is the current master
 // password, which the new credentials keep.
 func (s *Store) Rotate(ctx context.Context, r Remote, password []byte, opts CheckpointOptions) (Kit, error) {
-	if len(opts.Exclude) > 0 {
-		return Kit{}, errExcludeOnlyPasswd
+	if err := opts.onlyPasswd(); err != nil {
+		return Kit{}, err
 	}
 	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointRotate, verify: password, password: password, sk: opts.SecretKey, keep: opts.Keep})
 }
@@ -200,8 +219,8 @@ func (s *Store) RevokeDevices(ctx context.Context, r Remote, password []byte, id
 	if len(ids) == 0 {
 		return Kit{}, errors.New("store: name at least one device to revoke")
 	}
-	if len(opts.Exclude) > 0 {
-		return Kit{}, errExcludeOnlyPasswd
+	if err := opts.onlyPasswd(); err != nil {
+		return Kit{}, err
 	}
 	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointRevoke, verify: password, password: password, sk: opts.SecretKey, keep: opts.Keep, targets: ids})
 }
@@ -211,10 +230,21 @@ func (s *Store) RevokeDevices(ctx context.Context, r Remote, password []byte, id
 // opts.Keep. It is the only checkpoint allowed while
 // ServerInfo.CheckpointDue, and the commit that installs it ends that.
 func (s *Store) RecoveryCheckpoint(ctx context.Context, r Remote, next []byte, opts CheckpointOptions) (Kit, error) {
-	if len(opts.Exclude) > 0 {
-		return Kit{}, errExcludeOnlyPasswd
+	if err := opts.onlyPasswd(); err != nil {
+		return Kit{}, err
 	}
 	return s.runCheckpoint(ctx, r, &ckptRequest{kind: CheckpointRecovery, password: next, keep: opts.Keep})
+}
+
+// onlyPasswd refuses the options only a password change takes.
+func (o *CheckpointOptions) onlyPasswd() error {
+	switch {
+	case len(o.Exclude) > 0:
+		return errExcludeOnlyPasswd
+	case o.Shown != nil:
+		return errShownOnlyPasswd
+	}
+	return nil
 }
 
 // ResumeCheckpoint finishes a journaled checkpoint without a password, as
@@ -273,6 +303,18 @@ func (s *Store) PendingCheckpoint() (*CheckpointStatus, error) {
 
 // ckptJournal is the sealed journal (see above).
 type ckptJournal struct {
+	V          int             `json:"v"`
+	Kind       string          `json:"kind"`
+	Author     model.ID        `json:"author"`
+	Survivors  []model.ID      `json:"survivors"`
+	Targets    []model.ID      `json:"targets"`
+	Shown      []model.ID      `json:"shown"`
+	Names      []ckptName      `json:"names"`
+	Candidates []ckptCandidate `json:"candidates"`
+}
+
+// ckptJournalV1 is the journal before shown, read only to upgrade it.
+type ckptJournalV1 struct {
 	V          int             `json:"v"`
 	Kind       string          `json:"kind"`
 	Author     model.ID        `json:"author"`
@@ -392,8 +434,8 @@ func putCheckpointJournal(t *txn, rec *deviceRecord, vaultID model.ID, j *ckptJo
 		return err
 	}
 	defer key.Zero()
-	j.V = checkpointVersion
-	for _, l := range []*[]model.ID{&j.Survivors, &j.Targets} {
+	j.V = checkpointJournalVersion
+	for _, l := range []*[]model.ID{&j.Survivors, &j.Targets, &j.Shown} {
 		if *l == nil {
 			*l = []model.ID{}
 		}
@@ -451,8 +493,13 @@ func (s *Store) readCheckpointJournal(rec *deviceRecord, vaultID model.ID) (*ckp
 	}
 	defer clear(pt)
 	var j ckptJournal
-	if canonjson.Unmarshal(pt, &j) != nil || j.V != checkpointVersion {
-		return nil, bad
+	if canonjson.Unmarshal(pt, &j) != nil || j.V != checkpointJournalVersion {
+		var v1 ckptJournalV1
+		if canonjson.Unmarshal(pt, &v1) != nil || v1.V != 1 {
+			return nil, bad
+		}
+		j = ckptJournal{V: checkpointJournalVersion, Kind: v1.Kind, Author: v1.Author, Survivors: v1.Survivors,
+			Targets: v1.Targets, Names: v1.Names, Candidates: v1.Candidates}
 	}
 	switch j.Kind {
 	case CheckpointPasswd, CheckpointRotate, CheckpointRevoke, CheckpointRecovery:
@@ -661,6 +708,7 @@ type ckptRequest struct {
 	keep     []string
 	exclude  []string // a password change's answer to NewDevicesError
 	targets  []string
+	shown    []model.ID // a password change's CheckpointOptions.Shown
 	verified bool
 	// matched means the journal was started, or found to be req's, earlier
 	// in this call: a rebuild reuses its survivors without resolving the
@@ -772,7 +820,13 @@ func (s *Store) prepareCheckpoint(gen uint64, req *ckptRequest, mayBuild bool) (
 		}
 		// An uncertain outcome: the identical wire again (§5.4).
 		w, err := c.wire()
-		return Kit{}, w, err
+		if err != nil {
+			return Kit{}, nil, err
+		}
+		if err := s.holdRecoverySecretKey(j, c); err != nil {
+			return Kit{}, nil, err
+		}
+		return Kit{}, w, nil
 	}
 	if req.kind == "" {
 		return Kit{}, nil, ErrCheckpointRebuild
@@ -802,7 +856,31 @@ func (s *Store) prepareCheckpoint(gen uint64, req *ckptRequest, mayBuild bool) (
 	if err := s.commitTxn(t); err != nil {
 		return Kit{}, nil, err
 	}
+	if err := s.holdRecoverySecretKey(j, j.live()); err != nil {
+		return Kit{}, nil, err
+	}
 	return Kit{}, w, nil
+}
+
+// holdRecoverySecretKey makes the device record hold the Secret Key of c,
+// a recovery's live candidate, durably and read back (refreshSecretKey),
+// before c is posted. A recovery may sign in without the old Secret Key
+// (§11 addendum), and its record then holds none only while the recovery
+// is due; the commit that installs c ends that, so the record must already
+// hold c's Secret Key by then, whatever crash comes between the commit and
+// AckKit. A candidate that dies leaves its Secret Key in the record until
+// the rebuild's replaces it: the recovery stays due meanwhile. The commit's
+// kit then finds the record done, and records its creds generation in
+// device.json (persistKitSK). Other kinds store their Secret Key once
+// committed. The caller holds s.mu and the file lock.
+func (s *Store) holdRecoverySecretKey(j *ckptJournal, c *ckptCandidate) error {
+	if j.Kind != CheckpointRecovery || c == nil {
+		return nil
+	}
+	if err := s.hook("checkpoint:recovery-sk"); err != nil {
+		return err
+	}
+	return s.deviceStore(s.devCfg).refreshSecretKey(s.rec, c.SecretKey)
 }
 
 // newCheckpointJournal starts the journal of req, unwritten: its kind, this
@@ -819,7 +897,7 @@ func (s *Store) newCheckpointJournal(req *ckptRequest) (*ckptJournal, error) {
 		return nil, ErrRecoveryDue
 	case !due && req.kind == CheckpointRecovery:
 		return nil, ErrNoRecoveryDue
-	case req.kind == CheckpointPasswd && len(req.keep)+len(req.exclude) > 0:
+	case req.kind == CheckpointPasswd && len(req.keep)+len(req.exclude) > 0 && req.shown == nil:
 		// Nothing has appeared since it started: there is nothing to answer.
 		return nil, errPasswdKeep
 	}
@@ -832,7 +910,8 @@ func (s *Store) newCheckpointJournal(req *ckptRequest) (*ckptJournal, error) {
 	if err != nil {
 		return nil, err
 	}
-	j := &ckptJournal{V: checkpointVersion, Kind: req.kind, Author: s.dev.ID, Survivors: survivors, Targets: targets}
+	j := &ckptJournal{V: checkpointJournalVersion, Kind: req.kind, Author: s.dev.ID, Survivors: survivors, Targets: targets,
+		Shown: sortIDs(uniqueIDs(slices.Clone(req.shown)))}
 	j.addNames(s.state, survivors)
 	j.addNames(s.state, targets)
 	return j, nil
@@ -854,11 +933,20 @@ func (s *Store) chooseSurvivors(req *ckptRequest) (survivors, targets []model.ID
 		// The stale devices are its targets: decided, so a rebuild does not
 		// take them for new ones.
 		stale := s.staleActive(s.devCfg)
+		var fresh []model.ID
 		for id := range s.state.Devices {
-			if slices.Contains(stale, id) {
+			switch {
+			case slices.Contains(stale, id):
 				targets = append(targets, id)
-			} else {
+			case req.shown == nil || id == self || slices.Contains(req.shown, id):
 				survivors = append(survivors, id)
+			default:
+				fresh = append(fresh, id)
+			}
+		}
+		if req.shown != nil {
+			if survivors, targets, err = s.decideUnshown(survivors, targets, sortIDs(fresh), keep, req.exclude); err != nil {
+				return nil, nil, err
 			}
 		}
 	case CheckpointRevoke:
@@ -878,6 +966,49 @@ func (s *Store) chooseSurvivors(req *ckptRequest) (survivors, targets []model.ID
 		survivors = append([]model.ID{self}, keep...)
 	}
 	return sortIDs(survivors), sortIDs(targets), nil
+}
+
+// decideUnshown settles, before a password change's first journal, fresh:
+// the active devices the user was not shown (CheckpointOptions.Shown),
+// which joined while the passwords were typed, say (§10.1). Each must be
+// in keep (it survives) or exclude (it is revoked): otherwise it is a
+// NewDevicesError naming the undecided ones. Keep and Exclude may also name
+// what the change decides already (a kept device in keep, a stale one in
+// exclude); excluding a device it keeps, or naming one in both, is
+// ErrContradictsJournal. The caller holds s.mu.
+func (s *Store) decideUnshown(survivors, targets, fresh, keep []model.ID, excludeRefs []string) ([]model.ID, []model.ID, error) {
+	exclude, err := s.resolveDevices(excludeRefs)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, id := range keep {
+		switch {
+		case slices.Contains(exclude, id):
+			return nil, nil, fmt.Errorf("%w: device %v is both kept and excluded", ErrContradictsJournal, id)
+		case slices.Contains(targets, id):
+			return nil, nil, fmt.Errorf("%w: device %v is revoked by this password change; it can't be kept", ErrContradictsJournal, id)
+		}
+	}
+	for _, id := range exclude {
+		if slices.Contains(survivors, id) {
+			return nil, nil, fmt.Errorf("%w: device %v was shown, and this password change keeps it; Exclude names only the devices that were not shown", ErrContradictsJournal, id)
+		}
+	}
+	var missing []model.ID
+	for _, id := range fresh {
+		switch {
+		case slices.Contains(keep, id):
+			survivors = append(survivors, id)
+		case slices.Contains(exclude, id):
+			targets = append(targets, id)
+		default:
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, nil, &NewDevicesError{Devices: missing}
+	}
+	return survivors, targets, nil
 }
 
 // sameCheckpoint checks that req is the journaled checkpoint j, with the

@@ -19,8 +19,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -28,7 +26,6 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/syncclient"
-	"github.com/dalyem/hopkey/internal/vaultlog"
 )
 
 // Reason says why a flow asks for a secret, so the UI can word the prompt.
@@ -81,6 +78,10 @@ type UI interface {
 	SecretKey(ctx context.Context, r Reason, stale bool) (string, error)
 	// RecoveryKey asks for the Recovery Key from the Emergency Kit.
 	RecoveryKey(ctx context.Context) (string, error)
+	// RegistrationCode asks for another registration code (hop-server
+	// invite): the server refused the one signup was given, and published
+	// nothing with it.
+	RegistrationCode(ctx context.Context) (string, error)
 
 	// ShowRoutingCode shows the code the user carries to the approving
 	// device (hop auth approve CODE).
@@ -164,10 +165,6 @@ var (
 	// G2), and this process does not have it. Start again with
 	// EnrollOptions.Restart.
 	ErrEnrollmentInterrupted = errors.New("authflow: an enrollment by approval was interrupted and can't be continued; start it again")
-	// ErrNeedVaultID means enrollment by approval was started without the
-	// account's vault ID, which the new device can't learn from the API
-	// (gap G1).
-	ErrNeedVaultID = errors.New("authflow: enrollment by approval needs the account's vault ID")
 )
 
 // EnrollInterruptedError means an enrollment stopped before it finished,
@@ -198,7 +195,9 @@ type Vault struct {
 }
 
 // NewVault is the signed-in, unlocked store s in cfg's data directory,
-// with the server c talks to.
+// with the server c talks to. The vault ID comes from s's verified state
+// (store.ServerInfo), never from files it reads itself; a locked s is
+// refused. cfg is not used.
 func NewVault(cfg store.Config, s *store.Store, c *syncclient.Client) (*Vault, error) {
 	si, err := s.ServerInfo()
 	if errors.Is(err, store.ErrNotServerBacked) {
@@ -210,11 +209,14 @@ func NewVault(cfg store.Config, s *store.Store, c *syncclient.Client) (*Vault, e
 	if si.Server != "" && si.Server != c.Origin() {
 		return nil, fmt.Errorf("%w: %s, not %s", ErrServerMismatch, si.Server, c.Origin())
 	}
-	id, err := vaultIDOf(cfg.DataDir)
-	if err != nil {
-		return nil, err
+	// The unlocked store's verified state names the vault.
+	if s.Info().Locked {
+		return nil, fmt.Errorf("authflow: the vault is locked: %s", s.Info().LockReason)
 	}
-	return newVault(s, c, id)
+	if si.VaultID.IsZero() {
+		return nil, fmt.Errorf("%w: the vault has no vault ID", store.ErrCorrupt)
+	}
+	return newVault(s, c, si.VaultID)
 }
 
 func newVault(s *store.Store, c *syncclient.Client, vaultID model.ID) (*Vault, error) {
@@ -223,38 +225,6 @@ func newVault(s *store.Store, c *syncclient.Client, vaultID model.ID) (*Vault, e
 		return nil, err
 	}
 	return &Vault{Store: s, Client: c, VaultID: vaultID, Remote: c.Remote(vaultID, dev), dev: dev}, nil
-}
-
-// vaultIDOf reads the vault ID from an entry the store keeps on disk.
-//
-// Gap G3: the store exports no vault ID accessor. Every entry names its
-// vault, and the store keeps only verified entries, so the ID read here is
-// the one the store verified; it is only ever used to address the server,
-// which can do no more with a wrong one than refuse.
-func vaultIDOf(dataDir string) (model.ID, error) {
-	dir := filepath.Join(dataDir, "vault", "entries")
-	names, err := os.ReadDir(dir)
-	if err != nil {
-		return model.ID{}, fmt.Errorf("authflow: reading the vault's entries: %w", err)
-	}
-	for _, n := range names {
-		if !strings.HasSuffix(n.Name(), ".json") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(dir, n.Name()))
-		if err != nil {
-			return model.ID{}, err
-		}
-		w, err := vaultlog.ParseWire(b)
-		if err != nil {
-			return model.ID{}, fmt.Errorf("%w: %s: %v", store.ErrCorrupt, n.Name(), err)
-		}
-		if w.Entry.VaultID.IsZero() {
-			break
-		}
-		return w.Entry.VaultID, nil
-	}
-	return model.ID{}, fmt.Errorf("%w: no entry names the vault", store.ErrCorrupt)
 }
 
 // errDiscarded marks an enrollment message that failed its schema or its

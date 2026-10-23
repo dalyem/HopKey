@@ -250,6 +250,12 @@ type Store struct {
 	// pubAlarm is the equivocation the last publication resolution found
 	// (§4.3, §5.6); the publication stays pending.
 	pubAlarm error
+	// pubRefused is set, with the generation it was seen in, when the last
+	// publication resolution confirmed that the server refused the
+	// journaled registration code and holds no vault for it
+	// (ReplaceRegistrationCode).
+	pubRefused    bool
+	pubRefusedGen uint64
 	// revoked is set for good once a checkpoint revokes this device
 	// (§5.5, revoke): it wraps ErrDeviceRevoked. revokedC is closed then
 	// (Revoked), and isRevoked set (IsRevoked).
@@ -607,16 +613,37 @@ func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// Only a device enrolled by approval keeps no Secret Key (§11 addendum):
-	// its certificate carries the enrollment transcript.
+	// A device record keeps no Secret Key in exactly two cases (§11
+	// addendum): a device enrolled by approval, whose certificate carries
+	// the enrollment transcript, and a recovery signed in without one,
+	// until its checkpoint, which stores the new one before it is posted,
+	// commits.
 	if rec.SecretKey == "" {
-		if d, active := st.Devices[dev.ID]; !active || d.Cert.EnrollTranscript.IsZero() {
+		if err := s.emptySecretKeyAllowed(st, dev.ID); err != nil {
 			zeroSecrets(sec)
-			return nil, nil, fmt.Errorf("%w: the device record has no Secret Key, but this device was not enrolled by approval", ErrDeviceKey)
+			return nil, nil, err
 		}
 	}
 	ok = true
 	return &loaded{rec: rec, dev: dev, st: st, sec: sec, repaired: repaired, server: server}, unlock, nil
+}
+
+// emptySecretKeyAllowed checks that device id, verified in st, may keep a
+// record with no Secret Key (§11 addendum): it was enrolled by approval, or
+// a recovery's checkpoint is due (vault/server.json's recovery_gen). The
+// caller holds the file lock.
+func (s *Store) emptySecretKeyAllowed(st *vaultlog.State, id model.ID) error {
+	if d, active := st.Devices[id]; active && !d.Cert.EnrollTranscript.IsZero() {
+		return nil
+	}
+	sf, err := s.l.readServerFile()
+	if err != nil {
+		return err
+	}
+	if sf != nil && sf.RecoveryGen != 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: the device record has no Secret Key, but this device was not enrolled by approval and no recovery is due", ErrDeviceKey)
 }
 
 // finishUnlock is what every unlock does once its verified state is

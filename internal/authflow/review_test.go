@@ -287,6 +287,16 @@ func TestEnrollDiscardsInvalidMessages(t *testing.T) {
 		edit func(canonjson.Raw) canonjson.Raw
 	}{
 		{syncclient.MsgChal, func(canonjson.Raw) canonjson.Raw { return canonjson.Raw(`{"v":1}`) }},
+		// Well-formed, but for another enrollment: the store refuses it
+		// (store.ErrChalInvalid).
+		{syncclient.MsgChal, func(b canonjson.Raw) canonjson.Raw {
+			var ch crypto.EnrollChal
+			if err := canonjson.Unmarshal(b, &ch); err != nil {
+				panic(err)
+			}
+			ch.EnrollID[0] ^= 1
+			return mustCanon(ch)
+		}},
 		{syncclient.MsgDeliver, func(b canonjson.Raw) canonjson.Raw {
 			var env crypto.HPKEEnvelope
 			if err := canonjson.Unmarshal(b, &env); err != nil {
