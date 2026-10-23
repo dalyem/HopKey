@@ -60,7 +60,9 @@ const (
 	// CodeConfigNotWritten is a partial success: the change (an unlock, a
 	// put, a delete, a reload) took effect and the agent serves the
 	// vault's keys, but the ssh config could not be written. The daemon
-	// retries; the CLI shows the message as a warning.
+	// retries. It arrives as an error response, so a caller that treats
+	// every error as failure will misreport it; callers should show it as a
+	// warning (the CLI does not yet).
 	CodeConfigNotWritten = "config_not_written"
 )
 

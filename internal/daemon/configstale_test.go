@@ -262,8 +262,8 @@ func TestRevokedConfigIsClearedOnceItCanBeWritten(t *testing.T) {
 }
 
 // An unlock whose ssh config can't be written still unlocks and loads the
-// keys: it answers with config_not_written, a partial success the CLI
-// shows as a warning, not a failure to unlock.
+// keys: it answers with config_not_written, a partial success, not a
+// failure to unlock. This tests the daemon's answer only.
 func TestUnlockWithAnUnwritableConfigIsAPartialSuccess(t *testing.T) {
 	ctx := context.Background()
 	base := shortDir(t)
