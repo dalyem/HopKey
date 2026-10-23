@@ -102,6 +102,12 @@ var (
 	// ErrNeedSecretKey means a password unlock needs the Secret Key, which
 	// this device does not have stored.
 	ErrNeedSecretKey = errors.New("store: the Secret Key is not stored on this device; enter it from your Emergency Kit")
+	// ErrSecretKeyStale means the Secret Key stored on this device belongs
+	// to credentials that a checkpoint has replaced since (another
+	// device's, normally), and it did not open the account: a password
+	// check needs the Secret Key of the newest Emergency Kit. It matches
+	// ErrNeedSecretKey.
+	ErrSecretKeyStale error = staleSecretKeyError{}
 	// ErrKitPending means a password change committed but its Emergency Kit
 	// has not been confirmed yet.
 	ErrKitPending = errors.New("store: a new Emergency Kit is waiting to be confirmed; run hop passwd to see it")
@@ -177,6 +183,15 @@ type Info struct {
 	// Warnings are for the user, one sentence each.
 	Warnings []string `json:"warnings,omitempty"`
 }
+
+// staleSecretKeyError is ErrSecretKeyStale.
+type staleSecretKeyError struct{}
+
+func (staleSecretKeyError) Error() string {
+	return "store: the Secret Key stored on this device is out of date (the account's credentials changed since); enter the one from your newest Emergency Kit"
+}
+
+func (staleSecretKeyError) Is(target error) bool { return target == ErrNeedSecretKey }
 
 // Store is the encrypted vault. It implements model.Store; Head, Lock,
 // Unlock, UnlockWithPassword and ChangePassword are extra.

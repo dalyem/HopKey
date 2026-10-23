@@ -128,6 +128,7 @@ func PrepareInit(cfg Config, opts InitOptions) (*PendingInit, error) {
 	if err != nil {
 		return nil, err
 	}
+	devCfg.SecretKeyGen = secretKeyGen{DeviceID: rec.DeviceID, Gen: st.Creds.Gen}
 	return &PendingInit{
 		s: s, devCfg: devCfg, rec: rec, dev: dev, wire: w, state: st, sec: sec,
 		kit: Kit{AccountID: accountID.String(), SecretKey: sk.String(), RecoveryKey: rk.String(), Created: now.Time()},

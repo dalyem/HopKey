@@ -338,8 +338,12 @@ func (s *Store) settleCandidates(cs []approvalCandidate) (bool, error) {
 // commit, settled as far as verified history goes: a dead one is dropped,
 // and so is a committed one whose device is no longer active. The caller
 // holds s.mu and the file lock.
+//
+// A store that a commit interrupted meanwhile (the attempt's own budget
+// write, say) is locked, with no verified state: nothing is moved, and
+// the journal keeps the candidates for the load after the next unlock.
 func (s *Store) retireCandidates(a *crypto.Approval, j *approvalJournal) error {
-	if a == nil || j == nil || a.State() != crypto.ApprovalFailed || len(j.Candidates) == 0 {
+	if s.state == nil || a == nil || j == nil || a.State() != crypto.ApprovalFailed || len(j.Candidates) == 0 {
 		return nil
 	}
 	orphans, err := s.readOrphans()

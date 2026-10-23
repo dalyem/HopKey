@@ -34,13 +34,17 @@ import (
 // revocation or a recovery. A password change does not decide for the
 // user: it refuses to rebuild (NewDevicesError) until the call names each
 // new device in CheckpointOptions.Keep or Exclude, and journals the answer.
+// The name each chosen device had is journaled with its ID, so that the
+// same command, run again, may name a chosen device that has retired since
+// (and is passed over), while a name or ID that no chosen device ever had
+// is still ErrUnknownDevice.
 //
 // The journal is vault/checkpoint.json:
 //
 //	file    = JCS({"v":1, "vault_id":id, "sealed":AEAD(local_key, journal,
 //	              aad = lp("hopkey/v1/checkpoint-journal") || lp(vault_id_bytes))})
 //	journal = JCS({"v":1, "kind":"passwd"|"rotate"|"revoke"|"recovery", "author":id,
-//	              "survivors":[id], "targets":[id],
+//	              "survivors":[id], "targets":[id], "names":[{"id":id, "name":str}],
 //	              "candidates":[{"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead",
 //	                             "wire":wire, "secret_key":str, "recovery_key":str, "created":ts}]})
 //
@@ -267,7 +271,46 @@ type ckptJournal struct {
 	Author     model.ID        `json:"author"`
 	Survivors  []model.ID      `json:"survivors"`
 	Targets    []model.ID      `json:"targets"`
+	Names      []ckptName      `json:"names"`
 	Candidates []ckptCandidate `json:"candidates"`
+}
+
+// ckptName is the name a journaled survivor or target had when it was
+// chosen.
+type ckptName struct {
+	ID   model.ID `json:"id"`
+	Name string   `json:"name"`
+}
+
+// addNames journals the names that the devices of ids, active in st, have
+// now. A device already named keeps its name.
+func (j *ckptJournal) addNames(st *vaultlog.State, ids []model.ID) {
+	for _, id := range ids {
+		d, ok := st.Devices[id]
+		if !ok || slices.ContainsFunc(j.Names, func(n ckptName) bool { return n.ID == id }) {
+			continue
+		}
+		j.Names = append(j.Names, ckptName{ID: id, Name: d.Cert.Name})
+	}
+}
+
+// departed reports whether ref, a device ID or a name, is one of chosen,
+// the journaled survivors or targets, that is no longer active in st: by
+// its device ID, or by the name it had when it was chosen.
+func (j *ckptJournal) departed(st *vaultlog.State, chosen []model.ID, ref string) bool {
+	refID, idErr := model.ParseID(ref)
+	for _, id := range chosen {
+		if _, active := st.Devices[id]; active {
+			continue
+		}
+		if idErr == nil && refID == id {
+			return true
+		}
+		if idErr != nil && slices.Contains(j.Names, ckptName{ID: id, Name: ref}) {
+			return true
+		}
+	}
+	return false
 }
 
 // ckptCandidate is one journaled candidate: its entry's seq, prev and H,
@@ -347,6 +390,9 @@ func putCheckpointJournal(t *txn, rec *deviceRecord, vaultID model.ID, j *ckptJo
 		if *l == nil {
 			*l = []model.ID{}
 		}
+	}
+	if j.Names == nil {
+		j.Names = []ckptName{}
 	}
 	if j.Candidates == nil {
 		j.Candidates = []ckptCandidate{}
@@ -779,7 +825,10 @@ func (s *Store) newCheckpointJournal(req *ckptRequest) (*ckptJournal, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ckptJournal{V: checkpointVersion, Kind: req.kind, Author: s.dev.ID, Survivors: survivors, Targets: targets}, nil
+	j := &ckptJournal{V: checkpointVersion, Kind: req.kind, Author: s.dev.ID, Survivors: survivors, Targets: targets}
+	j.addNames(s.state, survivors)
+	j.addNames(s.state, targets)
+	return j, nil
 }
 
 // chooseSurvivors resolves req's survivors and targets against the
@@ -829,18 +878,23 @@ func (s *Store) chooseSurvivors(req *ckptRequest) (survivors, targets []model.ID
 // rebuild (§10.1), and a call that asks for another must not be finished
 // with it. Only the devices still active are compared: one the journal
 // names that retired since is gone, and the same command, run again, must
-// still finish the checkpoint (a device ID that is no longer active is
-// accepted, and a name no active device has is passed over). The caller
-// holds s.mu.
+// still finish the checkpoint (a reference to it, by its device ID or by
+// the name it had when it was chosen, is passed over). Any other reference
+// that no active device has is ErrUnknownDevice. The caller holds s.mu.
 func (s *Store) sameCheckpoint(j *ckptJournal, req *ckptRequest) error {
 	if req.kind != j.Kind || j.Author != s.dev.ID {
 		return &CheckpointPendingError{Kind: j.Kind}
 	}
 	if j.Kind == CheckpointPasswd {
-		// Its Keep and Exclude answer new devices (decideNewDevices).
-		return nil
+		// Its Keep and Exclude answer new devices (decideNewDevices); each
+		// must still name a device.
+		if _, err := s.resolveJournaled(j, j.Survivors, req.keep); err != nil {
+			return err
+		}
+		_, err := s.resolveJournaled(j, j.Targets, req.exclude)
+		return err
 	}
-	keep, err := s.resolveJournaled(req.keep)
+	keep, err := s.resolveJournaled(j, j.Survivors, req.keep)
 	if err != nil {
 		return err
 	}
@@ -849,7 +903,7 @@ func (s *Store) sameCheckpoint(j *ckptJournal, req *ckptRequest) error {
 		return &CheckpointPendingError{Kind: j.Kind}
 	}
 	if j.Kind == CheckpointRevoke {
-		targets, err := s.resolveJournaled(req.targets)
+		targets, err := s.resolveJournaled(j, j.Targets, req.targets)
 		if err != nil {
 			return err
 		}
@@ -860,25 +914,25 @@ func (s *Store) sameCheckpoint(j *ckptJournal, req *ckptRequest) error {
 	return nil
 }
 
-// resolveJournaled resolves device references against a journaled
-// checkpoint: as resolveDevices, except that a device ID needs not be
-// active and a name no active device has is passed over (its device may
-// have retired since the checkpoint started). The caller holds s.mu.
-func (s *Store) resolveJournaled(refs []string) ([]model.ID, error) {
+// resolveJournaled resolves device references against the journaled
+// checkpoint j, whose chosen devices (survivors or targets) are chosen: as
+// resolveDevices, except that a reference to a chosen device that has
+// retired since, by its device ID or by the name it had when it was
+// chosen, is passed over. Any other reference no active device has is
+// ErrUnknownDevice. The caller holds s.mu.
+func (s *Store) resolveJournaled(j *ckptJournal, chosen []model.ID, refs []string) ([]model.ID, error) {
 	var out []model.ID
 	for _, ref := range refs {
-		if id, err := model.ParseID(ref); err == nil {
-			out = append(out, id)
-			continue
-		}
 		id, err := s.resolveDevice(ref)
-		if errors.Is(err, ErrUnknownDevice) {
+		if errors.Is(err, ErrUnknownDevice) && j.departed(s.state, chosen, ref) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, id)
+		if !slices.Contains(out, id) {
+			out = append(out, id)
+		}
 	}
 	return sortIDs(out), nil
 }
@@ -898,9 +952,13 @@ func (s *Store) activeOf(ids []model.ID) []model.ID {
 // decideNewDevices settles, before a password change's candidate is built,
 // the devices active now that it neither keeps nor revokes: devices that
 // appeared since it started (§10.1). Without req's answer it refuses with
-// a NewDevicesError naming them; with one (each in req.keep or
-// req.exclude), the answer goes into j, journaled with the candidate. Keep
-// and Exclude with nothing to answer are refused. The caller holds s.mu.
+// a NewDevicesError naming them; with one, the devices it decides for the
+// first time go into j, journaled with the candidate. An answer the
+// journal already holds (the same command, run again after another device
+// appeared, in the same call or after a restart) is accepted as it is, and
+// only the devices still undecided are asked about again. An answer that
+// contradicts the journal, or names a device that is neither new nor
+// decided, is refused. The caller holds s.mu.
 func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
 	var fresh []model.ID
 	for id := range s.state.Devices {
@@ -909,29 +967,26 @@ func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
 		}
 	}
 	fresh = sortIDs(fresh)
-	if len(req.keep)+len(req.exclude) == 0 {
-		if len(fresh) > 0 {
-			return &NewDevicesError{Devices: fresh}
-		}
-		return nil
-	}
-	if len(fresh) == 0 {
-		return errPasswdKeep
-	}
-	keep, err := s.resolveDevices(req.keep)
+	keep, err := s.resolveJournaled(j, j.Survivors, req.keep)
 	if err != nil {
 		return err
 	}
-	exclude, err := s.resolveDevices(req.exclude)
+	exclude, err := s.resolveJournaled(j, j.Targets, req.exclude)
 	if err != nil {
 		return err
 	}
 	for _, id := range append(slices.Clone(keep), exclude...) {
-		if !slices.Contains(fresh, id) {
-			return fmt.Errorf("store: device %v did not appear during the password change; Keep and Exclude name only the devices that did", id)
-		}
-		if slices.Contains(keep, id) && slices.Contains(exclude, id) {
+		kept, excluded := slices.Contains(keep, id), slices.Contains(exclude, id)
+		switch {
+		case kept && excluded:
 			return fmt.Errorf("store: device %v is both kept and excluded", id)
+		case slices.Contains(fresh, id):
+		case kept && slices.Contains(j.Survivors, id), excluded && slices.Contains(j.Targets, id):
+			// Already decided so: the same answer again.
+		case kept && slices.Contains(j.Targets, id):
+			return fmt.Errorf("store: device %v was already excluded from this password change; it can't be kept now", id)
+		case excluded && slices.Contains(j.Survivors, id):
+			return fmt.Errorf("store: device %v is kept by this password change; Exclude names only the devices that appeared during it", id)
 		}
 	}
 	var missing []model.ID
@@ -943,8 +998,11 @@ func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
 	if len(missing) > 0 {
 		return &NewDevicesError{Devices: missing}
 	}
+	keep = slices.DeleteFunc(keep, func(id model.ID) bool { return !slices.Contains(fresh, id) })
+	exclude = slices.DeleteFunc(exclude, func(id model.ID) bool { return !slices.Contains(fresh, id) })
 	j.Survivors = sortIDs(append(j.Survivors, keep...))
 	j.Targets = sortIDs(append(j.Targets, exclude...))
+	j.addNames(s.state, fresh)
 	return nil
 }
 
@@ -952,7 +1010,10 @@ func (s *Store) decideNewDevices(j *ckptJournal, req *ckptRequest) error {
 // account once per call (§10.1: a checkpoint needs the master password,
 // and the Secret Key with it, which an enrolled device must be given).
 // Only a recovery's follow-up has none to check: the recovery sign-in
-// proved the Recovery Key. The caller holds s.mu.
+// proved the Recovery Key. A stored Secret Key that another checkpoint
+// replaced is ErrSecretKeyStale, not a wrong password; once the check
+// passes, the Secret Key it used is the stored one (keepSecretKey). The
+// caller holds s.mu and the file lock.
 func (s *Store) verifyCheckpointPassword(req *ckptRequest) error {
 	if req.verified || req.kind == CheckpointRecovery {
 		return nil
@@ -967,11 +1028,33 @@ func (s *Store) verifyCheckpointPassword(req *ckptRequest) error {
 	}
 	acct, err := openWithPassword(a, req.verify, sk)
 	if err != nil {
+		if req.sk == "" && errors.Is(err, ErrWrongPassword) && s.devCfg.secretKeyStale(s.rec.DeviceID, s.state.Creds.Gen) {
+			return ErrSecretKeyStale
+		}
 		return err
 	}
 	acct.Zero()
 	req.verified = true
-	return nil
+	return s.keepSecretKey(sk.String())
+}
+
+// keepSecretKey makes sk, which has just opened the account at the
+// verified head, the Secret Key this device stores: a stale one in the
+// record is replaced, durably and read back (refreshSecretKey), and
+// device.json records the current creds generation for it. An enrolled
+// device that stores none (§11 addendum) keeps none. The caller holds
+// s.mu and the file lock.
+func (s *Store) keepSecretKey(sk string) error {
+	if s.rec.SecretKey == "" {
+		return nil
+	}
+	if err := s.deviceStore(s.devCfg).refreshSecretKey(s.rec, sk); err != nil {
+		return err
+	}
+	if err := s.hook("secret-key:refreshed"); err != nil {
+		return err
+	}
+	return s.noteSecretKeyGen(s.rec.DeviceID, s.state.Creds.Gen)
 }
 
 // currentSecretKey is the account's Secret Key: given (an enrolled device

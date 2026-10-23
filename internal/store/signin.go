@@ -143,6 +143,14 @@ func signInWith(ctx context.Context, cfg Config, r SignInRemote, p SignInParams,
 		return nil, SignInResult{}, err
 	}
 	sf = p.serverFor(sf, o.d.st)
+	// The record's Secret Key opened the credentials of the sign-in's
+	// account keys: the current ones, unless a checkpoint replaced them
+	// meanwhile. A recovery never checked it (generation 0: not known to
+	// be current).
+	dcfg.SecretKeyGen = secretKeyGen{DeviceID: rec.DeviceID}
+	if p.Method != SignInRecovery && p.Account.AKV == o.d.st.Account.AKV {
+		dcfg.SecretKeyGen.Gen = o.d.st.Creds.Gen
+	}
 	if err := s.installSignIn(o, dcfg, sf); err != nil {
 		return nil, SignInResult{}, err
 	}

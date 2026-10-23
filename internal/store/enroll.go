@@ -786,9 +786,23 @@ func (e *Enrollment) stage(delivery *crypto.HPKEEnvelope) (*crypto.VerifiedDeliv
 // accept persists the held DONE state, which drops the staged delivery:
 // the delivery is accepted. If it fails, the enrollment is CONFIRMED again
 // with the delivery staged, and Install(nil) checks it again.
+//
+// The §7 deadline holds until the delivery is accepted, here: if it passed
+// while the delivery was checked, the attempt fails (FAILED, persisted),
+// exactly as a restart past the deadline fails it when it restores the
+// CONFIRMED state the record holds.
 func (e *Enrollment) accept() error {
 	if err := e.s.hook("enroll:accept"); err != nil {
 		return errors.Join(err, e.restore())
+	}
+	if !e.s.clock().Before(e.d.Deadline()) {
+		if err := e.restore(); err != nil {
+			return err
+		}
+		if e.d.State() != crypto.DeviceFailed {
+			return fmt.Errorf("%w: the deadline passed, but the enrollment is %s", crypto.ErrEnrollState, e.d.State())
+		}
+		return crypto.ErrEnrollExpired
 	}
 	if err := e.save(e.held, nil); err != nil {
 		return errors.Join(err, e.restore())

@@ -197,6 +197,11 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	}
 	acct, err := openWithPassword(a, password, sk)
 	if err != nil {
+		// The stored Secret Key of credentials a checkpoint replaced since
+		// is not a wrong password: the caller asks for the current one.
+		if secretKey == "" && errors.Is(err, ErrWrongPassword) && cfg.secretKeyStale(oldID, stored.Creds.Gen) {
+			return ErrSecretKeyStale
+		}
 		return err
 	}
 	if !acct.Pin().Equal(stored.Pin()) {
@@ -262,6 +267,8 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	// next attempt or unlock resolves it. It is installed (reconcileDevice)
 	// only once its record is saved.
 	next.Pending = &pendingDevice{DeviceID: rec.DeviceID}
+	// Its record holds the Secret Key that opened account.json.
+	next.SecretKeyGen = secretKeyGen{DeviceID: rec.DeviceID, Gen: stored.Creds.Gen}
 	self = next.self()
 	// From here device.json may be ahead of memory. If the replacement
 	// fails and the store stays unlocked with the old key, memory takes the
@@ -760,8 +767,7 @@ func (s *Store) persistKitSK() error {
 					return fail(err)
 				}
 			}
-			s.rec.zero()
-			s.rec, s.skErr, s.kitSKDurable = next, nil, true
+			s.kitSKStored(next)
 			return nil
 		}
 	}
@@ -769,9 +775,20 @@ func (s *Store) persistKitSK() error {
 	if err := ds.storeDurably(next); err != nil {
 		return fail(err)
 	}
+	s.kitSKStored(next)
+	return nil
+}
+
+// kitSKStored makes next, durable with the pending kit's Secret Key, the
+// record in memory, and records the kit's creds generation for it in
+// device.json (deviceConfig.SecretKeyGen). That record is best effort: an
+// older generation left there only makes the next password check try the
+// stored Secret Key before it asks for the current one, and the check that
+// passes records it. The caller holds the file lock.
+func (s *Store) kitSKStored(next *deviceRecord) {
 	s.rec.zero()
 	s.rec, s.skErr, s.kitSKDurable = next, nil, true
-	return nil
+	s.noteSecretKeyGen(next.DeviceID, s.state.Creds.Gen)
 }
 
 // hook is a test seam that simulates a crash at a named point.

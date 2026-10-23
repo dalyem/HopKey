@@ -64,6 +64,17 @@ func (OSKeyring) Delete(service, user string) error        { return keyring.Dele
 // (a password unlock replaced them, or was abandoned): they are still
 // active in the log, and the next hop passwd revokes them (§10.1). They are
 // a cleanup list only: never a source of the device key, never self.
+//
+// SecretKeyGen is the creds generation (creds.gen, §4.2) whose Secret Key
+// a self device's record holds. The record v2 schema is closed, so it is
+// kept here. Once the verified creds are newer, a checkpoint replaced the
+// Secret Key (another device's, normally): a password check that the
+// stored one fails then asks for the current one (ErrSecretKeyStale)
+// rather than calling the password wrong. It is written after the record
+// it describes is durable, so a crash in between can only leave an older
+// generation, which costs at most that question. Absent, or naming
+// another device, the generation is unknown and the stored Secret Key is
+// tried as it is; every password check that passes records it.
 type deviceConfig struct {
 	V            int            `json:"v"`
 	Store        string         `json:"store"`
@@ -79,7 +90,21 @@ type deviceConfig struct {
 	// device.next.key) before its bootstrap is posted, and it replaces this
 	// device once the destination vault is installed (promoteNext). It is
 	// never self and never a source of this vault's device key.
-	Next *nextDevice `json:"next,omitempty"`
+	Next         *nextDevice  `json:"next,omitempty"`
+	SecretKeyGen secretKeyGen `json:"secret_key_gen,omitzero"`
+}
+
+// secretKeyGen is device.json's secret_key_gen member:
+// {"device_id":id, "gen":u32}.
+type secretKeyGen struct {
+	DeviceID model.ID `json:"device_id"`
+	Gen      uint32   `json:"gen"`
+}
+
+// secretKeyStale reports whether device.json records that id's record
+// holds the Secret Key of creds older than gen.
+func (c deviceConfig) secretKeyStale(id model.ID, gen uint32) bool {
+	return !id.IsZero() && c.SecretKeyGen.DeviceID == id && c.SecretKeyGen.Gen < gen
 }
 
 // nextDevice is device.json's next member:
@@ -360,6 +385,25 @@ func (s *Store) writeDeviceConfig(c deviceConfig) error {
 		return err
 	}
 	return writeFileAtomic(s.l.deviceConfig(), b)
+}
+
+// noteSecretKeyGen records in device.json that id's record, durable,
+// holds the Secret Key of creds generation gen. The rest of device.json is
+// kept as it is on disk. The caller holds the file lock.
+func (s *Store) noteSecretKeyGen(id model.ID, gen uint32) error {
+	want := secretKeyGen{DeviceID: id, Gen: gen}
+	cfg, err := s.readDeviceConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.SecretKeyGen != want {
+		cfg.SecretKeyGen = want
+		if err := s.writeDeviceConfig(cfg); err != nil {
+			return err
+		}
+	}
+	s.devCfg.SecretKeyGen = want
+	return nil
 }
 
 // Describe says which store is in use, for hop status (§11).
@@ -1024,9 +1068,11 @@ func (d *deviceStore) upgradeRecord(rec *deviceRecord) error {
 // refreshSecretKey saves rec again, durably, with the Secret Key sk when it
 // holds another one: a sign-in retried after the account's Secret Key
 // changed reuses its earlier attempt's device, whose record must then keep
-// the Secret Key that opens pw_blob now. The device ID, its keys and
-// local_key stay. rec changes only once the store holds the new record.
-// The caller holds the file lock.
+// the Secret Key that opens pw_blob now, and so must the record of a
+// device whose stored Secret Key a checkpoint replaced, once a password
+// check passes with the current one (keepSecretKey). The device ID, its
+// keys and local_key stay. rec changes only once the store holds the new
+// record, read back. The caller holds the file lock.
 func (d *deviceStore) refreshSecretKey(rec *deviceRecord, sk string) error {
 	if rec.SecretKey == sk {
 		return nil
@@ -1035,7 +1081,7 @@ func (d *deviceStore) refreshSecretKey(rec *deviceRecord, sk string) error {
 	next.SecretKey = sk
 	if err := d.storeDurably(next); err != nil {
 		next.zero()
-		return fmt.Errorf("store: the device record could not be saved with this sign-in's Secret Key: %w", err)
+		return fmt.Errorf("store: the device record could not be saved with the current Secret Key: %w", err)
 	}
 	rec.zero()
 	*rec = *next
