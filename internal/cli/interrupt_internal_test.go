@@ -506,3 +506,111 @@ func TestAbandonWarnsInJSON(t *testing.T) {
 		t.Errorf("stderr %q is not one JSON warning: %v", out, err)
 	}
 }
+
+// openReal opens the vault in e's data directory for real, so the
+// owner lock is held while the returned store is open.
+func openReal(e *Env) (model.Store, error) {
+	s, err := store.Open(context.Background(), e.storeConfig())
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// A signal cuts the shutdown answer short, and the old daemon, its
+// sockets gone, still owns the vault while it drains. hop auth waits for
+// it to let go before it starts the daemon again, so the new one gets the
+// vault and serves, instead of finding it busy and exiting.
+func TestInterruptedShutdownWaitsForTheOldDaemon(t *testing.T) {
+	x := newInterruptEnv(t)
+	x.e.DaemonWait = 10 * time.Second
+	old, err := store.Open(context.Background(), x.e.storeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	var oldClosed atomic.Bool
+	ctx, cancel := interrupted()
+	fakeShutdown(t, x.e, func(c net.Conn, ln net.Listener) {
+		cancel(ErrInterrupted)
+		time.Sleep(100 * time.Millisecond) // the client gives up on the answer
+		ln.Close()                         // the sockets go first
+		time.Sleep(500 * time.Millisecond) // the store drains
+		oldClosed.Store(true)
+		old.Close()
+	})
+
+	// The replacement is the real hop daemon, on its own Env (its stderr is
+	// its own), opening the vault for real.
+	dctx, dcancel := context.WithCancel(context.Background())
+	defer dcancel()
+	replacement := &Env{
+		Stdout: &strings.Builder{}, Stderr: &strings.Builder{}, Getenv: x.e.Getenv,
+		DataDir: x.e.DataDir, Paths: x.e.Paths,
+	}
+	replacement.OpenStore = func() (model.Store, error) { return openReal(replacement) }
+	ran := make(chan error, 1)
+	var launched atomic.Int32
+	x.e.StartDaemon = func() error {
+		launched.Add(1)
+		go func() { ran <- runDaemon(dctx, replacement, nil) }()
+		return nil
+	}
+
+	if _, err := holdVault(ctx, x.e, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("hold: %v", err)
+	}
+	if !oldClosed.Load() {
+		t.Error("holdVault returned before the old daemon let go of the vault")
+	}
+	if n := launched.Load(); n != 1 {
+		t.Fatalf("the daemon was launched %d times, want once", n)
+	}
+	select {
+	case err := <-ran:
+		t.Fatalf("the new daemon ended: %v; stderr %q", err, replacement.Stderr)
+	default:
+	}
+	c, err := daemon.Dial(context.Background(), x.e.Paths.ControlSocket())
+	if err != nil {
+		t.Fatalf("the new daemon does not listen: %v; hop auth's stderr %q", err, x.e.Stderr)
+	}
+	err = c.Call(context.Background(), daemon.OpStatus, nil, nil)
+	c.Close()
+	if err != nil {
+		t.Fatalf("the new daemon does not answer: %v", err)
+	}
+	if s := x.e.Stderr.(*strings.Builder).String(); s != "" {
+		t.Errorf("hop auth warned: %q", s)
+	}
+	dcancel()
+	if err := <-ran; err != nil {
+		t.Errorf("runDaemon: %v; stderr %q", err, replacement.Stderr)
+	}
+}
+
+// A daemon started the ordinary way, with no handback, against a vault
+// that another process really owns (its owner lock is held) and no
+// daemon answering, fails within busyWait rather than wait for the vault.
+func TestDaemonFailsFastAgainstALiveOwner(t *testing.T) {
+	x := newInterruptEnv(t)
+	owner, err := store.Open(context.Background(), x.e.storeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	x.e.OpenStore = func() (model.Store, error) { return openReal(x.e) }
+	start := time.Now()
+	err = runDaemon(context.Background(), x.e, nil)
+	elapsed := time.Since(start)
+	var ee *exitError
+	if !errors.As(err, &ee) || ee.code != ExitFailure || ee.msg != "the vault is busy (another hop process owns it)" {
+		t.Fatalf("runDaemon: %v, want a failure saying the vault is busy", err)
+	}
+	if limit := busyWait + 2*time.Second; elapsed > limit {
+		t.Errorf("runDaemon took %v against a live owner, want under %v", elapsed, limit)
+	}
+	if busy, err := store.Busy(x.e.DataDir); err != nil || !busy {
+		t.Errorf("store.Busy with the owner open = %v, %v", busy, err)
+	}
+}

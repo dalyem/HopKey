@@ -285,11 +285,23 @@ func (h *vaultHold) open(ctx context.Context) (*store.Store, error) {
 // daemon that does not come up is a warning: the command itself is done,
 // and the next hop command starts it. The command has closed its stores
 // by now (each is closed by a defer that runs first).
+//
+// The old daemon removes its sockets before it closes its store, so it
+// can still own the vault here: when a signal cut its shutdown answer
+// short, or when the command ended before it opened the vault. A daemon
+// started then would find the vault busy and exit, so release first waits
+// for the vault to be free, with the marker still keeping autostart out.
 func (h *vaultHold) release(ctx context.Context) {
 	h.once.Do(func() {
-		h.unmark()
 		exists, err := store.Exists(h.cfg.DataDir)
 		if err != nil || !exists {
+			h.unmark()
+			return
+		}
+		free := waitVaultFree(h.cfg.DataDir)
+		h.unmark()
+		if !free {
+			warn(h.e, h.asJSON, fmt.Sprintf("the old hop daemon still had the vault after %s, so it was not started again, and nothing syncs until it is (any hop command starts it)", releaseBusyWait))
 			return
 		}
 		if err := startDaemon(context.WithoutCancel(ctx), h.e); err != nil {
@@ -297,6 +309,32 @@ func (h *vaultHold) release(ctx context.Context) {
 		}
 	})
 	h.e.setHold(nil)
+}
+
+// releaseBusyWait bounds how long release waits for a daemon on its way
+// out to let go of the vault. It does not stop for a cancelled context: a
+// signal is what leaves the old daemon draining. So release takes at most
+// releaseBusyWait plus the daemon start's wait (Env.DaemonWait, 10 s by
+// default), 15 s in all; abandon, which waits for a release under way
+// (once), can keep a signalled process up that long after
+// Env.InterruptGrace, 18 s by default.
+const releaseBusyWait = 5 * time.Second
+
+// waitVaultFree waits, for at most releaseBusyWait, until no process owns
+// the vault in dataDir, and reports whether none does. A failure to probe
+// counts as free: the daemon's own open reports it.
+func waitVaultFree(dataDir string) bool {
+	deadline := time.Now().Add(releaseBusyWait)
+	for {
+		busy, err := store.Busy(dataDir)
+		if err != nil || !busy {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 }
 
 // abandon is release for a process about to exit on a signal while its

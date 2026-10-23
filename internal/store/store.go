@@ -342,6 +342,25 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	return s, nil
 }
 
+// Busy reports whether a Store, in this process or another, owns the vault
+// in dataDir. It takes vault/owner.lock for a moment and gives it up at
+// once, so an Open racing it can find the vault busy. It writes nothing
+// but the empty lock file, if Open never made one. A data directory with
+// no vault directory is not busy.
+func Busy(dataDir string) (bool, error) {
+	f, err := filelock.TryLock(layout{data: dataDir}.ownerLock())
+	if errors.Is(err, filelock.ErrLocked) {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, f.Close()
+}
+
 // own takes vault/owner.lock without waiting.
 func (s *Store) own() error {
 	f, err := filelock.TryLock(s.l.ownerLock())
