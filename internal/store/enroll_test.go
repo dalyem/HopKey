@@ -415,7 +415,7 @@ func TestEnrollmentSubstitutedDeliveryRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.Install(ctx, x.remote(), &fake); !errors.Is(err, crypto.ErrAccountMismatch) {
+	if _, err := e.Install(ctx, x.remote(), &fake); !errors.Is(err, crypto.ErrAccountMismatch) || !errors.Is(err, ErrDeliveryInvalid) {
 		t.Fatalf("a substituted delivery: %v", err)
 	}
 	if e.State() != crypto.DeviceConfirmed {
@@ -644,6 +644,9 @@ func TestEnrollmentDeliveryMustMatchTheLog(t *testing.T) {
 		_, err := e.Install(ctx, laxReader{x.srv}, &env)
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("install: %v; want %q", err, want)
+		}
+		if !errors.Is(err, ErrDeliveryInvalid) {
+			t.Errorf("install: %v; want ErrDeliveryInvalid", err)
 		}
 		if exists, _ := (layout{data: x.cfg.DataDir}).exists(); exists {
 			t.Error("a refused delivery installed a vault")

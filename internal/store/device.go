@@ -171,7 +171,8 @@ func (c deviceConfig) withPending(id model.ID) deviceConfig {
 //
 // secret_key is "" for a device enrolled by approval (§7), which never
 // receives the Secret Key, until a checkpoint it authors stores the new one
-// (§11 addendum). The record is read with parseDeviceRecord, which refuses
+// (§11 addendum), and for a device a recovery signed in without one, until
+// its recovery's checkpoint stores the new one (the same addendum). The record is read with parseDeviceRecord, which refuses
 // anything else except a phase 1 record (v 1, no local_key). Unlock upgrades that one durably
 // before the store is used (upgradeRecord). Only v 2 is ever written.
 //
@@ -244,9 +245,10 @@ func parseDeviceRecord(b []byte) (*deviceRecord, error) {
 	case rec.SecretKey == "" && rec.V != 2:
 		err = errors.New("device record: a phase 1 record has no secret_key")
 	case rec.SecretKey == "":
-		// A device enrolled by approval never receives the Secret Key
-		// (§11, the "Enrolled devices" addendum). loadVault requires its
-		// certificate to show that it was.
+		// A device enrolled by approval never receives the Secret Key, and
+		// a recovery may sign in without it (§11, the "Enrolled devices"
+		// addendum). loadVault requires its certificate to show that it
+		// was enrolled, or its recovery to be due.
 	default:
 		err = crypto.CheckStr("secret_key", rec.SecretKey, 64)
 		if err == nil {
@@ -1077,9 +1079,10 @@ func (d *deviceStore) upgradeRecord(rec *deviceRecord) error {
 // device whose stored Secret Key a checkpoint replaced, once a password
 // check passes with the current one (keepSecretKey). The device ID, its
 // keys and local_key stay. rec changes only once the store holds the new
-// record, read back. The caller holds the file lock.
+// record, read back. sk "" (a recovery sign-in given none) keeps what rec
+// holds. The caller holds the file lock.
 func (d *deviceStore) refreshSecretKey(rec *deviceRecord, sk string) error {
-	if rec.SecretKey == sk {
+	if sk == "" || rec.SecretKey == sk {
 		return nil
 	}
 	next := rec.clone()

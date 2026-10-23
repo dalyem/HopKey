@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/zalando/go-keyring"
 
@@ -84,7 +85,43 @@ var (
 	// ErrEnrollmentInstalling means the enrollment's delivery was accepted
 	// and its device is being installed: only Install finishes it.
 	ErrEnrollmentInstalling = errors.New("store: this device's enrollment was approved and is being installed; run hop auth login again to finish it")
+	// ErrChalInvalid means HandleChal refused the chal itself: its schema,
+	// its enroll_id, or a second chal after one was accepted. Nothing
+	// changed (§7, invalid input), and the real chal is still accepted. The
+	// deadline, a rejected SAS, the enrollment's state and a failure to
+	// save it are not ErrChalInvalid.
+	ErrChalInvalid = errors.New("store: an invalid enrollment chal was discarded")
+	// ErrDeliveryInvalid means Install refused the delivery itself: a
+	// check of §7 step 6 failed (it does not open, its account or
+	// certificate does not match this enrollment, or its anchor, or its
+	// device in the log, does not verify against the server's log).
+	// Nothing changed, and the real delivery is still accepted. The
+	// deadline, a rejected SAS, the enrollment's state, a log that can't be
+	// read or does not verify, and a failure to save are not
+	// ErrDeliveryInvalid.
+	ErrDeliveryInvalid = errors.New("store: an invalid enrollment delivery was discarded")
 )
+
+// errEnrollSave marks a failure to save the enrollment record, which is
+// never the input's fault (ErrChalInvalid, ErrDeliveryInvalid).
+var errEnrollSave = errors.New("store: the enrollment state was not saved")
+
+// invalidInput wraps err, a refusal of a chal or a delivery by
+// crypto.DeviceEnrollment, in sentinel, unless it is not the message's
+// fault: the deadline, a rejected SAS, the enrollment's state (with notState
+// listing the ones that are the message's fault after all), or a failure to
+// save.
+func invalidInput(sentinel, err error, notState ...error) error {
+	if err == nil || errors.Is(err, errEnrollSave) || errors.Is(err, crypto.ErrEnrollExpired) || errors.Is(err, crypto.ErrSASRejected) {
+		return err
+	}
+	if errors.Is(err, crypto.ErrEnrollState) || errors.Is(err, crypto.ErrSASNotConfirmed) {
+		if !slices.ContainsFunc(notState, func(e error) bool { return errors.Is(err, e) }) {
+			return err
+		}
+	}
+	return fmt.Errorf("%w: %w", sentinel, err)
+}
 
 // EnrollRemote is the server as a device enrolled by approval reads it
 // before it has a vault: the log, read with the new device's own §9
@@ -192,10 +229,10 @@ func (p enrollPersister) Persist(state []byte) error {
 		return nil
 	}
 	if err := e.s.hook("enroll:persist"); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errEnrollSave, err)
 	}
 	if err := e.save(state, nil); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errEnrollSave, err)
 	}
 	e.setState(state)
 	e.staged = nil
@@ -630,10 +667,16 @@ func (e *Enrollment) Commit() crypto.EnrollCommit { return e.d.Commit() }
 func (e *Enrollment) SetEnrollID(id model.ID) error { return e.d.SetEnrollID(id) }
 
 // HandleChal accepts the approving device's chal, persists it (REVEALED)
-// and returns open. Exactly one chal is accepted.
+// and returns open. Exactly one chal is accepted. A chal it refuses for
+// itself matches ErrChalInvalid, and changes nothing.
 func (e *Enrollment) HandleChal(ch *crypto.EnrollChal) (crypto.EnrollOpen, error) {
-	return e.d.HandleChal(ch)
+	open, err := e.d.HandleChal(ch)
+	return open, invalidInput(ErrChalInvalid, err)
 }
+
+// Deadline is the attempt's §7 deadline, persisted with the enrollment:
+// no chal or delivery is accepted after it, after a restart too.
+func (e *Enrollment) Deadline() time.Time { return e.d.Deadline() }
 
 // Open returns open again once REVEALED, for re-sending.
 func (e *Enrollment) Open() (crypto.EnrollOpen, error) { return e.d.Open() }
@@ -693,7 +736,10 @@ func (e *Enrollment) Install(ctx context.Context, r EnrollRemote, delivery *cryp
 	var err error
 	switch {
 	case accepted && delivery != nil:
+		// Once DONE, only the accepted delivery is handed in again; any
+		// other is ErrEnrollState.
 		v, err = e.d.HandleDelivery(*delivery)
+		err = invalidInput(ErrDeliveryInvalid, err, crypto.ErrEnrollState)
 	case accepted:
 		v, err = e.d.Delivered()
 	default:
@@ -738,8 +784,14 @@ func (e *Enrollment) Install(ctx context.Context, r EnrollRemote, delivery *cryp
 	revoked := errors.As(err, &rev)
 	if !accepted {
 		if err != nil && !revoked {
-			// The delivery failed a check: nothing changes (§7).
-			return nil, errors.Join(err, e.unstage())
+			// The delivery failed a check: nothing changes (§7). If undoing
+			// the staged delivery fails, that is an operational error and
+			// takes precedence: it must not read as ErrDeliveryInvalid, or
+			// a caller would discard it and keep waiting.
+			if uerr := e.unstage(); uerr != nil {
+				return nil, fmt.Errorf("store: undoing a refused delivery failed: %w (it was refused: %v)", uerr, err)
+			}
+			return nil, err
 		}
 		// Every check passed (a revocation is met in verified history):
 		// the delivery is accepted, and the install owns the data
@@ -796,7 +848,7 @@ func (e *Enrollment) stage(delivery *crypto.HPKEEnvelope) (*crypto.VerifiedDeliv
 	v, err := e.d.HandleDelivery(env)
 	e.hold = false
 	if err != nil {
-		return nil, err
+		return nil, invalidInput(ErrDeliveryInvalid, err)
 	}
 	fail := func(err error) (*crypto.VerifiedDelivery, error) {
 		v.Account.Zero()
@@ -806,7 +858,7 @@ func (e *Enrollment) stage(delivery *crypto.HPKEEnvelope) (*crypto.VerifiedDeliv
 		return fail(fmt.Errorf("%w: the delivery was accepted without its state", crypto.ErrEnrollState))
 	}
 	if err := e.save(e.state, &env); err != nil {
-		return fail(err)
+		return fail(fmt.Errorf("%w: %w", errEnrollSave, err))
 	}
 	e.staged = &env
 	if err := e.s.hook("enroll:staged"); err != nil {
@@ -851,7 +903,10 @@ func (e *Enrollment) accept() error {
 func (e *Enrollment) unstage() error {
 	var err error
 	if e.staged != nil {
-		if err = e.save(e.state, nil); err == nil {
+		if err = e.s.hook("enroll:unstage"); err == nil {
+			err = e.save(e.state, nil)
+		}
+		if err == nil {
 			e.staged = nil
 		}
 	}
@@ -1071,14 +1126,16 @@ func enrolledDestination(ctx context.Context, r SignInRemote, o *signInSecrets, 
 	if err := d.fetchRest(ctx, r); err != nil {
 		return err
 	}
+	// From here on, a check that fails is the delivery's: it names an
+	// anchor, or a device, the server's log does not have.
 	if v.AnchorSeq >= uint64(len(d.wires)) {
-		return fmt.Errorf("store: the server's log ends at seq %d, before the delivered anchor (seq %d)", len(d.wires)-1, v.AnchorSeq)
+		return fmt.Errorf("%w: the server's log ends at seq %d, before the delivered anchor (seq %d)", ErrDeliveryInvalid, len(d.wires)-1, v.AnchorSeq)
 	}
 	aw := d.wires[v.AnchorSeq]
 	pin := o.acct.Pin()
 	trusted := &vaultlog.Head{Seq: v.AnchorSeq, H: v.AnchorH}
 	notAnchor := func(err error) error {
-		return fmt.Errorf("store: the delivered anchor (seq %d) does not verify: %w", v.AnchorSeq, err)
+		return fmt.Errorf("%w: the delivered anchor (seq %d) does not verify: %w", ErrDeliveryInvalid, v.AnchorSeq, err)
 	}
 	c, err := vaultlog.CheckAnchorPublic(pin, aw, d.objs)
 	if err != nil {
@@ -1088,7 +1145,10 @@ func enrolledDestination(ctx context.Context, r SignInRemote, o *signInSecrets, 
 		return notAnchor(errors.New("its H is not the delivered anchor_h"))
 	}
 	if err := d.checkSelf(c.Post); err != nil {
-		return err
+		if errors.As(err, new(*vaultlog.RevokedError)) {
+			return err
+		}
+		return fmt.Errorf("%w: %w", ErrDeliveryInvalid, err)
 	}
 	st, sec, _, err := vaultlog.Anchor(pin, o.acct, aw, d.objs, trusted)
 	if err != nil {
@@ -1110,10 +1170,10 @@ func enrolledDestination(ctx context.Context, r SignInRemote, o *signInSecrets, 
 		return err
 	}
 	if !found {
-		return errors.New("store: the server's log has no device_add with the delivered certificate")
+		return fmt.Errorf("%w: the server's log has no device_add with the delivered certificate", ErrDeliveryInvalid)
 	}
 	if _, active := d.st.Devices[self.ID]; !active {
-		return fmt.Errorf("%w: the enrolled device is not active in the verified log", ErrDeviceKey)
+		return fmt.Errorf("%w: %w: the enrolled device is not active in the verified log", ErrDeliveryInvalid, ErrDeviceKey)
 	}
 	return nil
 }

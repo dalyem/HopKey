@@ -44,7 +44,9 @@ import (
 //     commit. No vault: the identical upload is posted again. Another H:
 //     the equivocation alarm (§5.6), and the vault stays pending.
 //
-// A crash resumes at step 4 (ResumePublish).
+// A crash resumes at step 4 (ResumePublish). A registration code the
+// server refused, with no vault for it, is replaced in the journal by
+// ReplaceRegistrationCode, and the same upload is posted with the new one.
 
 var (
 	// ErrPublicationPending means a publication is journaled and not yet
@@ -61,6 +63,18 @@ var (
 	// ErrUploadTooLarge means the publication would exceed a server
 	// admission limit (plan R8, R9, R14).
 	ErrUploadTooLarge = errors.New("store: the vault is too large to publish")
+	// ErrRegistrationRefused is what a Publisher's Signup returns when the
+	// server refuses the registration code (an unknown or expired one: the
+	// server's 401), as opposed to acknowledging the upload or reporting a
+	// conflict with the publication that consumed it. A publication
+	// whose resolution sees it, with no vault on the server, fails with it,
+	// and ReplaceRegistrationCode may then replace the code.
+	ErrRegistrationRefused = errors.New("store: the server refused the registration code")
+	// ErrPublicationUncertain means ReplaceRegistrationCode was refused:
+	// the server has not confirmed that the journaled code published
+	// nothing (its last answer was not a refusal, or the vault's absence
+	// was not read after it). Resolve the publication first.
+	ErrPublicationUncertain = errors.New("store: the server has not confirmed that the registration code published nothing; finish the publication first")
 )
 
 // Admission limits a client can check locally (plan R8, R9, R14).
@@ -87,7 +101,10 @@ type Publisher interface {
 	// Signup fetches a signup challenge for req.Email and
 	// req.RegistrationCode, has req.Prove sign it, and posts the upload
 	// (POST /v1/signup/challenge, POST /v1/signup). It returns the server's
-	// acknowledgment, which is not trusted.
+	// acknowledgment, which is not trusted. A refusal of the registration
+	// code, the identical repost of a code whose challenge was refused
+	// included, matches ErrRegistrationRefused; a conflict with another
+	// publication must not.
 	Signup(ctx context.Context, req *SignupRequest) (vaultlog.Head, error)
 	// EntryAt returns the committed entry at seq of the published vault,
 	// read with device authentication (GET /v1/vaults/{id}/entries/{seq}).
@@ -381,7 +398,7 @@ func (s *Store) beginPublication(opts PublishOptions) (*publicationJSON, []*vaul
 	if err := s.commitTxn(t); err != nil {
 		return nil, nil, err
 	}
-	s.pubAlarm = nil
+	s.pubAlarm, s.pubRefused = nil, false
 	return j, wires, nil
 }
 
@@ -644,7 +661,13 @@ const maxPublishPosts = 2
 
 // resolvePublication is §4.3 step 4. postErr is the error of the post just
 // made, if any, for the report when the vault stays absent.
+//
+// A post the server refused (ErrRegistrationRefused) followed by a read
+// that finds no vault confirms that the journaled code published nothing:
+// the error then matches ErrRegistrationRefused, and ReplaceRegistrationCode
+// is allowed until anything else resolves or locks the vault.
 func (s *Store) resolvePublication(ctx context.Context, p Publisher, j *publicationJSON, wires []*vaultlog.Wire, postErr error) (Publication, error) {
+	s.setPubRefused(false)
 	for posts := 0; ; posts++ {
 		auth, err := s.DeviceAuth()
 		if err != nil {
@@ -659,6 +682,12 @@ func (s *Store) resolvePublication(ctx context.Context, p Publisher, j *publicat
 			return err
 		})
 		if errors.Is(err, ErrPublicationAbsent) {
+			if errors.Is(postErr, ErrRegistrationRefused) {
+				// The code was refused, and no vault followed: posting the
+				// same code again can't change that.
+				s.setPubRefused(true)
+				return Publication{}, fmt.Errorf("store: the publication did not commit, and it stays pending until the registration code is replaced (%w)", errors.Join(postErr, err))
+			}
 			if posts >= maxPublishPosts {
 				return Publication{}, fmt.Errorf("store: the publication did not commit (%w); it stays pending", errors.Join(err, postErr))
 			}
@@ -673,6 +702,71 @@ func (s *Store) resolvePublication(ctx context.Context, p Publisher, j *publicat
 		}
 		return s.finishPublication(ctx, p, j)
 	}
+}
+
+// setPubRefused records whether the server confirmed that the journaled
+// registration code published nothing, for this generation of the store.
+func (s *Store) setPubRefused(refused bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pubRefused, s.pubRefusedGen = refused, s.gen.Load()
+}
+
+// ReplaceRegistrationCode replaces the registration code of the pending
+// publication with code (§4.3), sealed in its journal in one durable
+// commit; the upload, its head and the rest of the journal stay. It is
+// allowed only once the server has confirmed that the journaled code
+// published nothing: the last resolution, in this store's current
+// generation, posted the identical upload, got a refusal of the code
+// (ErrRegistrationRefused, never an acknowledgment or a conflict), and then
+// found no vault (ErrPublicationAbsent). Anything else, an uncertain
+// outcome or a code another publication consumed included, is
+// ErrPublicationUncertain. ResumePublish then posts the upload with the new
+// code.
+func (s *Store) ReplaceRegistrationCode(code string) error {
+	if code == "" || crypto.CheckStr("registration_code", code, 256) != nil {
+		return errors.New("store: the registration code must be 1 to 256 characters")
+	}
+	if err := s.lockSync(); err != nil {
+		return err
+	}
+	defer s.syncMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == nil {
+		return s.lockedErr()
+	}
+	unlock, err := s.lockFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	j, err := s.readPublication(s.rec, s.state.VaultID)
+	if err != nil {
+		return err
+	}
+	if j == nil {
+		return ErrNoPublication
+	}
+	defer func() { j.RegistrationCode = "" }()
+	if !s.pubRefused || s.pubRefusedGen != s.gen.Load() {
+		return ErrPublicationUncertain
+	}
+	j.RegistrationCode = code
+	b, err := sealPublication(s.rec, j)
+	if err != nil {
+		return err
+	}
+	if err := s.hook("publish:replace-code"); err != nil {
+		return err
+	}
+	t := &txn{}
+	t.put(publishRel, b)
+	if err := s.commitTxn(t); err != nil {
+		return err
+	}
+	s.pubRefused = false
+	return nil
 }
 
 // remoteCall runs f, a request to the server, without s.mu, with a context
