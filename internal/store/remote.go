@@ -94,6 +94,29 @@ func (s *Store) syncContext(ctx context.Context) (context.Context, uint64, func(
 	return ctx, gen, done, nil
 }
 
+// RequestContext derives a context for a caller's own request to the
+// server that Lock and Close cancel, as a pull's is (§11.2). It returns
+// the lock generation it started in, which the caller compares with
+// Generation before acting on the answer, and a func that releases the
+// context; call it when the request is done. It fails while the vault is
+// locked or the store is closing.
+func (s *Store) RequestContext(ctx context.Context) (context.Context, uint64, func(), error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return nil, 0, nil, ErrClosed
+	}
+	if s.state == nil {
+		return nil, 0, nil, s.lockedErr()
+	}
+	ctx, gen, untrack := s.trackRequest(ctx)
+	return ctx, gen, func() {
+		s.mu.Lock()
+		untrack()
+		s.mu.Unlock()
+	}, nil
+}
+
 // trackRequest derives a context for requests to the server that Lock and
 // Close cancel (§11.2). It returns the lock generation it started in, and a
 // func that stops tracking the context and cancels it. Once Close has begun

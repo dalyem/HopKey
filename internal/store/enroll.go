@@ -327,7 +327,7 @@ func (p *EnrollParams) check(s *Store) (enrollConfig, string, error) {
 	email := ""
 	if p.Email != "" {
 		var err error
-		if email, err = NormalizeEmail(p.Email); err != nil {
+		if email, err = normalizeEmail(p.Email); err != nil {
 			return enrollConfig{}, "", err
 		}
 	}

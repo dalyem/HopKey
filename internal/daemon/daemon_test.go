@@ -796,7 +796,11 @@ func (s *flakyStore) Snapshot(ctx context.Context) (model.Snapshot, error) {
 	return s.Store.Snapshot(ctx)
 }
 
-func TestFailedReloadKeepsThePreviousKeyringAndConfig(t *testing.T) {
+// A reload that cannot read the store keeps the previous keyring and ssh
+// config. One that cannot write the config keeps the previous config but
+// still serves the keys the vault has now: the agent never waits on the
+// config to follow the vault.
+func TestFailedReloadKeepsWhatItCannotReplace(t *testing.T) {
 	base := shortDir(t)
 	paths := Paths{RunDir: filepath.Join(base, "run"), ConfigDir: filepath.Join(base, "home", ".ssh", "hop")}
 	inner := modeltest.New()
@@ -895,8 +899,13 @@ func TestFailedReloadKeepsThePreviousKeyringAndConfig(t *testing.T) {
 	if err := c.Call(ctx, OpReload, nil, nil); err == nil {
 		t.Fatal("reload succeeded with the keys directory blocked")
 	}
-	unchanged("write failure")
-	if st := d.state.Load(); st == nil || st.lastError == "" {
+	if got := agentKeys(); !slices.Equal(got, []string{"k1", "k2"}) {
+		t.Errorf("write failure: the agent serves %v, want the vault's keys [k1 k2]", got)
+	}
+	if got := readConfig(); got != wantBefore {
+		t.Errorf("write failure: the ssh config changed:\n%s", got)
+	}
+	if st := d.state.Load(); st == nil || st.lastError == "" || st.configErr == "" {
 		t.Errorf("the write failure was not recorded: %+v", st)
 	}
 
@@ -911,8 +920,8 @@ func TestFailedReloadKeepsThePreviousKeyringAndConfig(t *testing.T) {
 	if got := agentKeys(); !slices.Equal(got, []string{"k1", "k2"}) || !strings.Contains(readConfig(), "Host two\n") {
 		t.Errorf("after recovery: keys %v\n%s", got, readConfig())
 	}
-	if st := d.state.Load(); st.lastError != "" {
-		t.Errorf("lastError = %q after a good reload", st.lastError)
+	if st := d.state.Load(); st.lastError != "" || st.configErr != "" {
+		t.Errorf("lastError = %q, configErr = %q after a good reload", st.lastError, st.configErr)
 	}
 }
 

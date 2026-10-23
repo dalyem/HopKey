@@ -86,6 +86,7 @@ type sessionKey struct{ account, device model.ID }
 type session struct {
 	lock    chan struct{}
 	token   string
+	vault   model.ID  // the vault the token is bound to
 	expires time.Time // by the client's clock
 }
 
@@ -117,21 +118,38 @@ func (s *session) release() { <-s.lock }
 // refused with); otherwise it authenticates for a new one. force always
 // authenticates.
 func (c *Client) sessionToken(ctx context.Context, dev Device, stale string, force bool) (string, error) {
+	tok, _, err := c.sessionBound(ctx, dev, stale, force)
+	return tok, err
+}
+
+// sessionBound is sessionToken that also returns the vault the session is
+// bound to.
+func (c *Client) sessionBound(ctx context.Context, dev Device, stale string, force bool) (string, model.ID, error) {
 	s := c.session(dev)
 	if err := s.acquire(ctx); err != nil {
-		return "", err
+		return "", model.ID{}, err
 	}
 	defer s.release()
 	if !force && s.token != "" && s.token != stale && c.now().Before(s.expires.Add(-RefreshMargin)) {
-		return s.token, nil
+		return s.token, s.vault, nil
 	}
-	s.token = ""
-	tok, exp, err := c.authenticate(ctx, dev)
+	s.token, s.vault = "", model.ID{}
+	granted, err := c.authenticate(ctx, dev)
 	if err != nil {
-		return "", err
+		return "", model.ID{}, err
 	}
-	s.token, s.expires = tok, exp
-	return tok, nil
+	s.token, s.vault, s.expires = granted.token, granted.vault, granted.expires
+	return s.token, s.vault, nil
+}
+
+// SessionVault returns the vault the device's session is bound to: the
+// server scopes every session to its account's one vault (R1), so a device
+// that enrolled by approval, with its keys and certificate but no vault ID,
+// learns it here. It reuses the device's cached session, or authenticates
+// for one.
+func (c *Client) SessionVault(ctx context.Context, dev Device) (model.ID, error) {
+	_, vault, err := c.sessionBound(ctx, dev, "", false)
+	return vault, err
 }
 
 // dropSession forgets the device's session if it is still tok. When
@@ -145,7 +163,7 @@ func (c *Client) dropSession(dev Device, tok string) {
 	}
 	defer s.release()
 	if s.token == tok {
-		s.token = ""
+		s.token, s.vault = "", model.ID{}
 	}
 }
 
@@ -211,26 +229,35 @@ type sessionRequest struct {
 type sessionResponse struct {
 	AccessToken string          `json:"access_token"`
 	ExpiresAt   model.Timestamp `json:"expires_at"`
+	VaultID     model.ID        `json:"vault_id"`
+}
+
+// granted is a session the server issued: its token, the vault it is bound
+// to, and its expiry by the client's clock.
+type granted struct {
+	token   string
+	vault   model.ID
+	expires time.Time
 }
 
 // authenticate gets a new session (§9): a "session" challenge, the device's
 // signature over the device-auth object, and POST /v1/auth/session. A
 // refused challenge means the device is not active: ErrSessionEnded. A
 // refused session (the device left between the two calls, say) is tried
-// once more with a fresh challenge, which then tells. It returns the token
-// and its expiry by the client's clock.
-func (c *Client) authenticate(ctx context.Context, dev Device) (string, time.Time, error) {
+// once more with a fresh challenge, which then tells. A response without a
+// vault_id (an older server) is malformed. It returns the session granted.
+func (c *Client) authenticate(ctx context.Context, dev Device) (granted, error) {
 	for attempt := 0; ; attempt++ {
 		ch, err := c.challenge(ctx, dev, crypto.OperationSession)
 		if errors.Is(err, ErrUnauthorized) {
-			return "", time.Time{}, fmt.Errorf("%w: %w", ErrSessionEnded, err)
+			return granted{}, fmt.Errorf("%w: %w", ErrSessionEnded, err)
 		}
 		if err != nil {
-			return "", time.Time{}, err
+			return granted{}, err
 		}
 		sig, err := c.sign(dev, crypto.OperationSession, ch)
 		if err != nil {
-			return "", time.Time{}, err
+			return granted{}, err
 		}
 		sent := c.now()
 		r, err := c.exchange(ctx, &call{
@@ -238,7 +265,7 @@ func (c *Client) authenticate(ctx context.Context, dev Device) (string, time.Tim
 			body: sessionRequest{AccountID: dev.AccountID, DeviceID: dev.DeviceID, Challenge: ch, Sig: sig},
 		})
 		if err != nil {
-			return "", time.Time{}, err
+			return granted{}, err
 		}
 		var resp sessionResponse
 		err = r.decode(&resp)
@@ -246,12 +273,15 @@ func (c *Client) authenticate(ctx context.Context, dev Device) (string, time.Tim
 			continue
 		}
 		if err != nil {
-			return "", time.Time{}, err
+			return granted{}, err
 		}
 		if resp.AccessToken == "" {
-			return "", time.Time{}, fmt.Errorf("%w: an empty access token", ErrMalformedResponse)
+			return granted{}, fmt.Errorf("%w: an empty access token", ErrMalformedResponse)
 		}
-		return resp.AccessToken, sent.Add(lifetime(resp.ExpiresAt.Time(), r.header, sent)), nil
+		if resp.VaultID.IsZero() {
+			return granted{}, fmt.Errorf("%w: a zero vault ID", ErrMalformedResponse)
+		}
+		return granted{resp.AccessToken, resp.VaultID, sent.Add(lifetime(resp.ExpiresAt.Time(), r.header, sent))}, nil
 	}
 }
 

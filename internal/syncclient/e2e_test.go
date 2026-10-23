@@ -1042,3 +1042,49 @@ func TestCheckpointReauthenticates(t *testing.T) {
 	}
 	wantSnippets(t, s1, "device 1", "deploy", "after")
 }
+
+// A device holds its keys and certificate but no vault ID (one that
+// enrolled by approval is in that state): the Device the client takes
+// carries only the account and device IDs. SessionVault gets the vault the
+// real server bound its session to, and the log of that vault is readable
+// with the same session.
+func TestSessionVaultForADeviceWithOnlyItsKeys(t *testing.T) {
+	ctx := context.Background()
+	w := newWorld(t)
+	s1, kit := localVault(t)
+	c1 := w.client(t)
+	pub := publish(t, w, c1, s1)
+
+	c2 := w.client(t)
+	s2, _ := signIn(t, w, c2, kit, pub)
+
+	dev, err := syncclient.StoreDevice(s2.DeviceAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signs atomic.Int32
+	counted := dev
+	counted.Signer = func() (syncclient.Signer, error) {
+		signs.Add(1)
+		return dev.Signer()
+	}
+	c3 := w.client(t)
+	got, err := c3.SessionVault(ctx, counted)
+	if err != nil {
+		t.Fatalf("SessionVault: %v", err)
+	}
+	if got != pub.VaultID || got.IsZero() {
+		t.Fatalf("SessionVault %v; want %v", got, pub.VaultID)
+	}
+	// The ID opens the vault under the cached session: no second signature.
+	r := c3.Remote(got, counted)
+	if _, head, err := r.Since(ctx, 0); err != nil || head.Seq == 0 {
+		t.Fatalf("reading the vault %v: head %+v, %v", got, head, err)
+	}
+	if again, err := c3.SessionVault(ctx, counted); err != nil || again != got {
+		t.Fatalf("second SessionVault: %v, %v", again, err)
+	}
+	if n := signs.Load(); n != 1 {
+		t.Errorf("%d authentications; want 1", n)
+	}
+}

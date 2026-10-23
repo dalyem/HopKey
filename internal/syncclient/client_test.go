@@ -261,9 +261,13 @@ type fakeAuth struct {
 	refuse     int  // this many session requests get 401
 	logRefuse  bool // every log request gets 401
 	ttl        time.Duration
+	vault      model.ID // the vault the sessions are bound to
+	noVault    bool     // session responses have no vault_id, as an older server's
 }
 
-func newFakeAuth() *fakeAuth { return &fakeAuth{tokens: map[string]bool{}, ttl: 15 * time.Minute} }
+func newFakeAuth() *fakeAuth {
+	return &fakeAuth{tokens: map[string]bool{}, ttl: 15 * time.Minute, vault: model.ID{3}}
+}
 
 func (f *fakeAuth) unauthorized(w http.ResponseWriter) {
 	writeCanon(w, http.StatusUnauthorized, errorResponse{errorBody{"unauthorized", "authentication failed"}})
@@ -291,7 +295,15 @@ func (f *fakeAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		tok := "tok-" + strconv.Itoa(f.sessions)
 		f.tokens[tok] = true
-		writeCanon(w, http.StatusOK, sessionResponse{tok, model.TimestampOf(time.Now().Add(f.ttl))})
+		exp := model.TimestampOf(time.Now().Add(f.ttl))
+		if f.noVault {
+			writeCanon(w, http.StatusOK, struct {
+				AccessToken string          `json:"access_token"`
+				ExpiresAt   model.Timestamp `json:"expires_at"`
+			}{tok, exp})
+			return
+		}
+		writeCanon(w, http.StatusOK, sessionResponse{tok, exp, f.vault})
 	case strings.HasSuffix(r.URL.Path, "/log"):
 		f.logs++
 		tok, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
@@ -436,6 +448,60 @@ func TestSessionRefusedRetriedOnce(t *testing.T) {
 		t.Errorf("refused twice: %v", err)
 	}
 	wantCounts(t, f, 2, 2, 0)
+}
+
+// A session response without a vault_id (an older server), or with a zero
+// one, is malformed, and nothing is cached from it.
+func TestSessionWithoutVaultIDRefused(t *testing.T) {
+	for name, set := range map[string]func(f *fakeAuth){
+		"missing": func(f *fakeAuth) { f.noVault = true },
+		"zero":    func(f *fakeAuth) { f.vault = model.ID{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, r, _, _, c := sessionFixture(t)
+			f.set(set)
+			if _, _, err := r.Since(bg, 0); !errors.Is(err, ErrMalformedResponse) {
+				t.Errorf("Since: %v; want ErrMalformedResponse", err)
+			}
+			if _, err := c.SessionVault(bg, r.dev); !errors.Is(err, ErrMalformedResponse) {
+				t.Errorf("SessionVault: %v; want ErrMalformedResponse", err)
+			}
+			wantCounts(t, f, 2, 2, 0)
+		})
+	}
+}
+
+// SessionVault returns the vault the session is bound to, from the same
+// cached session the log requests use, and a replaced session brings its
+// own.
+func TestSessionVaultCached(t *testing.T) {
+	f, r, _, clk, c := sessionFixture(t)
+	v, err := c.SessionVault(bg, r.dev)
+	if err != nil || v != (model.ID{3}) {
+		t.Fatalf("SessionVault: %v, %v", v, err)
+	}
+	wantCounts(t, f, 1, 1, 0)
+	since(t, r) // reuses the session SessionVault authenticated
+	if v, err = c.SessionVault(bg, r.dev); err != nil || v != (model.ID{3}) {
+		t.Fatalf("second SessionVault: %v, %v", v, err)
+	}
+	wantCounts(t, f, 1, 1, 1)
+
+	// The next session is bound to another vault: the cache follows it.
+	f.set(func(f *fakeAuth) { f.vault = model.ID{4} })
+	clk.advance(sessionTTL)
+	if v, err = c.SessionVault(bg, r.dev); err != nil || v != (model.ID{4}) {
+		t.Fatalf("SessionVault after the refresh: %v, %v", v, err)
+	}
+	wantCounts(t, f, 2, 2, 1)
+
+	// A session replaced after a 401 brings its own vault.
+	f.revokeAll()
+	f.set(func(f *fakeAuth) { f.vault = model.ID{5} })
+	since(t, r)
+	if v, err = c.SessionVault(bg, r.dev); err != nil || v != (model.ID{5}) {
+		t.Fatalf("SessionVault after re-authentication: %v, %v", v, err)
+	}
 }
 
 // Concurrent calls share one authentication.
