@@ -3,10 +3,10 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/sshagent"
-	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/store"
 )
 
@@ -135,7 +135,8 @@ func (d *Daemon) lockVault(v Vault) {
 
 // dropKeysLocked empties the agent and forgets the last snapshot, as a lock
 // does. For a revoked device it also writes an ssh config with no hosts, so
-// nothing the vault decrypted stays behind (§5.5). The caller holds d.mu.
+// nothing the vault decrypted stays behind (§5.5), and keeps trying until
+// that works (clearConfigLocked). The caller holds d.mu.
 func (d *Daemon) dropKeysLocked(revoked bool) {
 	old := d.live.swap(sshagent.NewKeyring(), d.live.generation())
 	old.RemoveAll()
@@ -143,9 +144,7 @@ func (d *Daemon) dropKeysLocked(revoked bool) {
 	st.revoked = revoked
 	d.state.Store(st)
 	if revoked {
-		if err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, nil); err != nil {
-			d.logf("clearing the ssh config of a revoked device: %v", err)
-		}
+		d.clearConfigLocked()
 	}
 }
 
@@ -218,6 +217,11 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 	_, err = d.reloadLocked(ctx)
 	// Sync resumes from the last verified head (§11.2).
 	d.sync.wake()
+	if cw := (*configWriteError)(nil); errors.As(err, &cw) {
+		// The keys are loaded all the same: a partial success.
+		return &Error{Code: CodeConfigNotWritten, Message: fmt.Sprintf(
+			"vault unlocked and keys loaded; the ssh config could not be updated (%v), the daemon tries again every %v", cw.cause, d.configRetry())}
+	}
 	return err
 }
 

@@ -51,6 +51,14 @@ const configRetryInterval = 30 * time.Second
 // errConfigWrite marks a reload whose ssh config could not be written.
 var errConfigWrite = errors.New("writing the ssh config")
 
+// configWriteError is the error of a reload whose ssh config could not be
+// written. It is errConfigWrite, and unwraps to the cause.
+type configWriteError struct{ cause error }
+
+func (e *configWriteError) Error() string        { return errConfigWrite.Error() + ": " + e.cause.Error() }
+func (e *configWriteError) Is(target error) bool { return target == errConfigWrite }
+func (e *configWriteError) Unwrap() error        { return e.cause }
+
 // fingerprint identifies a snapshot by the IDs and versions of its items.
 // Every change to an item bumps its version, so this changes whenever the
 // store's contents do.
@@ -293,12 +301,53 @@ func (d *Daemon) apply(ctx context.Context, snap model.Snapshot, gen uint64) (*s
 
 	err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, hosts)
 	if err != nil {
-		err = fmt.Errorf("%w: %w", errConfigWrite, err)
+		err = &configWriteError{cause: err}
 		st.configErr = err.Error()
 		warn("%s", d.configWarning(st.configErr))
+	} else {
+		// This config replaces any a revocation could not clear.
+		d.clearErr.Store(nil)
 	}
 	slices.Sort(st.warnings)
 	return st, err
+}
+
+// configStale refuses to resolve a connection while the ssh config could
+// not be written from the vault: ssh would read host keys, users, ports
+// and jump hosts from the config as it was.
+func (d *Daemon) configStale(why string) error {
+	return &Error{Code: CodeConfigStale, Message: fmt.Sprintf("the ssh config in %s is out of date (%s), "+
+		"so ssh could use old host keys, users, ports or jump hosts: hop won't connect until it can be written; "+
+		"the daemon tries again every %v", d.opts.Paths.ConfigDir, why, d.configRetry())}
+}
+
+// clearWarning tells the user that a revoked device's ssh config could not
+// be emptied.
+func (d *Daemon) clearWarning(why string) string {
+	return fmt.Sprintf("this device was revoked, but the ssh config in %s could not be emptied (%s) and still names the vault's hosts; "+
+		"the daemon tries again every %v", d.opts.Paths.ConfigDir, why, d.configRetry())
+}
+
+// clearConfigLocked writes an ssh config with no hosts, so nothing the
+// vault decrypted stays behind (§5.5). A failure is kept in clearErr,
+// shown in status and retried by retryConfig. The caller holds d.mu.
+func (d *Daemon) clearConfigLocked() {
+	if err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, nil); err != nil {
+		why := err.Error()
+		d.clearErr.Store(&why)
+		d.logf("clearing the ssh config of a revoked device: %v", err)
+		return
+	}
+	d.clearErr.Store(nil)
+}
+
+// pendingClear says why a revoked device's ssh config could not be
+// emptied, or "" when nothing is pending.
+func (d *Daemon) pendingClear() string {
+	if p := d.clearErr.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // configWarning tells the user that the ssh config could not be written.
@@ -318,9 +367,14 @@ func (d *Daemon) configRetry() time.Duration {
 // retryConfig rebuilds from the store while the last reload could not
 // write the ssh config, on a timer of its own, so a sync loop that is
 // halted or idle does not leave the config stale. Each reload, unlock and
-// reconcile tries again too, since such a state is never current.
+// reconcile tries again too, since such a state is never current. A
+// revoked device's config that could not be emptied is emptied again,
+// with no snapshot needed.
 func (d *Daemon) retryConfig() {
-	dirty := func() bool { cur := d.state.Load(); return cur != nil && cur.configErr != "" }
+	dirty := func() bool {
+		cur := d.state.Load()
+		return d.pendingClear() != "" || (cur != nil && cur.configErr != "")
+	}
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
@@ -336,7 +390,10 @@ func (d *Daemon) retryConfig() {
 				continue
 			}
 			d.mu.Lock()
-			if dirty() && d.ctx.Err() == nil {
+			if d.pendingClear() != "" && d.ctx.Err() == nil {
+				d.clearConfigLocked()
+			}
+			if cur := d.state.Load(); cur != nil && cur.configErr != "" && d.ctx.Err() == nil {
 				d.reloadLocked(d.ctx) // a failure is recorded and logged
 			}
 			d.mu.Unlock()

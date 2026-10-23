@@ -184,6 +184,9 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 	if cur := d.state.Load(); cur != nil && cur.configErr != "" {
 		warn("%s", d.configWarning(cur.configErr))
 	}
+	if why := d.pendingClear(); why != "" {
+		warn("%s", d.clearWarning(why))
+	}
 	switch {
 	case out.Equivocation:
 		warn("the server showed two different histories of the vault (an equivocation): sync is stopped; compare hop status on your devices and contact the server's operator")

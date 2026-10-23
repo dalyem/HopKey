@@ -111,6 +111,9 @@ type Daemon struct {
 	// head moving (a queued write, a hold, a resolution), so the next
 	// request rebuilds from the overlay.
 	outboxGen atomic.Uint64
+	// clearErr says why a revoked device's ssh config could not be
+	// emptied; nil when nothing is pending (clearConfigLocked).
+	clearErr atomic.Pointer[string]
 
 	sync *syncer // nil for a store that does not sync
 

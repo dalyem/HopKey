@@ -53,6 +53,15 @@ const (
 	CodeStillHeld    = "still_held"    // a retry found the change still held
 	CodeStaleConfirm = "stale_confirm" // the confirmation token no longer matches the proposal
 	CodeConfirm      = "confirm"       // keep-mine and edit need the proposal's confirmation token
+
+	// CodeConfigStale refuses a resolve while the ssh config could not be
+	// written from the vault: ssh would use the settings it had before.
+	CodeConfigStale = "config_stale"
+	// CodeConfigNotWritten is a partial success: the change (an unlock, a
+	// put, a delete, a reload) took effect and the agent serves the
+	// vault's keys, but the ssh config could not be written. The daemon
+	// retries; the CLI shows the message as a warning.
+	CodeConfigNotWritten = "config_not_written"
 )
 
 // Request is one control call.

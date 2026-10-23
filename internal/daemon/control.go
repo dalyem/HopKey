@@ -119,6 +119,8 @@ func errorResponse(err error) Response {
 			e = &Error{Code: CodeNotFound, Message: err.Error()}
 		case errors.Is(err, model.ErrLocked):
 			e = &Error{Code: CodeLocked, Message: err.Error()}
+		case errors.Is(err, errConfigWrite):
+			e = &Error{Code: CodeConfigNotWritten, Message: err.Error()}
 		default:
 			e = &Error{Code: CodeInternal, Message: err.Error()}
 		}
@@ -215,6 +217,9 @@ func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 		Warnings: slices.Clone(st.warnings), LoadedAt: st.loadedAt, LastError: st.lastError,
 		Vault: d.vaultStatus(),
 	}
+	if why := d.pendingClear(); why != "" {
+		out.Warnings = append(out.Warnings, d.clearWarning(why))
+	}
 	if d.sync != nil {
 		out.Sync = d.syncStatus(false)
 	}
@@ -271,6 +276,11 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 	if err != nil {
 		return nil, err
 	}
+	// hop status and hop list still work while the ssh config is out of
+	// date; connecting does not.
+	if st.configErr != "" {
+		return nil, d.configStale(st.configErr)
+	}
 	ts := d.tsStatus(ctx)
 	in := resolve.Input{Target: p.Target, Hosts: snap.Hosts, Tailscale: ts, Interactive: p.Interactive}
 	res, err := resolve.Resolve(ctx, in)
@@ -284,6 +294,9 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		caughtUp = true
 		if snap, st, err = d.fresh(ctx); err != nil {
 			return nil, err
+		}
+		if st.configErr != "" {
+			return nil, d.configStale(st.configErr)
 		}
 		in.Hosts = snap.Hosts
 		if res, err = resolve.Resolve(ctx, in); err != nil {
