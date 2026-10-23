@@ -75,6 +75,9 @@ type Options struct {
 
 	// Tailscale defaults to the real command line client.
 	Tailscale TailscaleSource
+	// Sync configures automatic sync, which runs for a server-backed
+	// encrypted store (sync.go).
+	Sync SyncOptions
 	// Logf receives log lines. Nil discards them.
 	Logf func(format string, args ...any)
 }
@@ -95,6 +98,12 @@ type Daemon struct {
 	// ssh config always come from one snapshot, newest last.
 	mu    sync.Mutex
 	state atomic.Pointer[state]
+	// outboxGen moves whenever the outbox changes without the verified
+	// head moving (a queued write, a hold, a resolution), so the next
+	// request rebuilds from the overlay.
+	outboxGen atomic.Uint64
+
+	sync *syncer // nil for a store that does not sync
 
 	tsMu     sync.Mutex
 	tsCached *tailscale.Status
@@ -168,6 +177,7 @@ func Start(opts Options) (*Daemon, error) {
 		return nil, fmt.Errorf("daemon: loading the vault: %w", err)
 	}
 	d.watchRevoked()
+	d.startSync()
 
 	d.wg.Add(2)
 	go func() {

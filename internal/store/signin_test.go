@@ -1404,7 +1404,7 @@ func TestServerInfoIsRecorded(t *testing.T) {
 			t.Fatal(err)
 		}
 		s := open(t, f.cfg)
-		if si, err := s.ServerInfo(); err != nil || si != (ServerInfo{Server: pubOpts.Server, Email: testEmail}) {
+		if si, err := s.ServerInfo(); err != nil || si != (ServerInfo{Server: pubOpts.Server, Email: testEmail, VaultID: s.state.VaultID, AccountID: s.state.Account.AccountID}) {
 			t.Errorf("server info %+v %v", si, err)
 		}
 	})
@@ -1417,7 +1417,7 @@ func TestServerInfoIsRecorded(t *testing.T) {
 			t.Fatal(err)
 		}
 		s := open(t, m.src.cfg)
-		if si, err := s.ServerInfo(); err != nil || si != (ServerInfo{Server: m.srv.origin, Email: testEmail}) {
+		if si, err := s.ServerInfo(); err != nil || si != (ServerInfo{Server: m.srv.origin, Email: testEmail, VaultID: s.state.VaultID, AccountID: s.state.Account.AccountID}) {
 			t.Errorf("server info %+v %v", si, err)
 		}
 	})

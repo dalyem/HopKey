@@ -35,6 +35,8 @@ type state struct {
 	snap    model.Snapshot // what it was built from, when head is set
 	head    store.Head     // the store's head at the time, if it has one
 	hasHead bool
+	// outboxGen is the daemon's outboxGen when snap was read.
+	outboxGen uint64
 }
 
 // fingerprint identifies a snapshot by the IDs and versions of its items.
@@ -53,6 +55,9 @@ func fingerprint(s model.Snapshot) string {
 	}
 	for _, sn := range s.Snippets {
 		lines = append(lines, fmt.Sprintf("snippet %s %d", sn.ItemID, sn.ItemVersion))
+	}
+	for id, m := range s.Marks {
+		lines = append(lines, fmt.Sprintf("mark %s %s", id, m))
 	}
 	slices.Sort(lines)
 	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
@@ -75,6 +80,7 @@ func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
 	// The generation is read before the snapshot: if the store locks or
 	// unlocks in between, the keyring is fenced off until the next reload.
 	gen := d.live.generation()
+	outboxGen := d.outboxGen.Load()
 	head, hasHead := d.storeHead()
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
@@ -87,7 +93,7 @@ func (d *Daemon) reloadLocked(ctx context.Context) (model.Snapshot, error) {
 		d.noteError(err)
 		return model.Snapshot{}, err
 	}
-	next.snap, next.head, next.hasHead = snap, head, hasHead
+	next.snap, next.head, next.hasHead, next.outboxGen = snap, head, hasHead, outboxGen
 	d.state.Store(next)
 	return snap, nil
 }
@@ -103,14 +109,12 @@ func (d *Daemon) noteError(err error) {
 
 // fresh returns the current snapshot, reloading first if the store has
 // changed since the last reload (another device synced, say). A store that
-// reports its log head is asked only for that while it is unchanged. A
-// keyring from an earlier store generation (the vault locked and unlocked
-// again) is always reloaded.
+// reports its log head is asked only for that while neither it nor the
+// outbox has changed. A keyring from an earlier store generation (the
+// vault locked and unlocked again) is always reloaded.
 func (d *Daemon) fresh(ctx context.Context) (model.Snapshot, *state, error) {
-	if h, ok := d.storeHead(); ok {
-		if cur := d.state.Load(); cur != nil && cur.hasHead && cur.head == h && !d.live.stale() {
-			return cur.snap, cur, nil
-		}
+	if cur, ok := d.current(); ok {
+		return cur.snap, cur, nil
 	}
 	snap, err := d.store.Snapshot(ctx)
 	if err != nil {
@@ -129,6 +133,45 @@ func (d *Daemon) fresh(ctx context.Context) (model.Snapshot, *state, error) {
 		return model.Snapshot{}, nil, err
 	}
 	return snap, d.state.Load(), nil
+}
+
+// current returns the last reload's state when it still matches the
+// store: the same head, the same outbox and the same store generation.
+func (d *Daemon) current() (*state, bool) {
+	h, ok := d.storeHead()
+	if !ok {
+		return nil, false
+	}
+	cur := d.state.Load()
+	if cur == nil || !cur.hasHead || cur.head != h || cur.outboxGen != d.outboxGen.Load() || d.live.stale() {
+		return nil, false
+	}
+	return cur, true
+}
+
+// refreshAfterSync rebuilds the keyring and ssh config after a pull, a
+// push or a resolution, if the verified head or the outbox moved.
+func (d *Daemon) refreshAfterSync(ctx context.Context) {
+	if _, ok := d.current(); ok {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.current(); ok {
+		return
+	}
+	if _, err := d.reloadLocked(ctx); err != nil {
+		d.logf("reload after sync: %v", err)
+	}
+}
+
+// localWrite notes a write through the daemon: in a server-backed vault it
+// queued a record, so the overlay changed even though the head did not,
+// and the sync loop should push it now. The caller holds d.mu and reloads
+// next.
+func (d *Daemon) localWrite() {
+	d.outboxGen.Add(1)
+	d.sync.wake()
 }
 
 // tsStatus reads the tailnet, reusing a result that is a couple of seconds

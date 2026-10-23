@@ -1,0 +1,808 @@
+package daemon
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/syncclient"
+	"github.com/dalyem/hopkey/internal/vaultlog"
+)
+
+// Automatic sync (design "Automatic sync", crypto spec §11.2). While the
+// vault is server-backed and unlocked, one goroutine keeps it current: it
+// pushes the outbox head while records are pending, and otherwise holds a
+// long-poll open for the next entry. A local write, an unlock, sync.now
+// and a catch-up pull all wake it, cutting the long-poll short, since the
+// store runs one pull or push at a time. Failures back off exponentially,
+// with jitter, up to a minute. A lock pauses it (the store discards
+// whatever was in flight); an equivocation, a rule violation, a revocation
+// and a finished logout stop it.
+
+// SyncOptions configures automatic sync.
+type SyncOptions struct {
+	// Client configures the HTTP client of each server. DevInsecure is
+	// also set by HOP_DEV_INSECURE=1.
+	Client syncclient.Options
+	// Wait is how long a pull waits for a new entry; zero means 50 s.
+	Wait time.Duration
+
+	// Test hooks. after replaces time.After for backoff and idle waits;
+	// minBackoff and maxBackoff replace 1 s and 60 s; catchUpAge replaces
+	// how old the last pull must be before a catch-up; noPoll keeps the
+	// loop from pulling unless asked (it still pushes).
+	after                  func(time.Duration) <-chan time.Time
+	minBackoff, maxBackoff time.Duration
+	catchUpAge             time.Duration
+	noPoll                 bool
+}
+
+const (
+	defaultWait       = 50 * time.Second
+	defaultMinBackoff = time.Second
+	defaultMaxBackoff = 60 * time.Second
+	defaultCatchUpAge = 3 * time.Second
+	// catchUpTimeout bounds the pull a missed target waits for.
+	catchUpTimeout = 2 * time.Second
+	// idleRecheck is how often an idle loop looks at the store again, in
+	// case something changed that did not wake it (a publication, say).
+	idleRecheck = 30 * time.Second
+	// maxSyncNowPushes bounds the records one sync.now pushes.
+	maxSyncNowPushes = 64
+)
+
+// syncStore is the sync side of the encrypted store (*store.Store).
+type syncStore interface {
+	Generation() uint64
+	Info() store.Info
+	ServerInfo() (store.ServerInfo, error)
+	DeviceAuth() (store.DeviceAuth, error)
+	Status() (store.SyncStatus, error)
+	Pull(ctx context.Context, r store.Remote) error
+	PushHead(ctx context.Context, r store.Remote) (store.PushResult, error)
+	Lock()
+
+	Retirement() (string, error)
+	Logout(ctx context.Context, r store.Retirer, opts store.LogoutOptions) (store.LogoutResult, error)
+	Publication() (*store.Publication, error)
+	ResumePublish(ctx context.Context, p store.Publisher) (store.Publication, error)
+	PendingCheckpoint() (*store.CheckpointStatus, error)
+	ResumeCheckpoint(ctx context.Context, r store.Remote) (store.Kit, error)
+
+	HeldHead() (*store.HeldRecord, error)
+	Propose(r store.Resolution) (store.Proposal, error)
+	Resolve(r store.Resolution) error
+	Devices() ([]store.DeviceListing, error)
+	LostIntents() (uint64, error)
+	LostJournals() (store.LostJournals, error)
+}
+
+var _ syncStore = (*store.Store)(nil)
+
+// backoff is exponential backoff with jitter: the nth failure in a row
+// waits a random time in the upper half of min·2^(n-1), capped at max.
+type backoff struct {
+	min, max time.Duration
+	rand     func() float64 // in [0, 1)
+}
+
+func (b backoff) delay(attempt int) time.Duration {
+	d := b.min
+	for i := 1; i < attempt && d < b.max; i++ {
+		d *= 2
+	}
+	if d > b.max {
+		d = b.max
+	}
+	return d/2 + time.Duration(b.rand()*float64(d/2))
+}
+
+// step results: run again at once, wait to be woken, or stop.
+const (
+	stepNow  time.Duration = 0
+	stepIdle time.Duration = -1
+	stepStop time.Duration = -2
+)
+
+// request kinds.
+const (
+	reqPull    = iota // one pull, for a catch-up
+	reqSyncNow        // pull, then push the outbox
+)
+
+type syncReq struct {
+	ctx  context.Context
+	kind int
+	done chan error
+}
+
+// syncer is the sync engine.
+type syncer struct {
+	d    *Daemon
+	st   syncStore
+	opts SyncOptions
+	bo   backoff
+
+	wakeCh chan struct{}
+	// pause stops the loop from pulling or pushing (tests).
+	pause atomic.Bool
+
+	mu        sync.Mutex
+	pollStop  context.CancelFunc // ends the long-poll in flight
+	reqs      []*syncReq
+	stopped   bool
+	clients   map[string]*syncclient.Client
+	remote    *syncclient.Remote
+	remoteKey string
+	remoteGen uint64
+	resumed   uint64 // the generation whose startup work is done, if resumedOK
+	resumedOK bool
+
+	// Status.
+	phase     string
+	syncedAt  time.Time
+	lastErr   string
+	lastErrAt time.Time
+	attempt   int
+	retryAt   time.Time
+	halted    string
+	equivoc   bool
+	notes     []string // from the startup work: things that need the user
+}
+
+func newSyncer(d *Daemon, st syncStore, opts SyncOptions) *syncer {
+	if opts.Wait <= 0 {
+		opts.Wait = defaultWait
+	}
+	if opts.Wait > syncclient.MaxWait {
+		opts.Wait = syncclient.MaxWait
+	}
+	if opts.after == nil {
+		opts.after = time.After
+	}
+	if opts.minBackoff <= 0 {
+		opts.minBackoff = defaultMinBackoff
+	}
+	if opts.maxBackoff <= 0 {
+		opts.maxBackoff = defaultMaxBackoff
+	}
+	if opts.catchUpAge == 0 {
+		opts.catchUpAge = defaultCatchUpAge
+	}
+	if syncclient.DevInsecureFromEnv(os.Getenv) {
+		opts.Client.DevInsecure = true
+	}
+	return &syncer{
+		d: d, st: st, opts: opts,
+		bo:     backoff{min: opts.minBackoff, max: opts.maxBackoff, rand: rand.Float64},
+		wakeCh: make(chan struct{}, 1),
+		phase:  SyncStarting, clients: map[string]*syncclient.Client{},
+	}
+}
+
+// startSync starts the engine for a store that can sync.
+func (d *Daemon) startSync() {
+	st, ok := d.store.(syncStore)
+	if !ok {
+		return
+	}
+	d.sync = newSyncer(d, st, d.opts.Sync)
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		d.sync.run(d.ctx)
+	}()
+}
+
+// wake makes the loop look at the store again at once, ending a long-poll
+// or a backoff wait.
+func (e *syncer) wake() {
+	if e == nil {
+		return
+	}
+	// The token goes first: a long-poll that starts after it sees it
+	// (step), and one already started is ended here.
+	select {
+	case e.wakeCh <- struct{}{}:
+	default:
+	}
+	e.mu.Lock()
+	stop := e.pollStop
+	e.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+func (e *syncer) run(ctx context.Context) {
+	defer func() {
+		e.mu.Lock()
+		e.stopped = true
+		reqs := e.reqs
+		e.reqs = nil
+		clients := e.clients
+		e.mu.Unlock()
+		for _, r := range reqs {
+			r.done <- store.ErrClosed
+		}
+		for _, c := range clients {
+			c.CloseIdleConnections()
+		}
+	}()
+	for ctx.Err() == nil {
+		e.serveRequests(ctx)
+		switch wait := e.step(ctx); wait {
+		case stepStop:
+			e.idle(ctx, nil, true)
+			return
+		case stepNow:
+		case stepIdle:
+			e.idle(ctx, time.After(idleRecheck), false)
+		default:
+			e.idle(ctx, e.opts.after(wait), false)
+		}
+	}
+}
+
+// idle waits for a wake, ctx or timer. A stopped loop waits for ctx only,
+// answering requests (with refusals) meanwhile.
+func (e *syncer) idle(ctx context.Context, timer <-chan time.Time, stopped bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer:
+			return
+		case <-e.wakeCh:
+			if !stopped {
+				return
+			}
+			e.serveRequests(ctx)
+		}
+	}
+}
+
+func (e *syncer) set(f func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	f()
+}
+
+func (e *syncer) setPhase(p string) { e.set(func() { e.phase = p }) }
+
+// step does one round of syncing and says when to do the next.
+func (e *syncer) step(ctx context.Context) time.Duration {
+	if e.terminal() {
+		return stepStop
+	}
+	if e.pause.Load() {
+		return stepIdle
+	}
+	if e.status().Halted != "" {
+		// Never retried past an equivocation or a rule violation; the
+		// store stays halted until it is opened again.
+		return stepIdle
+	}
+	// A logout in progress resumes first. It needs no unlock.
+	if state, err := e.st.Retirement(); err != nil {
+		return e.fail(ctx, err)
+	} else if state != "" {
+		return e.resumeLogout(ctx)
+	}
+	info := e.st.Info()
+	switch {
+	case info.Revoked:
+		e.setPhase(SyncRevoked)
+		return stepStop
+	case info.Locked:
+		e.setPhase(SyncLocked)
+		return stepIdle
+	}
+	e.set(func() {
+		if e.phase == SyncLocked || e.phase == SyncOff {
+			e.phase = SyncStarting
+		}
+	})
+	gen := e.st.Generation()
+	if d, done := e.resumeUnlocked(ctx, gen); !done {
+		return d
+	}
+	r, err := e.remoteFor(gen)
+	if err != nil {
+		return e.fail(ctx, err)
+	}
+	if r == nil {
+		e.setPhase(SyncOff)
+		return stepIdle
+	}
+	st, err := e.st.Status()
+	if err != nil {
+		return e.fail(ctx, err)
+	}
+	if st.Halted != "" {
+		e.noteHalt(st.Halted, false)
+		return stepIdle
+	}
+	if st.Held == 0 && st.Pending > 0 {
+		res, err := e.st.PushHead(ctx, r)
+		if err != nil {
+			return e.fail(ctx, err)
+		}
+		e.pushed(ctx, gen, res)
+		if res.Outcome != store.PushEmpty {
+			return stepNow
+		}
+		// Nothing PushHead could push after all: wait for news rather
+		// than ask again.
+	}
+	if e.opts.noPoll {
+		return stepIdle
+	}
+	pctx, cancel := context.WithCancel(ctx)
+	e.set(func() { e.pollStop = cancel })
+	select {
+	case <-e.wakeCh:
+		// Woken before the long-poll could be ended by it.
+		cancel()
+	default:
+	}
+	err = e.st.Pull(pctx, r.WithWait(e.opts.Wait))
+	woken := pctx.Err() != nil
+	e.set(func() { e.pollStop = nil })
+	cancel()
+	if err != nil && woken && ctx.Err() == nil && e.st.Generation() == gen {
+		// Cut short by a wake: nothing was applied.
+		return stepNow
+	}
+	if err != nil {
+		return e.fail(ctx, err)
+	}
+	e.pulled(ctx, gen)
+	return stepNow
+}
+
+func (e *syncer) terminal() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.phase == SyncRevoked || e.phase == SyncLoggedOut
+}
+
+// pulled records a pull that worked and reloads if it changed anything.
+func (e *syncer) pulled(ctx context.Context, gen uint64) {
+	e.set(func() {
+		e.syncedAt = time.Now()
+		e.attempt, e.retryAt, e.lastErr, e.lastErrAt = 0, time.Time{}, "", time.Time{}
+		e.phase = SyncOnline
+	})
+	if e.st.Generation() == gen {
+		e.d.refreshAfterSync(ctx)
+	}
+}
+
+// pushed records a push that worked: PushHead pulled first, and the outbox
+// changed unless it was empty.
+func (e *syncer) pushed(ctx context.Context, gen uint64, res store.PushResult) {
+	if res.Outcome != store.PushEmpty {
+		e.d.outboxGen.Add(1)
+	}
+	if res.Outcome == store.PushHeld {
+		e.d.logf("sync: queued change %d is held: %+v", res.N, res.Hold)
+	}
+	e.pulled(ctx, gen)
+}
+
+// fail records err and says what to do next: wait for a wake when the
+// vault is locked or sync has halted, stop on a revocation, and otherwise
+// back off.
+func (e *syncer) fail(ctx context.Context, err error) time.Duration {
+	if ctx.Err() != nil || errors.Is(err, store.ErrClosed) {
+		return stepStop
+	}
+	if errors.Is(err, context.Canceled) {
+		// Not by the daemon: a lock or a close cancelled the request
+		// (§11.2), and the next step sees which.
+		return stepNow
+	}
+	var eq *vaultlog.EquivocationError
+	switch {
+	case errors.Is(err, store.ErrDeviceRevoked):
+		e.revoked(err)
+		return stepStop
+	case errors.As(err, &eq), errors.Is(err, store.ErrSyncHalted):
+		e.noteHalt(err.Error(), eq != nil)
+		return stepIdle
+	case errors.Is(err, model.ErrLocked):
+		e.setPhase(SyncLocked)
+		e.d.mu.Lock()
+		e.d.followStore(err)
+		e.d.mu.Unlock()
+		return stepIdle
+	case errors.Is(err, store.ErrNotServerBacked):
+		e.setPhase(SyncOff)
+		return stepIdle
+	case errors.Is(err, store.ErrSessionEnded):
+		if e.sessionEnded(ctx) {
+			return stepStop
+		}
+	}
+	var wait time.Duration
+	e.set(func() {
+		e.attempt++
+		wait = e.bo.delay(e.attempt)
+		e.phase, e.lastErr, e.lastErrAt, e.retryAt = SyncBackingOff, err.Error(), time.Now(), time.Now().Add(wait)
+	})
+	e.d.logf("sync: %v (retrying in %v)", err, wait.Round(time.Millisecond))
+	return wait
+}
+
+func (e *syncer) noteHalt(why string, equivocation bool) {
+	e.mu.Lock()
+	first := e.halted == ""
+	e.phase, e.halted = SyncHalted, why
+	e.equivoc = e.equivoc || equivocation
+	e.mu.Unlock()
+	if first {
+		e.d.logf("sync stopped: %s", why)
+	}
+}
+
+// revoked stops sync for good and takes the daemon to the revoked state:
+// an empty agent and an empty ssh config.
+func (e *syncer) revoked(err error) {
+	e.setPhase(SyncRevoked)
+	e.d.mu.Lock()
+	e.d.followStore(store.ErrDeviceRevoked)
+	e.d.mu.Unlock()
+	e.d.logf("sync stopped: %v", err)
+}
+
+// sessionEnded handles the server refusing this device a session: an
+// active device always gets one, so it left the account. Its entries are
+// not served to it any more, so the revocation can't be verified from the
+// log; retire-status says how it left (§9). If it did, sync stops, and
+// the vault is locked and the agent emptied, as for a verified
+// revocation, but not durably: the store is not marked revoked on the
+// server's word. It reports whether sync stopped.
+func (e *syncer) sessionEnded(ctx context.Context) bool {
+	info, err := e.st.ServerInfo()
+	if err != nil {
+		return false
+	}
+	c, err := e.client(info.Server)
+	if err != nil {
+		return false
+	}
+	auth, err := e.st.DeviceAuth()
+	if err != nil {
+		return false
+	}
+	rs, err := c.Retirer(info.VaultID).RetireStatus(ctx, auth, crypto.Hash{})
+	if err != nil || rs.Receipt == nil {
+		return false
+	}
+	why := fmt.Errorf("the server reports this device %s from the account at seq %d", rs.Receipt.How, rs.Receipt.Seq)
+	e.set(func() {
+		e.phase, e.lastErr, e.lastErrAt = SyncRevoked, why.Error(), time.Now()
+		e.notes = append(e.notes, why.Error()+"; it can't sync again (sign in again with hop auth login)")
+	})
+	e.d.mu.Lock()
+	e.st.Lock()
+	e.d.dropKeysLocked(true)
+	e.d.mu.Unlock()
+	e.d.logf("sync stopped: %v", why)
+	return true
+}
+
+// resumeLogout finishes a logout in progress (§11.1): RETIRING resumes its
+// resolution and RETIRED its cleanup.
+func (e *syncer) resumeLogout(ctx context.Context) time.Duration {
+	e.setPhase(SyncLoggingOut)
+	var r store.Retirer
+	if info, err := e.st.ServerInfo(); err == nil && info.Server != "" && !info.VaultID.IsZero() {
+		c, err := e.client(info.Server)
+		if err != nil {
+			return e.fail(ctx, err)
+		}
+		r = c.Retirer(info.VaultID)
+	}
+	res, err := e.st.Logout(ctx, r, store.LogoutOptions{})
+	if err != nil {
+		if errors.Is(err, store.ErrDeviceRevoked) || errors.Is(err, store.ErrClosed) || ctx.Err() != nil {
+			return e.fail(ctx, err)
+		}
+		d := e.fail(ctx, err)
+		e.setPhase(SyncLoggingOut)
+		return d
+	}
+	if !res.Done {
+		return stepNow
+	}
+	e.set(func() {
+		e.phase = SyncLoggedOut
+		e.attempt, e.retryAt = 0, time.Time{}
+		if res.RevokeElsewhere {
+			e.notes = append(e.notes, "the logout did not reach the server: if this device is still listed, revoke it from another device")
+		}
+	})
+	e.d.mu.Lock()
+	e.d.dropKeysLocked(true)
+	e.d.mu.Unlock()
+	e.d.logf("the logout finished: nothing of the vault is left on this device")
+	return stepStop
+}
+
+// resumeUnlocked runs, once per unlock, what an interrupted command left
+// for the daemon to finish: a publication, then a server-backed
+// checkpoint whose candidate may have committed. done is false while it
+// still has to run; d then says when to try again.
+func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duration, done bool) {
+	e.mu.Lock()
+	finished := e.resumedOK && e.resumed == gen
+	e.mu.Unlock()
+	if finished {
+		return 0, true
+	}
+	// Only a failure worth retrying (the server unreachable or busy, a
+	// lock) holds sync back; any other is left for the user, and sync goes
+	// on without it.
+	retry := func(err error) bool {
+		return syncclient.Retryable(err) || errors.Is(err, model.ErrLocked) || errors.Is(err, store.ErrClosed) ||
+			errors.Is(err, store.ErrDeviceRevoked) || ctx.Err() != nil
+	}
+	note := func(what string, err error) {
+		e.d.logf("%s: %v", what, err)
+		e.set(func() { e.notes = append(e.notes, fmt.Sprintf("%s: %v", what, err)) })
+	}
+	if p, err := e.st.Publication(); err != nil {
+		if retry(err) {
+			return e.fail(ctx, err), false
+		}
+		note("the pending publication can't be read", err)
+	} else if p != nil {
+		c, err := e.client(p.Server)
+		if err == nil {
+			_, err = e.st.ResumePublish(ctx, c.Publisher(p.VaultID))
+		}
+		var eq *vaultlog.EquivocationError
+		switch {
+		case errors.As(err, &eq):
+			// The publication stays pending with its alarm; it is never
+			// retried past an equivocation.
+			e.noteHalt(err.Error(), true)
+			return stepIdle, false
+		case err != nil && retry(err):
+			return e.fail(ctx, err), false
+		case err != nil:
+			note("the pending publication did not finish (run hop auth signup again)", err)
+		default:
+			e.d.logf("the pending publication to %s finished", p.Server)
+			e.d.outboxGen.Add(1)
+			e.d.refreshAfterSync(ctx)
+		}
+	}
+	if cp, err := e.st.PendingCheckpoint(); err != nil {
+		if retry(err) {
+			return e.fail(ctx, err), false
+		}
+		note("the pending checkpoint can't be read", err)
+	} else if cp != nil && !cp.Committed {
+		r, err := e.remoteFor(gen)
+		if err != nil {
+			return e.fail(ctx, err), false
+		}
+		if r != nil {
+			_, err := e.st.ResumeCheckpoint(ctx, r)
+			switch {
+			case errors.Is(err, store.ErrNoCheckpoint):
+			case err != nil && retry(err):
+				return e.fail(ctx, err), false
+			case err != nil:
+				note("a "+cp.Kind+" checkpoint did not finish (run the same command again)", err)
+			default:
+				e.d.logf("the pending %s checkpoint committed; its Emergency Kit is waiting", cp.Kind)
+				e.d.refreshAfterSync(ctx)
+			}
+		}
+	}
+	e.set(func() { e.resumed, e.resumedOK = gen, true })
+	return 0, true
+}
+
+// client returns the HTTP client for server, made once.
+func (e *syncer) client(server string) (*syncclient.Client, error) {
+	if server == "" {
+		return nil, errors.New("daemon: no server is recorded for this vault")
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if c, ok := e.clients[server]; ok {
+		return c, nil
+	}
+	c, err := syncclient.New(server, e.opts.Client)
+	if err != nil {
+		return nil, err
+	}
+	e.clients[server] = c
+	return c, nil
+}
+
+// remoteFor returns the vault's Remote for the unlocked store generation
+// gen, or nil when the vault is local-only or names no server.
+func (e *syncer) remoteFor(gen uint64) (*syncclient.Remote, error) {
+	info, err := e.st.ServerInfo()
+	if errors.Is(err, store.ErrNotServerBacked) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Server == "" || info.VaultID.IsZero() {
+		return nil, nil
+	}
+	key := info.Server + " " + info.VaultID.String()
+	e.mu.Lock()
+	if e.remote != nil && e.remoteKey == key && e.remoteGen == gen {
+		r := e.remote
+		e.mu.Unlock()
+		return r, nil
+	}
+	e.mu.Unlock()
+	c, err := e.client(info.Server)
+	if err != nil {
+		return nil, err
+	}
+	// Each authentication asks the store for a signer, so a lock ends the
+	// client's ability to authenticate too.
+	dev, err := syncclient.StoreDevice(e.st.DeviceAuth)
+	if err != nil {
+		return nil, err
+	}
+	r := c.Remote(info.VaultID, dev)
+	e.set(func() { e.remote, e.remoteKey, e.remoteGen = r, key, gen })
+	return r, nil
+}
+
+// request asks the loop to run kind and waits for it, or for ctx.
+func (e *syncer) request(ctx context.Context, kind int) error {
+	r := &syncReq{ctx: ctx, kind: kind, done: make(chan error, 1)}
+	e.mu.Lock()
+	if e.stopped {
+		e.mu.Unlock()
+		return store.ErrClosed
+	}
+	e.reqs = append(e.reqs, r)
+	e.mu.Unlock()
+	e.wake()
+	select {
+	case err := <-r.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *syncer) serveRequests(ctx context.Context) {
+	for {
+		e.mu.Lock()
+		if len(e.reqs) == 0 {
+			e.mu.Unlock()
+			return
+		}
+		r := e.reqs[0]
+		e.reqs = e.reqs[1:]
+		e.mu.Unlock()
+		if err := r.ctx.Err(); err != nil {
+			r.done <- err
+			continue
+		}
+		r.done <- e.serve(ctx, r)
+	}
+}
+
+// serve runs one request in the loop, so it never waits behind a
+// long-poll. Its own failures don't change the backoff schedule.
+func (e *syncer) serve(ctx context.Context, req *syncReq) error {
+	rctx, cancel := context.WithCancel(req.ctx)
+	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	switch phase := e.status().State; phase {
+	case SyncRevoked:
+		return store.ErrDeviceRevoked
+	case SyncLoggedOut, SyncLoggingOut:
+		return store.ErrLoggingOut
+	}
+	if e.st.Info().Locked {
+		return model.ErrLocked
+	}
+	gen := e.st.Generation()
+	r, err := e.remoteFor(gen)
+	if err != nil {
+		return err
+	}
+	if r == nil {
+		return store.ErrNotServerBacked
+	}
+	err = e.st.Pull(rctx, r)
+	if err == nil && req.kind == reqSyncNow {
+		for range maxSyncNowPushes {
+			var res store.PushResult
+			if res, err = e.st.PushHead(rctx, r); err != nil {
+				break
+			}
+			if res.Outcome != store.PushEmpty {
+				e.d.outboxGen.Add(1)
+			}
+			if res.Outcome == store.PushEmpty || res.Outcome == store.PushHeld {
+				break
+			}
+		}
+	}
+	if err != nil {
+		var eq *vaultlog.EquivocationError
+		switch {
+		case errors.Is(err, store.ErrDeviceRevoked):
+			e.revoked(err)
+		case errors.As(err, &eq), errors.Is(err, store.ErrSyncHalted):
+			e.noteHalt(err.Error(), eq != nil)
+		}
+		if req.kind == reqSyncNow {
+			e.set(func() { e.lastErr, e.lastErrAt = err.Error(), time.Now() })
+		}
+		return err
+	}
+	e.pulled(ctx, gen)
+	return nil
+}
+
+// catchUp runs one bounded pull for a target that matched nothing, when
+// the last pull is older than a few seconds. It reports whether one ran
+// and worked.
+func (e *syncer) catchUp(ctx context.Context) bool {
+	if e == nil {
+		return false
+	}
+	s := e.status()
+	switch s.State {
+	case SyncOff, SyncLocked, SyncHalted, SyncRevoked, SyncLoggingOut, SyncLoggedOut:
+		return false
+	}
+	if s.SyncedAt != nil && time.Since(*s.SyncedAt) < e.opts.catchUpAge {
+		return false
+	}
+	cctx, cancel := context.WithTimeout(ctx, catchUpTimeout)
+	defer cancel()
+	err := e.request(cctx, reqPull)
+	if err != nil {
+		e.d.logf("catch-up pull: %v", err)
+	}
+	return err == nil
+}
+
+// status is the engine's part of SyncStatusResult.
+func (e *syncer) status() SyncStatusResult {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := SyncStatusResult{State: e.phase, LastError: e.lastErr, Halted: e.halted, Equivocation: e.equivoc}
+	if !e.syncedAt.IsZero() {
+		t := e.syncedAt
+		out.SyncedAt = &t
+	}
+	if !e.lastErrAt.IsZero() {
+		t := e.lastErrAt
+		out.LastErrorAt = &t
+	}
+	if e.phase == SyncBackingOff {
+		out.Backoff = &SyncBackoff{Attempt: e.attempt, RetryAt: e.retryAt}
+	}
+	out.Warnings = append(out.Warnings, e.notes...)
+	return out
+}

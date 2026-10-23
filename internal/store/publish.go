@@ -12,6 +12,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/email"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
@@ -323,7 +324,7 @@ func (s *Store) beginPublication(opts PublishOptions) (*publicationJSON, []*vaul
 	if s.server {
 		return nil, nil, fmt.Errorf("%w: it is already published", ErrServerBacked)
 	}
-	email, err := NormalizeEmail(opts.Email)
+	addr, err := normalizeEmail(opts.Email)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -360,7 +361,7 @@ func (s *Store) beginPublication(opts PublishOptions) (*publicationJSON, []*vaul
 		return nil, nil, err
 	}
 	j := &publicationJSON{
-		V: publicationVersion, Server: opts.Server, Email: email, AccountID: s.state.Account.AccountID,
+		V: publicationVersion, Server: opts.Server, Email: addr, AccountID: s.state.Account.AccountID,
 		VaultID: s.state.VaultID, UploadSeq: s.state.Head.Seq, UploadH: s.state.Head.H,
 		RegistrationCode: opts.RegistrationCode,
 	}
@@ -817,58 +818,12 @@ func (s *Store) applyPublished(j *publicationJSON, entries []Committed, head vau
 	return true, nil
 }
 
-// TODO(slice E2 follow-up): another writer is adding a shared
-// internal/email package; once it is on the phase branch, use its
-// normalization here and delete this copy.
-//
-// NormalizeEmail normalizes and checks an email address as the server does
-// (plan R4): leading and trailing ASCII spaces and tabs are removed, the
-// domain is lowercased (ASCII only) and the local part kept byte for byte.
-// Only an ASCII dot-atom local part of 1 to 64 bytes and an ASCII DNS
-// domain name are accepted, at most 254 bytes in all.
-func NormalizeEmail(email string) (string, error) {
-	e := strings.Trim(email, " \t")
-	bad := func(why string) (string, error) { return "", fmt.Errorf("store: not a usable email address: %s", why) }
-	for i := 0; i < len(e); i++ {
-		if c := e[i]; c <= ' ' || c >= 0x7f {
-			return bad("it holds a space, a control character or a non-ASCII character")
-		}
-	}
-	at := strings.LastIndexByte(e, '@')
-	if at < 0 {
-		return bad("there is no @")
-	}
-	local, domain := e[:at], strings.ToLower(e[at+1:])
-	if len(local) < 1 || len(local) > 64 {
-		return bad("the part before @ must be 1 to 64 characters")
-	}
-	for _, atom := range strings.Split(local, ".") {
-		if atom == "" {
-			return bad("the part before @ has an empty dot-separated part")
-		}
-		for i := 0; i < len(atom); i++ {
-			c := atom[i]
-			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-/=?^_`{|}~", c) >= 0) {
-				return bad("the part before @ holds a character a dot-atom can't")
-			}
-		}
-	}
-	if domain == "" || len(domain) > 253 {
-		return bad("the domain must be 1 to 253 characters")
-	}
-	for _, label := range strings.Split(domain, ".") {
-		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return bad("the domain is not a DNS name")
-		}
-		for i := 0; i < len(label); i++ {
-			if c := label[i]; !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
-				return bad("the domain is not a DNS name")
-			}
-		}
-	}
-	out := local + "@" + domain
-	if len(out) > 254 {
-		return bad("it is longer than 254 characters")
+// normalizeEmail normalizes and checks an email address as the server does
+// (plan R4, internal/email).
+func normalizeEmail(addr string) (string, error) {
+	out, err := email.Normalize(addr)
+	if err != nil {
+		return "", fmt.Errorf("store: not a usable email address: %w", err)
 	}
 	return out, nil
 }

@@ -530,7 +530,7 @@ func TestNormalizeEmail(t *testing.T) {
 		"a@exam ple.com":                        "",
 		"a@" + strings.Repeat("b", 64) + ".com": "",
 	} {
-		got, err := NormalizeEmail(in)
+		got, err := normalizeEmail(in)
 		if want == "" {
 			if err == nil {
 				t.Errorf("%q accepted as %q", in, got)

@@ -129,6 +129,7 @@ func (d *Daemon) lockVault(v Vault) {
 	defer d.mu.Unlock()
 	v.Lock()
 	d.dropKeysLocked(false)
+	d.sync.wake() // so sync.status says locked at once
 	d.logf("vault locked")
 }
 
@@ -215,6 +216,8 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 		return err
 	}
 	_, err = d.reloadLocked(ctx)
+	// Sync resumes from the last verified head (§11.2).
+	d.sync.wake()
 	return err
 }
 

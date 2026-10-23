@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/resolve"
 	"github.com/dalyem/hopkey/internal/store"
@@ -27,6 +28,14 @@ const (
 	OpDelete    = "delete"
 	OpReload    = "reload"
 	OpShutdown  = "shutdown"
+
+	// Sync ops (sync.go). They need the encrypted store; sync.now,
+	// sync.held, sync.resolve and devices.list need it unlocked too.
+	OpSyncStatus  = "sync.status"
+	OpSyncNow     = "sync.now"
+	OpSyncHeld    = "sync.held"
+	OpSyncResolve = "sync.resolve"
+	OpDevicesList = "devices.list"
 )
 
 // Error codes.
@@ -35,6 +44,15 @@ const (
 	CodeNotFound = "not_found" // no such item
 	CodeLocked   = "locked"    // the vault is locked
 	CodeInternal = "internal"
+
+	CodeLocalOnly    = "local_only"    // the vault has no server to sync with
+	CodeRevoked      = "revoked"       // this device was revoked from the account
+	CodeSyncHalted   = "sync_halted"   // sync stopped on an equivocation or a rule violation
+	CodeUnreachable  = "unreachable"   // the server could not be reached, or is busy; it is retried
+	CodeNotHeld      = "not_held"      // no held change, or not the one named
+	CodeStillHeld    = "still_held"    // a retry found the change still held
+	CodeStaleConfirm = "stale_confirm" // the confirmation digest no longer matches the proposal
+	CodeConfirm      = "confirm"       // keep-mine and edit need the proposal's digest
 )
 
 // Request is one control call.
@@ -81,6 +99,12 @@ type ResolveResult struct {
 	// config. Empty means the host has none; SSHProblem then says why.
 	SSHAlias   string `json:"ssh_alias,omitempty"`
 	SSHProblem string `json:"ssh_problem,omitempty"`
+	// Mark is "pending" or "held" when a queued change to the host has
+	// not reached the server.
+	Mark model.Mark `json:"mark,omitempty"`
+	// CaughtUp means the target first matched nothing and a catch-up pull
+	// ran before this answer.
+	CaughtUp bool `json:"caught_up,omitempty"`
 }
 
 // PutHostParams is the request for OpPutHost. A zero ItemID creates the host.
@@ -133,6 +157,13 @@ type ListResult struct {
 	Snippets    []model.Snippet    `json:"snippets"`
 	SSH         map[string]HostSSH `json:"ssh"` // by host ID
 	Tailscale   *tailscale.Status  `json:"tailscale"`
+	// Marks names the items, of any type, with a queued change that has
+	// not reached the server: "pending", or "held" until hop sync resolve.
+	// By item ID; absent items have none.
+	Marks map[string]model.Mark `json:"marks,omitempty"`
+	// SyncedAt is the end of the last successful pull, for a server-backed
+	// vault that has had one.
+	SyncedAt *time.Time `json:"synced_at,omitempty"`
 }
 
 // StatusResult answers OpStatus.
@@ -152,11 +183,147 @@ type StatusResult struct {
 	LastError     string    `json:"last_error,omitempty"` // the last reload that failed, if any
 	// Vault describes the encrypted store: locked or not, the device key
 	// store in use and the log head. Nil for other stores.
-	Vault     *store.Info `json:"vault,omitempty"`
+	Vault *store.Info `json:"vault,omitempty"`
+	// Sync is sync.status without its device scan, for a store that syncs.
+	Sync      *SyncStatusResult `json:"sync,omitempty"`
 	Tailscale struct {
 		Available bool   `json:"available"`
 		Reason    string `json:"reason,omitempty"`
 	} `json:"tailscale"`
+}
+
+// Sync states, SyncStatusResult.State.
+const (
+	SyncOff        = "off"         // local-only, or no server is recorded
+	SyncLocked     = "locked"      // paused until the vault is unlocked (§11.2)
+	SyncStarting   = "starting"    // no pull has finished since the daemon started or the vault unlocked
+	SyncOnline     = "online"      // the last pull or push worked
+	SyncBackingOff = "backoff"     // the last attempt failed; it is retried at Backoff.RetryAt
+	SyncHalted     = "halted"      // stopped for good on an equivocation or a rule violation
+	SyncRevoked    = "revoked"     // this device was revoked; nothing syncs again
+	SyncLoggingOut = "logging_out" // a logout is resuming
+	SyncLoggedOut  = "logged_out"  // the logout finished; nothing of the vault is left
+)
+
+// SyncStatusResult answers OpSyncStatus and OpSyncNow. It works while the
+// vault is locked, with what can be read without the vault key.
+type SyncStatusResult struct {
+	State     string `json:"state"`
+	Server    string `json:"server,omitempty"`
+	Email     string `json:"email,omitempty"`
+	VaultID   string `json:"vault_id,omitempty"`
+	AccountID string `json:"account_id,omitempty"`
+	// Head is the last verified head; nil while locked.
+	Head    *store.Head `json:"head,omitempty"`
+	Pending int         `json:"pending"` // queued changes not held
+	Held    int         `json:"held"`    // held until hop sync resolve
+	// SyncedAt is the end of the last successful pull; null if there has
+	// been none since the daemon started.
+	SyncedAt    *time.Time   `json:"synced_at"`
+	LastError   string       `json:"last_error,omitempty"`
+	LastErrorAt *time.Time   `json:"last_error_at,omitempty"`
+	Backoff     *SyncBackoff `json:"backoff,omitempty"`
+	// Halted is why sync stopped for good; Equivocation says it was the
+	// server showing two different entries at one position (§5.6).
+	Halted       string `json:"halted,omitempty"`
+	Equivocation bool   `json:"equivocation,omitempty"`
+	// What still needs the user, each also a sentence in Warnings.
+	LostIntents        uint64                  `json:"lost_intents,omitempty"`
+	LostJournals       *store.LostJournals     `json:"lost_journals,omitempty"`
+	CheckpointDue      bool                    `json:"checkpoint_due,omitempty"`
+	Checkpoint         *store.CheckpointStatus `json:"checkpoint,omitempty"`
+	SecretKeyStale     bool                    `json:"secret_key_stale,omitempty"`
+	UndeliveredDevices int                     `json:"undelivered_devices,omitempty"`
+	Logout             string                  `json:"logout,omitempty"`
+	Publishing         bool                    `json:"publishing,omitempty"`
+	Merge              string                  `json:"merge,omitempty"`
+	Warnings           []string                `json:"warnings,omitempty"`
+}
+
+// SyncBackoff is the retry schedule after a failure.
+type SyncBackoff struct {
+	Attempt int       `json:"attempt"` // failures in a row
+	RetryAt time.Time `json:"retry_at"`
+}
+
+// SyncHeldResult answers OpSyncHeld. Only the outbox head can be held
+// (everything behind it waits), so Held has at most one record today.
+type SyncHeldResult struct {
+	Held []HeldChange `json:"held"`
+}
+
+// HeldChange is a held queued change. Seen, Want and Current are the
+// item's plaintext JSON (null when absent): what this device's change
+// started from, what it wants, and the item as verified from the server.
+// A key's private_key and a credential's password are left out.
+type HeldChange struct {
+	N       uint64          `json:"n"` // pass back in SyncResolveParams
+	Import  bool            `json:"import,omitempty"`
+	Action  merge.Action    `json:"action"`
+	ItemID  string          `json:"item_id"`
+	Type    model.Type      `json:"type"`
+	Seen    json.RawMessage `json:"seen"`
+	Want    json.RawMessage `json:"want"`
+	Current json.RawMessage `json:"current"`
+	// Hold says why it is held now; nil if a retry would apply it.
+	Hold *store.HoldInfo `json:"hold"`
+	// Choices are the resolutions on offer: keep-mine, edit, take-theirs
+	// and retry, less what the hold refuses.
+	Choices []string `json:"choices"`
+	// KeepMine is what keep-mine would write, with its digest, or nil
+	// when keep-mine is refused (KeepMineRefused says why).
+	KeepMine        *Proposal `json:"keep_mine,omitempty"`
+	KeepMineRefused string    `json:"keep_mine_refused,omitempty"`
+}
+
+// Proposal is the replacement a keep-mine or edit resolution writes, and
+// the digest that confirms it (§5.4).
+type Proposal struct {
+	N      uint64          `json:"n"`
+	Choice string          `json:"choice"`
+	Action merge.Action    `json:"action"`
+	ItemID string          `json:"item_id"`
+	Type   model.Type      `json:"type"`
+	Seen   json.RawMessage `json:"seen"`
+	Want   json.RawMessage `json:"want"`
+	NewID  string          `json:"new_id,omitempty"` // pass back in SyncResolveParams
+	Digest string          `json:"digest"`           // pass back as Confirm
+}
+
+// Resolution choices.
+const (
+	ChoiceKeepMine   = "keep-mine"
+	ChoiceEdit       = "edit"
+	ChoiceTakeTheirs = "take-theirs"
+	ChoiceRetry      = "retry"
+)
+
+// SyncResolveParams is the request for OpSyncResolve. N names the held
+// record (HeldChange.N). keep-mine and edit write only with Confirm, the
+// digest of the proposal (from HeldChange.KeepMine, or from a Propose
+// call for edit); with Propose they return the proposal and write
+// nothing. Edited is the edited item's plaintext JSON, for edit only, and
+// only for hosts and snippets: a key's or credential's secret never
+// crosses the control socket.
+type SyncResolveParams struct {
+	N       uint64          `json:"n"`
+	Choice  string          `json:"choice"`
+	Edited  json.RawMessage `json:"edited,omitempty"`
+	NewID   string          `json:"new_id,omitempty"`
+	Confirm string          `json:"confirm,omitempty"`
+	Propose bool            `json:"propose,omitempty"`
+}
+
+// SyncResolveResult answers OpSyncResolve: the proposal for Propose,
+// otherwise the sync status after the resolution.
+type SyncResolveResult struct {
+	Proposal *Proposal         `json:"proposal,omitempty"`
+	Status   *SyncStatusResult `json:"status,omitempty"`
+}
+
+// DevicesResult answers OpDevicesList.
+type DevicesResult struct {
+	Devices []store.DeviceListing `json:"devices"`
 }
 
 func invalidf(format string, args ...any) *Error {

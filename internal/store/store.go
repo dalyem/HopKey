@@ -171,6 +171,10 @@ type Info struct {
 	// StaleDevices counts devices this machine enrolled and lost the key
 	// of (password unlocks), still active in the log until hop passwd.
 	StaleDevices int `json:"stale_devices,omitempty"`
+	// SecretKeyStale means the Secret Key stored on this device belongs to
+	// credentials a later checkpoint replaced: commands that need it ask
+	// for the one from the newest Emergency Kit. Set only while unlocked.
+	SecretKeyStale bool `json:"secret_key_stale,omitempty"`
 	// Publishing means a publication is journaled and not resolved yet
 	// (§4.3): local appends are refused until it finishes.
 	Publishing bool `json:"publishing,omitempty"`
@@ -1085,6 +1089,9 @@ func (s *Store) Info() Info {
 		info.StaleDevices = len(cfg.StaleDevices)
 		if s.state != nil {
 			info.StaleDevices = len(s.staleActive(cfg))
+			if s.rec != nil {
+				info.SecretKeyStale = cfg.secretKeyStale(s.rec.DeviceID, s.state.Creds.Gen)
+			}
 		}
 	}
 	if s.lockErr != nil {

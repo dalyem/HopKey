@@ -193,6 +193,9 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 	if result, ok, err := d.dispatchVault(ctx, req, decode); ok {
 		return result, err
 	}
+	if result, ok, err := d.dispatchSync(ctx, req); ok {
+		return result, err
+	}
 	return nil, invalidf("unknown op %q", req.Op)
 }
 
@@ -211,6 +214,9 @@ func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 		Hosts: len(snap.Hosts), Keys: len(snap.Keys), KeysInAgent: st.keysInAgent, SSHHosts: st.sshHosts,
 		Warnings: slices.Clone(st.warnings), LoadedAt: st.loadedAt, LastError: st.lastError,
 		Vault: d.vaultStatus(),
+	}
+	if d.sync != nil {
+		out.Sync = d.syncStatus(false)
 	}
 	out.Tailscale.Available, out.Tailscale.Reason = ts.Available, ts.Reason
 	return out, nil
@@ -248,6 +254,15 @@ func (d *Daemon) opList(ctx context.Context) (*ListResult, error) {
 	for _, c := range snap.Credentials {
 		out.Credentials = append(out.Credentials, CredentialInfo{ID: c.ItemID.String(), Name: c.Name, Username: c.Username})
 	}
+	if len(snap.Marks) > 0 {
+		out.Marks = map[string]model.Mark{}
+		for id, m := range snap.Marks {
+			out.Marks[id.String()] = m
+		}
+	}
+	if d.sync != nil {
+		out.SyncedAt = d.sync.status().SyncedAt
+	}
 	return out, nil
 }
 
@@ -257,11 +272,25 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		return nil, err
 	}
 	ts := d.tsStatus(ctx)
-	res, err := resolve.Resolve(ctx, resolve.Input{Target: p.Target, Hosts: snap.Hosts, Tailscale: ts, Interactive: p.Interactive})
+	in := resolve.Input{Target: p.Target, Hosts: snap.Hosts, Tailscale: ts, Interactive: p.Interactive}
+	res, err := resolve.Resolve(ctx, in)
 	if err != nil {
 		return nil, invalidf("%v", err)
 	}
-	out := &ResolveResult{Result: res}
+	caughtUp := false
+	if (res.Status == resolve.StatusNoMatch || res.Status == resolve.StatusPlainSSH) && d.sync.catchUp(ctx) {
+		// A host added on another device a moment ago (design: "Fresh
+		// enough to trust").
+		caughtUp = true
+		if snap, st, err = d.fresh(ctx); err != nil {
+			return nil, err
+		}
+		in.Hosts = snap.Hosts
+		if res, err = resolve.Resolve(ctx, in); err != nil {
+			return nil, invalidf("%v", err)
+		}
+	}
+	out := &ResolveResult{Result: res, CaughtUp: caughtUp}
 	if res.Host != nil {
 		h := *res.Host
 		out.Host = &h
@@ -278,6 +307,7 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		}
 		info := st.ssh[h.ItemID.String()]
 		out.SSHAlias, out.SSHProblem = info.Alias, info.Problem
+		out.Mark = snap.Marks[h.ItemID]
 	}
 	return out, nil
 }
@@ -363,6 +393,7 @@ func (d *Daemon) opPutHost(ctx context.Context, p PutHostParams) (*model.Host, e
 	if err != nil {
 		return nil, storeError(err)
 	}
+	d.localWrite()
 	if _, err := d.reloadLocked(ctx); err != nil {
 		return nil, fmt.Errorf("saved, but reloading failed: %w", err)
 	}
@@ -406,6 +437,7 @@ func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error)
 	if err != nil {
 		return nil, storeError(err)
 	}
+	d.localWrite()
 	if _, err := d.reloadLocked(ctx); err != nil {
 		return nil, fmt.Errorf("saved, but reloading failed: %w", err)
 	}
@@ -423,6 +455,7 @@ func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {
 	if err := d.store.Delete(ctx, id); err != nil {
 		return storeError(err)
 	}
+	d.localWrite()
 	if _, err := d.reloadLocked(ctx); err != nil {
 		return fmt.Errorf("deleted, but reloading failed: %w", err)
 	}
