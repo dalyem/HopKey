@@ -98,19 +98,20 @@ func TestSASWithoutATerminal(t *testing.T) {
 		}
 	}
 
-	// The new device shows its code to carry over, and accepts only with
-	// --yes.
-	f = newUIFixture(t, false, "yes\n", nil)
-	f.u.role = roleLogin
-	if match, err := f.u.ConfirmSAS(ctx, testSAS, "laptop"); match || err == nil || !strings.Contains(err.Error(), "--yes") {
-		t.Errorf("login without --yes: %v, %v", match, err)
-	}
-	if !strings.Contains(f.stderr.String(), "1234 5678") {
-		t.Errorf("the new device does not show its code: %q", f.stderr.String())
-	}
-	f.u.yes = true
-	if match, err := f.u.ConfirmSAS(ctx, testSAS, "laptop"); !match || err != nil {
-		t.Errorf("login with --yes: %v, %v", match, err)
+	// The new device never confirms without a terminal: not with --yes,
+	// not with "yes" on stdin, not with --json.
+	for _, asJSON := range []bool{false, true} {
+		f = newUIFixture(t, false, "yes\n", nil)
+		f.u.role, f.u.yes, f.u.asJSON = roleLogin, true, asJSON
+		match, err := f.u.ConfirmSAS(ctx, testSAS, "laptop")
+		if match || err == nil || !isUIError(err) {
+			t.Fatalf("login without a terminal, --yes, json %v: %v, %v", asJSON, match, err)
+		}
+		for _, want := range []string{"terminal", "--method password", "--method recovery", "--yes does not confirm"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not say %q: %v", want, err)
+			}
+		}
 	}
 }
 

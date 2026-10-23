@@ -432,6 +432,69 @@ func TestEnrollmentSubstitutedDeliveryRefused(t *testing.T) {
 	x.installed(t, s)
 }
 
+// substitutedDelivery is what an approver in the middle sends: sealed to
+// D's key and binding the transcript D saw, but carrying the attacker's
+// own account.
+func substitutedDelivery(t *testing.T, commit crypto.EnrollCommit, chal crypto.EnrollChal, open crypto.EnrollOpen) crypto.HPKEEnvelope {
+	t.Helper()
+	m := newVault(t, testConfig(t))
+	acct := cloneAccount(t, m.s)
+	th := crypto.TranscriptHash(crypto.Transcript(commit.C, &chal, &open))
+	devID, _ := vaultlog.NewID()
+	cert := crypto.Cert{
+		V: crypto.Version, AccountID: acct.AccountID, AKV: acct.AKV, DeviceID: devID, Name: open.Name,
+		KEMFp: crypto.FpKEM(open.KEMPK), SigFp: crypto.FpSig(open.SigPK), EnrollTranscript: crypto.SomeHash(th),
+		IssuedAt: model.TimestampOf(time.Now()),
+	}
+	sig, err := crypto.SignCert(acct, &cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := crypto.SealUnlock(open.KEMPK, &cert, acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := crypto.SealDelivery(open.KEMPK, th, &crypto.EnrollDelivery{V: crypto.Version, Cert: cert, CertSig: sig, Unlock: unlock, AnchorSeq: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// §7: a substituted approver's delivery is never installed without the
+// user's SAS confirmation on D. Before the confirmation (the state hop
+// auth login is in when it has no terminal to confirm on) it is refused
+// with nothing written, whatever account it carries; after a rejection it
+// is refused for good.
+func TestEnrollmentSubstitutedApproverNeedsTheSAS(t *testing.T) {
+	ctx := context.Background()
+	x := newEnrollFix(t)
+	e, commit := x.begin(t)
+	chal, open := x.reveal(t, e, commit)
+	fake := substitutedDelivery(t, commit, chal, open)
+	for range 2 {
+		if _, err := e.Install(ctx, x.remote(), &fake); !errors.Is(err, crypto.ErrSASNotConfirmed) {
+			t.Fatalf("a substituted delivery before the confirmation: %v", err)
+		}
+		if e.State() != crypto.DeviceRevealed {
+			t.Fatalf("state after a substituted delivery: %s", e.State())
+		}
+		e = x.resume(t, e)
+	}
+	if _, err := os.Lstat(x.cfg.DataDir + "/device.json"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a delivery before the confirmation wrote device.json")
+	}
+	if err := e.RejectSAS(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Install(ctx, x.remote(), &fake); !errors.Is(err, crypto.ErrSASRejected) {
+		t.Fatalf("a substituted delivery after the rejection: %v", err)
+	}
+	if ok, err := Exists(x.cfg.DataDir); err != nil || ok {
+		t.Errorf("a vault exists after the rejection: %v %v", ok, err)
+	}
+}
+
 // A's approval budget (§7: 3 per rolling hour, one outstanding challenge)
 // is persisted, so a restart resets neither.
 func TestApprovalBudgetPersists(t *testing.T) {

@@ -8,12 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/resolve"
 	"github.com/dalyem/hopkey/internal/safepath"
+	"github.com/dalyem/hopkey/internal/store"
 )
 
 // connect returns a client for the daemon, starting the daemon if its control
@@ -28,6 +30,11 @@ func connect(ctx context.Context, e *Env) (*daemon.Client, error) {
 	// permission error, say) is reported as it is.
 	if !socketAbsent(err) {
 		return nil, fmt.Errorf("cannot reach the hop daemon at %s: %w", oneLine(path), cleanErr(err))
+	}
+	// A hop auth command stopped the daemon to run its flow, and starts
+	// it again when it ends; one started now would take the vault.
+	if pid, ok := e.authHolder(); ok {
+		return nil, errHeld(pid)
 	}
 	if err := startDaemon(ctx, e); err != nil {
 		return nil, err
@@ -115,23 +122,40 @@ func logTail(path string) string {
 	return ":\n  " + joinOne(lines, "\n  ")
 }
 
+// authSecretEnv are the variables that answer hop auth's prompts
+// (authui.go). They are this command's input, never a child's: a daemon
+// that a hop auth command restarts would otherwise keep the master
+// password in its environment for as long as it runs.
+var authSecretEnv = []string{envPassword, envNewPassword, envSecretKey, envRecoveryKey, envKitConfirm}
+
+// environ is the environment for every process hop starts: the caller's,
+// minus the hop auth secrets. Every exec in this package takes its
+// environment from here, or from sshEnviron, which builds on it.
 func (e *Env) environ() []string {
-	if e.Environ != nil {
-		return e.Environ
+	base := e.Environ
+	if base == nil {
+		base = os.Environ()
 	}
-	return os.Environ()
+	return withoutEnv(base, authSecretEnv...)
 }
 
-// sshEnviron is the environment for ssh: the caller's, minus any agent
-// socket. The generated config names its own agent.
-func (e *Env) sshEnviron() []string {
-	var out []string
-	for _, kv := range e.environ() {
-		if !strings.HasPrefix(kv, "SSH_AUTH_SOCK=") {
+// withoutEnv returns environ without the named variables.
+func withoutEnv(environ []string, names ...string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if !slices.Contains(names, name) {
 			out = append(out, kv)
 		}
 	}
 	return out
+}
+
+// sshEnviron is the environment for ssh: environ, minus any agent socket
+// (the generated config names its own agent) and the device key file's
+// passphrase, which only hop itself and its daemon read.
+func (e *Env) sshEnviron() []string {
+	return withoutEnv(e.environ(), "SSH_AUTH_SOCK", store.PassphraseEnv)
 }
 
 func (e *Env) sshBinary() string {

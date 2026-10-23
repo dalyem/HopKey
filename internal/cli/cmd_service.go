@@ -94,7 +94,9 @@ func (e *Env) runCommand(ctx context.Context, argv []string) ([]byte, error) {
 	if e.RunCommand != nil {
 		return e.RunCommand(ctx, argv[0], argv[1:]...)
 	}
-	return exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = e.environ()
+	return cmd.CombinedOutput()
 }
 
 // serviceFor builds the unit or agent for this system.

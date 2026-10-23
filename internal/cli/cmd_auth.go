@@ -61,6 +61,12 @@ never flags:
 --keep and --exclude choose devices, --yes confirms what deletes or revokes,
 --code gives the registration code, and hop auth approve --sas gives the
 check code the new device shows.
+Two things need a person at a terminal, by design:
+  hop auth login by approval, on the new device, which compares the check
+                      code (without one: --method password or recovery)
+  hop auth signup with no vault here, which creates an account whose new
+                      Emergency Kit you must see and type back (publishing
+                      a vault this device has works without one)
 `
 
 func authUsage() string {
@@ -192,8 +198,19 @@ type signupReport struct {
 	Created bool `json:"created"`
 }
 
+// errSignupNeedsTerminal is the one hop auth flow that has no answer
+// without a terminal, by design: a new account's Emergency Kit must be
+// shown to a person and typed back by them.
+const errSignupNeedsTerminal = "creating a new account needs a person at a terminal: its new Emergency Kit must be shown to you and typed back by you, " +
+	"which no flag or environment variable can do (this run has no terminal: --json, or stdin or stdout is not a terminal). " +
+	"Run hop auth signup in a terminal (an SSH session has one). " +
+	"Publishing a vault this device already has works without a terminal: hop init on a terminal once, then hop auth signup --server URL --email E --code CODE from anywhere"
+
 func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "auth signup", authCommands["signup"].usage)
+	helpNote(e, fs, "\nWith no vault on this device, signup creates a new account, and that needs a person at a terminal:\n"+
+		"its Emergency Kit is shown to you and typed back by you. Publishing a vault this device already has\n"+
+		"(made with hop init) works without a terminal.\n")
 	var o authOpts
 	o.jsonFlag(fs)
 	server := fs.String("server", "", "the hop-server URL (https://...)")
@@ -212,6 +229,12 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	u := o.ui(e)
+	if !u.interactive {
+		// Before the daemon stops: a new account can't be made here.
+		if ok, err := store.Exists(e.storeConfig().DataDir); err == nil && !ok {
+			return failf("%s", errSignupNeedsTerminal)
+		}
+	}
 	h, err := holdVault(ctx, e)
 	if err != nil {
 		return err
@@ -232,7 +255,7 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 			return authFailure(authflow.ErrSignedIn)
 		}
 	} else if !u.interactive {
-		return failf("there is no vault here, so hop auth signup would create one, which needs a terminal to set its master password and type back its Emergency Kit; run it on a terminal, or create the vault with hop init first")
+		return failf("%s", errSignupNeedsTerminal)
 	}
 	srv, addr, regCode := *server, *email, *code
 	if pending != nil {
@@ -362,6 +385,10 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	srv, err := u.need(*server, "server", "Server URL (https://...): ")
 	if err != nil {
 		return err
+	}
+	if *method == methodApprove && !u.interactive {
+		// Before the daemon stops or the server hears of it.
+		return failf("%s", errApproveNeedsTerminal)
 	}
 	addr := *email
 	if *method != methodApprove {
@@ -837,7 +864,7 @@ func runAuthPasswd(ctx context.Context, e *Env, args []string) error {
 			return nil, failf("unexpected argument %q", pos[0])
 		}
 		if si, err := v.Store.ServerInfo(); err == nil && si.CheckpointDue {
-			fmt.Fprintln(e.Stderr, "This device signed in with the Recovery Key: the new password finishes the recovery.")
+			env.UI.(*termUI).notice("This device signed in with the Recovery Key: the new password finishes the recovery.")
 			res, err := authflow.Resume(ctx, env, v)
 			if err != nil || res.Checkpoint == nil {
 				return nil, err
@@ -1076,7 +1103,7 @@ func runAuthMerge(ctx context.Context, e *Env, args []string) error {
 	case *discard:
 		var c crypto.Hash
 		if *token != "" {
-			if err := c.UnmarshalText([]byte(strings.TrimSpace(*token))); err != nil {
+			if err := c.UnmarshalText([]byte(strings.TrimSpace(*token))); err != nil || c == (crypto.Hash{}) {
 				return failf("--confirm %q is not a token hop auth merge --discard showed", *token)
 			}
 		} else {
@@ -1091,7 +1118,7 @@ func runAuthMerge(ctx context.Context, e *Env, args []string) error {
 				if o.asJSON {
 					printJSON(e, mergeReport{Discard: &prop})
 				}
-				return failf("discarding needs --confirm %s (the token of what is deleted)", prop.Digest.String())
+				return failf("discarding needs --confirm %s (the token of what is deleted)", prop.Token.String())
 			}
 			ok, err := confirm(e, false, fmt.Sprintf("Delete these %d item(s) for good?", len(prop.Items)))
 			if err != nil {
@@ -1100,7 +1127,7 @@ func runAuthMerge(ctx context.Context, e *Env, args []string) error {
 			if !ok {
 				return failf("nothing was discarded")
 			}
-			c = prop.Digest
+			c = prop.Token
 		}
 		prop, err := s.MergeDiscard(c)
 		if errors.Is(err, store.ErrStaleConfirm) {
@@ -1144,7 +1171,7 @@ func printDiscard(e *Env, p *store.DiscardProposal) {
 	for _, it := range p.Items {
 		e.printf("  %s %s (%s)\n", oneLine(string(it.Type)), dash(oneLine(it.Name)), oneLine(it.ItemID.String()))
 	}
-	e.printf("To discard them: hop auth merge --discard --confirm %s\n", p.Digest.String())
+	e.printf("To discard them: hop auth merge --discard --confirm %s\n", p.Token.String())
 }
 
 // ---- devices ----

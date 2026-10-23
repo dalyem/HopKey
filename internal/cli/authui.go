@@ -34,7 +34,7 @@ type termUI struct {
 	role        string // roleLogin, roleApprove or "" (prompts word the SAS by it)
 
 	// Answers from flags.
-	yes     bool     // --yes: the destructive confirmations, and the SAS on the new device
+	yes     bool     // --yes: the destructive confirmations (never the check code)
 	sas     string   // --sas: the code the new device shows, for hop auth approve
 	keep    []string // --keep
 	keepSet bool
@@ -72,6 +72,13 @@ const (
 	// space or a comma.
 	envKitConfirm = "HOP_KIT_CONFIRM"
 )
+
+// errApproveNeedsTerminal is why the new device can't sign in by
+// approval without a terminal, and what it can do instead.
+const errApproveNeedsTerminal = "signing in by approval needs a terminal on this device, to compare the check code with the approving device " +
+	"(this run has none: --json, or stdin or stdout is not a terminal; --yes does not confirm it). " +
+	"Run hop login in a terminal (an SSH session to a headless machine has one), " +
+	"or sign in with --method password (HOP_PASSWORD and HOP_SECRET_KEY) or --method recovery (HOP_RECOVERY_KEY)"
 
 // uiError is a prompt that could not be answered. A flow interrupted by
 // one is not resumed on its own: asking again would fail the same way.
@@ -292,6 +299,17 @@ func (u *termUI) jsonLine(v any) {
 	}
 }
 
+// notice tells the user what a command does next: a line on stderr, or
+// with --json a {"notice": ...} line there, so stderr stays JSON lines.
+// msg is constant text.
+func (u *termUI) notice(msg string) {
+	if u.asJSON {
+		u.jsonLine(map[string]string{"notice": msg})
+		return
+	}
+	u.say("%s\n", msg)
+}
+
 // groupSAS shows the 8-digit check code as two groups of four.
 func groupSAS(sas string) string {
 	if len(sas) == 8 {
@@ -311,8 +329,14 @@ func normalizeDigits(s string) string {
 // Without a terminal, hop auth approve compares the code against --sas,
 // which the user copies from the new device's screen: the approving
 // device never prints its own code there, so a script can't approve by
-// echoing it back. The new device prints its code for the user to carry
-// to the approving device, and accepts with --yes.
+// echoing it back.
+//
+// The new device never confirms without a terminal (§7: the SAS is
+// confirmed on both devices). A flag that said "the codes match" would
+// be given before the codes exist, so it would confirm whatever approver
+// the relay put in the middle; and the mailbox token lives only in
+// memory, so a later run can't confirm what an earlier one showed.
+// runAuthLogin refuses first; this is the backstop.
 func (u *termUI) ConfirmSAS(ctx context.Context, sas, deviceName string) (bool, error) {
 	sas, deviceName = oneLine(sas), oneLine(deviceName)
 	if !u.interactive {
@@ -323,15 +347,7 @@ func (u *termUI) ConfirmSAS(ctx context.Context, sas, deviceName string) (bool, 
 			}
 			return normalizeDigits(u.sas) == sas, nil
 		}
-		if u.asJSON {
-			u.jsonLine(map[string]string{"check_code": sas, "device_name": deviceName})
-		} else {
-			u.say("\nCheck code: %s (device %q). Compare it with the code on the approving device.\n", groupSAS(sas), deviceName)
-		}
-		if !u.yes {
-			return false, uiErrorf("confirming the check code needs a terminal, or --yes once you compare the codes on the approving device")
-		}
-		return true, nil
+		return false, &uiError{msg: errApproveNeedsTerminal}
 	}
 	other := "the approving device"
 	if u.role == roleApprove {

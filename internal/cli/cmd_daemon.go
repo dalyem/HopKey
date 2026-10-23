@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,7 +29,22 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	if e.OpenStore == nil {
 		return failf("this build has no vault store")
 	}
+	e.ctxAware = true // it closes cleanly when a signal cancels ctx
+	if pid, ok := e.authHolder(); ok {
+		return errHeld(pid)
+	}
 	vault, err := e.OpenStore()
+	if errors.Is(err, store.ErrVaultBusy) {
+		if pid, ok := e.handbackFrom(); ok {
+			// An interrupted hop auth command launched this daemon as it
+			// exits: the vault is free once it is gone.
+			waitGone(ctx, pid, handbackWait)
+			vault, err = e.OpenStore()
+		}
+	}
+	if err == nil {
+		e.clearHandback()
+	}
 	if errors.Is(err, store.ErrVaultBusy) {
 		// Another process owns the vault. Only a daemon that answers on the
 		// control socket makes this one redundant; anything else (hop init,
@@ -66,6 +83,30 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 		return d.Close()
 	case <-d.Done():
 		return nil
+	}
+}
+
+// handbackWait bounds how long a daemon waits for an interrupted hop auth
+// command to exit and free the vault.
+const handbackWait = 15 * time.Second
+
+// waitGone waits until process pid has exited, for at most d.
+func waitGone(ctx context.Context, pid int, d time.Duration) {
+	deadline := time.Now().Add(d)
+	for processAlive(pid) && time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
+// clearHandback removes a handback marker once the daemon has the vault.
+func (e *Env) clearHandback() {
+	path := e.holdMarker()
+	if b, err := os.ReadFile(path); err == nil && strings.HasSuffix(strings.TrimSpace(string(b)), " handback") {
+		os.Remove(path)
 	}
 }
 

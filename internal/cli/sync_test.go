@@ -939,6 +939,12 @@ func TestAuthNeedsItsFlagsWithoutATerminal(t *testing.T) {
 		{[]string{"auth", "login", "--method", "bogus"}, "approve, password or recovery"},
 		{[]string{"auth", "login", "--merge", "--server", "https://hop.example"}, "--method password or recovery"},
 		{[]string{"auth", "login", "--with-token"}, "not available yet"},
+		// The new device confirms the check code only on a terminal.
+		{[]string{"auth", "login", "--server", "https://hop.example", "--yes"}, "--method password"},
+		// A new account needs a person at a terminal for its kit.
+		{[]string{"auth", "signup", "--server", "https://hop.example", "--email", "a@example.com", "--code", "c"}, "needs a person at a terminal"},
+		{[]string{"auth", "signup", "--json"}, "Publishing a vault this device already has works without a terminal"},
+		{[]string{"login", "--server", "https://hop.example", "--yes", "--json"}, "--method recovery"},
 		{[]string{"login", "--with-token", "--server", "https://hop.example"}, "not available yet"},
 		{[]string{"auth", "logout"}, "--yes"},
 		{[]string{"logout", "--local-only"}, "--yes"},
@@ -958,8 +964,15 @@ func TestAuthNeedsItsFlagsWithoutATerminal(t *testing.T) {
 	if code, _, errOut := f.hop(t, "auth", "nope"); code != 255 || !strings.Contains(errOut, "unknown auth subcommand") {
 		t.Errorf("unknown: exit %d, %q", code, errOut)
 	}
-	if code, out, _ := f.hop(t, "auth", "help"); code != 0 || !strings.Contains(out, "HOP_PASSWORD") || !strings.Contains(out, "never flags") {
+	if code, out, _ := f.hop(t, "auth", "help"); code != 0 || !strings.Contains(out, "HOP_PASSWORD") || !strings.Contains(out, "never flags") ||
+		!strings.Contains(out, "need a person at a terminal") {
 		t.Errorf("auth help: exit %d, %q", code, out)
+	}
+	if code, _, errOut := f.hop(t, "auth", "signup", "-h"); code != 0 || !strings.Contains(errOut, "needs a person at a terminal") {
+		t.Errorf("auth signup -h: exit %d, %q", code, errOut)
+	}
+	if _, _, errOut := f.hop(t, "auth", "signup", "--bogus"); strings.Contains(errOut, "needs a person") {
+		t.Errorf("a parse error printed the help note: %q", errOut)
 	}
 	f.mu.Lock()
 	n := len(f.calls)

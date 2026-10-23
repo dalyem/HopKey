@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -128,6 +129,8 @@ type machine struct {
 	data  string
 	paths daemon.Paths
 	ring  *memRing
+	// noDaemon makes the CLI's daemon starts fail, so nothing syncs.
+	noDaemon atomic.Bool
 
 	mu sync.Mutex
 	d  *daemon.Daemon
@@ -160,6 +163,9 @@ func newMachine(t *testing.T, w *authWorld, name string) *machine {
 // machine's vault, trusting the test server.
 func (m *machine) startDaemon(t *testing.T) func() error {
 	return func() error {
+		if m.noDaemon.Load() {
+			return errors.New("this machine's daemon is off for the test")
+		}
 		s, err := store.Open(context.Background(), store.Config{DataDir: m.data, Keyring: m.ring, Getenv: func(string) string { return "" }})
 		if err != nil {
 			return err
@@ -540,6 +546,25 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 	if code := m4.hop(t, s, "login", "--method", "recovery", "--server", w.origin, "--email", authEmail, "--name", "m4", "--keep", keep); code != 255 || !strings.Contains(s.stderr.String(), "--yes") {
 		t.Fatalf("recovery without --yes: exit %d, %q", code, s.stderr.String())
 	}
+	// The recovery is not finished, and hop auth passwd would finish it:
+	// with --json its notice saying so is a JSON line, like all of stderr.
+	s = &session{}
+	if code := m4.hop(t, s, "auth", "passwd", "--json"); code != 255 {
+		t.Fatalf("passwd with nothing to answer its prompts: exit %d", code)
+	}
+	noticed := false
+	for _, line := range strings.Split(strings.TrimSpace(s.stderr.String()), "\n") {
+		var v map[string]any
+		if err := json.Unmarshal([]byte(line), &v); err != nil {
+			t.Errorf("hop auth passwd --json wrote a line that is not JSON on stderr: %q", line)
+		}
+		if n, _ := v["notice"].(string); strings.Contains(n, "the new password finishes the recovery") {
+			noticed = true
+		}
+	}
+	if !noticed {
+		t.Errorf("no recovery notice from hop auth passwd --json: %q", s.stderr.String())
+	}
 	s = &session{env: recEnv}
 	if code := m4.hop(t, s, "login", "--method", "recovery", "--server", w.origin, "--email", authEmail, "--name", "m4", "--keep", keep, "--yes"); code != 255 ||
 		!strings.Contains(s.stderr.String(), "HOP_KIT_CONFIRM") || !strings.Contains(s.stderr.String(), "hop auth resume") {
@@ -560,9 +585,8 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 		} `json:"devices"`
 	}
 	decodeJSON(t, m4.must(t, map[string]string{"HOP_KIT_CONFIRM": store.LastGroup(sk2) + " " + store.LastGroup(rk2)}, "auth", "resume", "--json"), &cr)
-	// The journal that named the kind is gone once the checkpoint
-	// committed, so the pending kit may be reported as a password change.
-	if (cr.Kind != store.CheckpointRecovery && cr.Kind != store.CheckpointPasswd) || len(cr.Devices) != 3 {
+	// The pending kit keeps the kind of the checkpoint that made it.
+	if cr.Kind != store.CheckpointRecovery || len(cr.Devices) != 3 {
 		t.Errorf("resume: %+v", cr)
 	}
 	if a := m4.authStatus(t); a.RecoveryDue || a.KitPending {
@@ -571,21 +595,44 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 	m4.must(t, nil, "add", "cache", "--address", "203.0.113.13")
 	waitFor(t, 20*time.Second, "cache on m1, which was kept", func() bool { _, ok := m1.hosts(t)["cache"]; return ok })
 
-	// An approval without terminals. The server goes away while the new
-	// device waits, and the enrollment resumes in the same process. The
-	// approving device then needs --sas: the digits the new device shows,
-	// which it never shows itself.
+	// The new device can't confirm the check code without a terminal,
+	// --yes or not: it refuses before it stops the daemon or reaches the
+	// server.
 	m5 := newMachine(t, w, "m5")
-	newcomer = &session{}
+	for _, args := range [][]string{
+		{"login", "--server", w.origin, "--name", "m5", "--yes"},
+		{"login", "--server", w.origin, "--name", "m5", "--yes", "--json"},
+	} {
+		s = &session{env: map[string]string{"HOP_KIT_CONFIRM": "yes yes"}}
+		if c := m5.hop(t, s, args...); c != 255 || !strings.Contains(s.stderr.String(), "--method password") || strings.Contains(s.stderr.String(), "routing") {
+			t.Errorf("%v without a terminal: exit %d, %q", args, c, s.stderr.String())
+		}
+	}
+	if ok, _ := store.Exists(m5.data); ok {
+		t.Fatal("a refused approval login left a vault")
+	}
+
+	// An approval with no terminal on the approving device. The server
+	// goes away while the new device waits, and the enrollment resumes in
+	// the same process. The approving device then needs --sas: the digits
+	// the new device shows, which it never shows itself.
+	newcomer = &session{tty: true, answer: func(prompt string) string {
+		if !strings.HasSuffix(prompt, "Type yes or no: ") {
+			t.Errorf("unexpected prompt %q", prompt)
+			return ""
+		}
+		// The test carries these digits to the approving device, which
+		// compares them.
+		return "yes"
+	}}
 	var m5Code int
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		m5Code = m5.hop(t, newcomer, "login", "--server", w.origin, "--name", "m5", "--yes", "--json")
+		m5Code = m5.hop(t, newcomer, "login", "--server", w.origin, "--name", "m5")
 	}()
-	routingJSON := regexp.MustCompile(`"routing_code":"([0-9A-Z]+)"`)
-	waitFor(t, 30*time.Second, "m5's routing code", func() bool { return routingJSON.MatchString(newcomer.stderr.String()) })
-	code = routingJSON.FindStringSubmatch(newcomer.stderr.String())[1]
+	waitFor(t, 30*time.Second, "m5's routing code", func() bool { return routingLine.MatchString(newcomer.stderr.String()) })
+	code = routingLine.FindStringSubmatch(newcomer.stderr.String())[1]
 	w.stop()
 	waitFor(t, 30*time.Second, "the enrollment resumes", func() bool { return strings.Contains(newcomer.stderr.String(), "resuming") })
 	w.start()
@@ -593,9 +640,8 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 	if c := m1.hop(t, approver, "auth", "approve", code); c != 255 || !strings.Contains(approver.stderr.String(), "--sas") {
 		t.Fatalf("approve without a terminal or --sas: exit %d, %q", c, approver.stderr.String())
 	}
-	checkJSON := regexp.MustCompile(`"check_code":"(\d{8})"`)
-	waitFor(t, 30*time.Second, "m5's check code", func() bool { return checkJSON.MatchString(newcomer.stderr.String()) })
-	sas := checkJSON.FindStringSubmatch(newcomer.stderr.String())[1]
+	waitFor(t, 30*time.Second, "m5's check code", func() bool { return sasOf(newcomer) != "" })
+	sas := strings.ReplaceAll(sasOf(newcomer), " ", "")
 	if strings.Contains(approver.stdout.String()+approver.stderr.String(), sas) {
 		t.Errorf("the approving device printed its check code without a terminal")
 	}
@@ -612,9 +658,8 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 	if m5Code != 0 {
 		t.Fatalf("m5 login: exit %d: %s", m5Code, newcomer.stderr.String())
 	}
-	decodeJSON(t, newcomer.stdout.String(), &li)
-	if li.DeviceName != "m5" || li.Method != "approve" {
-		t.Errorf("m5 login: %+v", li)
+	if !strings.Contains(newcomer.stdout.String(), "Signed in to "+w.origin+" as m5") {
+		t.Errorf("m5 login: %q", newcomer.stdout.String())
 	}
 	waitFor(t, 20*time.Second, "cache on m5", func() bool { _, ok := m5.hosts(t)["cache"]; return ok })
 }
@@ -670,5 +715,104 @@ func TestSignupCreatesAVault(t *testing.T) {
 	s = &session{}
 	if code := m.hop(t, s, "auth", "signup", "--server", w.origin, "--email", authEmail, "--code", "x"); code != 255 || !strings.Contains(s.stderr.String(), "already signed in") {
 		t.Errorf("a second signup: exit %d, %q", code, s.stderr.String())
+	}
+}
+
+// hex64 matches what a 32-byte hash prints as: the discard token, or the
+// digest it is made from, which must never be shown.
+var hex64 = regexp.MustCompile(`\b[0-9a-f]{64}\b`)
+
+// hop auth merge --discard shows, takes and reports a token, and nothing
+// else a hash could be: the digest of the merge's items, a verifier of
+// their plaintext, is never printed, in text or JSON, in a refusal or a
+// success.
+func TestMergeDiscardShowsOnlyTheToken(t *testing.T) {
+	w := newAuthWorld(t)
+	m1, m6 := newMachine(t, w, "m1"), newMachine(t, w, "m6")
+	pw := map[string]string{"Master password: ": resolvePassword, "Repeat it: ": resolvePassword}
+	initS := &session{secrets: pw}
+	if code := m1.hop(t, initS, "init"); code != 0 {
+		t.Fatalf("init: exit %d: %s", code, initS.stderr.String())
+	}
+	sk, _ := kitKeys(t, initS.stdout.String())
+	m1.must(t, nil, "auth", "signup", "--server", w.origin, "--email", authEmail, "--code", w.invite(t), "--json")
+
+	// m6 has a local vault, merged into the account with no daemon to
+	// upload it, then paused: its items are never imported.
+	initS = &session{secrets: pw}
+	if code := m6.hop(t, initS, "init"); code != 0 {
+		t.Fatalf("init on m6: exit %d: %s", code, initS.stderr.String())
+	}
+	m6.must(t, nil, "add", "local-web", "--address", "198.51.100.7")
+	m6.must(t, nil, "add", "local-db", "--address", "198.51.100.8")
+	m6.noDaemon.Store(true)
+	login := &session{tty: true, secrets: map[string]string{"Master password: ": resolvePassword, "Current master password: ": resolvePassword, "Secret Key": sk}}
+	if code := m6.hop(t, login, "login", "--method", "password", "--merge", "--server", w.origin, "--email", authEmail, "--name", "m6"); code != 0 {
+		t.Fatalf("login --merge: exit %d: %s", code, login.stderr.String())
+	}
+	m6.must(t, nil, "auth", "merge", "--pause", "--json")
+
+	onlyToken := func(what, out, token string) {
+		t.Helper()
+		for _, h := range hex64.FindAllString(out, -1) {
+			if h != token {
+				t.Errorf("%s shows %s, which is not the token", what, h)
+			}
+		}
+	}
+	s := &session{}
+	if code := m6.hop(t, s, "auth", "merge", "--discard", "--json"); code != 255 {
+		t.Fatalf("discard without --confirm: exit %d", code)
+	}
+	var prop struct {
+		Discard map[string]json.RawMessage `json:"discard"`
+	}
+	decodeJSON(t, s.stdout.String(), &prop)
+	var token string
+	if err := json.Unmarshal(prop.Discard["token"], &token); err != nil || !hex64.MatchString(token) {
+		t.Fatalf("the proposal has no token: %s (%v)", s.stdout.String(), err)
+	}
+	if _, ok := prop.Discard["digest"]; ok {
+		t.Errorf("the proposal has a digest: %s", s.stdout.String())
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(prop.Discard["items"], &items); err != nil || len(items) < 2 {
+		t.Errorf("the proposal lists %d items: %s", len(items), s.stdout.String())
+	}
+	if !strings.Contains(s.stderr.String(), "--confirm "+token) {
+		t.Errorf("the refusal does not name the token: %q", s.stderr.String())
+	}
+	onlyToken("--discard --json", s.stdout.String()+s.stderr.String(), token)
+
+	s = &session{}
+	if code := m6.hop(t, s, "auth", "merge", "--discard"); code != 255 || !strings.Contains(s.stdout.String(), "--confirm "+token) {
+		t.Fatalf("discard in text: exit %d, %q", code, s.stdout.String())
+	}
+	onlyToken("--discard", s.stdout.String()+s.stderr.String(), token)
+
+	// Another token confirms nothing.
+	s = &session{}
+	if code := m6.hop(t, s, "auth", "merge", "--discard", "--confirm", strings.Repeat("0", 64)); code != 255 || !strings.Contains(s.stderr.String(), "is not a token") {
+		t.Errorf("discard with a zero token: exit %d, %q", code, s.stderr.String())
+	}
+	s = &session{}
+	if code := m6.hop(t, s, "auth", "merge", "--discard", "--confirm", strings.Repeat("1", 64)); code != 255 || !strings.Contains(s.stderr.String(), "changed since that token was shown") {
+		t.Errorf("discard with another token: exit %d, %q", code, s.stderr.String())
+	}
+
+	s = &session{}
+	if code := m6.hop(t, s, "auth", "merge", "--discard", "--confirm", token, "--json"); code != 0 {
+		t.Fatalf("discard with the token: exit %d, %q %q", code, s.stdout.String(), s.stderr.String())
+	}
+	var done struct {
+		Done string `json:"done"`
+	}
+	if decodeJSON(t, s.stdout.String(), &done); done.Done != "discarded" {
+		t.Errorf("discard with the token: %s", s.stdout.String())
+	}
+	onlyToken("the discard's report", s.stdout.String()+s.stderr.String(), token)
+	var left map[string]any
+	if decodeJSON(t, m6.must(t, nil, "auth", "merge", "--json"), &left); left["merge"] != nil {
+		t.Errorf("a merge is left after the discard: %v", left)
 	}
 }

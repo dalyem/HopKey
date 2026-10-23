@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"golang.org/x/term"
 
@@ -18,6 +20,25 @@ func main() {
 		os.Exit(cli.ExitFailure)
 	}
 	exe, _ := os.Executable()
+
+	// SIGINT and SIGTERM cancel the context; cli.Run decides what else
+	// happens (a hop auth flow hands the vault back to the daemon). A
+	// second signal is not caught: it ends the process at once.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		signal.Stop(sigs)
+		cancel(cli.ErrInterrupted)
+	}()
+	// A prompt may have turned echo off; exiting on a signal turns it on.
+	stdinFd := int(os.Stdin.Fd())
+	var termState *term.State
+	if term.IsTerminal(stdinFd) {
+		termState, _ = term.GetState(stdinFd)
+	}
+
 	env := &cli.Env{
 		Stdin:     os.Stdin,
 		Stdout:    os.Stdout,
@@ -26,15 +47,21 @@ func main() {
 		Home:      home,
 		Paths:     daemon.DefaultPaths(home, os.Getenv),
 		StdoutTTY: term.IsTerminal(int(os.Stdout.Fd())),
-		StdinTTY:  term.IsTerminal(int(os.Stdin.Fd())),
+		StdinTTY:  term.IsTerminal(stdinFd),
 		OpenStore: openStore,
 		ReadPassword: func(prompt string) ([]byte, error) {
 			os.Stderr.WriteString(prompt)
-			b, err := term.ReadPassword(int(os.Stdin.Fd()))
+			b, err := term.ReadPassword(stdinFd)
 			os.Stderr.WriteString("\n")
 			return b, err
 		},
 		Executable: exe,
+		Exit: func(code int) {
+			if termState != nil {
+				term.Restore(stdinFd, termState)
+			}
+			os.Exit(code)
+		},
 	}
-	os.Exit(cli.Run(context.Background(), os.Args[1:], env))
+	os.Exit(cli.Run(ctx, os.Args[1:], env))
 }

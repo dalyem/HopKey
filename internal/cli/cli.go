@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
@@ -66,7 +67,9 @@ type Env struct {
 	SSHBinary string
 	// ExecSSH replaces the process with ssh (hop <target>). Tests replace it.
 	ExecSSH func(path string, argv, environ []string) error
-	// Environ is the environment given to ssh. Nil means os.Environ().
+	// Environ is the environment hop's child processes (ssh, the daemon)
+	// start from, before the hop auth secrets are removed. Nil means
+	// os.Environ().
 	Environ []string
 	// SSHProbeEnv is added to the otherwise bare environment (HOME, PATH) of
 	// the ssh -G runs of `hop import ssh-config`. Tests use it for the passwd
@@ -95,10 +98,78 @@ type Env struct {
 	// HOP_DEV_INSECURE=1 also sets DevInsecure, as it does for the daemon.
 	SyncClient syncclient.Options
 
+	// Exit ends the process when Run's context is cancelled by a signal
+	// and the command does not return on its own (see watchInterrupt). Nil
+	// means a cancelled context is all that happens, as in tests.
+	Exit func(code int)
+	// InterruptGrace is how long a command that holds the vault gets to
+	// return after its context is cancelled. Zero means 3 seconds.
+	InterruptGrace time.Duration
+
 	// warned holds the warnings already printed in this run, so a command
 	// that makes many changes says each one once.
 	warned map[string]bool
+
+	// hold is the hop auth command's hold of the vault while it lasts.
+	holdMu sync.Mutex
+	hold   *vaultHold
+	// ctxAware marks a command that returns on its own once the context
+	// is cancelled (hop daemon), so a signal never cuts it short.
+	ctxAware bool
 }
+
+// ExitInterrupted is the exit status after SIGINT or SIGTERM, as a shell
+// reports a command killed by SIGINT.
+const ExitInterrupted = 130
+
+// watchInterrupt runs while a command does. cmd/hop cancels Run's context
+// with ErrInterrupted on SIGINT and SIGTERM. A command that holds the vault for a hop auth
+// flow gets InterruptGrace to return, and its deferred release starts the
+// daemon again; one stuck where the context does not reach (a prompt
+// reading the terminal) is abandoned: the daemon is launched to take the
+// vault once this process is gone, and the process exits. A command that
+// holds nothing exits at once, as it did when the signal killed it,
+// unless it handles the context itself (hop daemon).
+func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}) {
+	if e.Exit == nil {
+		return
+	}
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+	}
+	if !errors.Is(context.Cause(ctx), ErrInterrupted) {
+		return // a deadline, not a signal
+	}
+	if e.ctxAware {
+		return
+	}
+	if h := e.currentHold(); h != nil {
+		grace := e.InterruptGrace
+		if grace <= 0 {
+			grace = 3 * time.Second
+		}
+		select {
+		case <-done:
+			return
+		case <-time.After(grace):
+		}
+		if h := e.currentHold(); h != nil {
+			h.abandon()
+		}
+	}
+	select {
+	case <-done:
+		return
+	default:
+	}
+	e.Exit(ExitInterrupted)
+}
+
+// ErrInterrupted is the cause cmd/hop gives the context it cancels on
+// SIGINT or SIGTERM (context.WithCancelCause).
+var ErrInterrupted = errors.New("interrupted")
 
 func (e *Env) now() time.Time {
 	if e.Now != nil {
@@ -204,7 +275,10 @@ func Run(ctx context.Context, args []string, e *Env) int {
 	if e.Getenv == nil {
 		e.Getenv = os.Getenv
 	}
+	done := make(chan struct{})
+	go e.watchInterrupt(ctx, done)
 	err := dispatch(ctx, e, args)
+	close(done)
 	if err == nil {
 		return 0
 	}
@@ -363,6 +437,19 @@ func newFlags(e *Env, name, usage string) *flag.FlagSet {
 		fs.SetOutput(out)
 	}
 	return fs
+}
+
+// helpNote adds text after the flags that -h prints, and not after a
+// parse error.
+func helpNote(e *Env, fs *flag.FlagSet, note string) {
+	base := fs.Usage
+	fs.Usage = func() {
+		base()
+		if out, ok := fs.Output().(*flagOut); ok && out.Len() > 0 {
+			return
+		}
+		fmt.Fprint(e.Stderr, note)
+	}
 }
 
 // parseFlags parses args allowing flags and positional arguments in any

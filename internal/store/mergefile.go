@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/hkdf"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,7 +62,9 @@ import (
 //     its record writes its receipt (settle); the commit that writes the
 //     last receipt deletes the file.
 //   - Ordinary item writes are refused while signed_in or importing.
-//   - MergePause, MergeResume and MergeDiscard follow §4.4 exactly.
+//   - MergePause, MergeResume and MergeDiscard follow §4.4 exactly, except
+//     that the confirmation is a token keyed by local_key over c, never c
+//     itself (DiscardProposal).
 
 var (
 	// ErrMergeFrozen means a login merge has sealed this vault's items
@@ -2038,12 +2043,48 @@ func (s *Store) MergeResume() (MergeStatus, error) {
 }
 
 // DiscardProposal is what hop auth merge --discard asks the user to
-// confirm: the items never imported and the digest c (§5.4).
+// confirm: the items never imported, and the token that confirms them.
+//
+// The digest c (§5.4) is computed from the items' plaintext manifest, so
+// it is a verifier of that plaintext and never leaves the store: what the
+// user sees, types back or a script passes in a flag is the token, a MAC
+// of c under a key only this device has (discardToken).
 type DiscardProposal struct {
 	VaultID model.ID    `json:"vault_id"`
 	TxnID   model.ID    `json:"txn_id"`
 	Items   []MergeItem `json:"items"` // the manifest rows with no receipt, sorted by item_id
-	Digest  crypto.Hash `json:"digest"`
+	Token   crypto.Hash `json:"token"`
+
+	digest crypto.Hash // c; unexported, so no encoding of the proposal carries it
+}
+
+// labelMergeDiscardToken is the HKDF info of the discard token's key.
+const labelMergeDiscardToken = "hopkey/v1/merge-discard-token"
+
+// discardToken is the confirmation token of discard digest c:
+//
+//	key   = HKDF-SHA256(ikm = local_key, salt = none, info = "hopkey/v1/merge-discard-token")
+//	token = HMAC-SHA256(key, c)
+//
+// local_key is in the device record, so the token is the same in every
+// process on this device and different on any other, and it says nothing
+// about c to anyone without local_key.
+func discardToken(rec *deviceRecord, c crypto.Hash) (crypto.Hash, error) {
+	lk, err := rec.localKey()
+	if err != nil {
+		return crypto.Hash{}, err
+	}
+	defer clear(lk[:])
+	key, err := hkdf.Key(sha256.New, lk[:], nil, labelMergeDiscardToken, sha256.Size)
+	if err != nil {
+		return crypto.Hash{}, err
+	}
+	defer clear(key)
+	mac := hmac.New(sha256.New, key)
+	mac.Write(c[:])
+	var t crypto.Hash
+	copy(t[:], mac.Sum(nil))
+	return t, nil
 }
 
 // discardCheck checks the §4.4 discard preconditions and returns the
@@ -2085,15 +2126,19 @@ func (s *Store) discardCheck() (*openedMerge, DiscardProposal, error) {
 	if err != nil {
 		return nil, DiscardProposal{}, err
 	}
-	p := DiscardProposal{VaultID: m.j.VaultID, TxnID: m.j.TxnID, Items: []MergeItem{}, Digest: d}
+	tok, err := discardToken(s.rec, d)
+	if err != nil {
+		return nil, DiscardProposal{}, err
+	}
+	p := DiscardProposal{VaultID: m.j.VaultID, TxnID: m.j.TxnID, Items: []MergeItem{}, Token: tok, digest: d}
 	for _, r := range rows {
 		p.Items = append(p.Items, MergeItem{ItemID: r.ItemID, Type: r.Type, Name: itemName(items[r.ItemID])})
 	}
 	return m, p, nil
 }
 
-// MergeDiscardProposal returns what a discard would delete and its digest
-// c, without changing anything.
+// MergeDiscardProposal returns what a discard would delete and the token
+// that confirms it, without changing anything.
 func (s *Store) MergeDiscardProposal() (DiscardProposal, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2107,12 +2152,13 @@ func (s *Store) MergeDiscardProposal() (DiscardProposal, error) {
 }
 
 // MergeDiscard discards a paused merge (§4.4): it deletes the file, and
-// with it the items that were never imported. confirm must be the digest c
-// of DiscardProposal, recomputed here, with the preconditions, immediately
-// before anything is deleted. A zero confirm changes nothing and returns
-// the proposal with ErrConfirmRequired (the non-interactive case); a
-// different one returns ErrStaleConfirm.
-func (s *Store) MergeDiscard(confirm crypto.Hash) (DiscardProposal, error) {
+// with it the items that were never imported. token must be the Token of
+// DiscardProposal: the digest c and its token are recomputed here from
+// the current state, with the preconditions, immediately before anything
+// is deleted, and the tokens compared in constant time. A zero token
+// changes nothing and returns the proposal with ErrConfirmRequired (the
+// non-interactive case); a different one returns ErrStaleConfirm.
+func (s *Store) MergeDiscard(token crypto.Hash) (DiscardProposal, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	unlock, err := s.lockFile()
@@ -2124,10 +2170,10 @@ func (s *Store) MergeDiscard(confirm crypto.Hash) (DiscardProposal, error) {
 	if err != nil {
 		return DiscardProposal{}, err
 	}
-	if confirm == (crypto.Hash{}) {
+	if token == (crypto.Hash{}) {
 		return p, ErrConfirmRequired
 	}
-	if !confirm.Equal(p.Digest) {
+	if !token.Equal(p.Token) {
 		return p, ErrStaleConfirm
 	}
 	t := &txn{}
