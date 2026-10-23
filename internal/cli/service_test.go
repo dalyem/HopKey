@@ -761,6 +761,31 @@ func TestSetupServiceUninstallStopFails(t *testing.T) {
 	}
 }
 
+// The second systemd uninstall command failing fails the run and keeps
+// the file, so a retry runs every stop step again.
+func TestSetupServiceUninstallSecondStopFails(t *testing.T) {
+	s := newServiceEnv(t, "linux")
+	if code, _, errOut := s.hop(t, "setup", "--service", "--yes"); code != 0 {
+		t.Fatalf("install: exit %d: %s", code, errOut)
+	}
+	stop := "systemctl --user stop hopkey.service"
+	s.fail = stop
+	code, out, errOut := s.hop(t, "setup", "--service", "--uninstall", "--yes", "--json")
+	if code != 255 || strings.Contains(out, `"active"`) || !strings.Contains(errOut, stop+" failed") {
+		t.Errorf("failing second stop: exit %d, %q, %q", code, out, errOut)
+	}
+	if _, err := os.Lstat(s.servicePath()); err != nil {
+		t.Errorf("failing second stop removed the file: %v", err)
+	}
+	s.fail = ""
+	if code, _, errOut := s.hop(t, "setup", "--service", "--uninstall", "--yes"); code != 0 {
+		t.Errorf("retry: exit %d: %s", code, errOut)
+	}
+	if _, err := os.Lstat(s.servicePath()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("retry: file still there: %v", err)
+	}
+}
+
 // With the file already gone, uninstall still stops what the service
 // manager runs.
 func TestSetupServiceUninstallWithoutTheFile(t *testing.T) {

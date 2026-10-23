@@ -208,18 +208,31 @@ func systemdQuote(s string, cmd bool) string {
 
 // launchdNotLoaded: launchctl bootout fails with 3 (ESRCH, "No such
 // process") or 113 ("Could not find specified service") when the domain
-// has no such service.
-func launchdNotLoaded(out []byte, err error) bool {
-	if c := exitStatusOf(err); c == 3 || c == 113 {
-		return true
-	}
-	return bytes.Contains(out, []byte("No such process")) || bytes.Contains(out, []byte("Could not find specified service"))
+// has no such service. Only the exit status counts: text alone could come
+// with some other failure.
+func launchdNotLoaded(_ []byte, err error) bool {
+	c := exitStatusOf(err)
+	return c == 3 || c == 113
 }
 
+// systemdUnit is the unit setup installs.
+const systemdUnit = "hopkey.service"
+
 // systemdNotLoaded: systemctl says "Unit file hopkey.service does not
-// exist" (disable) or "Unit hopkey.service not loaded" (stop).
-func systemdNotLoaded(out []byte, err error) bool {
-	return bytes.Contains(out, []byte("does not exist")) || bytes.Contains(out, []byte("not loaded")) || bytes.Contains(out, []byte("not found"))
+// exist" (disable), "Unit hopkey.service not loaded" (stop) or "Unit
+// hopkey.service not found". Only those complete phrases, naming this
+// unit, count; any other failure is a failure.
+func systemdNotLoaded(out []byte, _ error) bool {
+	for _, p := range []string{
+		"Unit file " + systemdUnit + " does not exist",
+		"Unit " + systemdUnit + " not loaded",
+		"Unit " + systemdUnit + " not found",
+	} {
+		if bytes.Contains(out, []byte(p)) {
+			return true
+		}
+	}
+	return false
 }
 
 func exitStatusOf(err error) int {
