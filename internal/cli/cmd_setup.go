@@ -105,6 +105,16 @@ func runSetup(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "setup", commands["setup"].usage)
 	yes := fs.Bool("yes", false, "do not ask")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
+	service := fs.Bool("service", false, "install a user service (systemd --user or launchd) that runs the hop daemon from login. "+
+		"It runs this hop binary by its current path, so run hop setup --service again after moving or upgrading hop. "+
+		"The directory the service file goes in (~/.config/systemd/user or ~/Library/LaunchAgents) is set to mode 0700. "+
+		"Every run has the service manager reload the file and restart the daemon from it "+
+		"(systemd: daemon-reload, enable, restart; launchd: bootout, bootstrap, kickstart -k); "+
+		"if a step fails, hop says which, and running again repeats every step. "+
+		"If a hop daemon started some other way owns the vault, the service's daemon exits: run hop daemon stop, then hop setup --service again. "+
+		"An older hop talking to a newer daemon does not show config_not_written warnings")
+	uninstall := fs.Bool("uninstall", false, "with --service: stop the service, then remove its file. "+
+		"If stopping fails, the file stays and running again retries")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -112,6 +122,12 @@ func runSetup(ctx context.Context, e *Env, args []string) error {
 	if len(pos) != 0 {
 		fs.Usage()
 		return failf("setup takes no arguments")
+	}
+	if *uninstall && !*service {
+		return failf("--uninstall goes with --service")
+	}
+	if *service {
+		return runService(ctx, e, *yes, *uninstall, *asJSON)
 	}
 
 	sshDir := filepath.Join(e.Home, ".ssh")

@@ -40,7 +40,8 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	}
 	defer c.Close()
 	if !*usePassword {
-		if err := c.Call(ctx, daemon.OpUnlock, nil, nil); err != nil {
+		w, err := c.CallWarn(ctx, daemon.OpUnlock, nil, nil)
+		if err := changeWarning(e, false, w, err); err != nil {
 			return failf("%v", err)
 		}
 		e.printf("vault unlocked\n")
@@ -56,7 +57,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	}
 	defer clear(pw)
 	p := daemon.UnlockParams{Password: string(pw)}
-	err = c.Call(ctx, daemon.OpUnlock, p, nil)
+	w, err := c.CallWarn(ctx, daemon.OpUnlock, p, nil)
 	if daemon.IsCode(err, daemon.CodeNeedSecretKey) {
 		sk, rerr := e.ReadPassword("Secret Key (from your Emergency Kit): ")
 		if rerr != nil {
@@ -64,12 +65,12 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 		}
 		p.SecretKey = string(sk)
 		clear(sk)
-		err = c.Call(ctx, daemon.OpUnlock, p, nil)
+		w, err = c.CallWarn(ctx, daemon.OpUnlock, p, nil)
 	}
 	if daemon.IsCode(err, daemon.CodeWrongPassword) {
 		return failf("wrong master password or Secret Key; the vault was not unlocked")
 	}
-	if err != nil {
+	if err := changeWarning(e, false, w, err); err != nil {
 		return failf("%v", err)
 	}
 	e.printf("vault unlocked with the master password; this device has a new device key\n")

@@ -80,6 +80,26 @@ type Env struct {
 	// DaemonWait is how long autostart waits for the control socket. Zero
 	// means 10 seconds.
 	DaemonWait time.Duration
+
+	// Now is the clock for "how long ago". Nil means time.Now.
+	Now func() time.Time
+	// GOOS picks the service manager hop setup --service writes for. Empty
+	// means runtime.GOOS.
+	GOOS string
+	// RunCommand runs systemctl or launchctl for hop setup --service and
+	// returns its combined output. Nil means os/exec. Tests replace it.
+	RunCommand func(ctx context.Context, name string, args ...string) ([]byte, error)
+
+	// warned holds the warnings already printed in this run, so a command
+	// that makes many changes says each one once.
+	warned map[string]bool
+}
+
+func (e *Env) now() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now()
 }
 
 func (e *Env) dialTimeout() time.Duration {
@@ -145,13 +165,17 @@ func init() {
 		"key":     {runKey, "hop key add <path> [--name N] | hop key ls | hop key rm <name> [--yes]"},
 		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run] [--yes] [--json]"},
 		"ts":      {runTS, "hop ts import [name...] [--user U] [--key K] [--tag T] [--no-pin] [--dry-run] | hop ts link <host> <node-id-or-dns-name>"},
-		"setup":   {runSetup, "hop setup [--yes]"},
+		"setup":   {runSetup, "hop setup [--yes] | hop setup --service [--uninstall] [--yes] [--json]"},
 		"daemon":  {runDaemon, "hop daemon [stop]"},
 		"status":  {runStatus, "hop status [--json]"},
 		"init":    {runInit, "hop init [--device-key-store keychain|file] [--kit-file PATH]"},
 		"lock":    {runLock, "hop lock"},
 		"unlock":  {runUnlock, "hop unlock [--password]"},
 		"passwd":  {runPasswd, "hop passwd [--kit-file PATH]"},
+		"sync":    {runSync, "hop sync [--json] | hop sync resolve [N] [--keep-mine [--confirm TOKEN] | --edit --set FIELD=VALUE... [--confirm TOKEN] | --take-theirs [--yes] | --retry] [--json]"},
+		"auth":    {runAuth, "hop auth <devices|login|signup|approve|logout|rotate|passwd|merge|status> [--json]"},
+		"login":   {runLogin, "hop login [flags of hop auth login]"},
+		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
 	}
 }
 
@@ -160,8 +184,9 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop check|which|trust <target>
        hop ls [tag] | info <target> | add | edit | rm
        hop key add|ls|rm | import ssh-config | ts import|link
-       hop setup | status | daemon
+       hop setup [--service] | status | daemon
        hop init | lock | unlock [--password] | passwd
+       hop sync [resolve] | auth devices
 
 Every command takes --json. Run "hop <command> -h" for its flags.
 `

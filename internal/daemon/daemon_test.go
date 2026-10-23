@@ -896,8 +896,10 @@ func TestFailedReloadKeepsWhatItCannotReplace(t *testing.T) {
 	if err := os.WriteFile(keysDir, []byte("in the way"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Call(ctx, OpReload, nil, nil); err == nil {
-		t.Fatal("reload succeeded with the keys directory blocked")
+	// The keyring is swapped in and only the config is behind: a success
+	// that carries a config_not_written warning, as for any change.
+	if w, err := c.CallWarn(ctx, OpReload, nil, nil); err != nil || w == nil || w.Code != CodeConfigNotWritten {
+		t.Fatalf("reload with the keys directory blocked: %v, warning %+v", err, w)
 	}
 	if got := agentKeys(); !slices.Equal(got, []string{"k1", "k2"}) {
 		t.Errorf("write failure: the agent serves %v, want the vault's keys [k1 k2]", got)

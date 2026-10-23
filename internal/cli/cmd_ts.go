@@ -240,9 +240,7 @@ func runTSImport(ctx context.Context, e *Env, args []string) error {
 		if *dryRun {
 			return h, nil
 		}
-		var saved model.Host
-		err := call(ctx, e, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved)
-		return saved, err
+		return putHost(ctx, e, *asJSON, h)
 	}
 	ambiguity := tsCandidates(st, hosts)
 	for _, n := range nodes {
@@ -374,8 +372,8 @@ func runTSLink(ctx context.Context, e *Env, args []string) error {
 		return failf("%s is already linked to tailscale node %s; pass --force to relink it", h.Name, h.Tailscale.StableNodeID)
 	}
 	tsLink(&h, n, !*noPin)
-	var saved model.Host
-	if err := call(ctx, e, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved); err != nil {
+	saved, err := putHost(ctx, e, *asJSON, h)
+	if err != nil {
 		return err
 	}
 	return printTSReport(e, *asJSON, []TSEntry{{Node: n.HostName, NodeID: n.ID, Host: saved.Name, Status: "linked"}})

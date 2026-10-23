@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -154,13 +155,76 @@ func call(ctx context.Context, e *Env, op string, params, result any) error {
 	return cleanErr(c.Call(ctx, op, params, result))
 }
 
+// configStale adds a hint to the daemon's config_stale refusal: the daemon
+// will not resolve a target, so nothing connects, while the ssh config it
+// writes is out of date. Other errors pass through.
+func configStale(e *Env, err error) error {
+	if !daemon.IsCode(err, daemon.CodeConfigStale) {
+		return err
+	}
+	return failf("%v. Check that you own %s and can write to it and the files in it (ls -la %s)", err, e.Paths.ConfigDir, e.Paths.ConfigDir)
+}
+
+// callChange is call for an op that changes the vault (put_host, put_key,
+// delete). When the change took effect but the ssh config could not be
+// written, the daemon answers with a success that carries the result (the
+// saved host or key) and a config_not_written warning; callChange prints
+// the warning and returns nil, with result filled in.
+func callChange(ctx context.Context, e *Env, asJSON bool, op string, params, result any) error {
+	c, err := connect(ctx, e)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	w, err := c.CallWarn(ctx, op, params, result)
+	return changeWarning(e, asJSON, w, err)
+}
+
+// changeWarning prints the warning on a change's answer and returns its
+// error. A daemon from before warnings answered config_not_written as an
+// error with no result; the change took effect all the same, so that is
+// a warning too, and a caller that needs the result finds it empty.
+func changeWarning(e *Env, asJSON bool, w *daemon.Error, err error) error {
+	err = cleanErr(err)
+	if daemon.IsCode(err, daemon.CodeConfigNotWritten) {
+		warn(e, asJSON, err.Error())
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if w != nil {
+		warn(e, asJSON, w.Message)
+	}
+	return nil
+}
+
+// warn prints a warning to stderr once per run: "hop: warning: ..." on one
+// line, or a {"warning": ...} line when the caller asked for JSON, so
+// stdout keeps its shape.
+func warn(e *Env, asJSON bool, msg string) {
+	if e.warned[msg] {
+		return
+	}
+	if e.warned == nil {
+		e.warned = map[string]bool{}
+	}
+	e.warned[msg] = true
+	if asJSON {
+		b, _ := json.Marshal(map[string]string{"warning": msg})
+		fmt.Fprintln(e.Stderr, string(escapeJSONControls(b)))
+		return
+	}
+	fmt.Fprintf(e.Stderr, "hop: warning: %s\n", oneLine(msg))
+}
+
 // resolveTarget asks the daemon to resolve target. With interactive, an
 // ambiguous result goes to a picker when stdin is a terminal.
 func resolveTarget(ctx context.Context, e *Env, target string, interactive bool) (*daemon.ResolveResult, error) {
 	var rr daemon.ResolveResult
 	params := daemon.ResolveParams{Target: target, Interactive: interactive}
 	if err := call(ctx, e, daemon.OpResolve, params, &rr); err != nil {
-		return nil, err
+		return nil, configStale(e, err)
 	}
 	if interactive && e.StdinTTY && rr.Result.Status == resolve.StatusAmbiguous {
 		picked, err := pick(e, rr.Result)
@@ -174,7 +238,7 @@ func resolveTarget(ctx context.Context, e *Env, target string, interactive bool)
 		}
 		rr = daemon.ResolveResult{}
 		if err := call(ctx, e, daemon.OpResolve, params, &rr); err != nil {
-			return nil, err
+			return nil, configStale(e, err)
 		}
 	}
 	return &rr, nil

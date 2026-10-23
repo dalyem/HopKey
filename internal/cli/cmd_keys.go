@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/sshkeys"
 )
 
@@ -93,8 +94,7 @@ func runKeyAdd(ctx context.Context, e *Env, args []string) error {
 	if *name == "" {
 		*name = filepath.Base(pos[0])
 	}
-	var info daemon.KeyInfo
-	err = call(ctx, e, daemon.OpPutKey, daemon.PutKeyParams{Name: *name, PrivateKey: pem}, &info)
+	info, err := putKey(ctx, e, *asJSON, *name, pem)
 	if err != nil {
 		return err
 	}
@@ -105,10 +105,26 @@ func runKeyAdd(ctx context.Context, e *Env, args []string) error {
 	return nil
 }
 
+// putKey saves a key and returns it as the daemon saved it, ID included,
+// which the daemon's answer carries even when the ssh config could not be
+// written (a warning). An answer without an ID is an error, as for
+// putHost.
+func putKey(ctx context.Context, e *Env, asJSON bool, name, pem string) (daemon.KeyInfo, error) {
+	var info daemon.KeyInfo
+	if err := callChange(ctx, e, asJSON, daemon.OpPutKey, daemon.PutKeyParams{Name: name, PrivateKey: pem}, &info); err != nil {
+		return daemon.KeyInfo{}, err
+	}
+	if info.ID == "" {
+		return daemon.KeyInfo{}, failf("the daemon saved the key %s but did not say as what, so its ID is unknown; see hop key ls", name)
+	}
+	return info, nil
+}
+
 // KeyView is the --json shape of hop key ls: no private half.
 type KeyView struct {
 	daemon.KeyInfo
-	Hosts []string `json:"hosts"` // hosts that log in with it
+	Hosts []string   `json:"hosts"`          // hosts that log in with it
+	Mark  model.Mark `json:"mark,omitempty"` // pending or held, as for hosts
 }
 
 func runKeyLs(ctx context.Context, e *Env, args []string) error {
@@ -123,7 +139,7 @@ func runKeyLs(ctx context.Context, e *Env, args []string) error {
 	}
 	views := make([]KeyView, 0, len(l.Keys))
 	for _, k := range l.Keys {
-		v := KeyView{KeyInfo: k, Hosts: []string{}}
+		v := KeyView{KeyInfo: k, Hosts: []string{}, Mark: l.Marks[k.ID]}
 		for _, h := range l.Hosts {
 			if h.KeyID.String() == k.ID {
 				v.Hosts = append(v.Hosts, h.Name)
@@ -140,11 +156,20 @@ func runKeyLs(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintln(e.Stderr, "no keys")
 		return nil
 	}
+	marked := slices.ContainsFunc(views, func(v KeyView) bool { return v.Mark != "" })
 	tw := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tTYPE\tFINGERPRINT\tHOSTS")
+	if marked {
+		fmt.Fprintln(tw, "NAME\tTYPE\tFINGERPRINT\tHOSTS\tSYNC")
+	} else {
+		fmt.Fprintln(tw, "NAME\tTYPE\tFINGERPRINT\tHOSTS")
+	}
 	for _, v := range views {
 		// Vault text: no tabs or newlines may break the table.
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", oneLine(v.Name), oneLine(v.KeyType), oneLine(v.Fingerprint), dash(joinOne(v.Hosts, ",")))
+		row := fmt.Sprintf("%s\t%s\t%s\t%s", oneLine(v.Name), oneLine(v.KeyType), oneLine(v.Fingerprint), dash(joinOne(v.Hosts, ",")))
+		if marked {
+			row += "\t" + dash(oneLine(string(v.Mark)))
+		}
+		fmt.Fprintln(tw, row)
 	}
 	return tw.Flush()
 }
@@ -185,7 +210,7 @@ func runKeyRm(ctx context.Context, e *Env, args []string) error {
 	if !ok {
 		return failf("not removed")
 	}
-	if err := call(ctx, e, daemon.OpDelete, daemon.DeleteParams{ID: id.String()}, nil); err != nil {
+	if err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: id.String()}, nil); err != nil {
 		return err
 	}
 	if *asJSON {

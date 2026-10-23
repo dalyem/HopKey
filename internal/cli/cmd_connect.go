@@ -101,6 +101,9 @@ func runConnect(ctx context.Context, e *Env, args []string) error {
 	if err != nil {
 		return err
 	}
+	if interactiveResolution(e, false) {
+		syncNotice(ctx, e)
+	}
 	if rr.Result.Status == resolve.StatusPlainSSH {
 		return plainSSH(ctx, e, rr.Result)
 	}
@@ -428,7 +431,10 @@ func runWhich(ctx context.Context, e *Env, args []string) error {
 	// candidates instead.
 	var rr daemon.ResolveResult
 	if err := call(ctx, e, daemon.OpResolve, daemon.ResolveParams{Target: pos[0], Interactive: interactive}, &rr); err != nil {
-		return err
+		return configStale(e, err)
+	}
+	if interactive {
+		syncNotice(ctx, e)
 	}
 	w := whichResult(&rr)
 	matched := rr.Result.Status == resolve.StatusMatched
@@ -604,6 +610,9 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 	rr, err := resolveTarget(ctx, e, pos[0], interactiveResolution(e, *asJSON))
 	if err != nil {
 		return err
+	}
+	if interactiveResolution(e, *asJSON) {
+		syncNotice(ctx, e)
 	}
 	res := rr.Result
 	c.run("resolved", nil, func() (string, string) {
@@ -822,7 +831,7 @@ func runTrust(ctx context.Context, e *Env, args []string) error {
 		keep = append(keep, l)
 	}
 	host.HostKeys = append(keep, line)
-	if err := call(ctx, e, daemon.OpPutHost, daemon.PutHostParams{Host: host}, nil); err != nil {
+	if err := callChange(ctx, e, *asJSON, daemon.OpPutHost, daemon.PutHostParams{Host: host}, nil); err != nil {
 		return err
 	}
 	return reportTrust(e, *asJSON, host.Name, key, got, true, "pinned")

@@ -119,8 +119,6 @@ func errorResponse(err error) Response {
 			e = &Error{Code: CodeNotFound, Message: err.Error()}
 		case errors.Is(err, model.ErrLocked):
 			e = &Error{Code: CodeLocked, Message: err.Error()}
-		case errors.Is(err, errConfigWrite):
-			e = &Error{Code: CodeConfigNotWritten, Message: err.Error()}
 		default:
 			e = &Error{Code: CodeInternal, Message: err.Error()}
 		}
@@ -132,7 +130,8 @@ func (d *Daemon) handle(req Request) Response {
 	ctx, cancel := context.WithTimeout(d.ctx, requestTimeout)
 	defer cancel()
 	result, err := d.dispatch(ctx, req)
-	if err != nil {
+	warning := configWarning(err)
+	if err != nil && warning == nil {
 		d.mu.Lock()
 		d.followStore(err)
 		d.mu.Unlock()
@@ -146,7 +145,47 @@ func (d *Daemon) handle(req Request) Response {
 		}
 		raw = b
 	}
-	return Response{OK: true, Result: raw}
+	return Response{OK: true, Result: raw, Warning: warning}
+}
+
+// configWarning is the warning for an op whose change took effect but
+// whose ssh config could not be written (a configWriteError from the
+// reload after it, or the CodeConfigNotWritten error an op built from
+// one), or nil for any other outcome. Such an op returns its result
+// together with that error, and the response is a success that carries
+// both: the caller gets the saved item, and the warning. With any other
+// error the result is dropped.
+func configWarning(err error) *Error {
+	var e *Error
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, &e):
+		if e.Code == CodeConfigNotWritten {
+			return e
+		}
+		return nil
+	case errors.Is(err, errConfigWrite):
+		return &Error{Code: CodeConfigNotWritten, Message: err.Error()}
+	}
+	return nil
+}
+
+// reloadAfter reloads after a change (what: "saved", "deleted",
+// "resolved") that has already taken effect. A config that could not be
+// written is a CodeConfigNotWritten error, which the caller returns with
+// its result (configWarning); any other failure to reload is an error.
+// The caller holds d.mu.
+func (d *Daemon) reloadAfter(ctx context.Context, what string) error {
+	_, err := d.reloadLocked(ctx)
+	if err == nil {
+		return nil
+	}
+	if cw := (*configWriteError)(nil); errors.As(err, &cw) {
+		return &Error{Code: CodeConfigNotWritten, Message: fmt.Sprintf(
+			"%s; the ssh config could not be updated (%v), the daemon tries again every %v", what, cw.cause, d.configRetry())}
+	}
+	return fmt.Errorf("%s, but reloading failed: %w", what, err)
 }
 
 func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
@@ -407,10 +446,7 @@ func (d *Daemon) opPutHost(ctx context.Context, p PutHostParams) (*model.Host, e
 		return nil, storeError(err)
 	}
 	d.localWrite()
-	if _, err := d.reloadLocked(ctx); err != nil {
-		return nil, fmt.Errorf("saved, but reloading failed: %w", err)
-	}
-	return &saved, nil
+	return &saved, d.reloadAfter(ctx, "saved")
 }
 
 func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error) {
@@ -451,11 +487,8 @@ func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error)
 		return nil, storeError(err)
 	}
 	d.localWrite()
-	if _, err := d.reloadLocked(ctx); err != nil {
-		return nil, fmt.Errorf("saved, but reloading failed: %w", err)
-	}
 	info := keyInfo(saved)
-	return &info, nil
+	return &info, d.reloadAfter(ctx, "saved")
 }
 
 func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {
@@ -469,10 +502,7 @@ func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {
 		return storeError(err)
 	}
 	d.localWrite()
-	if _, err := d.reloadLocked(ctx); err != nil {
-		return fmt.Errorf("deleted, but reloading failed: %w", err)
-	}
-	return nil
+	return d.reloadAfter(ctx, "deleted")
 }
 
 // storeError passes the store's own sentinel errors through and presents any
