@@ -3,7 +3,9 @@ package authflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/model"
@@ -35,8 +37,8 @@ const maxRounds = 8
 // ckpt is one checkpoint the user asked for.
 type ckpt struct {
 	kind    string
-	keep    []string // survivors besides this device
-	targets []string // a revocation's
+	keep    []string // survivors besides this device, by ID
+	targets []string // a revocation's, by ID once chosen
 	current []byte   // the current master password
 	next    []byte   // the new one, for passwd and recovery
 	opts    store.CheckpointOptions
@@ -200,7 +202,10 @@ func checkpoint(ctx context.Context, env *Env, v *Vault, kind string, targets []
 
 // choose asks for the survivors (§10.1): a password change keeps every
 // device and shows them; the others keep only this device and the ones
-// the user chooses.
+// the user chooses. Every reference, a revocation's targets included, is
+// resolved here, once, against the list the user was shown, and only
+// device IDs go to the store: a name resolved again after a later pull
+// could pick a device that joined meanwhile under the same name.
 func choose(ctx context.Context, env *Env, v *Vault, k *ckpt, self string) error {
 	// The list is the verified state's: bring it up to date first.
 	if err := env.retry(ctx, func() error { return v.Store.Pull(ctx, v.Remote) }); err != nil {
@@ -215,21 +220,64 @@ func choose(ctx context.Context, env *Env, v *Vault, k *ckpt, self string) error
 	}
 	var targets []model.ID
 	if k.kind == store.CheckpointRevoke {
-		if targets, err = v.Store.ResolveDevices(k.targets); err != nil {
+		if targets, err = resolveListed(devices, k.targets); err != nil {
 			return err
 		}
+		k.targets = idStrings(targets)
 	}
-	keep, err := env.UI.ChooseSurvivors(ctx, SurvivorChoice{Kind: k.kind, Devices: devices, Targets: targets})
+	refs, err := env.UI.ChooseSurvivors(ctx, SurvivorChoice{Kind: k.kind, Devices: devices, Targets: targets})
 	if err != nil {
 		return err
 	}
-	k.keep = others(keep, self)
+	keep, err := resolveListed(devices, refs)
+	if err != nil {
+		return err
+	}
+	k.keep = others(idStrings(keep), self)
 	return nil
+}
+
+// resolveListed resolves device references against listed, the devices
+// the user was shown: each a listed device's ID, or a name exactly one
+// listed device has. The errors are the store's (store.ErrUnknownDevice,
+// store.ErrAmbiguousDevice).
+func resolveListed(listed []store.DeviceListing, refs []string) ([]model.ID, error) {
+	var out []model.ID
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		var found []model.ID
+		if id, err := model.ParseID(ref); err == nil {
+			if slices.ContainsFunc(listed, func(d store.DeviceListing) bool { return d.ID == id }) {
+				found = append(found, id)
+			}
+		} else {
+			for _, d := range listed {
+				if d.Name == ref {
+					found = append(found, d.ID)
+				}
+			}
+		}
+		switch len(found) {
+		case 0:
+			return nil, fmt.Errorf("%w: %q is not among the devices listed", store.ErrUnknownDevice, ref)
+		case 1:
+		default:
+			return nil, fmt.Errorf("%w: %q names %d devices", store.ErrAmbiguousDevice, ref, len(found))
+		}
+		if !slices.Contains(out, found[0]) {
+			out = append(out, found[0])
+		}
+	}
+	return out, nil
 }
 
 // answerNewDevices asks which devices that appeared during a password
 // change to keep; the rest are revoked (§10.1). The answers add to the
-// earlier ones, which the journal holds.
+// earlier ones, which the journal holds. The user answers about the
+// devices listed, by ID; any other ID is refused.
 func answerNewDevices(ctx context.Context, env *Env, v *Vault, k *ckpt, ids []model.ID) error {
 	all, err := v.Store.Devices()
 	if err != nil {
@@ -244,6 +292,11 @@ func answerNewDevices(ctx context.Context, env *Env, v *Vault, k *ckpt, ids []mo
 	keep, err := env.UI.ConfirmNewDevices(ctx, listed)
 	if err != nil {
 		return err
+	}
+	for _, id := range keep {
+		if !slices.ContainsFunc(listed, func(d store.DeviceListing) bool { return d.ID == id }) {
+			return fmt.Errorf("%w: %v is not among the new devices listed", store.ErrUnknownDevice, id)
+		}
 	}
 	for _, id := range ids {
 		ref := id.String()

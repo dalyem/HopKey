@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -37,6 +38,9 @@ const (
 type memRing struct {
 	mu sync.Mutex
 	m  map[string]string
+	// failDelete fails that many deletions, as a keychain that is locked
+	// for a moment would.
+	failDelete atomic.Int32
 }
 
 func (r *memRing) Get(service, user string) (string, error) {
@@ -56,7 +60,13 @@ func (r *memRing) Set(service, user, secret string) error {
 	return nil
 }
 
+var errKeychain = errors.New("memRing: the keychain is locked")
+
 func (r *memRing) Delete(service, user string) error {
+	if r.failDelete.Add(-1) >= 0 {
+		return errKeychain
+	}
+	r.failDelete.Store(0)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.m, service+"/"+user)
@@ -64,15 +74,22 @@ func (r *memRing) Delete(service, user string) error {
 }
 
 // world is a real hop-server on SQLite behind an httptest TLS server whose
-// certificate the clients trust.
+// certificate the clients trust. The server's clock runs skew ahead of the
+// real one, and tap, when set, sees every request first.
 type world struct {
 	st     *server.SQLite
 	origin string
 	pool   *x509.CertPool
+	skew   atomic.Int64 // a time.Duration
+	tap    atomic.Pointer[tapFunc]
 }
+
+// tapFunc serves a request in the server's place; next is the server.
+type tapFunc func(rw http.ResponseWriter, r *http.Request, next http.Handler)
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
+	w := &world{}
 	ts := httptest.NewUnstartedServer(nil)
 	origin := "https://" + ts.Listener.Addr().String()
 	st, err := server.OpenSQLite(filepath.Join(t.TempDir(), "hop.db"))
@@ -84,11 +101,19 @@ func newWorld(t *testing.T) *world {
 	srv, err := server.New(context.Background(), server.Config{
 		Origin: origin, Store: st, Rates: &rates,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:    func() time.Time { return time.Now().Add(time.Duration(w.skew.Load())) },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts.Config.Handler = srv.Handler()
+	h := srv.Handler()
+	ts.Config.Handler = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if f := w.tap.Load(); f != nil {
+			(*f)(rw, r, h)
+			return
+		}
+		h.ServeHTTP(rw, r)
+	})
 	ts.StartTLS()
 	t.Cleanup(func() {
 		ts.Close()
@@ -97,7 +122,8 @@ func newWorld(t *testing.T) *world {
 	})
 	pool := x509.NewCertPool()
 	pool.AddCert(ts.Certificate())
-	return &world{st: st, origin: origin, pool: pool}
+	w.st, w.origin, w.pool = st, origin, pool
+	return w
 }
 
 // env is a device's environment: a data directory of its own, a client
@@ -145,6 +171,10 @@ type scriptUI struct {
 	recoveryKey string
 	// failNew fails NewPassword, as a UI with no way to ask would.
 	failNew error
+	// onPassword runs once, when Password is first asked.
+	onPassword func()
+	// failSAS fails the next ConfirmSAS, once.
+	failSAS error
 	// routing receives the routing code.
 	routing chan string
 	// sas answers ConfirmSAS; nil fails it.
@@ -169,6 +199,13 @@ type scriptUI struct {
 var errNoAnswer = errors.New("scriptUI: no answer scripted")
 
 func (u *scriptUI) Password(context.Context, authflow.Reason) ([]byte, error) {
+	u.mu.Lock()
+	f := u.onPassword
+	u.onPassword = nil
+	u.mu.Unlock()
+	if f != nil {
+		f()
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.password == "" {
@@ -222,8 +259,12 @@ func (u *scriptUI) ShowRoutingCode(_ context.Context, code string) error {
 func (u *scriptUI) ConfirmSAS(_ context.Context, sas, name string) (bool, error) {
 	u.mu.Lock()
 	u.sasShown = append(u.sasShown, sas)
-	f := u.sas
+	f, ferr := u.sas, u.failSAS
+	u.failSAS = nil
 	u.mu.Unlock()
+	if ferr != nil {
+		return false, ferr
+	}
 	if f == nil {
 		return false, errNoAnswer
 	}
@@ -485,44 +526,87 @@ func TestSignupFresh(t *testing.T) {
 	}
 }
 
+// enrollRun is D (LoginApprove) running in the background.
+type enrollRun struct {
+	env  *authflow.Env
+	ui   *scriptUI
+	code string
+	done chan enrollOutcome
+}
+
+type enrollOutcome struct {
+	res *authflow.LoginResult
+	err error
+}
+
+// startEnroll starts D with opts (VaultID set from vA) and waits for its
+// routing code.
+func startEnroll(t *testing.T, ctx context.Context, w *world, vA *authflow.Vault, sasD func(sas, name string) bool) *enrollRun {
+	t.Helper()
+	routing := make(chan string, 1)
+	ui := &scriptUI{routing: routing, sas: sasD}
+	r := &enrollRun{env: w.env(t, "phone", ui), ui: ui, done: make(chan enrollOutcome, 1)}
+	r.resume(ctx, authflow.EnrollOptions{Email: email, DeviceName: "phone", VaultID: vA.VaultID})
+	select {
+	case r.code = <-routing:
+	case o := <-r.done:
+		t.Fatalf("D ended before showing a routing code: %v", o.err)
+	}
+	return r
+}
+
+// resume runs LoginApprove again with opts.
+func (r *enrollRun) resume(ctx context.Context, opts authflow.EnrollOptions) {
+	go func() {
+		res, err := authflow.LoginApprove(ctx, r.env, opts)
+		r.done <- enrollOutcome{res, err}
+	}()
+}
+
+// wait returns D's outcome; a vault it returns is closed at cleanup.
+func (r *enrollRun) wait(t *testing.T) (*authflow.LoginResult, error) {
+	t.Helper()
+	select {
+	case o := <-r.done:
+		if o.res != nil {
+			t.Cleanup(func() { o.res.Vault.Store.Close() })
+		}
+		return o.res, o.err
+	case <-time.After(3 * time.Minute):
+		t.Fatal("D did not finish")
+	}
+	return nil, nil
+}
+
+func setSAS(env *authflow.Env, sas func(sas, name string) bool) {
+	ui := env.UI.(*scriptUI)
+	ui.mu.Lock()
+	ui.sas = sas
+	ui.mu.Unlock()
+}
+
 // approval runs D (LoginApprove) and A (Approve) concurrently, each
 // answering the SAS with its own function, and returns both outcomes.
 func approval(t *testing.T, w *world, envA *authflow.Env, vA *authflow.Vault, sasD, sasA func(sas, name string) bool) (*authflow.Env, *authflow.LoginResult, error, *authflow.ApproveResult, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	routing := make(chan string, 1)
-	uiD := &scriptUI{routing: routing, sas: sasD}
-	envD := w.env(t, "phone", uiD)
-	envA.UI.(*scriptUI).mu.Lock()
-	envA.UI.(*scriptUI).sas = sasA
-	envA.UI.(*scriptUI).mu.Unlock()
-	type outcome struct {
-		res *authflow.LoginResult
-		err error
+	setSAS(envA, sasA)
+	d := startEnroll(t, ctx, w, vA, sasD)
+	ar, aerr := authflow.Approve(ctx, envA, vA, d.code)
+	if aerr != nil {
+		// D may wait for a delivery that never comes: give it a moment to
+		// end on its own (a rejection), then stop it.
+		go func() {
+			select {
+			case <-time.After(30 * time.Second):
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
 	}
-	done := make(chan outcome, 1)
-	go func() {
-		res, err := authflow.LoginApprove(ctx, envD, authflow.EnrollOptions{Email: email, DeviceName: "phone", VaultID: vA.VaultID})
-		done <- outcome{res, err}
-	}()
-	var code string
-	select {
-	case code = <-routing:
-	case o := <-done:
-		t.Fatalf("D ended before showing a routing code: %v", o.err)
-	}
-	ar, aerr := authflow.Approve(ctx, envA, vA, code)
-	var o outcome
-	select {
-	case o = <-done:
-	case <-ctx.Done():
-		t.Fatal("D did not finish")
-	}
-	if o.res != nil {
-		t.Cleanup(func() { o.res.Vault.Store.Close() })
-	}
-	return envD, o.res, o.err, ar, aerr
+	res, err := d.wait(t)
+	return d.env, res, err, ar, aerr
 }
 
 // A third device signs in by approval: both devices show the same SAS,

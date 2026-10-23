@@ -26,9 +26,11 @@ type ApproveResult struct {
 // commits the device_add and sends the delivery.
 //
 // A mismatch ends the attempt (ErrSASMismatch) with nothing committed or
-// delivered; so do an open that does not match the commit and the
-// deadline. Any other failure leaves the attempt as it is persisted, and
-// Approve with the same code resumes it; AbortApproval ends it.
+// delivered; so does the deadline, or the mailbox expiring. An open that
+// fails its schema or the commitment is discarded, and Approve keeps
+// waiting for the real one (§7, invalid input). Any other failure leaves
+// the attempt as it is persisted, and Approve with the same code resumes
+// it; AbortApproval ends it.
 func Approve(ctx context.Context, env *Env, v *Vault, routingCode string) (*ApproveResult, error) {
 	s, c := v.Store, v.Client
 	code := normalizeRoutingCode(routingCode)
@@ -158,10 +160,15 @@ func (a *approverSide) run(ctx context.Context, state crypto.ApprovalState, comm
 }
 
 // awaitOpen waits for D's open and checks it against the commit (§7 step
-// 4). An open that does not match ends the attempt: the relay holds no
-// other.
+// 4). An open that fails its schema or the commitment is discarded with no
+// change of state, and read again after a pause: the real one may still
+// arrive before the deadline. The deadline, the mailbox's expiry and an
+// unusable SAS end the attempt; any other failure leaves it CHALLENGED,
+// and Approve with the same code resumes it.
 func (a *approverSide) awaitOpen(ctx context.Context) (sas, name string, err error) {
-	for retries := 0; ; {
+	// The relay numbers chal 1 and open 2.
+	after := uint64(1)
+	for retries, discards := 0, 0; ; {
 		if !a.deadline.IsZero() && time.Now().After(a.deadline) {
 			return "", "", a.fail(crypto.ErrEnrollExpired)
 		}
@@ -169,7 +176,7 @@ func (a *approverSide) awaitOpen(ctx context.Context) (sas, name string, err err
 		if !a.deadline.IsZero() {
 			wait = min(wait, time.Until(a.deadline))
 		}
-		msgs, err := a.relay.Messages(ctx, 1, wait.Truncate(time.Second))
+		msgs, err := a.relay.Messages(ctx, after, wait.Truncate(time.Second))
 		switch {
 		case err == nil:
 			retries = 0
@@ -186,17 +193,39 @@ func (a *approverSide) awaitOpen(ctx context.Context) (sas, name string, err err
 		}
 		for _, m := range msgs {
 			if m.Type != syncclient.MsgOpen {
+				after = m.N
 				continue
 			}
-			var o crypto.EnrollOpen
-			if err := crypto.ParseEnrollMessage(m.Body, &o); err != nil {
-				return "", "", a.fail(fmt.Errorf("authflow: the new device's open is malformed: %w", err))
+			sas, name, err := a.open(m)
+			if errors.Is(err, errDiscarded) {
+				// Read the same position again, not at the relay's pace.
+				if err := sleep(ctx, a.env.discardPause(discards)); err != nil {
+					return "", "", err
+				}
+				discards++
+				break
 			}
-			sas, name, err := a.v.Store.ApproveOpen(&o)
-			if err != nil {
+			switch {
+			case err == nil:
+				return sas, name, nil
+			case errors.Is(err, crypto.ErrEnrollExpired), errors.Is(err, crypto.ErrSASAbort):
 				return "", "", a.fail(err)
 			}
-			return sas, name, nil
+			return "", "", err
 		}
 	}
+}
+
+// open checks one open message; one that fails its schema or the
+// commitment is errDiscarded.
+func (a *approverSide) open(m syncclient.Message) (sas, name string, err error) {
+	var o crypto.EnrollOpen
+	if err := crypto.ParseEnrollMessage(m.Body, &o); err != nil {
+		return "", "", fmt.Errorf("%w: the open is malformed: %w", errDiscarded, err)
+	}
+	sas, name, err = a.v.Store.ApproveOpen(&o)
+	if errors.Is(err, crypto.ErrCommitMismatch) {
+		return "", "", fmt.Errorf("%w: %w", errDiscarded, err)
+	}
+	return sas, name, err
 }

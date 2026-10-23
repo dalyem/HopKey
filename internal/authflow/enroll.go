@@ -45,11 +45,14 @@ const relayWait = syncclient.MaxWait
 // approving device's chal with open, shows the SAS for the user to
 // compare, and installs the vault once the confirmed delivery verifies.
 //
-// A rejected SAS is terminal: the enrollment is discarded, nothing is
-// installed, and the error matches crypto.ErrSASRejected. An attempt past
-// its deadline, or whose mailbox the server no longer has, matches
-// crypto.ErrEnrollExpired and is discarded too. Any other interruption
-// (a cancelled context, an unreachable server, a UI error) returns an
+// A chal or a delivery that fails its schema or its checks (a substituted
+// one, say) is discarded with no change of state, and LoginApprove keeps
+// waiting for the real one (§7, invalid input). A rejected SAS is
+// terminal: the enrollment is discarded, nothing is installed, and the
+// error matches crypto.ErrSASRejected. An attempt past its deadline, or
+// whose mailbox the server no longer has, matches crypto.ErrEnrollExpired
+// and is discarded too. Any other interruption (a cancelled context, a
+// server still unreachable after the retries, a UI error) returns an
 // *EnrollInterruptedError whose Mailbox resumes it in this process; the
 // mailbox token is not persisted (gap G2). A delivery the store accepted
 // is installed by the next call even without the mailbox.
@@ -72,7 +75,7 @@ func LoginApprove(ctx context.Context, env *Env, opts EnrollOptions) (*LoginResu
 		case st == crypto.DeviceDone:
 			// A delivery was accepted: only its install is left, which
 			// needs no relay.
-			s, err := install(ctx, env, e, reader, nil)
+			s, err := installAccepted(ctx, env, e, reader)
 			if err != nil {
 				return nil, err
 			}
@@ -155,12 +158,12 @@ func discard(cfg store.Config, e *store.Enrollment) error {
 	return errors.Join(e.Close(), store.DiscardEnrollment(cfg))
 }
 
-// install hands the delivery to the store, retrying the log reads that
-// failed in a retryable way; delivery nil installs the accepted one.
-func install(ctx context.Context, env *Env, e *store.Enrollment, r store.EnrollRemote, delivery *crypto.HPKEEnvelope) (*store.Store, error) {
+// installAccepted installs the delivery an earlier call accepted,
+// retrying the log reads that failed in a retryable way.
+func installAccepted(ctx context.Context, env *Env, e *store.Enrollment, r store.EnrollRemote) (*store.Store, error) {
 	var s *store.Store
 	err := env.retry(ctx, func() (err error) {
-		s, err = e.Install(ctx, r, delivery)
+		s, err = e.Install(ctx, r, nil)
 		return err
 	})
 	if err != nil {
@@ -194,6 +197,12 @@ func (d *deviceSide) gone(err error) error {
 
 func (d *deviceSide) run(ctx context.Context) (*store.Store, error) {
 	ui := d.env.UI
+	// TODO(store round): poll against the enrollment's persisted deadline.
+	// store.Enrollment does not expose it (crypto.DeviceEnrollment.Deadline
+	// is not reachable), so a resumed attempt waits from now. The store
+	// still refuses a chal or a delivery past the real deadline, and the
+	// server refuses the mailbox once it expires, so this only bounds the
+	// wait, never what is accepted.
 	deadline := time.Now().Add(crypto.EnrollDeadline)
 	if d.e.State() == crypto.DeviceCommitted {
 		if err := ui.ShowRoutingCode(ctx, d.mb.RoutingCode); err != nil {
@@ -208,7 +217,7 @@ func (d *deviceSide) run(ctx context.Context) (*store.Store, error) {
 		}
 	}
 	after := uint64(0)
-	for retries := 0; ; {
+	for retries, discards := 0, 0; ; {
 		if time.Now().After(deadline) {
 			return nil, d.gone(crypto.ErrEnrollExpired)
 		}
@@ -230,45 +239,75 @@ func (d *deviceSide) run(ctx context.Context) (*store.Store, error) {
 			return nil, d.interrupted(err)
 		}
 		for _, m := range msgs {
-			after = m.N
 			s, err := d.handle(ctx, m)
+			if errors.Is(err, errDiscarded) {
+				// Read the same position again, not at the relay's pace:
+				// the real message may still arrive before the deadline.
+				if err := sleep(ctx, d.env.discardPause(discards)); err != nil {
+					return nil, d.interrupted(err)
+				}
+				discards++
+				break
+			}
 			if err != nil || s != nil {
 				return s, err
 			}
+			after = m.N
 		}
 	}
 }
 
 // handle acts on one relay message: a chal in COMMITTED, a delivery in
-// CONFIRMED. Anything else, and any message that fails its checks, is
-// discarded with no change of state (§7, invalid input).
+// CONFIRMED; anything else is skipped. A chal or a delivery that fails its
+// schema or its checks is errDiscarded, with no change of state (§7,
+// invalid input). The deadline and a rejection end the attempt; an
+// operational failure interrupts it, and the same process resumes it with
+// the mailbox.
 func (d *deviceSide) handle(ctx context.Context, m syncclient.Message) (*store.Store, error) {
 	switch {
 	case m.Type == syncclient.MsgChal && d.e.State() == crypto.DeviceCommitted:
 		var ch crypto.EnrollChal
-		if crypto.ParseEnrollMessage(m.Body, &ch) != nil {
-			return nil, nil
+		if err := crypto.ParseEnrollMessage(m.Body, &ch); err != nil {
+			return nil, fmt.Errorf("%w: the chal is malformed: %w", errDiscarded, err)
 		}
 		if _, err := d.e.HandleChal(&ch); err != nil {
 			if errors.Is(err, crypto.ErrEnrollExpired) {
 				return nil, d.gone(err)
 			}
-			return nil, nil
+			return nil, fmt.Errorf("%w: %w", errDiscarded, err)
 		}
 		return nil, d.reveal(ctx)
 	case m.Type == syncclient.MsgDeliver && d.e.State() == crypto.DeviceConfirmed:
 		var env crypto.HPKEEnvelope
-		if canonjson.Unmarshal(m.Body, &env) != nil || env.Check() != nil {
-			return nil, nil
+		if err := canonjson.Unmarshal(m.Body, &env); err != nil {
+			return nil, fmt.Errorf("%w: the delivery is malformed: %w", errDiscarded, err)
 		}
-		s, err := install(ctx, d.env, d.e, d.reader, &env)
-		if err != nil {
-			// Install closed the enrollment, which keeps its state: a
-			// substituted delivery changed nothing, and an accepted one
-			// is installed by the next call.
-			return nil, fmt.Errorf("authflow: installing the approved device: %w", err)
+		if err := env.Check(); err != nil {
+			return nil, fmt.Errorf("%w: the delivery is malformed: %w", errDiscarded, err)
 		}
-		return s, nil
+		var s *store.Store
+		err := d.env.retry(ctx, func() (err error) {
+			s, err = d.e.Install(ctx, d.reader, &env)
+			return err
+		})
+		if err == nil {
+			return s, nil
+		}
+		switch st := d.e.State(); {
+		case st == crypto.DeviceDone:
+			// The delivery was accepted: the next call installs it, with or
+			// without the mailbox.
+			return nil, d.interrupted(fmt.Errorf("authflow: installing the approved device: %w", err))
+		case st == crypto.DeviceFailed || st == crypto.DeviceRejected || errors.Is(err, crypto.ErrEnrollExpired):
+			return nil, d.gone(err)
+		case ctx.Err() != nil || syncclient.Retryable(err):
+			// The log could not be read: the delivery stays in the
+			// mailbox, and the same process checks it again.
+			return nil, d.interrupted(fmt.Errorf("authflow: checking the delivery: %w", err))
+		}
+		// A delivery that fails a check of step 6 (a substituted one, or
+		// one naming another anchor) changed nothing.
+		return nil, fmt.Errorf("%w: %w", errDiscarded, err)
 	}
 	return nil, nil
 }

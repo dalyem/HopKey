@@ -65,8 +65,10 @@ type KitTypeBack struct {
 
 // UI is every point where a flow needs the user. A method that cannot get
 // an answer (no TTY and no flag, say) returns an error, which the flow
-// returns as it is, wrapped. Secrets are returned as fresh slices the flow
-// may clear.
+// returns as it is, or wrapped, to its caller, which may print or log it.
+// An implementation must therefore never put a secret (a password, a
+// Secret Key, a Recovery Key, a kit) into an error it returns. Secrets are
+// returned as fresh slices the flow may clear.
 type UI interface {
 	// Password asks for the current master password.
 	Password(ctx context.Context, r Reason) ([]byte, error)
@@ -91,11 +93,13 @@ type UI interface {
 	// which keeps them all (§10.1).
 	ShowDevices(ctx context.Context, devices []store.DeviceListing) error
 	// ChooseSurvivors returns the devices to keep besides this one, by ID
-	// (or a name exactly one device has). Nil keeps only this device.
+	// (or a name exactly one device has), from c.Devices: the flow resolves
+	// them against that list at once and refuses any other. Nil keeps
+	// only this device.
 	ChooseSurvivors(ctx context.Context, c SurvivorChoice) ([]string, error)
 	// ConfirmNewDevices asks which of the devices that appeared during a
-	// password change to keep (§10.1). Every one it does not return is
-	// revoked.
+	// password change to keep (§10.1), by ID from devices. Every one it
+	// does not return is revoked.
 	ConfirmNewDevices(ctx context.Context, devices []store.DeviceListing) ([]model.ID, error)
 
 	// ShowKit shows a new Emergency Kit.
@@ -251,6 +255,20 @@ func vaultIDOf(dataDir string) (model.ID, error) {
 		return w.Entry.VaultID, nil
 	}
 	return model.ID{}, fmt.Errorf("%w: no entry names the vault", store.ErrCorrupt)
+}
+
+// errDiscarded marks an enrollment message that failed its schema or its
+// checks: it is discarded with no change of state (§7, invalid input).
+var errDiscarded = errors.New("authflow: an invalid enrollment message was discarded")
+
+// maxDiscardPause bounds the pause before a mailbox is read again after an
+// invalid message.
+const maxDiscardPause = 15 * time.Second
+
+// discardPause is the pause before reading a mailbox again after the
+// n-th (from 0) invalid message in a row: like a retry's backoff, capped.
+func (env *Env) discardPause(n int) time.Duration {
+	return min(env.backoff(min(n, 8)), maxDiscardPause)
 }
 
 // retry runs f until it succeeds, fails in a way that is not retryable,

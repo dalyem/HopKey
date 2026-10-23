@@ -17,11 +17,23 @@ import (
 //
 // A logout whose outcome the server can't tell yet is retried while the
 // failure is retryable; after that the error matches
-// store.ErrLogoutPending, and Logout again finishes it.
+// store.ErrLogoutPending, and Logout again finishes it. A retired device
+// whose cleanup failed part way (a keychain that refused a deletion, say)
+// finishes it with Logout again, on the same store or after a restart.
 //
 // There is no token-machine logout: the store has no token mode yet
 // (phase 4).
 func Logout(ctx context.Context, env *Env, s *store.Store, opts store.LogoutOptions) (store.LogoutResult, error) {
+	state, err := s.Retirement()
+	if err != nil {
+		return store.LogoutResult{}, err
+	}
+	if state == store.StateRetired {
+		// Only the local cleanup is left, which resumes where it stopped.
+		// It needs no server, and it may already have deleted the entries
+		// the vault ID is read from.
+		return s.Logout(ctx, nil, opts)
+	}
 	var r store.Retirer
 	if env.Client != nil {
 		id, err := vaultIDOf(env.Config.DataDir)
@@ -38,7 +50,7 @@ func Logout(ctx context.Context, env *Env, s *store.Store, opts store.LogoutOpti
 		return store.LogoutResult{}, errors.New("authflow: a logout needs the server unless it is local-only")
 	}
 	var res store.LogoutResult
-	err := env.retry(ctx, func() (err error) {
+	err = env.retry(ctx, func() (err error) {
 		res, err = s.Logout(ctx, r, opts)
 		return err
 	})
