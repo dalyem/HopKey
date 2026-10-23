@@ -143,6 +143,7 @@ func signInWith(ctx context.Context, cfg Config, r SignInRemote, p SignInParams,
 		return nil, SignInResult{}, err
 	}
 	sf = p.serverFor(sf, o.d.st)
+	dcfg.SecretKeyGen = p.secretKeyGen(rec.DeviceID, o.d.st)
 	if err := s.installSignIn(o, dcfg, sf); err != nil {
 		return nil, SignInResult{}, err
 	}
@@ -191,6 +192,13 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 			}
 		}
 		return nil, deviceConfig{}, false, ErrVaultExists
+	}
+	// An enrollment by approval in progress here owns the data directory's
+	// next device (enroll.go).
+	if pending, err := s.l.enrollPending(); err != nil {
+		return nil, deviceConfig{}, false, err
+	} else if pending {
+		return nil, deviceConfig{}, false, fmt.Errorf("%w: %w", ErrVaultExists, ErrEnrollmentPending)
 	}
 	if present {
 		if dcfg.AccountID != acctID || !dcfg.DeviceID.IsZero() || dcfg.Next != nil {
@@ -357,6 +365,14 @@ func (s *Store) installSignIn(o *signInSecrets, dcfg deviceConfig, sf serverFile
 	} else if g.isRevoked(dcfg.AccountID, id) {
 		return s.stillRevoked(s.deviceStore(dcfg), id,
 			fmt.Errorf("%w: %w (device %v, recorded in %s)", ErrDeviceRevoked, ErrSignInRevoked, id, s.l.ledgerFile()))
+	}
+	// The record, durable, holds the Secret Key of dcfg.SecretKeyGen:
+	// device.json records it before the install commits, so the unlock
+	// that finishes an install a crash interrupted keeps it.
+	if g := dcfg.SecretKeyGen; !g.DeviceID.IsZero() {
+		if err := s.noteSecretKeyGen(g.DeviceID, g.Gen); err != nil {
+			return err
+		}
 	}
 	t := &txn{}
 	if err := s.putDestination(t, o.d, sf); err != nil {

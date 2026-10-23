@@ -616,6 +616,9 @@ func (s *Store) OutboxEmpty() (bool, error) {
 func (s *Store) HasCheckpointJournal() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if ok, err := s.l.checkpointExists(); err != nil || ok {
+		return ok, err
+	}
 	seqs, err := s.journalSeqs()
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -631,6 +634,82 @@ func (s *Store) LostIntents() (uint64, error) {
 	defer s.mu.Unlock()
 	m, err := s.readOutboxMeta()
 	return m.Lost, err
+}
+
+// LostJournals are the journals a password unlock dropped because no
+// readable device record could open them (§11): what was in progress is
+// unknown, so each may still need the user.
+type LostJournals struct {
+	// Checkpoint means a server-backed checkpoint's journal was dropped.
+	// Its candidate may have committed: then the account has credentials
+	// whose Emergency Kit no one can read, and only a new checkpoint (hop
+	// auth rotate) makes a kit again. If it did not, nothing changed.
+	Checkpoint bool `json:"checkpoint"`
+	// Approval means an approval's journal was dropped. Its device_add may
+	// have committed: then the new device is active but never received its
+	// delivery, and only a checkpoint that revokes it removes it.
+	Approval bool `json:"approval"`
+}
+
+type lostJournalsFile struct {
+	V          int  `json:"v"`
+	Checkpoint bool `json:"checkpoint"`
+	Approval   bool `json:"approval"`
+}
+
+const lostJournalsRel = "lost-journals.json"
+
+func (l layout) lostJournalsFile() string { return filepath.Join(l.vault(), lostJournalsRel) }
+
+func (s *Store) readLostJournals() (LostJournals, error) {
+	b, err := os.ReadFile(s.l.lostJournalsFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return LostJournals{}, nil
+	}
+	if err != nil {
+		return LostJournals{}, err
+	}
+	var f lostJournalsFile
+	if canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
+		return LostJournals{}, fmt.Errorf("%w: %s does not parse", ErrCorrupt, s.l.lostJournalsFile())
+	}
+	return LostJournals{Checkpoint: f.Checkpoint, Approval: f.Approval}, nil
+}
+
+func putLostJournals(t *txn, lost LostJournals) error {
+	b, err := canonjson.Marshal(lostJournalsFile{V: 1, Checkpoint: lost.Checkpoint, Approval: lost.Approval})
+	if err != nil {
+		return err
+	}
+	t.put(lostJournalsRel, b)
+	return nil
+}
+
+// LostJournals reports the journals a password unlock dropped (see
+// LostJournals), until AckLostJournals. It works while the vault is
+// locked.
+func (s *Store) LostJournals() (LostJournals, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readLostJournals()
+}
+
+// AckLostJournals records that the user has seen the loss LostJournals
+// reports.
+func (s *Store) AckLostJournals() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, err := s.lockFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if lost, err := s.readLostJournals(); err != nil || lost == (LostJournals{}) {
+		return err
+	}
+	t := &txn{}
+	t.remove(lostJournalsRel)
+	return s.commitTxn(t)
 }
 
 // AckLostIntents records that the user has seen the loss LostIntents

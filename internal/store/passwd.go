@@ -197,6 +197,11 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	}
 	acct, err := openWithPassword(a, password, sk)
 	if err != nil {
+		// The stored Secret Key of credentials a checkpoint replaced since
+		// is not a wrong password: the caller asks for the current one.
+		if secretKey == "" && errors.Is(err, ErrWrongPassword) && cfg.secretKeyStale(oldID, stored.Creds.Gen) {
+			return ErrSecretKeyStale
+		}
 		return err
 	}
 	if !acct.Pin().Equal(stored.Pin()) {
@@ -262,6 +267,8 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	// next attempt or unlock resolves it. It is installed (reconcileDevice)
 	// only once its record is saved.
 	next.Pending = &pendingDevice{DeviceID: rec.DeviceID}
+	// Its record holds the Secret Key that opened account.json.
+	next.SecretKeyGen = secretKeyGen{DeviceID: rec.DeviceID, Gen: stored.Creds.Gen}
 	self = next.self()
 	// From here device.json may be ahead of memory. If the replacement
 	// fails and the store stays unlocked with the old key, memory takes the
@@ -399,23 +406,54 @@ func (s *Store) outside(fl *fileHold, gen uint64, f func() error) error {
 // dropLostRecords deletes every queued outbox record, which no readable
 // device record can open, and adds their number to the count LostIntents
 // reports, in one commit (§11). The caller holds the file lock.
+//
+// The other files sealed under that local_key go in the same commit, and
+// the loss is recorded with them (LostJournals) until AckLostJournals: a
+// server-backed checkpoint's journal (checkpoint.go), whose candidate may
+// still have committed with a kit no one can read, and an approval's
+// journal (approve.go), whose device_add may have committed for a device
+// that was never delivered.
 func (s *Store) dropLostRecords() error {
 	ns, err := s.l.outboxNumbers()
-	if err != nil || len(ns) == 0 {
-		return err
-	}
-	m, err := s.readOutboxMeta()
 	if err != nil {
 		return err
 	}
 	t := &txn{}
-	for _, n := range ns {
-		t.remove(outboxRel(n))
-		m.Next = max(m.Next, n+1)
-	}
-	m.Lost += uint64(len(ns))
-	if err := putOutboxMeta(t, m); err != nil {
+	lost, err := s.readLostJournals()
+	if err != nil {
 		return err
+	}
+	dropped := false
+	for _, f := range []struct {
+		rel    string
+		exists func() (bool, error)
+		flag   *bool
+	}{{checkpointRel, s.l.checkpointExists, &lost.Checkpoint}, {approvalRel, s.l.approvalExists, &lost.Approval}} {
+		if ok, err := f.exists(); err != nil {
+			return err
+		} else if ok {
+			t.remove(f.rel)
+			*f.flag, dropped = true, true
+		}
+	}
+	if dropped {
+		if err := putLostJournals(t, lost); err != nil {
+			return err
+		}
+	}
+	if len(ns) > 0 {
+		m, err := s.readOutboxMeta()
+		if err != nil {
+			return err
+		}
+		for _, n := range ns {
+			t.remove(outboxRel(n))
+			m.Next = max(m.Next, n+1)
+		}
+		m.Lost += uint64(len(ns))
+		if err := putOutboxMeta(t, m); err != nil {
+			return err
+		}
 	}
 	return s.commitTxn(t)
 }
@@ -673,10 +711,19 @@ func (s *Store) AckKit() error {
 	if !s.kitSKDurable {
 		return errors.New("store: the new Secret Key is not saved durably on this device, so the Emergency Kit stays pending; run hop passwd to try again")
 	}
-	if err := s.removeJournal(s.kitSeq); err != nil {
+	if err := s.hook("kit:ack"); err != nil {
 		return err
 	}
-	s.kit = nil
+	if s.kitServer {
+		t := &txn{}
+		t.remove(checkpointRel)
+		if err := s.commitTxn(t); err != nil {
+			return err
+		}
+	} else if err := s.removeJournal(s.kitSeq); err != nil {
+		return err
+	}
+	s.kit, s.kitServer, s.kitKind = nil, false, ""
 	return nil
 }
 
@@ -720,8 +767,7 @@ func (s *Store) persistKitSK() error {
 					return fail(err)
 				}
 			}
-			s.rec.zero()
-			s.rec, s.skErr, s.kitSKDurable = next, nil, true
+			s.kitSKStored(next)
 			return nil
 		}
 	}
@@ -729,9 +775,20 @@ func (s *Store) persistKitSK() error {
 	if err := ds.storeDurably(next); err != nil {
 		return fail(err)
 	}
+	s.kitSKStored(next)
+	return nil
+}
+
+// kitSKStored makes next, durable with the pending kit's Secret Key, the
+// record in memory, and records the kit's creds generation for it in
+// device.json (deviceConfig.SecretKeyGen). That record is best effort: an
+// older generation left there only makes the next password check try the
+// stored Secret Key before it asks for the current one, and the check that
+// passes records it. The caller holds the file lock.
+func (s *Store) kitSKStored(next *deviceRecord) {
 	s.rec.zero()
 	s.rec, s.skErr, s.kitSKDurable = next, nil, true
-	return nil
+	s.noteSecretKeyGen(next.DeviceID, s.state.Creds.Gen)
 }
 
 // hook is a test seam that simulates a crash at a named point.
@@ -936,6 +993,7 @@ func (s *Store) resealJournals(st *vaultlog.State, from, to *vaultlog.LocalDevic
 //     checkpoint, is deleted without being shown.
 func (s *Store) recoverJournal() error {
 	s.kit, s.kitOrphaned, s.skErr, s.kitSKDurable = nil, false, nil, false
+	s.kitServer, s.kitKind = false, ""
 	seqs, err := s.journalSeqs()
 	if err != nil {
 		return err
@@ -1010,6 +1068,8 @@ func (s *Store) recoverJournal() error {
 	if s.kit != nil {
 		// A failure is kept in skErr: the kit stays pending, AckKit retries.
 		s.persistKitSK()
+		return nil
 	}
-	return nil
+	// A server-backed checkpoint's journal (checkpoint.go).
+	return s.recoverServerJournal()
 }

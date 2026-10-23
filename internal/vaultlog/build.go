@@ -346,6 +346,22 @@ type Changes struct {
 	Deploy []DeployOp
 	// Devices to add by approval (§7).
 	Devices []DeviceInfo
+	// Enrolled are devices to add by approval whose device_add the
+	// approving device prepared itself (crypto.Approval.Prepare): they are
+	// written as they are, so the delivery names the same certificate.
+	Enrolled []EnrolledDevice
+}
+
+// EnrolledDevice is a prepared device_add (§7): the certificate with
+// enroll_transcript = SHA-256(T), its signature, the device's public keys
+// and the unlock blob sealed to its KEM key. The transition checks it like
+// any other device_add.
+type EnrolledDevice struct {
+	Cert    crypto.Cert
+	CertSig []byte
+	KEMPK   []byte
+	SigPK   []byte
+	Unlock  crypto.HPKEEnvelope
 }
 
 // BuildNormal builds a normal entry authored by dev, adds every bundle_put
@@ -374,6 +390,16 @@ func buildNormalWire(pre *State, sec *Secrets, dev DeviceKey, ch Changes, t mode
 		if err := b.deviceAdd(sec.Account, d, t); err != nil {
 			return nil, err
 		}
+	}
+	for _, d := range ch.Enrolled {
+		h, err := b.object(d.Unlock)
+		if err != nil {
+			return nil, err
+		}
+		b.op(&DeviceAddOp{
+			Op: OpDeviceAdd, Cert: d.Cert, CertSig: slices.Clone(d.CertSig),
+			KEMPK: slices.Clone(d.KEMPK), SigPK: slices.Clone(d.SigPK), UnlockSHA256: h,
+		})
 	}
 
 	puts := map[model.ID]crypto.Item{}

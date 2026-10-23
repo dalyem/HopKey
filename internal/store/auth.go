@@ -18,6 +18,9 @@ import (
 //	device-auth = {"v":1, "origin":str≤256, "account_id":id, "device_id":id, "operation":str≤32, "challenge":b64}
 //	signup-pop  = {"v":1, "origin":str≤256, "email":str≤254, "account_id":id, "vault_id":id,
 //	               "upload_seq":u64s, "upload_h":h, "challenge":b64}
+//
+// TODO(slice E2 follow-up): these duplicate the server's types; switch to
+// the shared ones once they exist on the phase branch.
 const (
 	labelDeviceAuth = "hopkey/v1/device-auth"
 	labelSignupPoP  = "hopkey/v1/signup-pop"

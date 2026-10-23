@@ -56,6 +56,11 @@ func PrepareInit(cfg Config, opts InitOptions) (*PendingInit, error) {
 	} else if pending {
 		return nil, fmt.Errorf("%w: a sign-in is in progress here; finish it with hop auth login", ErrVaultExists)
 	}
+	if pending, err := s.l.enrollPending(); err != nil {
+		return nil, err
+	} else if pending {
+		return nil, fmt.Errorf("%w: %w", ErrVaultExists, ErrEnrollmentPending)
+	}
 	store := opts.DeviceStore
 	if store == "" {
 		store = DeviceStoreKeychain
@@ -123,6 +128,7 @@ func PrepareInit(cfg Config, opts InitOptions) (*PendingInit, error) {
 	if err != nil {
 		return nil, err
 	}
+	devCfg.SecretKeyGen = secretKeyGen{DeviceID: rec.DeviceID, Gen: st.Creds.Gen}
 	return &PendingInit{
 		s: s, devCfg: devCfg, rec: rec, dev: dev, wire: w, state: st, sec: sec,
 		kit: Kit{AccountID: accountID.String(), SecretKey: sk.String(), RecoveryKey: rk.String(), Created: now.Time()},

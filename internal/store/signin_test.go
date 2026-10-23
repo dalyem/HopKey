@@ -113,6 +113,11 @@ func untrackedRecords(t *testing.T, cfg Config) []string {
 			dnext[c.Next.DeviceID] = true
 		}
 	}
+	// An enrollment by approval in progress tracks its own record (slice
+	// E2, enroll.go).
+	if ec, err := (&Store{cfg: cfg, l: layout{data: cfg.DataDir}}).readEnrollConfig(); err == nil {
+		tracked[enrollSlot(ec.Ref)] = true
+	}
 	var out []string
 	if ring, ok := cfg.Keyring.(*memRing); ok {
 		ring.mu.Lock()

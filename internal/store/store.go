@@ -102,6 +102,12 @@ var (
 	// ErrNeedSecretKey means a password unlock needs the Secret Key, which
 	// this device does not have stored.
 	ErrNeedSecretKey = errors.New("store: the Secret Key is not stored on this device; enter it from your Emergency Kit")
+	// ErrSecretKeyStale means the Secret Key stored on this device belongs
+	// to credentials that a checkpoint has replaced since (another
+	// device's, normally), and it did not open the account: a password
+	// check needs the Secret Key of the newest Emergency Kit. It matches
+	// ErrNeedSecretKey.
+	ErrSecretKeyStale error = staleSecretKeyError{}
 	// ErrKitPending means a password change committed but its Emergency Kit
 	// has not been confirmed yet.
 	ErrKitPending = errors.New("store: a new Emergency Kit is waiting to be confirmed; run hop passwd to see it")
@@ -178,6 +184,15 @@ type Info struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
+// staleSecretKeyError is ErrSecretKeyStale.
+type staleSecretKeyError struct{}
+
+func (staleSecretKeyError) Error() string {
+	return "store: the Secret Key stored on this device is out of date (the account's credentials changed since); enter the one from your newest Emergency Kit"
+}
+
+func (staleSecretKeyError) Is(target error) bool { return target == ErrNeedSecretKey }
+
 // Store is the encrypted vault. It implements model.Store; Head, Lock,
 // Unlock, UnlockWithPassword and ChangePassword are extra.
 type Store struct {
@@ -193,6 +208,10 @@ type Store struct {
 	lockErr error
 	kit     *Kit   // a committed password change whose kit is not confirmed
 	kitSeq  uint64 // the seq of kit's journal
+	// kitServer means kit is a server-backed checkpoint's, journaled in
+	// vault/checkpoint.json (checkpoint.go), of kind kitKind.
+	kitServer bool
+	kitKind   string
 	// kitOrphaned means the current checkpoint's journal is sealed only to
 	// a device key this device no longer has: its kit cannot be shown.
 	kitOrphaned bool
@@ -411,6 +430,7 @@ func (s *Store) dropLocked(reason error) {
 	zeroDevice(s.dev)
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
+	s.kitServer, s.kitKind = false, ""
 	s.lockErr = reason
 	// §11.2: locking stops pulls and pushes. In-flight requests are
 	// cancelled, and their responses are discarded by generation.
@@ -582,6 +602,14 @@ func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
 	st, sec, repaired, err := s.replay(stored, raw, acct, dev, nil)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Only a device enrolled by approval keeps no Secret Key (§11 addendum):
+	// its certificate carries the enrollment transcript.
+	if rec.SecretKey == "" {
+		if d, active := st.Devices[dev.ID]; !active || d.Cert.EnrollTranscript.IsZero() {
+			zeroSecrets(sec)
+			return nil, nil, fmt.Errorf("%w: the device record has no Secret Key, but this device was not enrolled by approval", ErrDeviceKey)
+		}
 	}
 	ok = true
 	return &loaded{rec: rec, dev: dev, st: st, sec: sec, repaired: repaired, server: server}, unlock, nil
@@ -1083,6 +1111,33 @@ func (s *Store) Info() Info {
 	if m, err := s.readOutboxMeta(); err == nil && m.Lost > 0 {
 		info.Warnings = append(info.Warnings, fmt.Sprintf("%d queued change(s), pending or held, were lost when hop unlock --password "+
 			"replaced an unreadable device key; make them again", m.Lost))
+	}
+	if lost, err := s.readLostJournals(); err == nil && lost.Checkpoint {
+		info.Warnings = append(info.Warnings, "a checkpoint (hop passwd, hop auth rotate or revoke) was in progress when hop unlock --password "+
+			"replaced an unreadable device key, and its journal was lost. If it committed, the account's new Emergency Kit can't be "+
+			"recovered: run hop auth rotate to make a new one. If it did not, run it again")
+	}
+	if lost, err := s.readLostJournals(); err == nil && lost.Approval {
+		info.Warnings = append(info.Warnings, "an approval of a new device was in progress when hop unlock --password replaced an "+
+			"unreadable device key, and its journal was lost. If its device was added, it never received its delivery: "+
+			"check hop auth devices and revoke a device you don't recognize")
+	}
+	if s.state != nil && s.server {
+		if devs, unsettled, err := s.undelivered(); err == nil {
+			if len(devs) > 0 {
+				ids := make([]string, len(devs))
+				for i, id := range devs {
+					ids[i] = id.String()
+				}
+				info.Warnings = append(info.Warnings, fmt.Sprintf("%d device(s) were added by an approval on this device but never received "+
+					"their delivery (%s); unless that approval is still running, revoke them with hop auth devices revoke",
+					len(devs), strings.Join(ids, ", ")))
+			}
+			if unsettled > 0 {
+				info.Warnings = append(info.Warnings, "an approval on this device ended, and its device may still be added; "+
+					"sync, then check hop auth devices")
+			}
+		}
 	}
 	if s.syncHalt != nil {
 		info.Warnings = append(info.Warnings, s.syncHalt.Error())
