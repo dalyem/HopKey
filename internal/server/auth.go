@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/email"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
@@ -48,7 +49,7 @@ func (s *Server) prelogin(w http.ResponseWriter, r *http.Request, c *call) error
 	if err := s.decode(c.body, &req); err != nil {
 		return err
 	}
-	email, err := NormalizeEmail(req.Email)
+	email, err := email.Normalize(req.Email)
 	if err != nil {
 		return errBadRequest("invalid email")
 	}

@@ -1,16 +1,19 @@
-package server
+// Package email holds the phase 2 email address rules (plan R4), shared by
+// the server and its clients so both sides normalize an address the same
+// way.
+package email
 
 import (
 	"errors"
 	"strings"
 )
 
-// ErrBadEmail is returned for an address outside the phase 2 email rules.
-var ErrBadEmail = errors.New("server: invalid email address")
+// ErrInvalid is returned for an address outside the phase 2 email rules.
+var ErrInvalid = errors.New("email: invalid email address")
 
-// NormalizeEmail applies the phase 2 email rules (R4). It removes leading
-// and trailing ASCII SP and HTAB only, keeps the local part byte for byte,
-// and lowercases ASCII A-Z in the domain only. It accepts only an ASCII
+// Normalize applies the phase 2 email rules (R4). It removes leading and
+// trailing ASCII SP and HTAB only, keeps the local part byte for byte, and
+// lowercases ASCII A-Z in the domain only. It accepts only an ASCII
 // dot-atom local part of 1 to 64 bytes and an ASCII DNS domain name
 // (A-labels included), at most 254 bytes in all. Quoted local parts,
 // domain literals, any remaining whitespace, control characters and
@@ -19,23 +22,23 @@ var ErrBadEmail = errors.New("server: invalid email address")
 //
 // The same function serves invite issuance, capability binding, signup
 // proofs, uniqueness, prelogin and email-keyed rate limits.
-func NormalizeEmail(s string) (string, error) {
+func Normalize(s string) (string, error) {
 	s = strings.Trim(s, " \t")
 	if len(s) > 254 {
-		return "", ErrBadEmail
+		return "", ErrInvalid
 	}
 	for i := 0; i < len(s); i++ {
 		if c := s[i]; c <= ' ' || c >= 0x7f {
-			return "", ErrBadEmail
+			return "", ErrInvalid
 		}
 	}
 	local, domain, ok := strings.Cut(s, "@")
 	if !ok || !dotAtom(local) || len(local) > 64 {
-		return "", ErrBadEmail
+		return "", ErrInvalid
 	}
 	domain = asciiLower(domain)
 	if !dnsName(domain) {
-		return "", ErrBadEmail
+		return "", ErrInvalid
 	}
 	return local + "@" + domain, nil
 }

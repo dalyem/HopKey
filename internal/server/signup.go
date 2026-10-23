@@ -9,6 +9,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/email"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
@@ -19,8 +20,8 @@ const purposeSignup = "signup"
 // CreateInvite issues a single-use registration capability bound to the
 // normalized email (the admin invite of R3) and returns its code. Issuing
 // one reveals nothing about existing accounts and reserves nothing.
-func CreateInvite(ctx context.Context, st Store, email string, ttl time.Duration, now time.Time) (string, error) {
-	norm, err := NormalizeEmail(email)
+func CreateInvite(ctx context.Context, st Store, addr string, ttl time.Duration, now time.Time) (string, error) {
+	norm, err := email.Normalize(addr)
 	if err != nil {
 		return "", err
 	}
@@ -76,7 +77,7 @@ func (s *Server) signupChallenge(w http.ResponseWriter, r *http.Request, c *call
 	if err := s.decode(c.body, &req); err != nil {
 		return err
 	}
-	email, err := NormalizeEmail(req.Email)
+	email, err := email.Normalize(req.Email)
 	if err != nil {
 		return errBadRequest("invalid email")
 	}
@@ -182,7 +183,7 @@ func (s *Server) signup(w http.ResponseWriter, r *http.Request, c *call) error {
 	if err := s.decode(body, &req); err != nil {
 		return err
 	}
-	email, err := NormalizeEmail(req.Email)
+	email, err := email.Normalize(req.Email)
 	if err != nil {
 		return errBadRequest("invalid email")
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/email"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
@@ -243,7 +244,7 @@ func findAccount(tx Tx, who string) (*Account, error) {
 	if id, ok := parseID(who); ok {
 		a, err = tx.Account(id)
 	} else {
-		email, nerr := NormalizeEmail(who)
+		email, nerr := email.Normalize(who)
 		if nerr != nil {
 			return nil, errors.New("server: not an account ID or email")
 		}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
+	"github.com/dalyem/hopkey/internal/email"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
 )
@@ -49,7 +50,7 @@ func TestSignupRequiresCapability(t *testing.T) {
 	e := newEnv(t)
 	v := newVault(t, "a@example.com")
 	code := e.invite("A@Example.COM ") // the domain is normalized; the local part is not
-	if _, err := NormalizeEmail("A@Example.COM "); err != nil {
+	if _, err := email.Normalize("A@Example.COM "); err != nil {
 		t.Fatal(err)
 	}
 	wantCode(t, e.do("POST", "/v1/signup/challenge", "", signupChallengeRequest{v.email, code}), 401, "unauthorized",
