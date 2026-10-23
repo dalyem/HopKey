@@ -174,6 +174,20 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 	e.printf("agent socket: %s\n", oneLine(st.AgentSocket))
 	e.printf("ssh config:   %s\n", oneLine(st.ConfigDir))
 	printVaultStatus(e, st.Vault)
+	if st.Sync != nil {
+		o := syncBlockOpts{shown: map[string]bool{}}
+		if st.Vault != nil {
+			o.device = st.Vault.DeviceID
+			o.skipHead = st.Vault.Head != nil
+			for _, w := range st.Vault.Warnings {
+				o.shown[w] = true
+			}
+		}
+		for _, w := range st.Warnings {
+			o.shown[w] = true
+		}
+		printSyncBlock(e, e.Stdout, st.Sync, o)
+	}
 	if st.Tailscale.Available {
 		e.printf("tailscale:    available\n")
 	} else {

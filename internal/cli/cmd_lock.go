@@ -40,7 +40,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	}
 	defer c.Close()
 	if !*usePassword {
-		if err := c.Call(ctx, daemon.OpUnlock, nil, nil); err != nil {
+		if err := unlockWritten(e, c.Call(ctx, daemon.OpUnlock, nil, nil)); err != nil {
 			return failf("%v", err)
 		}
 		e.printf("vault unlocked\n")
@@ -69,12 +69,24 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	if daemon.IsCode(err, daemon.CodeWrongPassword) {
 		return failf("wrong master password or Secret Key; the vault was not unlocked")
 	}
-	if err != nil {
+	if err := unlockWritten(e, err); err != nil {
 		return failf("%v", err)
 	}
 	e.printf("vault unlocked with the master password; this device has a new device key\n")
 	vaultWarnings(ctx, e, c)
 	return kitReminder(ctx, e, c)
+}
+
+// unlockWritten turns the daemon's config_not_written answer to an unlock
+// into a warning: the vault is unlocked and the agent has its keys, only
+// the ssh config is behind, and the daemon keeps retrying it. Any other
+// error is returned as it is.
+func unlockWritten(e *Env, err error) error {
+	if daemon.IsCode(err, daemon.CodeConfigNotWritten) {
+		warn(e, false, err.Error())
+		return nil
+	}
+	return err
 }
 
 // vaultWarnings prints the vault's warnings (a lost Emergency Kit, stale

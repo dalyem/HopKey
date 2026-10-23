@@ -105,6 +105,8 @@ func runSetup(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "setup", commands["setup"].usage)
 	yes := fs.Bool("yes", false, "do not ask")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
+	service := fs.Bool("service", false, "install a user service (systemd --user or launchd) that runs the hop daemon from login")
+	uninstall := fs.Bool("uninstall", false, "with --service: stop and remove the service")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -112,6 +114,12 @@ func runSetup(ctx context.Context, e *Env, args []string) error {
 	if len(pos) != 0 {
 		fs.Usage()
 		return failf("setup takes no arguments")
+	}
+	if *uninstall && !*service {
+		return failf("--uninstall goes with --service")
+	}
+	if *service {
+		return runService(ctx, e, *yes, *uninstall, *asJSON)
 	}
 
 	sshDir := filepath.Join(e.Home, ".ssh")

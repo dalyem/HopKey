@@ -44,22 +44,25 @@ type tsView struct {
 
 // HostView is the --json shape of hop ls (a list of them) and hop info.
 type HostView struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name"`
-	Aliases     []string       `json:"aliases"`
-	Addresses   []string       `json:"addresses"`
-	Port        uint32         `json:"port"`
-	User        string         `json:"user"`
-	Key         *keyRef        `json:"key"`
-	JumpHost    string         `json:"jump_host,omitempty"`
-	Tags        []string       `json:"tags"`
-	Description string         `json:"description"`
-	Route       string         `json:"route"`
-	AgentAccess string         `json:"agent_access"`
-	Tailscale   *tsView        `json:"tailscale"`
-	HostKeys    []pinView      `json:"host_keys"`
-	SSHAlias    string         `json:"ssh_alias,omitempty"`
-	SSHProblem  string         `json:"ssh_problem,omitempty"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Aliases     []string  `json:"aliases"`
+	Addresses   []string  `json:"addresses"`
+	Port        uint32    `json:"port"`
+	User        string    `json:"user"`
+	Key         *keyRef   `json:"key"`
+	JumpHost    string    `json:"jump_host,omitempty"`
+	Tags        []string  `json:"tags"`
+	Description string    `json:"description"`
+	Route       string    `json:"route"`
+	AgentAccess string    `json:"agent_access"`
+	Tailscale   *tsView   `json:"tailscale"`
+	HostKeys    []pinView `json:"host_keys"`
+	SSHAlias    string    `json:"ssh_alias,omitempty"`
+	SSHProblem  string    `json:"ssh_problem,omitempty"`
+	// Mark is "pending" while a change to the host has not reached the
+	// server, and "held" while that change waits for hop sync resolve.
+	Mark        model.Mark     `json:"mark,omitempty"`
 	ChosenRoute *resolve.Route `json:"chosen_route,omitempty"` // hop info only
 }
 
@@ -100,6 +103,7 @@ func hostView(h model.Host, l *daemon.ListResult) HostView {
 	}
 	info := l.SSH[v.ID]
 	v.SSHAlias, v.SSHProblem = info.Alias, info.Problem
+	v.Mark = l.Marks[v.ID]
 	return v
 }
 
@@ -141,14 +145,24 @@ func runLs(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		return printJSON(e, views)
 	}
+	if interactiveResolution(e, false) {
+		syncNotice(ctx, e)
+	}
 	if len(views) == 0 {
 		fmt.Fprintln(e.Stderr, "no hosts")
 		return nil
 	}
+	// The SYNC column appears only while some host has a change that has
+	// not reached the server.
+	marked := slices.ContainsFunc(views, func(v HostView) bool { return v.Mark != "" })
 	// Every field is vault text: oneLine takes out the tabs and newlines that
 	// would break the table, and the escapes that would redraw it.
 	tw := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tADDRESS\tUSER\tKEY\tTAGS\tTAILSCALE\tPINS\tSSH")
+	header := "NAME\tADDRESS\tUSER\tKEY\tTAGS\tTAILSCALE\tPINS\tSSH"
+	if marked {
+		header += "\tSYNC"
+	}
+	fmt.Fprintln(tw, header)
 	for _, v := range views {
 		addr := ""
 		if len(v.Addresses) > 0 {
@@ -176,7 +190,11 @@ func runLs(ctx context.Context, e *Env, args []string) error {
 		if v.SSHProblem != "" {
 			sshState = "blocked"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", oneLine(v.Name), addr, dash(oneLine(v.User)), key, dash(joinOne(v.Tags, ",")), ts, len(v.HostKeys), sshState)
+		row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s", oneLine(v.Name), addr, dash(oneLine(v.User)), key, dash(joinOne(v.Tags, ",")), ts, len(v.HostKeys), sshState)
+		if marked {
+			row += "\t" + dash(oneLine(string(v.Mark)))
+		}
+		fmt.Fprintln(tw, row)
 	}
 	return tw.Flush()
 }
@@ -212,8 +230,14 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 	}
 	v := hostView(*rr.Host, l)
 	v.ChosenRoute = rr.Route
+	if v.Mark == "" {
+		v.Mark = rr.Mark
+	}
 	if *asJSON {
 		return printJSON(e, v)
+	}
+	if interactiveResolution(e, false) {
+		syncNotice(ctx, e)
 	}
 	// Every value below is vault text (or comes from the daemon's view of
 	// it), so each goes through oneLine as it is inserted.
@@ -259,6 +283,9 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 		e.printf("ssh:          ssh %s\n", oneLine(v.SSHAlias))
 	} else {
 		e.printf("ssh:          not available: %s\n", oneLine(orUnknown(v.SSHProblem)))
+	}
+	if v.Mark != "" {
+		e.printf("sync:         %s\n", markText(v.Mark))
 	}
 	return nil
 }
@@ -416,11 +443,33 @@ func runAdd(ctx context.Context, e *Env, args []string) error {
 	if err := hf.apply(ctx, e, &h, l); err != nil {
 		return err
 	}
-	var saved model.Host
-	if err := call(ctx, e, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved); err != nil {
+	saved, err := putHost(ctx, e, *asJSON, h)
+	if err != nil {
 		return err
 	}
 	return reportHost(ctx, e, *asJSON, saved, "added")
+}
+
+// putHost saves h. When the daemon saved it but could not write the ssh
+// config (config_not_written, a warning) its answer carries no host, so
+// putHost reads the host back: by ID when h has one, else by name, which
+// is unique.
+func putHost(ctx context.Context, e *Env, asJSON bool, h model.Host) (model.Host, error) {
+	var saved model.Host
+	written, err := callChange(ctx, e, asJSON, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved)
+	if err != nil || written {
+		return saved, err
+	}
+	l, err := listAll(ctx, e)
+	if err != nil {
+		return h, nil
+	}
+	for _, o := range l.Hosts {
+		if (!h.ItemID.IsZero() && o.ItemID == h.ItemID) || (h.ItemID.IsZero() && strings.EqualFold(o.Name, h.Name)) {
+			return o, nil
+		}
+	}
+	return h, nil
 }
 
 func reportHost(ctx context.Context, e *Env, asJSON bool, h model.Host, verb string) error {
@@ -468,8 +517,8 @@ func runEdit(ctx context.Context, e *Env, args []string) error {
 	if err := hf.apply(ctx, e, &h, l); err != nil {
 		return err
 	}
-	var saved model.Host
-	if err := call(ctx, e, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved); err != nil {
+	saved, err := putHost(ctx, e, *asJSON, h)
+	if err != nil {
 		return err
 	}
 	return reportHost(ctx, e, *asJSON, saved, "updated")
@@ -502,7 +551,7 @@ func runRm(ctx context.Context, e *Env, args []string) error {
 	if !ok {
 		return failf("not removed")
 	}
-	if err := call(ctx, e, daemon.OpDelete, daemon.DeleteParams{ID: h.ItemID.String()}, nil); err != nil {
+	if _, err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: h.ItemID.String()}, nil); err != nil {
 		return err
 	}
 	if *asJSON {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -154,13 +155,56 @@ func call(ctx context.Context, e *Env, op string, params, result any) error {
 	return cleanErr(c.Call(ctx, op, params, result))
 }
 
+// configStale adds a hint to the daemon's config_stale refusal: the daemon
+// will not resolve a target, so nothing connects, while the ssh config it
+// writes is out of date. Other errors pass through.
+func configStale(e *Env, err error) error {
+	if !daemon.IsCode(err, daemon.CodeConfigStale) {
+		return err
+	}
+	return failf("%v. Check that you own %s and can write to it and the files in it (ls -la %s)", err, e.Paths.ConfigDir, e.Paths.ConfigDir)
+}
+
+// callChange is call for an op that changes the vault (put_host, put_key,
+// delete). The daemon answers config_not_written when the change took
+// effect but the ssh config could not be written: a partial success, so
+// callChange prints the daemon's message as a warning and returns nil.
+// written is false then, and result was not filled in.
+func callChange(ctx context.Context, e *Env, asJSON bool, op string, params, result any) (written bool, err error) {
+	err = call(ctx, e, op, params, result)
+	if daemon.IsCode(err, daemon.CodeConfigNotWritten) {
+		warn(e, asJSON, err.Error())
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// warn prints a warning to stderr once per run: "hop: warning: ..." on one
+// line, or a {"warning": ...} line when the caller asked for JSON, so
+// stdout keeps its shape.
+func warn(e *Env, asJSON bool, msg string) {
+	if e.warned[msg] {
+		return
+	}
+	if e.warned == nil {
+		e.warned = map[string]bool{}
+	}
+	e.warned[msg] = true
+	if asJSON {
+		b, _ := json.Marshal(map[string]string{"warning": msg})
+		fmt.Fprintln(e.Stderr, string(escapeJSONControls(b)))
+		return
+	}
+	fmt.Fprintf(e.Stderr, "hop: warning: %s\n", oneLine(msg))
+}
+
 // resolveTarget asks the daemon to resolve target. With interactive, an
 // ambiguous result goes to a picker when stdin is a terminal.
 func resolveTarget(ctx context.Context, e *Env, target string, interactive bool) (*daemon.ResolveResult, error) {
 	var rr daemon.ResolveResult
 	params := daemon.ResolveParams{Target: target, Interactive: interactive}
 	if err := call(ctx, e, daemon.OpResolve, params, &rr); err != nil {
-		return nil, err
+		return nil, configStale(e, err)
 	}
 	if interactive && e.StdinTTY && rr.Result.Status == resolve.StatusAmbiguous {
 		picked, err := pick(e, rr.Result)
@@ -174,7 +218,7 @@ func resolveTarget(ctx context.Context, e *Env, target string, interactive bool)
 		}
 		rr = daemon.ResolveResult{}
 		if err := call(ctx, e, daemon.OpResolve, params, &rr); err != nil {
-			return nil, err
+			return nil, configStale(e, err)
 		}
 	}
 	return &rr, nil

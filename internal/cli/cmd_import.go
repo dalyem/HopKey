@@ -116,7 +116,7 @@ func runImport(ctx context.Context, e *Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	imp := &importer{ctx: ctx, e: e, scan: scan, prober: prober, home: home, config: path, l: l, withKeys: *withKeys, dryRun: *dryRun,
+	imp := &importer{ctx: ctx, e: e, scan: scan, prober: prober, home: home, config: path, l: l, withKeys: *withKeys, dryRun: *dryRun, asJSON: *asJSON,
 		report: ImportReport{Source: path, DryRun: *dryRun}}
 	if err := imp.run(); err != nil {
 		return failf("%v", err)
@@ -216,6 +216,7 @@ type importer struct {
 	l        *daemon.ListResult
 	withKeys bool
 	dryRun   bool
+	asJSON   bool
 	report   ImportReport
 	warnings []string
 }
@@ -452,8 +453,8 @@ func (im *importer) save(cands []*candidate) {
 			c.saved = &h
 			return
 		}
-		var saved model.Host
-		if err := call(im.ctx, im.e, daemon.OpPutHost, daemon.PutHostParams{Host: c.host}, &saved); err != nil {
+		saved, err := putHost(im.ctx, im.e, im.asJSON, c.host)
+		if err != nil {
 			im.report.Entries[c.entry].Status, im.report.Entries[c.entry].Reason = "failed", oneLine(err.Error())
 			c.skipped = true
 			return
@@ -521,8 +522,8 @@ func (im *importer) importKey(path string) (model.ID, string, error) {
 		im.l.Keys = append(im.l.Keys, daemon.KeyInfo{Name: name, Fingerprint: fp})
 		return model.ID{}, "", nil
 	}
-	var info daemon.KeyInfo
-	if err := call(im.ctx, im.e, daemon.OpPutKey, daemon.PutKeyParams{Name: name, PrivateKey: pem}, &info); err != nil {
+	info, err := putKey(im.ctx, im.e, im.asJSON, name, pem)
+	if err != nil {
 		im.add("key", name, "failed", oneLine(err.Error()))
 		return model.ID{}, "", err
 	}
