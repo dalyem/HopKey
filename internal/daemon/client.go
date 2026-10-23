@@ -37,8 +37,22 @@ func Dial(ctx context.Context, path string) (*Client, error) {
 func (c *Client) Close() error { return c.conn.Close() }
 
 // Call sends one request and decodes the result into result, if non-nil. A
-// refusal by the daemon is returned as *Error.
+// refusal by the daemon is returned as *Error. So is a warning on a
+// success, with result decoded all the same: a caller that only checks
+// the error never takes a partial success for a whole one. A caller that
+// handles warnings uses CallWarn.
 func (c *Client) Call(ctx context.Context, op string, params, result any) error {
+	w, err := c.CallWarn(ctx, op, params, result)
+	if err == nil && w != nil {
+		return w
+	}
+	return err
+}
+
+// CallWarn is Call that also returns the warning a successful response
+// carries (CodeConfigNotWritten: the change took effect, the ssh config is
+// behind). The result is decoded either way.
+func (c *Client) CallWarn(ctx context.Context, op string, params, result any) (warning *Error, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -46,13 +60,13 @@ func (c *Client) Call(ctx context.Context, op string, params, result any) error 
 	if params != nil {
 		b, err := json.Marshal(params)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		req.Params = b
 	}
 	line, err := json.Marshal(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -65,31 +79,31 @@ func (c *Client) Call(ctx context.Context, op string, params, result any) error 
 	defer stop()
 
 	if _, err := c.conn.Write(append(line, '\n')); err != nil {
-		return connError(ctx, err)
+		return nil, connError(ctx, err)
 	}
 	if !c.sc.Scan() {
 		err := c.sc.Err()
 		if err == nil {
 			err = errors.New("the daemon closed the connection")
 		}
-		return connError(ctx, err)
+		return nil, connError(ctx, err)
 	}
 	var resp Response
 	if err := json.Unmarshal(c.sc.Bytes(), &resp); err != nil {
-		return fmt.Errorf("daemon: malformed response: %w", err)
+		return nil, fmt.Errorf("daemon: malformed response: %w", err)
 	}
 	if !resp.OK {
 		if resp.Error == nil {
-			return errors.New("daemon: request failed")
+			return nil, errors.New("daemon: request failed")
 		}
-		return resp.Error
+		return nil, resp.Error
 	}
 	if result != nil && len(resp.Result) > 0 {
 		if err := json.Unmarshal(resp.Result, result); err != nil {
-			return fmt.Errorf("daemon: malformed result: %w", err)
+			return nil, fmt.Errorf("daemon: malformed result: %w", err)
 		}
 	}
-	return nil
+	return resp.Warning, nil
 }
 
 func connError(ctx context.Context, err error) error {

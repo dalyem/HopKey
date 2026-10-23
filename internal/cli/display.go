@@ -8,8 +8,8 @@ package cli
 // make a string safe to show. The rule is:
 //
 //	Every vault-, config-, filesystem- or network-derived string that reaches
-//	human-readable output passes through oneLine (or printable) at the point
-//	where it is inserted into a message, table or prompt.
+//	human-readable output passes through oneLine (or printable, or exact) at
+//	the point where it is inserted into a message, table or prompt.
 //
 // Sanitizing at the point of insertion matters because the finished message
 // has line breaks of its own (layout), and a filter over the finished message
@@ -27,6 +27,7 @@ import (
 	"reflect"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // unsafeRune reports whether c could redraw, reorder or otherwise rewrite
@@ -78,6 +79,39 @@ func printable(s string) string {
 		return out + "..."
 	}
 	return out
+}
+
+// exact makes s safe to show on one line without losing or blurring any of
+// it: every character unsafeRune reports, a line or paragraph separator, a
+// byte that is not UTF-8, and the backslash itself are written as Go
+// escapes (\x1b, \u202e, \\), and nothing is cut. Two different values
+// never look the same, so it is for values someone approves, such as the
+// protected fields of a sync resolution, where oneLine's '?' and
+// printable's cut could hide what is being confirmed.
+func exact(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		c, n := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case c == utf8.RuneError && n == 1:
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		case c == '\\':
+			b.WriteString(`\\`)
+		case unsafeRune(c) || c == '\u2028' || c == '\u2029':
+			switch {
+			case c < 0x100:
+				fmt.Fprintf(&b, `\x%02x`, c)
+			case c <= 0xffff:
+				fmt.Fprintf(&b, `\u%04x`, c)
+			default:
+				fmt.Fprintf(&b, `\U%08x`, c)
+			}
+		default:
+			b.WriteRune(c)
+		}
+		i += n
+	}
+	return b.String()
 }
 
 // safef is fmt.Sprintf for a message that quotes untrusted values: string,

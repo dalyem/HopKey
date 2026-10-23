@@ -448,8 +448,6 @@ func (d *Daemon) opSyncResolve(ctx context.Context, p SyncResolveParams) (*SyncR
 	}
 	d.logf("sync: queued change %d resolved: %s", p.N, p.Choice)
 	d.localWrite()
-	if _, err := d.reloadLocked(ctx); err != nil {
-		return nil, fmt.Errorf("resolved, but reloading failed: %w", err)
-	}
-	return &SyncResolveResult{Status: d.syncStatus(false)}, nil
+	err = d.reloadAfter(ctx, "resolved")
+	return &SyncResolveResult{Status: d.syncStatus(false)}, err
 }

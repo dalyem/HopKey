@@ -831,7 +831,7 @@ func runTrust(ctx context.Context, e *Env, args []string) error {
 		keep = append(keep, l)
 	}
 	host.HostKeys = append(keep, line)
-	if _, err := callChange(ctx, e, *asJSON, daemon.OpPutHost, daemon.PutHostParams{Host: host}, nil); err != nil {
+	if err := callChange(ctx, e, *asJSON, daemon.OpPutHost, daemon.PutHostParams{Host: host}, nil); err != nil {
 		return err
 	}
 	return reportTrust(e, *asJSON, host.Name, key, got, true, "pinned")

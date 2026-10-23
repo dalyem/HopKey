@@ -21,9 +21,13 @@ import (
 // "Always running"): a systemd --user unit on Linux, a launchd agent on
 // macOS. The CLI still starts the daemon itself when it is not running.
 
-// serviceMarker opens every file hop setup --service writes; --uninstall
-// removes only a file that has it.
-const serviceMarker = "Written by hop setup --service"
+// The marker opens every file hop setup --service writes; --uninstall
+// removes only a file that has it. The plist's is an XML comment, which
+// can't hold "--", so it has its own.
+const (
+	unitMarker  = "Written by hop setup --service"
+	plistMarker = "Written by hop setup (service)"
+)
 
 // serviceEnv is the environment the daemon's paths depend on (sockets,
 // log, vault). The service gets the values this shell has, so the daemon
@@ -34,20 +38,30 @@ type serviceSpec struct {
 	kind      string // "systemd" or "launchd"
 	dir       string
 	name      string
+	marker    string // in every file hop writes; see unitMarker
 	body      string
 	install   [][]string // commands that load and start it
 	uninstall [][]string // commands that stop and unload it, before the file goes
 	reload    [][]string // commands after the file is gone
+	// loaded is a command that succeeds when the service manager already
+	// has the service loaded (launchd only: bootstrap fails then).
+	loaded []string
+	active string // what a successful install means, for people
 }
 
 func (s *serviceSpec) path() string { return filepath.Join(s.dir, s.name) }
 
-// ServiceResult is the --json shape of hop setup --service.
+// ServiceResult is the --json shape of hop setup --service. Changed says
+// the file was written (or removed); Active says the service manager took
+// the service: systemd enabled and started it, or launchd has it loaded.
+// A file already in place is not enough for Active: every run asks the
+// service manager again.
 type ServiceResult struct {
 	Service   string     `json:"service"`
 	Path      string     `json:"path"`
 	Installed bool       `json:"installed"`
 	Changed   bool       `json:"changed"`
+	Active    bool       `json:"active"`
 	Commands  [][]string `json:"commands"`
 	Notes     []string   `json:"notes,omitempty"`
 }
@@ -89,7 +103,7 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 		}
 		const unit = "hopkey.service"
 		var b strings.Builder
-		fmt.Fprintf(&b, "# %s: it runs the hop daemon from login, so the vault\n", serviceMarker)
+		fmt.Fprintf(&b, "# %s: it runs the hop daemon from login, so the vault\n", unitMarker)
 		b.WriteString("# stays in sync before any hop command. Remove it with hop setup --service --uninstall.\n")
 		b.WriteString("[Unit]\nDescription=HopKey daemon (hop)\n\n[Service]\nType=simple\n")
 		fmt.Fprintf(&b, "ExecStart=%s daemon\n", systemdQuote(exe, true))
@@ -98,7 +112,8 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 		}
 		b.WriteString("Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n")
 		return &serviceSpec{
-			kind: "systemd", dir: filepath.Join(cfg, "systemd", "user"), name: unit, body: b.String(),
+			kind: "systemd", dir: filepath.Join(cfg, "systemd", "user"), name: unit, marker: unitMarker, body: b.String(),
+			active: "enabled and started",
 			install: [][]string{
 				{"systemctl", "--user", "daemon-reload"},
 				{"systemctl", "--user", "enable", "--now", unit},
@@ -114,7 +129,7 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 		var b strings.Builder
 		b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 		b.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
-		fmt.Fprintf(&b, "<!-- %s: it runs the hop daemon from login. Remove it with hop setup --service --uninstall. -->\n", serviceMarker)
+		fmt.Fprintf(&b, "<!-- %s: it runs the hop daemon from login. hop setup removes it with the service and uninstall options. -->\n", plistMarker)
 		b.WriteString("<plist version=\"1.0\">\n<dict>\n")
 		fmt.Fprintf(&b, "\t<key>Label</key>\n\t<string>%s</string>\n", label)
 		fmt.Fprintf(&b, "\t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>%s</string>\n\t\t<string>daemon</string>\n\t</array>\n", xmlText(exe))
@@ -134,9 +149,11 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 		fmt.Fprintf(&b, "\t<key>StandardErrorPath</key>\n\t<string>%s</string>\n", xmlText(e.Paths.LogFile()))
 		b.WriteString("</dict>\n</plist>\n")
 		return &serviceSpec{
-			kind: "launchd", dir: dir, name: label + ".plist", body: b.String(),
+			kind: "launchd", dir: dir, name: label + ".plist", marker: plistMarker, body: b.String(),
 			install:   [][]string{{"launchctl", "bootstrap", domain, path}},
 			uninstall: [][]string{{"launchctl", "bootout", domain, path}},
+			loaded:    []string{"launchctl", "print", domain + "/" + label},
+			active:    "loaded",
 		}, nil
 	}
 	return nil, failf("hop setup --service supports systemd on Linux and launchd on macOS, not %s; hop starts the daemon itself when you run a command", e.goos())
@@ -173,32 +190,33 @@ func runService(ctx context.Context, e *Env, yes, uninstall, asJSON bool) error 
 	if err != nil {
 		return err
 	}
-	if existed && old == spec.body {
-		if asJSON {
-			return printJSON(e, res)
-		}
-		e.printf("the %s service is already installed: %s\n", spec.kind, oneLine(path))
-		return nil
-	}
-	if existed && !strings.Contains(old, serviceMarker) {
+	same := existed && old == spec.body
+	if existed && !same && !strings.Contains(old, spec.marker) {
 		return failf("%s exists and hop did not write it; move it away first", path)
 	}
+	res.Notes = append(res.Notes, safef("the service runs %s by that path: run hop setup --service again after moving or upgrading hop", e.Executable))
 
+	// The file in place says nothing about whether the service runs (an
+	// earlier run may have failed after writing it), so every run asks the
+	// service manager to load and start it again. Only writing the file
+	// needs consent.
 	cmds := spec.install
-	if existed && spec.kind == "launchd" {
-		// A loaded agent has to go before the new one can load.
-		cmds = append(slices.Clone(spec.uninstall), cmds...)
-	}
-	fmt.Fprintf(e.Stderr, "hop will write %s, so the hop daemon runs from login, and then run:\n", oneLine(path))
-	for _, c := range cmds {
-		fmt.Fprintf(e.Stderr, "  %s\n", oneLine(strings.Join(c, " ")))
-	}
-	ok, err := confirm(e, yes, "Install the service?")
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return failf("no changes made")
+	if !same {
+		if existed && spec.kind == "launchd" {
+			// A loaded agent has to go before the new one can load.
+			cmds = append(slices.Clone(spec.uninstall), cmds...)
+		}
+		fmt.Fprintf(e.Stderr, "hop will write %s, so the hop daemon runs from login, and then run:\n", oneLine(path))
+		for _, c := range cmds {
+			fmt.Fprintf(e.Stderr, "  %s\n", oneLine(strings.Join(c, " ")))
+		}
+		ok, err := confirm(e, yes, "Install the service?")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return failf("no changes made")
+		}
 	}
 	if spec.kind == "launchd" {
 		// launchd opens the log itself, and wants its directory there.
@@ -206,32 +224,53 @@ func runService(ctx context.Context, e *Env, yes, uninstall, asJSON bool) error 
 			return failf("%v", err)
 		}
 	}
-	if err := writeServiceFile(spec); err != nil {
-		return err
-	}
-	res.Changed = true
-	if c, err := dialExisting(ctx, e); err == nil && c != nil {
-		c.Close()
-		if !existed {
-			res.Notes = append(res.Notes, "a hop daemon is already running outside the service: the service runs it from your next login, or now after hop daemon stop and starting the service again")
+	if !same {
+		if err := writeServiceFile(spec); err != nil {
+			return err
+		}
+		res.Changed = true
+		res.Notes = append(res.Notes, safef("%s is now mode 0700, as hop keeps the directories it writes to", spec.dir))
+		if c, err := dialExisting(ctx, e); err == nil && c != nil {
+			c.Close()
+			if !existed {
+				res.Notes = append(res.Notes, "a hop daemon is already running outside the service: the service runs it from your next login, or now after hop daemon stop and starting the service again")
+			}
 		}
 	}
 	for i, c := range cmds {
 		out, err := e.runCommand(ctx, c)
 		res.Commands = append(res.Commands, c)
-		if err != nil {
-			if existed && spec.kind == "launchd" && i == 0 {
-				continue // the old agent was not loaded
-			}
-			return failf("wrote %s, but %s failed: %v: %s", path, strings.Join(c, " "), err, printable(strings.TrimSpace(string(out))))
+		if err == nil {
+			continue
 		}
+		if !same && existed && spec.kind == "launchd" && i == 0 {
+			continue // the old agent was not loaded
+		}
+		if same && spec.loaded != nil && slices.Equal(c, spec.install[len(spec.install)-1]) {
+			// bootstrap refuses an agent that is already loaded, from
+			// this same file: that is what this run wants.
+			res.Commands = append(res.Commands, spec.loaded)
+			if _, lerr := e.runCommand(ctx, spec.loaded); lerr == nil {
+				continue
+			}
+		}
+		what := "wrote " + path
+		if same {
+			what = path + " is in place"
+		}
+		return failf("%s, but %s failed: %v: %s", what, strings.Join(c, " "), err, printable(strings.TrimSpace(string(out))))
 	}
+	res.Active = true
 	if asJSON {
 		return printJSON(e, res)
 	}
-	e.printf("installed the %s service: %s\n", spec.kind, oneLine(path))
+	if same {
+		e.printf("the %s service is already installed: %s (%s)\n", spec.kind, oneLine(path), spec.active)
+	} else {
+		e.printf("installed the %s service: %s (%s)\n", spec.kind, oneLine(path), spec.active)
+	}
 	for _, n := range res.Notes {
-		fmt.Fprintf(e.Stderr, "hop: note: %s\n", n)
+		fmt.Fprintf(e.Stderr, "hop: note: %s\n", oneLine(n))
 	}
 	return nil
 }
@@ -239,18 +278,24 @@ func runService(ctx context.Context, e *Env, yes, uninstall, asJSON bool) error 
 func uninstallService(ctx context.Context, e *Env, spec *serviceSpec, yes, asJSON bool) error {
 	path := spec.path()
 	res := ServiceResult{Service: spec.kind, Path: path, Commands: [][]string{}}
-	old, existed, err := readServiceFile(path)
-	if err != nil {
-		return err
-	}
-	if !existed {
+	notInstalled := func() error {
 		if asJSON {
 			return printJSON(e, res)
 		}
 		e.printf("no %s service is installed (%s)\n", spec.kind, oneLine(path))
 		return nil
 	}
-	if !strings.Contains(old, serviceMarker) {
+	if _, err := os.Lstat(spec.dir); errors.Is(err, os.ErrNotExist) {
+		return notInstalled()
+	}
+	old, existed, err := readServiceFile(path)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		return notInstalled()
+	}
+	if !strings.Contains(old, spec.marker) {
 		return failf("%s was not written by hop setup --service; leaving it alone", path)
 	}
 	ok, err := confirm(e, yes, safef("Stop the %s service and remove %s?", spec.kind, path))
@@ -260,6 +305,20 @@ func uninstallService(ctx context.Context, e *Env, spec *serviceSpec, yes, asJSO
 	if !ok {
 		return failf("no changes made")
 	}
+	// The same checks as for writing: the directory is the user's, and
+	// nobody else can swap the file hop removes. The file is read again
+	// from the checked path before it goes.
+	dir, err := safepath.EnsurePrivateDir(spec.dir)
+	if err != nil {
+		return failf("%v", err)
+	}
+	checked := filepath.Join(dir, spec.name)
+	if old, existed, err = readServiceFile(checked); err != nil {
+		return err
+	}
+	if !existed || !strings.Contains(old, spec.marker) {
+		return failf("%s changed while hop was removing it; leaving it alone", path)
+	}
 	for _, c := range spec.uninstall {
 		res.Commands = append(res.Commands, c)
 		if out, err := e.runCommand(ctx, c); err != nil {
@@ -267,7 +326,7 @@ func uninstallService(ctx context.Context, e *Env, spec *serviceSpec, yes, asJSO
 			res.Notes = append(res.Notes, safef("%s failed: %v: %s", strings.Join(c, " "), err, printable(strings.TrimSpace(string(out)))))
 		}
 	}
-	if err := os.Remove(path); err != nil {
+	if err := os.Remove(checked); err != nil {
 		return failf("%v", err)
 	}
 	res.Changed = true

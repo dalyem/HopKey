@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -111,9 +114,13 @@ func TestResolveRefusesWhileTheSSHConfigIsStale(t *testing.T) {
 	fail.Store(true)
 	changed := web
 	changed.User, changed.HostKeys = "root", []string{pinB.line()}
-	err = c.Call(ctx, OpPutHost, PutHostParams{Host: changed}, nil)
-	if !IsCode(err, CodeConfigNotWritten) || !strings.Contains(err.Error(), "saved") {
-		t.Fatalf("put_host with the config unwritable: %v", err)
+	var saved model.Host
+	w, err := c.CallWarn(ctx, OpPutHost, PutHostParams{Host: changed}, &saved)
+	if err != nil || w == nil || w.Code != CodeConfigNotWritten || !strings.Contains(w.Message, "saved") {
+		t.Fatalf("put_host with the config unwritable: %v, warning %+v", err, w)
+	}
+	if saved.ItemID != web.ItemID || saved.User != "root" || saved.ItemVersion <= web.ItemVersion {
+		t.Errorf("put_host returned %+v; want the saved host", saved)
 	}
 	if !strings.Contains(config(), "User deploy") || pinned(pinB) {
 		t.Fatalf("the config changed though it could not be written:\n%s", config())
@@ -262,8 +269,8 @@ func TestRevokedConfigIsClearedOnceItCanBeWritten(t *testing.T) {
 }
 
 // An unlock whose ssh config can't be written still unlocks and loads the
-// keys: it answers with config_not_written, a partial success, not a
-// failure to unlock. This tests the daemon's answer only.
+// keys: it answers with a success that carries a config_not_written
+// warning, not a failure to unlock. This tests the daemon's answer only.
 func TestUnlockWithAnUnwritableConfigIsAPartialSuccess(t *testing.T) {
 	ctx := context.Background()
 	base := shortDir(t)
@@ -297,16 +304,119 @@ func TestUnlockWithAnUnwritableConfigIsAPartialSuccess(t *testing.T) {
 		t.Fatalf("%d keys after lock", len(l))
 	}
 	fail.Store(true)
-	err = c.Call(ctx, OpUnlock, nil, nil)
-	if !IsCode(err, CodeConfigNotWritten) {
-		t.Fatalf("unlock with the config unwritable: %v", err)
+	w, err := c.CallWarn(ctx, OpUnlock, nil, nil)
+	if err != nil || w == nil || w.Code != CodeConfigNotWritten {
+		t.Fatalf("unlock with the config unwritable: %v, warning %+v", err, w)
 	}
 	for _, want := range []string{"vault unlocked and keys loaded", "ssh config could not be updated", "read-only"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the unlock message %q does not say %q", err, want)
+		if !strings.Contains(w.Message, want) {
+			t.Errorf("the unlock warning %q does not say %q", w.Message, want)
 		}
 	}
 	if l, _ := d.live.List(); len(l) != 1 {
 		t.Errorf("%d keys after the partial unlock; want 1", len(l))
+	}
+}
+
+// Every change that takes effect while the ssh config can't be written is
+// a success on the wire: ok, the op's result (the saved host or key, with
+// its ID), and a config_not_written warning beside it. A caller that has
+// to know what was saved, such as an import whose next host jumps through
+// this one, gets it from the answer, not from reading the vault again.
+func TestChangesWithAnUnwritableConfigAnswerWithTheirResult(t *testing.T) {
+	ctx := context.Background()
+	base := shortDir(t)
+	paths := Paths{RunDir: filepath.Join(base, "run"), ConfigDir: filepath.Join(base, "cfg")}
+	var fail atomic.Bool
+	d, err := Start(Options{Paths: paths, Store: modeltest.New(), Version: "test", Tailscale: fakeTS{}, Logf: t.Logf,
+		writeConfig: failingWrites(&fail), configRetry: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	conn, err := net.Dial("unix", d.ControlSocket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	sc := bufio.NewScanner(conn)
+	sc.Buffer(make([]byte, 0, 64<<10), maxRequest)
+	// raw sends one request and returns the response line as it came.
+	raw := func(op string, params any) Response {
+		t.Helper()
+		b, err := json.Marshal(params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		line, _ := json.Marshal(Request{Op: op, Params: b})
+		if _, err := conn.Write(append(line, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		if !sc.Scan() {
+			t.Fatalf("%s: no response: %v", op, sc.Err())
+		}
+		var resp Response
+		if err := json.Unmarshal(sc.Bytes(), &resp); err != nil {
+			t.Fatalf("%s: %v: %s", op, err, sc.Bytes())
+		}
+		if !resp.OK || resp.Error != nil || resp.Warning == nil || resp.Warning.Code != CodeConfigNotWritten ||
+			!strings.Contains(resp.Warning.Message, "read-only") {
+			t.Fatalf("%s with the config unwritable: %s", op, sc.Bytes())
+		}
+		return resp
+	}
+
+	fail.Store(true)
+	k := genKey(t)
+	resp := raw(OpPutKey, PutKeyParams{Name: "k1", PrivateKey: k.pem})
+	var key KeyInfo
+	if err := json.Unmarshal(resp.Result, &key); err != nil || key.ID == "" || key.Name != "k1" {
+		t.Fatalf("put_key result %s: %v", resp.Result, err)
+	}
+	keyID, err := model.ParseID(key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp = raw(OpPutHost, PutHostParams{Host: webHost("bastion", keyID, "203.0.113.1")})
+	var bastion model.Host
+	if err := json.Unmarshal(resp.Result, &bastion); err != nil || bastion.ItemID.IsZero() || bastion.Name != "bastion" {
+		t.Fatalf("put_host result %s: %v", resp.Result, err)
+	}
+	inner := webHost("inner", keyID, "10.0.0.5")
+	inner.JumpHostID = bastion.ItemID
+	resp = raw(OpPutHost, PutHostParams{Host: inner})
+	var saved model.Host
+	if err := json.Unmarshal(resp.Result, &saved); err != nil || saved.JumpHostID != bastion.ItemID {
+		t.Fatalf("put_host of a host that jumps through the first: %s: %v", resp.Result, err)
+	}
+
+	resp = raw(OpDelete, DeleteParams{ID: saved.ItemID.String()})
+	if len(resp.Result) != 0 {
+		t.Errorf("delete result %s", resp.Result)
+	}
+	raw(OpReload, nil)
+
+	// The vault has what the answers said; only the config is behind.
+	snap, err := d.store.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Hosts) != 1 || snap.Hosts[0].ItemID != bastion.ItemID || len(snap.Keys) != 1 {
+		t.Errorf("vault after the changes: %+v %+v", snap.Hosts, snap.Keys)
+	}
+
+	// Any other refusal is still an error, with no warning.
+	fail.Store(false)
+	b, _ := json.Marshal(PutHostParams{Host: model.Host{Name: "nowhere"}})
+	line, _ := json.Marshal(Request{Op: OpPutHost, Params: b})
+	conn.Write(append(line, '\n'))
+	if !sc.Scan() {
+		t.Fatal(sc.Err())
+	}
+	var bad Response
+	json.Unmarshal(sc.Bytes(), &bad)
+	if bad.OK || bad.Error == nil || bad.Warning != nil || len(bad.Result) != 0 {
+		t.Errorf("a refused put_host: %s", sc.Bytes())
 	}
 }

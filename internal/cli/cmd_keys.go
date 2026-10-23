@@ -105,22 +105,17 @@ func runKeyAdd(ctx context.Context, e *Env, args []string) error {
 	return nil
 }
 
-// putKey saves a key. When the daemon saved it but could not write the
-// ssh config (config_not_written, a warning) its answer carries no key, so
-// putKey reads it back by name, which is unique.
+// putKey saves a key and returns it as the daemon saved it, ID included,
+// which the daemon's answer carries even when the ssh config could not be
+// written (a warning). An answer without an ID is an error, as for
+// putHost.
 func putKey(ctx context.Context, e *Env, asJSON bool, name, pem string) (daemon.KeyInfo, error) {
 	var info daemon.KeyInfo
-	written, err := callChange(ctx, e, asJSON, daemon.OpPutKey, daemon.PutKeyParams{Name: name, PrivateKey: pem}, &info)
-	if err != nil || written {
-		return info, err
+	if err := callChange(ctx, e, asJSON, daemon.OpPutKey, daemon.PutKeyParams{Name: name, PrivateKey: pem}, &info); err != nil {
+		return daemon.KeyInfo{}, err
 	}
-	info.Name = name
-	if l, err := listAll(ctx, e); err == nil {
-		for _, k := range l.Keys {
-			if strings.EqualFold(k.Name, strings.TrimSpace(name)) {
-				return k, nil
-			}
-		}
+	if info.ID == "" {
+		return daemon.KeyInfo{}, failf("the daemon saved the key %s but did not say as what, so its ID is unknown; see hop key ls", name)
 	}
 	return info, nil
 }
@@ -215,7 +210,7 @@ func runKeyRm(ctx context.Context, e *Env, args []string) error {
 	if !ok {
 		return failf("not removed")
 	}
-	if _, err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: id.String()}, nil); err != nil {
+	if err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: id.String()}, nil); err != nil {
 		return err
 	}
 	if *asJSON {

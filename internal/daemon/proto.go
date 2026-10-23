@@ -58,11 +58,11 @@ const (
 	// written from the vault: ssh would use the settings it had before.
 	CodeConfigStale = "config_stale"
 	// CodeConfigNotWritten is a partial success: the change (an unlock, a
-	// put, a delete, a reload) took effect and the agent serves the
-	// vault's keys, but the ssh config could not be written. The daemon
-	// retries. It arrives as an error response, so a caller that treats
-	// every error as failure will misreport it; callers should show it as a
-	// warning (the CLI does not yet).
+	// put, a delete, a resolution, a reload) took effect and the agent
+	// serves the vault's keys, but the ssh config could not be written. The
+	// daemon retries. It is never an error response: the response is a
+	// success, with the op's result (the saved host or key, say), and this
+	// code in its Warning.
 	CodeConfigNotWritten = "config_not_written"
 )
 
@@ -72,11 +72,14 @@ type Request struct {
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
-// Response answers one Request.
+// Response answers one Request. A success can carry a Warning beside its
+// Result: the change took effect, and something after it did not
+// (CodeConfigNotWritten).
 type Response struct {
-	OK     bool            `json:"ok"`
-	Error  *Error          `json:"error,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
+	OK      bool            `json:"ok"`
+	Error   *Error          `json:"error,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Warning *Error          `json:"warning,omitempty"`
 }
 
 // Error is a failed call.

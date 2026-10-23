@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
@@ -66,6 +67,15 @@ type HostView struct {
 	ChosenRoute *resolve.Route `json:"chosen_route,omitempty"` // hop info only
 }
 
+// InfoView is the --json shape of hop info: the host, and when the vault
+// last synced. synced_at is always present: null for a local-only vault,
+// or when there has been no successful pull since the daemon started.
+// hop ls --json, an array, has no room for it.
+type InfoView struct {
+	HostView
+	SyncedAt *time.Time `json:"synced_at"`
+}
+
 func hostView(h model.Host, l *daemon.ListResult) HostView {
 	v := HostView{
 		ID: h.ItemID.String(), Name: h.Name, Aliases: nonNil(h.Aliases), Addresses: nonNil(h.Addresses),
@@ -116,7 +126,8 @@ func nonNil(s []string) []string {
 
 func runLs(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "ls", commands["ls"].usage)
-	asJSON := fs.Bool("json", false, "print the hosts as JSON")
+	asJSON := fs.Bool("json", false, "print the hosts as a JSON array. It stays an array for the scripts that read it, "+
+		"so it does not say when the vault last synced: hop info --json and hop sync --json have synced_at")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -234,7 +245,7 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 		v.Mark = rr.Mark
 	}
 	if *asJSON {
-		return printJSON(e, v)
+		return printJSON(e, InfoView{HostView: v, SyncedAt: l.SyncedAt})
 	}
 	if interactiveResolution(e, false) {
 		syncNotice(ctx, e)
@@ -450,26 +461,20 @@ func runAdd(ctx context.Context, e *Env, args []string) error {
 	return reportHost(ctx, e, *asJSON, saved, "added")
 }
 
-// putHost saves h. When the daemon saved it but could not write the ssh
-// config (config_not_written, a warning) its answer carries no host, so
-// putHost reads the host back: by ID when h has one, else by name, which
-// is unique.
+// putHost saves h and returns the host as the daemon saved it, which is
+// the only record of a new host's ID: the daemon's answer carries it even
+// when the ssh config could not be written (a warning). An answer without
+// one is an error, so nothing that refers to the host (an imported host
+// that jumps through it) goes on with a zero ID.
 func putHost(ctx context.Context, e *Env, asJSON bool, h model.Host) (model.Host, error) {
 	var saved model.Host
-	written, err := callChange(ctx, e, asJSON, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved)
-	if err != nil || written {
-		return saved, err
+	if err := callChange(ctx, e, asJSON, daemon.OpPutHost, daemon.PutHostParams{Host: h}, &saved); err != nil {
+		return model.Host{}, err
 	}
-	l, err := listAll(ctx, e)
-	if err != nil {
-		return h, nil
+	if saved.ItemID.IsZero() {
+		return model.Host{}, failf("the daemon saved %s but did not say as what, so its ID is unknown; see hop ls", h.Name)
 	}
-	for _, o := range l.Hosts {
-		if (!h.ItemID.IsZero() && o.ItemID == h.ItemID) || (h.ItemID.IsZero() && strings.EqualFold(o.Name, h.Name)) {
-			return o, nil
-		}
-	}
-	return h, nil
+	return saved, nil
 }
 
 func reportHost(ctx context.Context, e *Env, asJSON bool, h model.Host, verb string) error {
@@ -551,7 +556,7 @@ func runRm(ctx context.Context, e *Env, args []string) error {
 	if !ok {
 		return failf("not removed")
 	}
-	if _, err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: h.ItemID.String()}, nil); err != nil {
+	if err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: h.ItemID.String()}, nil); err != nil {
 		return err
 	}
 	if *asJSON {

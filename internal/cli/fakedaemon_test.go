@@ -21,7 +21,8 @@ import (
 // fakeDaemon answers the control protocol on a real Unix socket with
 // whatever each test sets, so the CLI can be driven through states and
 // error codes a real daemon reaches only with a server: sync states, held
-// changes, config_stale, config_not_written. It records every request.
+// changes, config_stale, config_not_written warnings. It records every
+// request.
 type fakeDaemon struct {
 	base  string
 	home  string
@@ -104,6 +105,9 @@ func (f *fakeDaemon) serve(c net.Conn) {
 			resp.Error = de
 		} else {
 			resp.OK = true
+			if w, ok := res.(warned); ok {
+				res, resp.Warning = w.result, &daemon.Error{Code: daemon.CodeConfigNotWritten, Message: w.warning}
+			}
 			if res != nil {
 				b, err := json.Marshal(res)
 				if err != nil {
@@ -116,6 +120,14 @@ func (f *fakeDaemon) serve(c net.Conn) {
 			return
 		}
 	}
+}
+
+// warned is a handler's answer for a change that took effect while the ssh
+// config could not be written: a success that carries result and a
+// config_not_written warning, as the daemon answers.
+type warned struct {
+	result  any
+	warning string
 }
 
 // on sets the handler for op.

@@ -29,7 +29,10 @@ this device was revoked, or the server can't be reached.
 
 hop sync resolve settles a queued change the daemon held because it
 conflicts with the server. Without a choice it lists the held change and its
-proposals; on a terminal it asks what to do.`
+proposals; on a terminal it asks what to do. With --json, or when stdin or
+stdout is not a terminal, it never asks: keep-mine and edit need --confirm
+with the proposal's token, and take-theirs needs --yes. --edit starts from
+the server's current version, so --set names only what you change in it.`
 
 // SyncReport is the --json shape of hop sync: the daemon's sync status, with
 // the error when the sync could not run. synced_at is always present (null
@@ -271,7 +274,7 @@ const resolveUsage = "hop sync resolve [N] [--keep-mine [--confirm TOKEN] | --ed
 func runSyncResolve(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "sync resolve", resolveUsage)
 	keepMine := fs.Bool("keep-mine", false, "write your change over the server's (needs the proposal's --confirm token)")
-	edit := fs.Bool("edit", false, "write an edited version of your change (hosts and snippets; needs --set and the --confirm token)")
+	edit := fs.Bool("edit", false, "write an edited version: the server's, or yours when the server no longer has the item, with --set applied (hosts and snippets; needs the --confirm token)")
 	takeTheirs := fs.Bool("take-theirs", false, "drop your change and keep the server's")
 	retry := fs.Bool("retry", false, "try the change again as it is")
 	token := fs.String("confirm", "", "the confirmation token of the proposal to apply")
@@ -320,6 +323,8 @@ func runSyncResolve(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	defer c.Close()
+	// Only a terminal session asks anything: with --json, or stdin or
+	// stdout redirected, every write needs its flag (--confirm, --yes).
 	r := &resolver{ctx: ctx, e: e, c: c, asJSON: *asJSON, interactive: e.StdinTTY && e.StdoutTTY && !*asJSON}
 	held, err := r.held()
 	if err != nil {
@@ -577,8 +582,10 @@ func compact(raw json.RawMessage) string {
 }
 
 // memberText shows one member of an item for a table cell: a string as
-// it is, a list of strings joined, anything else as compact JSON, each
-// made single-line safe and cut to a printable length. An absent item or
+// it is, anything else (a list included) as compact JSON, through exact.
+// These cells are what keep-mine and edit ask the user to approve, so
+// nothing is cut and no two values look alike: a list keeps its quotes,
+// so an element with ", " in it is not two elements. An absent item or
 // member is "-".
 func memberText(raw json.RawMessage, member string) string {
 	m, ok := members(raw)
@@ -594,13 +601,9 @@ func memberText(raw json.RawMessage, member string) string {
 		if s == "" {
 			return `""`
 		}
-		return printable(s)
+		return exact(s)
 	}
-	var ss []string
-	if json.Unmarshal(v, &ss) == nil {
-		return "[" + printable(strings.Join(ss, ", ")) + "]"
-	}
-	return printable(compact(v))
+	return exact(compact(v))
 }
 
 // showProposal prints what a keep-mine or edit would write: for a delete,
@@ -690,6 +693,11 @@ func (r *resolver) apply(h *daemon.HeldChange, choice string, req request) error
 	params := daemon.SyncResolveParams{N: h.N, Choice: choice}
 	switch choice {
 	case daemon.ChoiceTakeTheirs:
+		if !req.yes && !r.interactive {
+			// --json, or stdin or stdout not a terminal: nothing may
+			// prompt, even when stdin could answer.
+			return failf("take-theirs drops your change %d: pass --yes to confirm (it can't be asked here: --json, or no terminal)", h.N)
+		}
 		ok, err := confirm(r.e, req.yes, safef("Drop your change %d and keep the server's version?", h.N))
 		if err != nil {
 			return err
@@ -787,7 +795,8 @@ func (r *resolver) propose(h *daemon.HeldChange, choice string, req request) (*d
 
 // readSets asks for FIELD=VALUE lines on the terminal, up to an empty one.
 func (r *resolver) readSets(h *daemon.HeldChange) ([]string, error) {
-	fmt.Fprintln(r.e.Stderr, "Edit your version: one FIELD=VALUE per line (lists comma-separated), an empty line to finish.")
+	fmt.Fprintln(r.e.Stderr, "The edit starts from the server's version (SERVER above), or yours when the server no longer has the item.")
+	fmt.Fprintln(r.e.Stderr, "Change it: one FIELD=VALUE per line (lists comma-separated), an empty line to finish.")
 	var out []string
 	for {
 		fmt.Fprint(r.e.Stderr, "> ")
@@ -803,17 +812,23 @@ func (r *resolver) readSets(h *daemon.HeldChange) ([]string, error) {
 	}
 }
 
-// editItem applies FIELD=VALUE edits to this device's version of the item
-// (or, for a held delete, the server's) and returns the edited plaintext.
-// A value takes the type of the member it replaces: a string, a number, a
-// boolean, or a list of strings given comma-separated. Only members the
-// item already has can be set, and never the header.
+// editItem applies FIELD=VALUE edits to the version of the item an edit
+// starts from (merge.EditStart): for a put of a live item, the server's
+// version as it is now (current), so whatever another device changed and
+// --set does not name is kept; for a create, or a put of an item the
+// server no longer has, this device's version. It returns the edited
+// plaintext, which the daemon turns into a proposal. A value takes the type
+// of the member it replaces: a string, a number, a boolean, or a list of
+// strings given comma-separated. Only members the item already has can be
+// set, and never the header.
 func editItem(h *daemon.HeldChange, sets []string) (json.RawMessage, error) {
-	base, ok := members(h.Want)
+	start, err := editStart(h)
+	if err != nil {
+		return nil, err
+	}
+	base, ok := members(start)
 	if !ok {
-		if base, ok = members(h.Current); !ok {
-			return nil, failf("change %d has no version of the item to edit", h.N)
-		}
+		return nil, failf("change %d has no version of the item to edit", h.N)
 	}
 	for _, s := range sets {
 		k, v, found := strings.Cut(s, "=")
@@ -846,6 +861,39 @@ func editItem(h *daemon.HeldChange, sets []string) (json.RawMessage, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// editStart is the plaintext merge.EditStart picks for h: S (the server's
+// current version) or this device's want, by the hold's row.
+func editStart(h *daemon.HeldChange) (json.RawMessage, error) {
+	if h.Hold == nil {
+		return nil, failf("nothing holds change %d any more; send it as it is with --retry", h.N)
+	}
+	id, err := model.ParseID(h.ItemID)
+	if err != nil {
+		return nil, failf("change %d: %v", h.N, err)
+	}
+	parse := func(raw json.RawMessage) (*merge.Item, error) {
+		if _, ok := members(raw); !ok {
+			return nil, nil
+		}
+		return merge.ParseItem(raw)
+	}
+	held := merge.Intent{Action: h.Action, ItemID: id, Type: h.Type}
+	var s *merge.Item
+	if held.Seen, err = parse(h.Seen); err == nil {
+		if held.Want, err = parse(h.Want); err == nil {
+			s, err = parse(h.Current)
+		}
+	}
+	if err != nil {
+		return nil, failf("change %d: %v", h.N, err)
+	}
+	start, err := merge.EditStart(held, h.Hold.Cause, s)
+	if err != nil {
+		return nil, failf("--edit can't start for change %d: %v", h.N, err)
+	}
+	return start.Plaintext(), nil
 }
 
 // typedLike encodes v as JSON of the same kind as old.
@@ -905,10 +953,14 @@ func (r *resolver) unconfirmed(h *daemon.HeldChange, p *daemon.Proposal, req req
 	return failf("nothing was written: %s needs --confirm with the proposal's token", p.Choice)
 }
 
+// resolve calls sync.resolve. A resolution that took effect while the ssh
+// config could not be written is a success with a warning, which it
+// prints.
 func (r *resolver) resolve(p daemon.SyncResolveParams) (*daemon.SyncResolveResult, error) {
 	var res daemon.SyncResolveResult
-	if err := r.c.Call(r.ctx, daemon.OpSyncResolve, p, &res); err != nil {
-		return nil, cleanErr(err)
+	w, err := r.c.CallWarn(r.ctx, daemon.OpSyncResolve, p, &res)
+	if err := changeWarning(r.e, r.asJSON, w, err); err != nil {
+		return nil, err
 	}
 	return &res, nil
 }
@@ -928,13 +980,8 @@ func (r *resolver) resolveError(n uint64, err error) error {
 	return err
 }
 
-// report prints the outcome of a resolution. config_not_written is a
-// partial success: the resolution took effect.
+// report prints the outcome of a resolution.
 func (r *resolver) report(h *daemon.HeldChange, choice string, res *daemon.SyncResolveResult, err error) error {
-	if daemon.IsCode(err, daemon.CodeConfigNotWritten) {
-		warn(r.e, r.asJSON, err.Error())
-		res, err = &daemon.SyncResolveResult{}, nil
-	}
 	if err != nil {
 		return r.resolveError(h.N, err)
 	}
