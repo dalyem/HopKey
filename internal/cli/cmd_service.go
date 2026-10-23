@@ -23,7 +23,9 @@ import (
 
 // The marker opens every file hop setup --service writes; --uninstall
 // removes only a file that has it. The plist's is an XML comment, which
-// can't hold "--", so it has its own.
+// can't hold "--", so it has its own. Plists written before that carry
+// unitMarker, and hop still owns them: it replaces or removes them, and
+// writes only plistMarker.
 const (
 	unitMarker  = "Written by hop setup --service"
 	plistMarker = "Written by hop setup (service)"
@@ -35,27 +37,42 @@ const (
 var serviceEnv = []string{"XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_DATA_HOME"}
 
 type serviceSpec struct {
-	kind      string // "systemd" or "launchd"
-	dir       string
-	name      string
-	marker    string // in every file hop writes; see unitMarker
-	body      string
-	install   [][]string // commands that load and start it
-	uninstall [][]string // commands that stop and unload it, before the file goes
-	reload    [][]string // commands after the file is gone
-	// loaded is a command that succeeds when the service manager already
-	// has the service loaded (launchd only: bootstrap fails then).
-	loaded []string
-	active string // what a successful install means, for people
+	kind    string // "systemd" or "launchd"
+	dir     string
+	name    string
+	markers []string // a file with any of these is hop's; the first is the one hop writes
+	body    string
+	// install runs on every install, in order, whether or not the file
+	// changed: it makes the service manager load the file as it is now
+	// and run a daemon from it. Any failure fails the run, and the next
+	// run starts again from the first step.
+	install []serviceStep
+	stop    []serviceStep // uninstall: stop and unload it, before the file goes
+	reload  [][]string    // uninstall: after the file is gone
+	// notLoaded says a failed command failed only because the service
+	// manager does not have the service.
+	notLoaded func(out []byte, err error) bool
+	active    string // what a successful install means, for people
+}
+
+// serviceStep is a command; notLoadedOK says it is done when it fails
+// because the service is not loaded (nothing to stop).
+type serviceStep struct {
+	argv        []string
+	notLoadedOK bool
 }
 
 func (s *serviceSpec) path() string { return filepath.Join(s.dir, s.name) }
 
+func (s *serviceSpec) owns(body string) bool {
+	return slices.ContainsFunc(s.markers, func(m string) bool { return strings.Contains(body, m) })
+}
+
 // ServiceResult is the --json shape of hop setup --service. Changed says
-// the file was written (or removed); Active says the service manager took
-// the service: systemd enabled and started it, or launchd has it loaded.
-// A file already in place is not enough for Active: every run asks the
-// service manager again.
+// the file was written (or removed). Active says the service manager ran
+// every step: on install, it loaded the file as it is now and (re)started
+// the daemon from it; on uninstall it is false, as the service stopped.
+// A run where a step failed prints an error instead.
 type ServiceResult struct {
 	Service   string     `json:"service"`
 	Path      string     `json:"path"`
@@ -112,20 +129,30 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 		}
 		b.WriteString("Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n")
 		return &serviceSpec{
-			kind: "systemd", dir: filepath.Join(cfg, "systemd", "user"), name: unit, marker: unitMarker, body: b.String(),
-			active: "enabled and started",
-			install: [][]string{
-				{"systemctl", "--user", "daemon-reload"},
-				{"systemctl", "--user", "enable", "--now", unit},
+			kind: "systemd", dir: filepath.Join(cfg, "systemd", "user"), name: unit, markers: []string{unitMarker}, body: b.String(),
+			active: "reloaded, enabled and restarted",
+			// restart starts a stopped service too, and makes a running
+			// one run the unit as daemon-reload just read it.
+			install: []serviceStep{
+				{argv: []string{"systemctl", "--user", "daemon-reload"}},
+				{argv: []string{"systemctl", "--user", "enable", unit}},
+				{argv: []string{"systemctl", "--user", "restart", unit}},
 			},
-			uninstall: [][]string{{"systemctl", "--user", "disable", "--now", unit}},
+			// disable --now stops nothing when the unit file is gone, and
+			// systemd may still run the unit it loaded: stop does that.
+			stop: []serviceStep{
+				{argv: []string{"systemctl", "--user", "disable", "--now", unit}, notLoadedOK: true},
+				{argv: []string{"systemctl", "--user", "stop", unit}, notLoadedOK: true},
+			},
 			reload:    [][]string{{"systemctl", "--user", "daemon-reload"}},
+			notLoaded: systemdNotLoaded,
 		}, nil
 	case "darwin":
 		const label = "com.github.dalyem.hopkey"
 		dir := filepath.Join(e.Home, "Library", "LaunchAgents")
 		path := filepath.Join(dir, label+".plist")
 		domain := fmt.Sprintf("gui/%d", os.Getuid())
+		target := domain + "/" + label
 		var b strings.Builder
 		b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 		b.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
@@ -148,12 +175,21 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 		fmt.Fprintf(&b, "\t<key>StandardOutPath</key>\n\t<string>%s</string>\n", xmlText(e.Paths.LogFile()))
 		fmt.Fprintf(&b, "\t<key>StandardErrorPath</key>\n\t<string>%s</string>\n", xmlText(e.Paths.LogFile()))
 		b.WriteString("</dict>\n</plist>\n")
+		bootout := serviceStep{argv: []string{"launchctl", "bootout", target}, notLoadedOK: true}
 		return &serviceSpec{
-			kind: "launchd", dir: dir, name: label + ".plist", marker: plistMarker, body: b.String(),
-			install:   [][]string{{"launchctl", "bootstrap", domain, path}},
-			uninstall: [][]string{{"launchctl", "bootout", domain, path}},
-			loaded:    []string{"launchctl", "print", domain + "/" + label},
-			active:    "loaded",
+			kind: "launchd", dir: dir, name: label + ".plist", markers: []string{plistMarker, unitMarker}, body: b.String(),
+			// bootstrap refuses a loaded agent and reads the file only when
+			// it loads, so the agent goes first; kickstart -k then runs the
+			// daemon from what bootstrap loaded, even when the one RunAtLoad
+			// started has exited.
+			install: []serviceStep{
+				bootout,
+				{argv: []string{"launchctl", "bootstrap", domain, path}},
+				{argv: []string{"launchctl", "kickstart", "-k", target}},
+			},
+			stop:      []serviceStep{bootout},
+			notLoaded: launchdNotLoaded,
+			active:    "loaded and started",
 		}, nil
 	}
 	return nil, failf("hop setup --service supports systemd on Linux and launchd on macOS, not %s; hop starts the daemon itself when you run a command", e.goos())
@@ -168,6 +204,52 @@ func systemdQuote(s string, cmd bool) string {
 		r = append(r, "$", "$$")
 	}
 	return `"` + strings.NewReplacer(r...).Replace(s) + `"`
+}
+
+// launchdNotLoaded: launchctl bootout fails with 3 (ESRCH, "No such
+// process") or 113 ("Could not find specified service") when the domain
+// has no such service.
+func launchdNotLoaded(out []byte, err error) bool {
+	if c := exitStatusOf(err); c == 3 || c == 113 {
+		return true
+	}
+	return bytes.Contains(out, []byte("No such process")) || bytes.Contains(out, []byte("Could not find specified service"))
+}
+
+// systemdNotLoaded: systemctl says "Unit file hopkey.service does not
+// exist" (disable) or "Unit hopkey.service not loaded" (stop).
+func systemdNotLoaded(out []byte, err error) bool {
+	return bytes.Contains(out, []byte("does not exist")) || bytes.Contains(out, []byte("not loaded")) || bytes.Contains(out, []byte("not found"))
+}
+
+func exitStatusOf(err error) int {
+	var ec interface{ ExitCode() int }
+	if errors.As(err, &ec) {
+		return ec.ExitCode()
+	}
+	return -1
+}
+
+// runSteps runs steps in order and stops at the first that fails, with
+// what failed.
+func runSteps(ctx context.Context, e *Env, spec *serviceSpec, steps []serviceStep, res *ServiceResult) error {
+	for _, st := range steps {
+		res.Commands = append(res.Commands, st.argv)
+		out, err := e.runCommand(ctx, st.argv)
+		if err == nil || st.notLoadedOK && spec.notLoaded(out, err) {
+			continue
+		}
+		return failf("%s failed: %v: %s", strings.Join(st.argv, " "), err, printable(strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+func argvs(steps []serviceStep) [][]string {
+	out := make([][]string, len(steps))
+	for i, st := range steps {
+		out[i] = st.argv
+	}
+	return out
 }
 
 func xmlText(s string) string {
@@ -191,23 +273,19 @@ func runService(ctx context.Context, e *Env, yes, uninstall, asJSON bool) error 
 		return err
 	}
 	same := existed && old == spec.body
-	if existed && !same && !strings.Contains(old, spec.marker) {
+	if existed && !same && !spec.owns(old) {
 		return failf("%s exists and hop did not write it; move it away first", path)
 	}
 	res.Notes = append(res.Notes, safef("the service runs %s by that path: run hop setup --service again after moving or upgrading hop", e.Executable))
+	res.Notes = append(res.Notes, "if a hop daemon started some other way owns the vault, the service's daemon exits: run hop daemon stop, then hop setup --service again")
 
-	// The file in place says nothing about whether the service runs (an
-	// earlier run may have failed after writing it), so every run asks the
-	// service manager to load and start it again. Only writing the file
-	// needs consent.
-	cmds := spec.install
+	// The file in place says nothing about what the service manager runs
+	// (an earlier run may have failed after writing it, or the daemon may
+	// have exited), so every run has it load the file and restart the
+	// daemon. Only writing the file needs consent.
 	if !same {
-		if existed && spec.kind == "launchd" {
-			// A loaded agent has to go before the new one can load.
-			cmds = append(slices.Clone(spec.uninstall), cmds...)
-		}
 		fmt.Fprintf(e.Stderr, "hop will write %s, so the hop daemon runs from login, and then run:\n", oneLine(path))
-		for _, c := range cmds {
+		for _, c := range argvs(spec.install) {
 			fmt.Fprintf(e.Stderr, "  %s\n", oneLine(strings.Join(c, " ")))
 		}
 		ok, err := confirm(e, yes, "Install the service?")
@@ -230,35 +308,13 @@ func runService(ctx context.Context, e *Env, yes, uninstall, asJSON bool) error 
 		}
 		res.Changed = true
 		res.Notes = append(res.Notes, safef("%s is now mode 0700, as hop keeps the directories it writes to", spec.dir))
-		if c, err := dialExisting(ctx, e); err == nil && c != nil {
-			c.Close()
-			if !existed {
-				res.Notes = append(res.Notes, "a hop daemon is already running outside the service: the service runs it from your next login, or now after hop daemon stop and starting the service again")
-			}
-		}
 	}
-	for i, c := range cmds {
-		out, err := e.runCommand(ctx, c)
-		res.Commands = append(res.Commands, c)
-		if err == nil {
-			continue
-		}
-		if !same && existed && spec.kind == "launchd" && i == 0 {
-			continue // the old agent was not loaded
-		}
-		if same && spec.loaded != nil && slices.Equal(c, spec.install[len(spec.install)-1]) {
-			// bootstrap refuses an agent that is already loaded, from
-			// this same file: that is what this run wants.
-			res.Commands = append(res.Commands, spec.loaded)
-			if _, lerr := e.runCommand(ctx, spec.loaded); lerr == nil {
-				continue
-			}
-		}
+	if err := runSteps(ctx, e, spec, spec.install, &res); err != nil {
 		what := "wrote " + path
 		if same {
 			what = path + " is in place"
 		}
-		return failf("%s, but %s failed: %v: %s", what, strings.Join(c, " "), err, printable(strings.TrimSpace(string(out))))
+		return failf("%s, but %v; run hop setup --service again to retry", what, err)
 	}
 	res.Active = true
 	if asJSON {
@@ -275,56 +331,60 @@ func runService(ctx context.Context, e *Env, yes, uninstall, asJSON bool) error 
 	return nil
 }
 
+// uninstallService stops the service, then removes its file. The file
+// goes only once the service manager has stopped it, so a failure leaves
+// it in place and running again retries. With no file, it still stops a
+// service the manager may have loaded.
 func uninstallService(ctx context.Context, e *Env, spec *serviceSpec, yes, asJSON bool) error {
 	path := spec.path()
 	res := ServiceResult{Service: spec.kind, Path: path, Commands: [][]string{}}
-	notInstalled := func() error {
-		if asJSON {
-			return printJSON(e, res)
-		}
-		e.printf("no %s service is installed (%s)\n", spec.kind, oneLine(path))
-		return nil
-	}
-	if _, err := os.Lstat(spec.dir); errors.Is(err, os.ErrNotExist) {
-		return notInstalled()
-	}
 	old, existed, err := readServiceFile(path)
 	if err != nil {
 		return err
 	}
-	if !existed {
-		return notInstalled()
-	}
-	if !strings.Contains(old, spec.marker) {
+	if existed && !spec.owns(old) {
 		return failf("%s was not written by hop setup --service; leaving it alone", path)
 	}
-	ok, err := confirm(e, yes, safef("Stop the %s service and remove %s?", spec.kind, path))
+	question := safef("Stop the %s service and remove %s?", spec.kind, path)
+	if !existed {
+		question = safef("There is no %s; stop the %s service in case it is still loaded?", path, spec.kind)
+	}
+	ok, err := confirm(e, yes, question)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return failf("no changes made")
 	}
-	// The same checks as for writing: the directory is the user's, and
-	// nobody else can swap the file hop removes. The file is read again
-	// from the checked path before it goes.
-	dir, err := safepath.EnsurePrivateDir(spec.dir)
-	if err != nil {
-		return failf("%v", err)
-	}
-	checked := filepath.Join(dir, spec.name)
-	if old, existed, err = readServiceFile(checked); err != nil {
-		return err
-	}
-	if !existed || !strings.Contains(old, spec.marker) {
-		return failf("%s changed while hop was removing it; leaving it alone", path)
-	}
-	for _, c := range spec.uninstall {
-		res.Commands = append(res.Commands, c)
-		if out, err := e.runCommand(ctx, c); err != nil {
-			// It may not be loaded; removing the file is what matters.
-			res.Notes = append(res.Notes, safef("%s failed: %v: %s", strings.Join(c, " "), err, printable(strings.TrimSpace(string(out)))))
+	checked := path
+	if existed {
+		// The same checks as for writing: the directory is the user's, and
+		// nobody else can swap the file hop removes. The file is read again
+		// from the checked path before it goes.
+		dir, err := safepath.EnsurePrivateDir(spec.dir)
+		if err != nil {
+			return failf("%v", err)
 		}
+		checked = filepath.Join(dir, spec.name)
+		if old, existed, err = readServiceFile(checked); err != nil {
+			return err
+		}
+		if !existed || !spec.owns(old) {
+			return failf("%s changed while hop was removing it; leaving it alone", path)
+		}
+	}
+	if err := runSteps(ctx, e, spec, spec.stop, &res); err != nil {
+		if existed {
+			return failf("%v; the service may still be running, so hop left %s in place; run hop setup --service --uninstall again to retry", err, path)
+		}
+		return failf("%v; the service may still be running; run hop setup --service --uninstall again to retry", err)
+	}
+	if !existed {
+		if asJSON {
+			return printJSON(e, res)
+		}
+		e.printf("no %s service is installed (%s), and none is running\n", spec.kind, oneLine(path))
+		return nil
 	}
 	if err := os.Remove(checked); err != nil {
 		return failf("%v", err)
@@ -333,6 +393,8 @@ func uninstallService(ctx context.Context, e *Env, spec *serviceSpec, yes, asJSO
 	for _, c := range spec.reload {
 		res.Commands = append(res.Commands, c)
 		if out, err := e.runCommand(ctx, c); err != nil {
+			// The service has stopped; the manager forgets the unit at
+			// its next reload.
 			res.Notes = append(res.Notes, safef("%s failed: %v: %s", strings.Join(c, " "), err, printable(strings.TrimSpace(string(out)))))
 		}
 	}
