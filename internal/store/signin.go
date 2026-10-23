@@ -192,6 +192,13 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 		}
 		return nil, deviceConfig{}, false, ErrVaultExists
 	}
+	// An enrollment by approval in progress here owns the data directory's
+	// next device (enroll.go).
+	if pending, err := s.l.enrollPending(); err != nil {
+		return nil, deviceConfig{}, false, err
+	} else if pending {
+		return nil, deviceConfig{}, false, fmt.Errorf("%w: %w", ErrVaultExists, ErrEnrollmentPending)
+	}
 	if present {
 		if dcfg.AccountID != acctID || !dcfg.DeviceID.IsZero() || dcfg.Next != nil {
 			return nil, deviceConfig{}, false, fmt.Errorf("%w: %s belongs to another device or sign-in", ErrVaultExists, s.l.deviceConfig())

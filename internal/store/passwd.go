@@ -399,23 +399,40 @@ func (s *Store) outside(fl *fileHold, gen uint64, f func() error) error {
 // dropLostRecords deletes every queued outbox record, which no readable
 // device record can open, and adds their number to the count LostIntents
 // reports, in one commit (§11). The caller holds the file lock.
+//
+// The other files sealed under that local_key go in the same commit: a
+// server-backed checkpoint's journal (checkpoint.go), whose kit is then
+// lost (the next checkpoint makes a new one), and an approval in progress
+// (approve.go), which then fails on the approving side.
 func (s *Store) dropLostRecords() error {
 	ns, err := s.l.outboxNumbers()
-	if err != nil || len(ns) == 0 {
-		return err
-	}
-	m, err := s.readOutboxMeta()
 	if err != nil {
 		return err
 	}
 	t := &txn{}
-	for _, n := range ns {
-		t.remove(outboxRel(n))
-		m.Next = max(m.Next, n+1)
+	for _, f := range []struct {
+		rel    string
+		exists func() (bool, error)
+	}{{checkpointRel, s.l.checkpointExists}, {approvalRel, s.l.approvalExists}} {
+		if ok, err := f.exists(); err != nil {
+			return err
+		} else if ok {
+			t.remove(f.rel)
+		}
 	}
-	m.Lost += uint64(len(ns))
-	if err := putOutboxMeta(t, m); err != nil {
-		return err
+	if len(ns) > 0 {
+		m, err := s.readOutboxMeta()
+		if err != nil {
+			return err
+		}
+		for _, n := range ns {
+			t.remove(outboxRel(n))
+			m.Next = max(m.Next, n+1)
+		}
+		m.Lost += uint64(len(ns))
+		if err := putOutboxMeta(t, m); err != nil {
+			return err
+		}
 	}
 	return s.commitTxn(t)
 }
@@ -673,10 +690,19 @@ func (s *Store) AckKit() error {
 	if !s.kitSKDurable {
 		return errors.New("store: the new Secret Key is not saved durably on this device, so the Emergency Kit stays pending; run hop passwd to try again")
 	}
-	if err := s.removeJournal(s.kitSeq); err != nil {
+	if err := s.hook("kit:ack"); err != nil {
 		return err
 	}
-	s.kit = nil
+	if s.kitServer {
+		t := &txn{}
+		t.remove(checkpointRel)
+		if err := s.commitTxn(t); err != nil {
+			return err
+		}
+	} else if err := s.removeJournal(s.kitSeq); err != nil {
+		return err
+	}
+	s.kit, s.kitServer, s.kitKind = nil, false, ""
 	return nil
 }
 
@@ -936,6 +962,7 @@ func (s *Store) resealJournals(st *vaultlog.State, from, to *vaultlog.LocalDevic
 //     checkpoint, is deleted without being shown.
 func (s *Store) recoverJournal() error {
 	s.kit, s.kitOrphaned, s.skErr, s.kitSKDurable = nil, false, nil, false
+	s.kitServer, s.kitKind = false, ""
 	seqs, err := s.journalSeqs()
 	if err != nil {
 		return err
@@ -1010,6 +1037,8 @@ func (s *Store) recoverJournal() error {
 	if s.kit != nil {
 		// A failure is kept in skErr: the kit stays pending, AckKit retries.
 		s.persistKitSK()
+		return nil
 	}
-	return nil
+	// A server-backed checkpoint's journal (checkpoint.go).
+	return s.recoverServerJournal()
 }

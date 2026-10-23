@@ -139,8 +139,10 @@ func (c deviceConfig) withPending(id model.ID) deviceConfig {
 //
 //	JCS({"v":2, "account_id":id, "device_id":id, "kem_sk":b64, "sig_seed":b64(32), "secret_key":str≤64, "local_key":b64(32)})
 //
-// and is read with parseDeviceRecord, which refuses anything else except a
-// phase 1 record (v 1, no local_key). Unlock upgrades that one durably
+// secret_key is "" for a device enrolled by approval (§7), which never
+// receives the Secret Key, until a checkpoint it authors stores the new one
+// (§11 addendum). The record is read with parseDeviceRecord, which refuses
+// anything else except a phase 1 record (v 1, no local_key). Unlock upgrades that one durably
 // before the store is used (upgradeRecord). Only v 2 is ever written.
 //
 // local_key never leaves the machine. Every rewrite carries it unchanged,
@@ -174,8 +176,9 @@ const localKeySize = 32
 // parseDeviceRecord strictly decodes a device record: unknown, missing,
 // duplicate and wrongly typed members are refused, and so is a record with
 // another version, an empty ID or kem_sk, a signing seed that is not 32
-// bytes, or a secret_key that is not a str≤64 holding a valid Secret Key
-// (§12). Its errors never quote the record: they could carry a character of
+// bytes, or a secret_key that is neither "" (a v 2 record of a device
+// enrolled by approval, §11 addendum) nor a str≤64 holding a valid Secret
+// Key (§12). Its errors never quote the record: they could carry a character of
 // the keys.
 func parseDeviceRecord(b []byte) (*deviceRecord, error) {
 	var rec deviceRecord
@@ -208,12 +211,18 @@ func parseDeviceRecord(b []byte) (*deviceRecord, error) {
 		err = errors.New("device record: empty kem_sk")
 	case len(rec.SigSeed) != ed25519.SeedSize:
 		err = errors.New("device record: sig_seed is not 32 bytes")
+	case rec.SecretKey == "" && rec.V != 2:
+		err = errors.New("device record: a phase 1 record has no secret_key")
+	case rec.SecretKey == "":
+		// A device enrolled by approval never receives the Secret Key
+		// (§11, the "Enrolled devices" addendum). loadVault requires its
+		// certificate to show that it was.
 	default:
 		err = crypto.CheckStr("secret_key", rec.SecretKey, 64)
-	}
-	if err == nil {
-		if _, perr := crypto.ParseSecretKey(rec.SecretKey); perr != nil {
-			err = errors.New("device record: secret_key is not a valid Secret Key")
+		if err == nil {
+			if _, perr := crypto.ParseSecretKey(rec.SecretKey); perr != nil {
+				err = errors.New("device record: secret_key is not a valid Secret Key")
+			}
 		}
 	}
 	if err != nil {
@@ -270,7 +279,14 @@ func (r *deviceRecord) device() (*vaultlog.LocalDevice, error) {
 	return &vaultlog.LocalDevice{ID: r.DeviceID, KEM: kem, Sig: ed25519.NewKeyFromSeed(r.SigSeed)}, nil
 }
 
+// secretKey returns the stored Secret Key. A device enrolled by approval
+// stores none (§11 addendum) until a checkpoint it authors: then it is
+// ErrNeedSecretKey, and the caller asks the user for the one in the
+// Emergency Kit.
 func (r *deviceRecord) secretKey() (*crypto.SecretKey, error) {
+	if r.SecretKey == "" {
+		return nil, ErrNeedSecretKey
+	}
 	sk, err := crypto.ParseSecretKey(r.SecretKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: the stored Secret Key does not parse", ErrDeviceKey)

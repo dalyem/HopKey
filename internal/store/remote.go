@@ -200,12 +200,24 @@ func (s *Store) applyPulled(gen uint64, entries []Committed, head vaultlog.Head)
 	before := s.state.Head.Seq
 	st, sec, err := s.applyEntries(s.state, s.sec, s.dev, nil, entries, s.rec)
 	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+		if sec != s.sec {
+			zeroSecrets(sec)
+		}
 		return false, s.revoke(rev)
 	}
 	// An interrupted commit locks the store (commitTxn): then nothing is
-	// installed, and the next unlock replays the journal.
+	// installed, and the next unlock replays the journal. The secrets
+	// applyEntries returned are then nobody's.
 	if s.current(gen) == nil && st != s.state {
 		s.state, s.sec = st, sec
+		// A journaled checkpoint this pull committed shows its kit now.
+		if s.kit == nil {
+			if rerr := s.recoverServerJournal(); rerr != nil && err == nil {
+				err = rerr
+			}
+		}
+	} else if s.state == nil && sec != nil {
+		zeroSecrets(sec)
 	}
 	if err != nil {
 		return false, s.haltOn(err)
@@ -237,7 +249,11 @@ func (s *Store) haltOn(err error) error {
 
 // applyEntries verifies entries on top of (st, sec) and commits each one,
 // with the outbox records it settles. It returns the last committed state,
-// even with an error. Entries this device already holds are compared with
+// even with an error. The secrets of every state it replaces are dropped
+// once their successor is committed (supersede): the caller's sec too, so
+// the caller installs what it returns, or zeroes it, and never uses sec
+// again once an entry committed. A verified successor whose commit fails
+// is dropped at once. Entries this device already holds are compared with
 // what it holds (§5.6). rec is the device record whose local_key opens the
 // outbox: a password unlock passes the new record, which carries the old
 // one's local_key, before it is saved. A password unlock has no dev, and
@@ -278,12 +294,12 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 		if err != nil {
 			return st, sec, err
 		}
-		// TODO(D2 review round 3, tracked follow-up): the secrets this
-		// entry supersedes are not zeroed (see supersede), nor are nsec's
-		// when commitVerified fails.
 		if err := s.commitVerified(c.Wire, h, next, rec); err != nil {
+			// nsec was never installed: drop what it does not share.
+			supersede(nsec, sec)
 			return st, sec, err
 		}
+		supersede(sec, nsec)
 		st, sec = next, nsec
 	}
 	return st, sec, nil
@@ -319,6 +335,11 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 		}
 		return s.entryHash(seq)
 	}, rec, st.VaultID); err != nil {
+		return err
+	}
+	// A journaled checkpoint's candidate at this seq is settled in the same
+	// commit (checkpoint.go).
+	if err := s.settleCheckpointJournal(t, w, h, st, rec); err != nil {
 		return err
 	}
 	return s.commitTxn(t)

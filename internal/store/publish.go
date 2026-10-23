@@ -397,6 +397,12 @@ func (s *Store) refuseCheckpoint() error {
 	if len(seqs) > 0 {
 		return ErrCheckpointPending
 	}
+	// A server-backed checkpoint's journal (checkpoint.go).
+	if ok, err := s.l.checkpointExists(); err != nil {
+		return err
+	} else if ok {
+		return ErrCheckpointPending
+	}
 	return nil
 }
 
@@ -764,10 +770,16 @@ func (s *Store) applyPublished(j *publicationJSON, entries []Committed, head vau
 	before := s.state.Head.Seq
 	st, sec, err := s.applyEntries(s.state, s.sec, s.dev, nil, entries, s.rec)
 	if rev := (*vaultlog.RevokedError)(nil); errors.As(err, &rev) {
+		if sec != s.sec {
+			zeroSecrets(sec)
+		}
 		return false, s.revoke(rev)
 	}
 	if s.state != nil && st != s.state {
 		s.state, s.sec = st, sec
+	} else if s.state == nil && sec != nil {
+		// An interrupted commit locked the store: these were never installed.
+		zeroSecrets(sec)
 	}
 	if err != nil {
 		var eq *vaultlog.EquivocationError
@@ -805,6 +817,10 @@ func (s *Store) applyPublished(j *publicationJSON, entries []Committed, head vau
 	return true, nil
 }
 
+// TODO(slice E2 follow-up): another writer is adding a shared
+// internal/email package; once it is on the phase branch, use its
+// normalization here and delete this copy.
+//
 // NormalizeEmail normalizes and checks an email address as the server does
 // (plan R4): leading and trailing ASCII spaces and tabs are removed, the
 // domain is lowercased (ASCII only) and the local part kept byte for byte.

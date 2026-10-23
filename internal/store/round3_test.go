@@ -249,8 +249,23 @@ func TestDeviceRecordRefusesABadSecretKey(t *testing.T) {
 	if _, err := parseDeviceRecord(with(sk)); err != nil {
 		t.Fatalf("control: %v", err)
 	}
+	// Slice E2: "" now parses (a device enrolled by approval stores no
+	// Secret Key, §11 addendum), but a device that was not enrolled by
+	// approval still never unlocks with it.
+	t.Run("empty", func(t *testing.T) {
+		b := with("")
+		if _, err := parseDeviceRecord(b); err != nil {
+			t.Fatalf("an enrolled device's record is refused: %v", err)
+		}
+		if err := cfg.Keyring.Set(keychainService, user, string(b)); err != nil {
+			t.Fatal(err)
+		}
+		info := open(t, cfg).Info()
+		if !info.Locked || !strings.Contains(info.LockReason, "not enrolled by approval") {
+			t.Errorf("locked=%v reason %q", info.Locked, info.LockReason)
+		}
+	})
 	for name, v := range map[string]string{
-		"empty":        "",
 		"garbage":      "not-a-secret-key",
 		"bad checksum": sk[:len(sk)-1] + string(swap),
 	} {

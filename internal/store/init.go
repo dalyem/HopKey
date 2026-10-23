@@ -56,6 +56,11 @@ func PrepareInit(cfg Config, opts InitOptions) (*PendingInit, error) {
 	} else if pending {
 		return nil, fmt.Errorf("%w: a sign-in is in progress here; finish it with hop auth login", ErrVaultExists)
 	}
+	if pending, err := s.l.enrollPending(); err != nil {
+		return nil, err
+	} else if pending {
+		return nil, fmt.Errorf("%w: %w", ErrVaultExists, ErrEnrollmentPending)
+	}
 	store := opts.DeviceStore
 	if store == "" {
 		store = DeviceStoreKeychain

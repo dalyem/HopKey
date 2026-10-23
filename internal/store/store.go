@@ -193,6 +193,10 @@ type Store struct {
 	lockErr error
 	kit     *Kit   // a committed password change whose kit is not confirmed
 	kitSeq  uint64 // the seq of kit's journal
+	// kitServer means kit is a server-backed checkpoint's, journaled in
+	// vault/checkpoint.json (checkpoint.go), of kind kitKind.
+	kitServer bool
+	kitKind   string
 	// kitOrphaned means the current checkpoint's journal is sealed only to
 	// a device key this device no longer has: its kit cannot be shown.
 	kitOrphaned bool
@@ -411,6 +415,7 @@ func (s *Store) dropLocked(reason error) {
 	zeroDevice(s.dev)
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
+	s.kitServer, s.kitKind = false, ""
 	s.lockErr = reason
 	// §11.2: locking stops pulls and pushes. In-flight requests are
 	// cancelled, and their responses are discarded by generation.
@@ -582,6 +587,14 @@ func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
 	st, sec, repaired, err := s.replay(stored, raw, acct, dev, nil)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Only a device enrolled by approval keeps no Secret Key (§11 addendum):
+	// its certificate carries the enrollment transcript.
+	if rec.SecretKey == "" {
+		if d, active := st.Devices[dev.ID]; !active || d.Cert.EnrollTranscript.IsZero() {
+			zeroSecrets(sec)
+			return nil, nil, fmt.Errorf("%w: the device record has no Secret Key, but this device was not enrolled by approval", ErrDeviceKey)
+		}
 	}
 	ok = true
 	return &loaded{rec: rec, dev: dev, st: st, sec: sec, repaired: repaired, server: server}, unlock, nil

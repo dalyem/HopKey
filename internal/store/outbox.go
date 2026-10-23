@@ -616,6 +616,9 @@ func (s *Store) OutboxEmpty() (bool, error) {
 func (s *Store) HasCheckpointJournal() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if ok, err := s.l.checkpointExists(); err != nil || ok {
+		return ok, err
+	}
 	seqs, err := s.journalSeqs()
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
