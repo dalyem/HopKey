@@ -13,3 +13,6 @@
 
 # Build cache of scripts/check.sh
 /.check-cache/
+
+# Binaries built by scripts/preview-server.sh
+/.bin/
