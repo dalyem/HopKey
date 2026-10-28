@@ -247,6 +247,9 @@ type Store struct {
 	// syncHalt is the error that stopped syncing (an equivocation or a
 	// rule violation in a server entry).
 	syncHalt error
+	// replaced is what settled candidates replaced of other devices'
+	// values, until TakeReplacements (remote.go).
+	replaced []Replacement
 	// pubAlarm is the equivocation the last publication resolution found
 	// (§4.3, §5.6); the publication stays pending.
 	pubAlarm error
@@ -472,6 +475,7 @@ func (s *Store) dropLocked(reason error) {
 	}
 	zeroDevice(s.dev)
 	s.state, s.sec, s.dev, s.rec, s.kit = nil, nil, nil, nil, nil
+	s.replaced = nil
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
 	s.kitServer, s.kitKind = false, ""
 	s.lockErr = reason

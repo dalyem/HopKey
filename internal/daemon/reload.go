@@ -328,13 +328,22 @@ func (d *Daemon) clearWarning(why string) string {
 		"the daemon tries again every %v", d.opts.Paths.ConfigDir, why, d.configRetry())
 }
 
+// logoutCleaner is the encrypted store's mark of a finished logout that
+// still owes the ssh config (*store.Store).
+type logoutCleaner interface{ ClearLogoutCleanup() error }
+
 // clearConfigLocked wipes what the vault decrypted into the ssh config
 // directory, so nothing of it stays behind (§5.5): a config with no hosts,
-// and no key files or pins (sshconfig.Wipe). A failure is kept in
-// clearErr, shown in status and retried by retryConfig. The caller holds
-// d.mu.
+// and no key files or pins (sshconfig.Wipe). Once that worked, the store's
+// mark of a logout that owes it is cleared, so no later start wipes again.
+// A failure is kept in clearErr, shown in status and retried by
+// retryConfig. The caller holds d.mu.
 func (d *Daemon) clearConfigLocked() {
-	if err := d.wipeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}); err != nil {
+	err := d.wipeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()})
+	if c, ok := d.store.(logoutCleaner); ok && err == nil {
+		err = c.ClearLogoutCleanup()
+	}
+	if err != nil {
 		why := err.Error()
 		d.clearErr.Store(&why)
 		d.logf("clearing the ssh config: %v", err)

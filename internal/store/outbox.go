@@ -19,14 +19,19 @@ import (
 // The outbox of a server-backed vault (§11.1). Every host, key, credential
 // and snippet write is stored first as a record, one file per record:
 //
-//	vault/outbox/<n>.json   record = JCS({"v":1, "vault_id":id, "n":u64s, "sealed":AEAD(local_key, state, aad), "wires":[wire, ...]})
+//	vault/outbox/<n>.json   record = JCS({"v":2, "vault_id":id, "n":u64s, "sealed":AEAD(local_key, state, aad), "wires":[wire, ...]})
 //	vault/outbox.json       the next n, and the count of records lost with an unreadable device record
 //
 // with
 //
 //	intent = JCS({"v":1, "action":"create"|"put"|"delete", "item_id":id, "type":type, "seen":item|null, "want":item|null, "import":id|""})
-//	state  = JCS({"v":1, "intent":intent, "held":bool, "candidates":[{"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead"}]})
+//	state  = JCS({"v":2, "intent":intent, "held":bool, "candidates":[{"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead"}],
+//	              "replaced":[{"h":h, "name":string, "fields":[member, ...]}]})
 //	aad    = lp("hopkey/v1/outbox") || lp(vault_id) || u64(n)
+//
+// replaced says, for a candidate by its h, which free members it replaces
+// of another device's values (Replacement), journaled with the candidate.
+// A version 1 record, which has no replaced member, is still read.
 //
 // Records are pushed in strict n order. Only the head is ever pushed, and a
 // held head blocks every record behind it. A record never changes except
@@ -51,6 +56,10 @@ const (
 	labelOutbox = "hopkey/v1/outbox"
 
 	outboxVersion = 1
+	// recordVersion is the version of outbox/<n>.json and of its sealed
+	// state. Version 2 added the sealed state's replaced member; a version
+	// 1 record is still read (with none).
+	recordVersion = 2
 
 	statusLive      = "live"
 	statusCommitted = "committed"
@@ -101,10 +110,29 @@ type candidate struct {
 
 // sealedState is the plaintext of a record's sealed member.
 type sealedState struct {
+	V          int            `json:"v"`
+	Intent     intentJSON     `json:"intent"`
+	Held       bool           `json:"held"`
+	Candidates []candidate    `json:"candidates"`
+	Replaced   []replacedJSON `json:"replaced"`
+}
+
+// sealedStateV1 is sealedState as version 1 wrote it.
+type sealedStateV1 struct {
 	V          int         `json:"v"`
 	Intent     intentJSON  `json:"intent"`
 	Held       bool        `json:"held"`
 	Candidates []candidate `json:"candidates"`
+}
+
+// replacedJSON says, for the candidate with H, what it replaces of another
+// device's (Replacement; the item is the record's intent's). It is kept
+// with the journaled candidate so that whichever pull settles the
+// candidate, in this process or after a restart, can report it.
+type replacedJSON struct {
+	H      crypto.Hash `json:"h"`
+	Name   string      `json:"name"`
+	Fields []string    `json:"fields"`
 }
 
 // recordFile is outbox/<n>.json.
@@ -134,6 +162,21 @@ type record struct {
 	// Wires holds the candidate wires by H. A wire in the file whose H is
 	// not listed in the sealed candidates is ignored.
 	Wires map[crypto.Hash]*vaultlog.Wire
+	// Replaced holds, by H, what a candidate replaces of another device's
+	// values, for the candidates that replace any.
+	Replaced map[crypto.Hash]*Replacement
+}
+
+// replacement is what candidate h replaces, or nil.
+func (r *record) replacement(h crypto.Hash) *Replacement {
+	rp := r.Replaced[h]
+	if rp == nil {
+		return nil
+	}
+	out := *rp
+	out.ItemID, out.Type = r.Intent.ItemID, r.Intent.Type
+	out.Fields = slices.Clone(rp.Fields)
+	return &out
 }
 
 // live returns the record's live candidate, if it has one.
@@ -183,11 +226,16 @@ func (j *intentJSON) intent() (merge.Intent, error) {
 // sealRecord encodes r under key for the vault.
 func sealRecord(key *crypto.SymKey, vaultID model.ID, r *record) ([]byte, error) {
 	st := sealedState{
-		V: outboxVersion, Intent: intentToJSON(r.Intent, r.Import), Held: r.Held,
-		Candidates: slices.Clone(r.Cands),
+		V: recordVersion, Intent: intentToJSON(r.Intent, r.Import), Held: r.Held,
+		Candidates: slices.Clone(r.Cands), Replaced: []replacedJSON{},
 	}
 	if st.Candidates == nil {
 		st.Candidates = []candidate{}
+	}
+	for _, c := range r.Cands {
+		if rp := r.Replaced[c.H]; rp != nil {
+			st.Replaced = append(st.Replaced, replacedJSON{H: c.H, Name: rp.Name, Fields: slices.Clone(rp.Fields)})
+		}
 	}
 	pt, err := canonjson.Marshal(st)
 	if err != nil {
@@ -197,7 +245,7 @@ func sealRecord(key *crypto.SymKey, vaultID model.ID, r *record) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	f := recordFile{V: outboxVersion, VaultID: vaultID, N: r.N, Sealed: env, Wires: []canonjson.Raw{}}
+	f := recordFile{V: recordVersion, VaultID: vaultID, N: r.N, Sealed: env, Wires: []canonjson.Raw{}}
 	for _, c := range r.Cands {
 		w, ok := r.Wires[c.H]
 		if !ok {
@@ -222,7 +270,7 @@ func openRecord(key *crypto.SymKey, vaultID model.ID, n uint64, b []byte) (*reco
 	if err := canonjson.Unmarshal(b, &f); err != nil {
 		return nil, bad("%v", err)
 	}
-	if f.V != outboxVersion || f.N != n || f.VaultID != vaultID {
+	if (f.V != recordVersion && f.V != 1) || f.N != n || f.VaultID != vaultID {
 		return nil, bad("wrong version, number or vault")
 	}
 	pt, err := crypto.OpenAEAD(key, f.Sealed, outboxAAD(vaultID, n))
@@ -230,9 +278,15 @@ func openRecord(key *crypto.SymKey, vaultID model.ID, n uint64, b []byte) (*reco
 		return nil, bad("the sealed state does not open")
 	}
 	var st sealedState
-	err = canonjson.Unmarshal(pt, &st)
+	if f.V == 1 {
+		var v1 sealedStateV1
+		err = canonjson.Unmarshal(pt, &v1)
+		st = sealedState{V: v1.V, Intent: v1.Intent, Held: v1.Held, Candidates: v1.Candidates}
+	} else {
+		err = canonjson.Unmarshal(pt, &st)
+	}
 	clear(pt)
-	if err != nil || st.V != outboxVersion {
+	if err != nil || st.V != f.V {
 		return nil, bad("the sealed state does not parse")
 	}
 	in, err := st.Intent.intent()
@@ -257,6 +311,15 @@ func openRecord(key *crypto.SymKey, vaultID model.ID, n uint64, b []byte) (*reco
 	}
 	if live > 1 {
 		return nil, bad("more than one live candidate")
+	}
+	for _, rj := range st.Replaced {
+		if !listed[rj.H] || r.Replaced[rj.H] != nil || len(rj.Fields) == 0 {
+			return nil, bad("a replacement names no candidate, one twice, or no field")
+		}
+		if r.Replaced == nil {
+			r.Replaced = map[crypto.Hash]*Replacement{}
+		}
+		r.Replaced[rj.H] = &Replacement{Name: rj.Name, Fields: rj.Fields}
 	}
 	for _, raw := range f.Wires {
 		w, err := vaultlog.ParseWire(raw)

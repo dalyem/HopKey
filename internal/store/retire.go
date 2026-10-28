@@ -535,6 +535,12 @@ func (s *Store) cleanupRetired() error {
 	if j == nil || j.State != StateRetired {
 		return fmt.Errorf("%w: the logout's cleanup needs its RETIRED journal", ErrCorrupt)
 	}
+	// What the vault decrypted outside the store is the caller's to
+	// remove. The mark of it goes down first and outlives the journal, so
+	// a crash anywhere from here still leaves it owed.
+	if err := markLogoutCleanup(s.l.data); err != nil {
+		return err
+	}
 	// The outbox, in one commit.
 	ns, err := s.l.outboxNumbers()
 	if err != nil {
@@ -601,6 +607,49 @@ func (s *Store) cleanupRetired() error {
 	}
 	return syncDir(s.l.vault())
 }
+
+// logoutCleanupName marks a finished logout whose cleanup outside the
+// store (the ssh config hop generated from the vault) is not confirmed. It
+// lives in the data directory, beside device.json, not in the vault.
+const logoutCleanupName = "logout-cleanup"
+
+// markLogoutCleanup writes the mark, durably, unless it is there.
+func markLogoutCleanup(dataDir string) error {
+	path := filepath.Join(dataDir, logoutCleanupName)
+	if _, err := os.Lstat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writeFileAtomic(path, []byte("a logout finished; hop removes what the vault decrypted into the ssh config, then this file\n"))
+}
+
+// LogoutCleanupPending reports whether a logout finished in dataDir and
+// what the vault decrypted outside the store, the ssh config hop
+// generated, may still be there. A logout's cleanup marks it before it
+// deletes anything, so a crash at any point after RETIRED leaves the mark,
+// and only ClearLogoutCleanup removes it: the caller does so once those
+// files are gone.
+func LogoutCleanupPending(dataDir string) (bool, error) {
+	_, err := os.Lstat(filepath.Join(dataDir, logoutCleanupName))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// ClearLogoutCleanup removes the mark LogoutCleanupPending reads. One
+// that is not there is no error.
+func ClearLogoutCleanup(dataDir string) error {
+	if err := os.Remove(filepath.Join(dataDir, logoutCleanupName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDir(dataDir)
+}
+
+// ClearLogoutCleanup is ClearLogoutCleanup of this store's data
+// directory, for the daemon, which never sees the path.
+func (s *Store) ClearLogoutCleanup() error { return ClearLogoutCleanup(s.l.data) }
 
 // deleteRetiredRecords deletes, each one conclusively (one already gone
 // counts), the keychain entry of every device record the journal j names,

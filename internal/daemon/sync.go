@@ -81,6 +81,7 @@ type syncStore interface {
 	RequestContext(ctx context.Context) (context.Context, uint64, func(), error)
 	Pull(ctx context.Context, r store.Remote) error
 	PushHead(ctx context.Context, r store.Remote) (store.PushResult, error)
+	TakeReplacements() []store.Replacement
 	Lock()
 
 	Retirement() (string, error)
@@ -360,9 +361,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		return stepIdle
 	}
 	if st.Held == 0 && st.Pending > 0 {
-		pctx, cancel := context.WithTimeout(ctx, e.opts.pushTimeout)
-		res, err := e.st.PushHead(pctx, r)
-		cancel()
+		res, err := e.pushHead(ctx, r)
 		if err != nil {
 			e.reconcile(ctx, gen, &st)
 			return e.fail(ctx, err)
@@ -416,8 +415,19 @@ func (e *syncer) terminal() bool {
 	return e.phase == SyncRevoked || e.phase == SyncLoggedOut
 }
 
+// pushHead pushes the outbox's head record under the per-push deadline,
+// its pulls included, so queued changes do not wait on a server that
+// stopped answering for as long as a request may take, whether the loop
+// or hop sync pushes.
+func (e *syncer) pushHead(ctx context.Context, r store.Remote) (store.PushResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, e.opts.pushTimeout)
+	defer cancel()
+	return e.st.PushHead(ctx, r)
+}
+
 // pulled records a pull that worked and reloads if it changed anything.
 func (e *syncer) pulled(ctx context.Context, gen uint64) {
+	e.noteReplaced()
 	e.set(func() {
 		e.syncedAt = time.Now()
 		e.attempt, e.retryAt, e.lastErr, e.lastErrAt = 0, time.Time{}, "", time.Time{}
@@ -438,6 +448,7 @@ func (e *syncer) pulled(ctx context.Context, gen uint64) {
 // generation gen (a lock fences the old keyring off already) or the
 // daemon is closing.
 func (e *syncer) reconcile(ctx context.Context, gen uint64, before *store.SyncStatus) {
+	e.noteReplaced()
 	if ctx.Err() != nil || e.st.Generation() != gen {
 		return
 	}
@@ -457,7 +468,6 @@ func (e *syncer) pushed(ctx context.Context, gen uint64, res store.PushResult) {
 	if res.Outcome != store.PushEmpty {
 		e.d.outboxGen.Add(1)
 	}
-	e.noteReplaced(res)
 	if res.Outcome == store.PushHeld {
 		e.d.logf("sync: queued change %d is held: %+v", res.N, res.Hold)
 	}
@@ -508,30 +518,30 @@ func (e *syncer) fail(ctx context.Context, err error) time.Duration {
 	return wait
 }
 
-// noteReplaced records a pushed change that replaced another device's
-// value of a free member (store.Replacement): the merge keeps the last
-// change to reach the server there, and holds nothing (§5.4), so the
-// other device's value is gone and this is where the user hears of it.
-// The note names the item and the members, never a value; it goes to the
-// log and to sync.status.
-func (e *syncer) noteReplaced(res store.PushResult) {
-	r := res.Replaced
-	if res.Outcome != store.PushCommitted || r == nil {
-		return
-	}
-	what := fmt.Sprintf("%s %q", r.Type, r.Name)
-	if r.Name == "" {
-		what = fmt.Sprintf("%s %s", r.Type, r.ItemID)
-	}
-	msg := fmt.Sprintf("%s: this device's edit of its %s replaced a different value another device had saved first "+
-		"(for this field the last change to reach the server wins)", what, strings.Join(r.Fields, ", "))
-	e.d.logf("sync: %s", msg)
-	e.set(func() {
-		e.replaced = append(e.replaced, msg)
-		if len(e.replaced) > maxReplacedNotes {
-			e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
+// noteReplaced records the pushed changes that replaced another device's
+// value of a free member (store.Replacement), as verified history settles
+// them: the merge keeps the last change to reach the server there, and
+// holds nothing (§5.4), so the other device's value is gone and this is
+// where the user hears of it. It runs after every pull and push, worked or
+// not, since the one that settles a change need not be the push that
+// posted it (an answer lost, a post repeated). The note names the item and
+// the members, never a value; it goes to the log and to sync.status.
+func (e *syncer) noteReplaced() {
+	for _, r := range e.st.TakeReplacements() {
+		what := fmt.Sprintf("%s %q", r.Type, r.Name)
+		if r.Name == "" {
+			what = fmt.Sprintf("%s %s", r.Type, r.ItemID)
 		}
-	})
+		msg := fmt.Sprintf("%s: this device's edit of its %s replaced a different value another device had saved first "+
+			"(for this field the last change to reach the server wins)", what, strings.Join(r.Fields, ", "))
+		e.d.logf("sync: %s", msg)
+		e.set(func() {
+			e.replaced = append(e.replaced, msg)
+			if len(e.replaced) > maxReplacedNotes {
+				e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
+			}
+		})
+	}
 }
 
 func (e *syncer) noteHalt(why string, equivocation bool) {
@@ -894,13 +904,12 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 	if err == nil && req.kind == reqSyncNow {
 		for range maxSyncNowPushes {
 			var res store.PushResult
-			if res, err = e.st.PushHead(rctx, r); err != nil {
+			if res, err = e.pushHead(rctx, r); err != nil {
 				break
 			}
 			if res.Outcome != store.PushEmpty {
 				e.d.outboxGen.Add(1)
 			}
-			e.noteReplaced(res)
 			if res.Outcome == store.PushEmpty || res.Outcome == store.PushHeld {
 				break
 			}

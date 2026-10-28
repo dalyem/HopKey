@@ -1242,3 +1242,97 @@ func TestPullEquivocation(t *testing.T) {
 		t.Errorf("pull from a server that lost an entry: %v", err)
 	}
 }
+
+// An edit that replaces another device's description is reported once,
+// when verified history settles its candidate, whichever call does that:
+// the push after one whose answer was lost, a pull, or a push after a
+// restart, including a re-post of a candidate that had not committed.
+func TestReplacementIsReportedWhenVerifiedHistorySettlesIt(t *testing.T) {
+	reopen := func(t *testing.T, p *pair) *Store {
+		t.Helper()
+		if err := p.a.s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return open(t, p.a.cfg)
+	}
+	for _, tc := range []struct {
+		name   string
+		commit bool // whether the post whose answer is lost commits
+		settle func(t *testing.T, p *pair) *Store
+	}{
+		{"the next push", true, func(t *testing.T, p *pair) *Store { pushAll(t, p.a.s, p.r); return p.a.s }},
+		{"a pull", true, func(t *testing.T, p *pair) *Store { pull(t, p.a.s, p.r); return p.a.s }},
+		{"a push after a restart", true, func(t *testing.T, p *pair) *Store { a := reopen(t, p); pushAll(t, a, p.r); return a }},
+		{"a re-post after a restart", false, func(t *testing.T, p *pair) *Store { a := reopen(t, p); pushAll(t, a, p.r); return a }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPair(t)
+			a, b := p.a.s, p.b.s
+			editHost(t, b, p.host.ItemID, func(h *model.Host) { h.Description = "from B" })
+			pushAll(t, b, p.r)
+			editHost(t, a, p.host.ItemID, func(h *model.Host) { h.Description = "from A" })
+			p.r.onPost = func(*vaultlog.Wire) (bool, error) { return tc.commit, errLostResponse }
+			if _, err := a.PushHead(context.Background(), p.r); !errors.Is(err, errLostResponse) {
+				t.Fatalf("push with a lost answer: %v", err)
+			}
+			p.r.onPost = nil
+			if got := a.TakeReplacements(); len(got) != 0 {
+				t.Errorf("reported before verified history settled it: %+v", got)
+			}
+
+			s := tc.settle(t, p)
+			if len(records(t, s)) != 0 {
+				t.Fatal("the edit is still queued")
+			}
+			got := s.TakeReplacements()
+			if len(got) != 1 || got[0].ItemID != p.host.ItemID || got[0].Type != model.TypeHost || got[0].Name != "web" ||
+				!slices.Equal(got[0].Fields, []string{"description"}) {
+				t.Errorf("replacements: %+v", got)
+			}
+			if again := s.TakeReplacements(); len(again) != 0 {
+				t.Errorf("reported twice: %+v", again)
+			}
+			if h, _ := verifiedHost(t, s, p.host.ItemID); h.Description != "from A" {
+				t.Errorf("host %+v", h)
+			}
+		})
+	}
+}
+
+// A record written before the sealed state recorded replacements (record
+// version 1) still opens and is pushed.
+func TestVersion1RecordStillOpens(t *testing.T) {
+	p := newPair(t)
+	a := p.a.s
+	editHost(t, a, p.host.ItemID, func(h *model.Host) { h.Description = "queued before the upgrade" })
+	r := records(t, a)[0]
+	a.mu.Lock()
+	vaultID := a.state.VaultID
+	key, err := a.rec.localKey()
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, err := canonjson.Marshal(sealedStateV1{V: 1, Intent: intentToJSON(r.Intent, r.Import), Held: r.Held, Candidates: []candidate{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := crypto.SealAEAD(key, pt, outboxAAD(vaultID, r.N))
+	key.Zero()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := canonjson.Marshal(recordFile{V: 1, VaultID: vaultID, N: r.N, Sealed: env, Wires: []canonjson.Raw{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(p.a.cfg.DataDir, "vault", outboxRel(r.N)), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res := pushAll(t, a, p.r); res.Outcome != PushEmpty {
+		t.Fatalf("push: %+v", res)
+	}
+	if h, _ := verifiedHost(t, a, p.host.ItemID); h.Description != "queued before the upgrade" {
+		t.Errorf("host %+v", h)
+	}
+}

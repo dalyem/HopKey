@@ -59,6 +59,17 @@ func loggedOut(t *testing.T, cfg Config, who ids) {
 	if _, err := tryOpen(t, cfg); !errors.Is(err, ErrNoVault) {
 		t.Errorf("open after the logout: %v; want ErrNoVault", err)
 	}
+	// The ssh config is the caller's to empty, and stays owed until it
+	// says it has.
+	if pending, err := LogoutCleanupPending(cfg.DataDir); err != nil || !pending {
+		t.Errorf("the cleanup outside the store is not marked as owed: %v %v", pending, err)
+	}
+	if err := ClearLogoutCleanup(cfg.DataDir); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := LogoutCleanupPending(cfg.DataDir); err != nil || pending {
+		t.Errorf("still owed after ClearLogoutCleanup: %v %v", pending, err)
+	}
 }
 
 // retiredOnServer reports how the server says dev left, or "".

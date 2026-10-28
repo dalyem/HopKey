@@ -48,8 +48,11 @@ func socketAbsent(err error) bool {
 }
 
 // startDaemon launches the daemon and waits for its control socket. A
-// daemon that exits first ends the wait at once, and the error shows what
-// it logged on this start, which says why.
+// daemon that fails to start ends the wait at once, and the error shows
+// what it logged on this start, which says why. One that exits because
+// another daemon has the sockets (exit 0) or the vault (exitVaultBusy)
+// leaves the wait to go on: that daemon, started by another command at
+// the same moment, may still be unlocking the vault.
 func startDaemon(ctx context.Context, e *Env) error {
 	wait := e.DaemonWait
 	if wait == 0 {
@@ -94,12 +97,13 @@ func startDaemon(ctx context.Context, e *Env) error {
 		}
 		select {
 		case <-exited:
-			// One that found another daemon serving exits too; that one
-			// answers.
 			if dial() {
 				return nil
 			}
-			return failure("the hop daemon exited as it started")
+			if code := proc.exitCode(); code != 0 && code != exitVaultBusy {
+				return failure("the hop daemon exited as it started")
+			}
+			exited = nil // another daemon is starting: wait for it
 		case <-ctx.Done():
 		case <-time.After(50 * time.Millisecond):
 		}
@@ -115,6 +119,8 @@ type daemonProc struct {
 	// exited is closed once the daemon has exited and been reaped, so it
 	// is never left defunct under a long-lived hop mcp.
 	exited <-chan struct{}
+	// code is the exit status, set before exited is closed.
+	code int
 	// logFrom is the log's size before the daemon started: what it
 	// writes comes after.
 	logFrom int64
@@ -157,12 +163,18 @@ func spawnDaemon(e *Env) (*daemonProc, error) {
 		return nil, err
 	}
 	exited := make(chan struct{})
+	p := &daemonProc{exited: exited, logFrom: logFrom}
 	go func() {
 		cmd.Wait()
+		p.code = cmd.ProcessState.ExitCode()
 		close(exited)
 	}()
-	return &daemonProc{exited: exited, logFrom: logFrom}, nil
+	return p, nil
 }
+
+// exitCode is the daemon's exit status, once exited is closed: -1 for one
+// a signal ended.
+func (p *daemonProc) exitCode() int { return p.code }
 
 // logTail returns the last few lines of the daemon log for an error message:
 // of those written from offset from on, when from is not negative and the

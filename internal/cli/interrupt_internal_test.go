@@ -604,7 +604,7 @@ func TestDaemonFailsFastAgainstALiveOwner(t *testing.T) {
 	err = runDaemon(context.Background(), x.e, nil)
 	elapsed := time.Since(start)
 	var ee *exitError
-	if !errors.As(err, &ee) || ee.code != ExitFailure || ee.msg != "the vault is busy (another hop process owns it)" {
+	if !errors.As(err, &ee) || ee.code != exitVaultBusy || ee.msg != "the vault is busy (another hop process owns it)" {
 		t.Fatalf("runDaemon: %v, want a failure saying the vault is busy", err)
 	}
 	if limit := busyWait + 2*time.Second; elapsed > limit {

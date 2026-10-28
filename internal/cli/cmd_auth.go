@@ -991,6 +991,15 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if s == nil {
+		if h.loggedOut {
+			// An earlier logout was recorded and cut short; opening the
+			// vault finished it, and open emptied the ssh config.
+			if o.asJSON {
+				return printJSON(e, logoutReport{LogoutResult: store.LogoutResult{State: store.StateRetired, Done: true}})
+			}
+			e.printf("An interrupted logout is finished: this device's keys and vault are deleted.\n")
+			return nil
+		}
 		// A logout that deleted the vault but could not empty the ssh
 		// config said to run it again: this is that retry.
 		wipeSSHConfig(e, o.asJSON)
@@ -1040,12 +1049,32 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 // wipeSSHConfig removes what the vault decrypted into the ssh config
 // directory (§5.5), as the daemon does for a logout it finishes: the
 // config is left with no hosts, and the key files and pins go
-// (sshconfig.Wipe). Files hop did not write are left alone. A failure is
-// a warning, and hop logout run again retries it.
+// (sshconfig.Wipe). Files hop did not write are left alone. Once that
+// worked, the store's mark of a logout that still owes it is cleared. A
+// failure is a warning: the mark stays, and the next hop command that
+// finds no vault, or starts the daemon, tries again (finishLogoutCleanup),
+// as does hop logout run again.
 func wipeSSHConfig(e *Env, asJSON bool) {
 	err := sshconfig.Wipe(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()})
+	if err == nil {
+		err = store.ClearLogoutCleanup(e.storeConfig().DataDir)
+	}
 	if err != nil {
-		warn(e, asJSON, fmt.Sprintf("the ssh config in %s could not be emptied (%v) and may still name the vault's hosts; run hop logout again to retry", e.Paths.ConfigDir, err))
+		warn(e, asJSON, fmt.Sprintf("the ssh config in %s could not be emptied (%v) and may still name the vault's hosts; hop tries again on its next start, or run hop logout again", e.Paths.ConfigDir, err))
+	}
+}
+
+// finishLogoutCleanup empties the ssh config if a finished logout still
+// owes it (store.LogoutCleanupPending): one a crash cut short after it was
+// recorded, which store.Open has just finished, or one whose wipe failed.
+func finishLogoutCleanup(e *Env, asJSON bool) {
+	pending, err := store.LogoutCleanupPending(e.storeConfig().DataDir)
+	if err != nil {
+		warn(e, asJSON, fmt.Sprintf("could not tell whether a logout still has to empty the ssh config in %s: %v", e.Paths.ConfigDir, err))
+		return
+	}
+	if pending {
+		wipeSSHConfig(e, asJSON)
 	}
 }
 

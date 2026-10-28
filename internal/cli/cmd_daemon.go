@@ -52,8 +52,14 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 			fmt.Fprintln(e.Stderr, "hop daemon is already running")
 			return nil
 		}
-		return failf("the vault is busy (another hop process owns it)")
+		// Most often another daemon that is still unlocking the vault: the
+		// command that started this one keeps waiting for it (startDaemon).
+		return &exitError{code: exitVaultBusy, msg: "the vault is busy (another hop process owns it)"}
 	}
+	// A logout that Open has just finished (a crash had cut it short), or
+	// one whose wipe failed, still owes the ssh config: empty it before
+	// this daemon exits, or before it writes a new vault's config.
+	finishLogoutCleanup(e, false)
 	if err != nil {
 		return failf("opening the vault: %v", err)
 	}
@@ -108,6 +114,11 @@ func (e *Env) clearHandback() {
 		os.Remove(path)
 	}
 }
+
+// exitVaultBusy is hop daemon's exit status when another process owns the
+// vault and no daemon answered in busyWait (EX_TEMPFAIL): not a failure to
+// start, since that process is most often a daemon still unlocking.
+const exitVaultBusy = 75
 
 // busyWait is how long a daemon that finds the vault busy waits for the
 // owner to answer on the control socket: a daemon that has just opened the

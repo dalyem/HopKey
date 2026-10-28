@@ -94,6 +94,8 @@ type vaultHold struct {
 	asJSON bool // the command's output mode, for the warnings of release and abandon
 	marker string
 	once   sync.Once // the daemon's restart, by release or abandon
+	// loggedOut says open finished a logout that a crash had cut short.
+	loggedOut bool
 }
 
 // holdMarkerName is the marker's name in the run directory.
@@ -252,18 +254,28 @@ const vaultBusyWait = 10 * time.Second
 
 // open opens the data directory's vault, or returns nil when there is
 // none. The daemon closes the vault after its sockets are gone, so a busy
-// vault is tried again for a while.
+// vault is tried again for a while. A logout that was recorded before a
+// crash finishes as the vault opens (store.ErrLoggedOut), and open then
+// returns nil with h.loggedOut set. Wherever there turns out to be no
+// vault, the ssh config a finished logout still owes is emptied
+// (finishLogoutCleanup).
 func (h *vaultHold) open(ctx context.Context) (*store.Store, error) {
 	exists, err := store.Exists(h.cfg.DataDir)
 	if err != nil {
 		return nil, failf("%v", err)
 	}
 	if !exists {
+		finishLogoutCleanup(h.e, h.asJSON)
 		return nil, nil
 	}
 	deadline := time.Now().Add(vaultBusyWait)
 	for {
 		s, err := store.Open(ctx, h.cfg)
+		if errors.Is(err, store.ErrNoVault) {
+			h.loggedOut = errors.Is(err, store.ErrLoggedOut)
+			finishLogoutCleanup(h.e, h.asJSON)
+			return nil, nil
+		}
 		if !errors.Is(err, store.ErrVaultBusy) || time.Now().After(deadline) {
 			if errors.Is(err, store.ErrVaultBusy) {
 				return nil, failf("the vault is busy: another hop process owns it (hop auth stops the daemon first; is another hop auth command running?)")
