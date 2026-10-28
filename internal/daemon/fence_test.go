@@ -128,6 +128,9 @@ func (f *fencedStore) Unlock(context.Context) error {
 func (f *fencedStore) UnlockWithPassword(ctx context.Context, _ []byte, _ string) error {
 	return f.Unlock(ctx)
 }
+func (f *fencedStore) UnlockWithPassphrase(ctx context.Context, _ []byte) error {
+	return f.Unlock(ctx)
+}
 func (f *fencedStore) ChangePassword(context.Context, []byte, []byte) (store.Kit, error) {
 	return store.Kit{}, errors.New("not in this test")
 }

@@ -82,9 +82,10 @@ type Options struct {
 	// Logf receives log lines. Nil discards them.
 	Logf func(format string, args ...any)
 
-	// Test hooks: writeConfig replaces sshconfig.Write, and configRetry
-	// configRetryInterval.
+	// Test hooks: writeConfig replaces sshconfig.Write, wipeConfig
+	// sshconfig.Wipe, and configRetry configRetryInterval.
 	writeConfig func(sshconfig.Options, []sshconfig.Host) error
+	wipeConfig  func(sshconfig.Options) error
 	configRetry time.Duration
 }
 
@@ -100,8 +101,10 @@ type Daemon struct {
 	agent   *sshagent.Server
 	control *controlListener
 
-	// writeConfig writes the ssh config (sshconfig.Write).
+	// writeConfig writes the ssh config (sshconfig.Write), and wipeConfig
+	// empties it and removes its files (sshconfig.Wipe).
 	writeConfig func(sshconfig.Options, []sshconfig.Host) error
+	wipeConfig  func(sshconfig.Options) error
 
 	// mu serializes changes to the vault and reloads, so the keyring and the
 	// ssh config always come from one snapshot, newest last.
@@ -175,10 +178,13 @@ func Start(opts Options) (*Daemon, error) {
 		opts: opts, store: opts.Store, ts: opts.Tailscale, logf: logf,
 		started: time.Now(), live: live, agent: agentSrv, control: control,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		writeConfig: opts.writeConfig,
+		writeConfig: opts.writeConfig, wipeConfig: opts.wipeConfig,
 	}
 	if d.writeConfig == nil {
 		d.writeConfig = sshconfig.Write
+	}
+	if d.wipeConfig == nil {
+		d.wipeConfig = sshconfig.Wipe
 	}
 	if err := d.reload(ctx); (errors.Is(err, model.ErrLocked) || errors.Is(err, store.ErrDeviceRevoked)) && d.canUnlock() {
 		// A locked vault (its device key unreadable, say) still gets a

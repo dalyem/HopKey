@@ -8,14 +8,30 @@ import (
 	"github.com/dalyem/hopkey/internal/store"
 )
 
+// LockResult is the --json shape of hop lock and hop unlock.
+type LockResult struct {
+	Locked bool `json:"locked"`
+	// Password says hop unlock --password replaced the device key.
+	Password bool `json:"password,omitempty"`
+}
+
 // runLock is `hop lock`: the daemon drops every secret and the agent holds
 // no keys until hop unlock.
 func runLock(ctx context.Context, e *Env, args []string) error {
-	if len(args) != 0 {
+	fs := newFlags(e, "lock", commands["lock"].usage)
+	asJSON := fs.Bool("json", false, "print the result as JSON")
+	pos, _, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 0 {
 		return failf("usage: %s", commands["lock"].usage)
 	}
 	if err := call(ctx, e, daemon.OpLock, nil, nil); err != nil {
 		return err
+	}
+	if *asJSON {
+		return printJSON(e, LockResult{Locked: true})
 	}
 	e.printf("vault locked; the agent holds no keys\n")
 	return nil
@@ -24,9 +40,16 @@ func runLock(ctx context.Context, e *Env, args []string) error {
 // runUnlock is `hop unlock`: reload the vault with the device key, or with
 // --password, open it with the master password and the Secret Key and
 // replace the device key (the path for a lost or broken keychain entry).
+//
+// A sealed device key file opens with the device passphrase. hop unlock
+// sends the daemon its own HOP_DEVICE_PASSPHRASE; without one, on a
+// terminal, it asks for it once the daemon's own (if any) did not open
+// the file. A daemon that hop mcp or the login service started has none,
+// and uses the one it is sent for this unlock only.
 func runUnlock(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "unlock", commands["unlock"].usage)
 	usePassword := fs.Bool("password", false, "unlock with the master password and set up a new device key")
+	asJSON := fs.Bool("json", false, "print the result as JSON")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -39,14 +62,42 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	defer c.Close()
-	if !*usePassword {
-		w, err := c.CallWarn(ctx, daemon.OpUnlock, nil, nil)
-		if err := changeWarning(e, false, w, err); err != nil {
-			return failf("%v", err)
+	done := func(password bool) error {
+		switch {
+		case *asJSON:
+			if err := printJSON(e, LockResult{Password: password}); err != nil {
+				return err
+			}
+		case password:
+			e.printf("vault unlocked with the master password; this device has a new device key\n")
+		default:
+			e.printf("vault unlocked\n")
 		}
-		e.printf("vault unlocked\n")
 		vaultWarnings(ctx, e, c)
 		return kitReminder(ctx, e, c)
+	}
+	if !*usePassword {
+		unlock := func(pass []byte) (*daemon.Error, error) {
+			var p any
+			if len(pass) > 0 {
+				p = daemon.UnlockParams{DevicePassphrase: string(pass)}
+			}
+			return c.CallWarn(ctx, daemon.OpUnlock, p, nil)
+		}
+		pass := []byte(e.Getenv(store.PassphraseEnv))
+		w, err := unlock(pass)
+		if err != nil && len(pass) == 0 && canAskPassphrase(e) {
+			// The daemon has no passphrase of its own, or the wrong one.
+			if pass, err = e.ReadPassword("Device passphrase: "); err != nil {
+				return failf("reading the device passphrase: %v", err)
+			}
+			defer clear(pass)
+			w, err = unlock(pass)
+		}
+		if err := changeWarning(e, *asJSON, w, err); err != nil {
+			return failf("%v", err)
+		}
+		return done(false)
 	}
 	if e.ReadPassword == nil {
 		return failf("hop unlock --password needs a terminal to ask for the master password")
@@ -70,12 +121,20 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	if daemon.IsCode(err, daemon.CodeWrongPassword) {
 		return failf("wrong master password or Secret Key; the vault was not unlocked")
 	}
-	if err := changeWarning(e, false, w, err); err != nil {
+	if err := changeWarning(e, *asJSON, w, err); err != nil {
 		return failf("%v", err)
 	}
-	e.printf("vault unlocked with the master password; this device has a new device key\n")
-	vaultWarnings(ctx, e, c)
-	return kitReminder(ctx, e, c)
+	return done(true)
+}
+
+// canAskPassphrase reports whether hop unlock may ask for the device
+// passphrase: there is a terminal, and the device key is a sealed file.
+func canAskPassphrase(e *Env) bool {
+	if !e.StdinTTY || e.ReadPassword == nil {
+		return false
+	}
+	sealed, err := store.SealedDeviceFile(e.storeConfig().DataDir)
+	return err == nil && sealed
 }
 
 // vaultWarnings prints the vault's warnings (a lost Emergency Kit, stale

@@ -321,21 +321,23 @@ func (d *Daemon) configStale(why string) error {
 		"the daemon tries again every %v", d.opts.Paths.ConfigDir, why, d.configRetry())}
 }
 
-// clearWarning tells the user that a revoked device's ssh config could not
-// be emptied.
+// clearWarning tells the user that a revoked or logged-out device's ssh
+// config could not be emptied.
 func (d *Daemon) clearWarning(why string) string {
-	return fmt.Sprintf("this device was revoked, but the ssh config in %s could not be emptied (%s) and still names the vault's hosts; "+
+	return fmt.Sprintf("this device was revoked or logged out, but the ssh config in %s could not be emptied (%s) and may still name the vault's hosts; "+
 		"the daemon tries again every %v", d.opts.Paths.ConfigDir, why, d.configRetry())
 }
 
-// clearConfigLocked writes an ssh config with no hosts, so nothing the
-// vault decrypted stays behind (§5.5). A failure is kept in clearErr,
-// shown in status and retried by retryConfig. The caller holds d.mu.
+// clearConfigLocked wipes what the vault decrypted into the ssh config
+// directory, so nothing of it stays behind (§5.5): a config with no hosts,
+// and no key files or pins (sshconfig.Wipe). A failure is kept in
+// clearErr, shown in status and retried by retryConfig. The caller holds
+// d.mu.
 func (d *Daemon) clearConfigLocked() {
-	if err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, nil); err != nil {
+	if err := d.wipeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}); err != nil {
 		why := err.Error()
 		d.clearErr.Store(&why)
-		d.logf("clearing the ssh config of a revoked device: %v", err)
+		d.logf("clearing the ssh config: %v", err)
 		return
 	}
 	d.clearErr.Store(nil)

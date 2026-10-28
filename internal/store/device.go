@@ -413,6 +413,25 @@ func (s *Store) noteSecretKeyGen(id model.ID, gen uint32) error {
 	return nil
 }
 
+// SealedDeviceFile reports whether the vault in dataDir keeps its device
+// key in a sealed file, which opens only with the device passphrase. It
+// reads device.json and nothing else, so it works while a daemon owns
+// the vault. A data directory with no device.json has none.
+func SealedDeviceFile(dataDir string) (bool, error) {
+	b, err := os.ReadFile(layout{data: dataDir}.deviceConfig())
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var c deviceConfig
+	if err := json.Unmarshal(b, &c); err != nil {
+		return false, fmt.Errorf("%s does not parse: %w", layout{data: dataDir}.deviceConfig(), err)
+	}
+	return c.Store == DeviceStoreFile && c.Sealed, nil
+}
+
 // Describe says which store is in use, for hop status (§11).
 func (d *deviceStore) Describe() string {
 	switch {
@@ -702,7 +721,7 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 	case d.cfg.Sealed && f.KDFVersion == crypto.KDFv1.Version && len(f.Salt) == crypto.SaltSize:
 		pass := d.getenv(PassphraseEnv)
 		if pass == "" {
-			return nil, fmt.Errorf("%w: %s is sealed; set %s", ErrDeviceKey, path, PassphraseEnv)
+			return nil, fmt.Errorf("%w: %s is sealed; run hop unlock with %s set, or on a terminal to type the passphrase", ErrDeviceKey, path, PassphraseEnv)
 		}
 		env, err := crypto.ParseAEADEnvelope(f.Key)
 		if err != nil {

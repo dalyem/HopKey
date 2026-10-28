@@ -368,6 +368,7 @@ func (s *Server) authenticate(tx Tx, tokHash crypto.Hash) (*principal, error) {
 		if !now.Before(sess.ExpiresAt) {
 			return nil, errUnauthorized
 		}
+		s.noteSeen(sess.AccountID, sess.DeviceID)
 		return &principal{
 			kind: credSession, tokenHash: tokHash, accountID: sess.AccountID, vaultID: sess.VaultID,
 			deviceID: sess.DeviceID, expiresAt: sess.ExpiresAt,

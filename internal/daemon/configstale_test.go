@@ -31,6 +31,16 @@ func failingWrites(fail *atomic.Bool) func(sshconfig.Options, []sshconfig.Host) 
 	}
 }
 
+// failingWipes is a wipeConfig hook that fails while it is set.
+func failingWipes(fail *atomic.Bool) func(sshconfig.Options) error {
+	return func(o sshconfig.Options) error {
+		if fail.Load() {
+			return errors.New("the directory is read-only")
+		}
+		return sshconfig.Wipe(o)
+	}
+}
+
 // knownHosts is the known_hosts file that config points ssh at.
 func knownHosts(t *testing.T, config string) string {
 	t.Helper()
@@ -212,7 +222,7 @@ func TestRevokedConfigIsClearedOnceItCanBeWritten(t *testing.T) {
 	var fail atomic.Bool
 	paths := Paths{RunDir: filepath.Join(base, "run"), ConfigDir: filepath.Join(base, "cfg")}
 	d, err := Start(Options{Paths: paths, Store: rs, Version: "test", Tailscale: fakeTS{}, Logf: t.Logf,
-		writeConfig: failingWrites(&fail), configRetry: 50 * time.Millisecond})
+		writeConfig: failingWrites(&fail), wipeConfig: failingWipes(&fail), configRetry: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,6 +275,13 @@ func TestRevokedConfigIsClearedOnceItCanBeWritten(t *testing.T) {
 	})
 	if st := status(); hasWarning(st.Warnings, "could not be emptied") || st.KeysInAgent != 0 {
 		t.Errorf("status after the config was emptied: %d keys, %q", st.KeysInAgent, st.Warnings)
+	}
+	// The key files and the pins went with it, at once, not after the
+	// grace period that keeps them for an ssh still reading them.
+	for _, pattern := range []string{"known_hosts*", filepath.Join("keys", "*.pub")} {
+		if left, _ := filepath.Glob(filepath.Join(paths.ConfigDir, pattern)); len(left) != 0 {
+			t.Errorf("left behind after the revocation: %q", left)
+		}
 	}
 }
 

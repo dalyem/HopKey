@@ -26,8 +26,10 @@ func TestRebuildPut(t *testing.T) {
 		want mods
 		s    mods
 
-		// Write: the result is the base host with these mods, at S's version.
-		result mods
+		// Write: the result is the base host with these mods, at S's version,
+		// and the free members whose remote value want replaced.
+		result   mods
+		replaced []string
 		// Hold: the cause and the guarded members on each side.
 		hold          Cause
 		local, remote []string
@@ -55,22 +57,25 @@ func TestRebuildPut(t *testing.T) {
 			result: mods{name("theirs"), hostDesc("local")},
 		},
 		{
-			name:   "free member in both takes want",
-			want:   mods{hostDesc("b")},
-			s:      mods{hostDesc("c")},
-			result: mods{hostDesc("b")},
+			name:     "free member in both takes want",
+			want:     mods{hostDesc("b")},
+			s:        mods{hostDesc("c")},
+			result:   mods{hostDesc("b")},
+			replaced: []string{"description"},
 		},
 		{
-			name:   "free in both, guarded only local",
-			want:   mods{name("new"), hostDesc("b")},
-			s:      mods{hostDesc("c")},
-			result: mods{name("new"), hostDesc("b")},
+			name:     "free in both, guarded only local",
+			want:     mods{name("new"), hostDesc("b")},
+			s:        mods{hostDesc("c")},
+			result:   mods{name("new"), hostDesc("b")},
+			replaced: []string{"description"},
 		},
 		{
-			name:   "free in both, guarded only remote",
-			want:   mods{hostDesc("b")},
-			s:      mods{user("admin"), hostDesc("c")},
-			result: mods{user("admin"), hostDesc("b")},
+			name:     "free in both, guarded only remote",
+			want:     mods{hostDesc("b")},
+			s:        mods{user("admin"), hostDesc("c")},
+			result:   mods{user("admin"), hostDesc("b")},
+			replaced: []string{"description"},
 		},
 		{
 			name:   "free in both, equal",
@@ -208,6 +213,9 @@ func TestRebuildPut(t *testing.T) {
 				t.Fatalf("got %s/%s/%v, want a put write", res.Kind, res.Action, res.Cause)
 			}
 			samePlain(t, res.Plaintext, host(t, verS, tc.result...))
+			if !slices.Equal(res.Replaced, tc.replaced) {
+				t.Errorf("replaced %v, want %v", res.Replaced, tc.replaced)
+			}
 		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,11 +39,13 @@ type SyncOptions struct {
 
 	// Test hooks. after replaces time.After for backoff and idle waits;
 	// minBackoff and maxBackoff replace 1 s and 60 s; catchUpAge replaces
-	// how old the last pull must be before a catch-up; noPoll keeps the
-	// loop from pulling unless asked (it still pushes).
+	// how old the last pull must be before a catch-up; pushTimeout
+	// replaces 15 s; noPoll keeps the loop from pulling unless asked (it
+	// still pushes).
 	after                  func(time.Duration) <-chan time.Time
 	minBackoff, maxBackoff time.Duration
 	catchUpAge             time.Duration
+	pushTimeout            time.Duration
 	noPoll                 bool
 }
 
@@ -53,11 +56,19 @@ const (
 	defaultCatchUpAge = 3 * time.Second
 	// catchUpTimeout bounds the pull a missed target waits for.
 	catchUpTimeout = 2 * time.Second
+	// defaultPushTimeout bounds one push, its pull included, so queued
+	// changes do not wait on a server that stopped answering for as long
+	// as a request may take, while status says online.
+	defaultPushTimeout = 15 * time.Second
 	// idleRecheck is how often an idle loop looks at the store again, in
 	// case something changed that did not wake it (a publication, say).
 	idleRecheck = 30 * time.Second
 	// maxSyncNowPushes bounds the records one sync.now pushes.
 	maxSyncNowPushes = 64
+	// maxReplacedNotes bounds the notes noteReplaced keeps.
+	maxReplacedNotes = 10
+	// devicesSeenTimeout bounds the question devices.list asks the server.
+	devicesSeenTimeout = 5 * time.Second
 )
 
 // syncStore is the sync side of the encrypted store (*store.Store).
@@ -158,6 +169,9 @@ type syncer struct {
 	halted    string
 	equivoc   bool
 	notes     []string // from the startup work: things that need the user
+	// replaced are the newest notes of pushed changes that replaced
+	// another device's (noteReplaced), at most maxReplacedNotes.
+	replaced []string
 	// retired is the server's unverified word that this device left the
 	// account (sessionEnded).
 	retired *ServerRetirement
@@ -185,6 +199,9 @@ func newSyncer(d *Daemon, st syncStore, opts SyncOptions) *syncer {
 	}
 	if opts.catchUpAge == 0 {
 		opts.catchUpAge = defaultCatchUpAge
+	}
+	if opts.pushTimeout <= 0 {
+		opts.pushTimeout = defaultPushTimeout
 	}
 	if syncclient.DevInsecureFromEnv(os.Getenv) {
 		opts.Client.DevInsecure = true
@@ -343,7 +360,9 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		return stepIdle
 	}
 	if st.Held == 0 && st.Pending > 0 {
-		res, err := e.st.PushHead(ctx, r)
+		pctx, cancel := context.WithTimeout(ctx, e.opts.pushTimeout)
+		res, err := e.st.PushHead(pctx, r)
+		cancel()
 		if err != nil {
 			e.reconcile(ctx, gen, &st)
 			return e.fail(ctx, err)
@@ -366,7 +385,14 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		cancel()
 	default:
 	}
-	err = e.st.Pull(pctx, r.WithWait(e.opts.Wait))
+	// Only once the server has answered does a pull wait for news: until
+	// then, at start and after a failure, status would say starting or
+	// retrying for as long as the long-poll lasts.
+	wait := e.opts.Wait
+	if e.status().State != SyncOnline {
+		wait = 0
+	}
+	err = e.st.Pull(pctx, r.WithWait(wait))
 	woken := pctx.Err() != nil
 	e.set(func() { e.pollStop = nil })
 	cancel()
@@ -431,6 +457,7 @@ func (e *syncer) pushed(ctx context.Context, gen uint64, res store.PushResult) {
 	if res.Outcome != store.PushEmpty {
 		e.d.outboxGen.Add(1)
 	}
+	e.noteReplaced(res)
 	if res.Outcome == store.PushHeld {
 		e.d.logf("sync: queued change %d is held: %+v", res.N, res.Hold)
 	}
@@ -479,6 +506,32 @@ func (e *syncer) fail(ctx context.Context, err error) time.Duration {
 	})
 	e.d.logf("sync: %v (retrying in %v)", err, wait.Round(time.Millisecond))
 	return wait
+}
+
+// noteReplaced records a pushed change that replaced another device's
+// value of a free member (store.Replacement): the merge keeps the last
+// change to reach the server there, and holds nothing (§5.4), so the
+// other device's value is gone and this is where the user hears of it.
+// The note names the item and the members, never a value; it goes to the
+// log and to sync.status.
+func (e *syncer) noteReplaced(res store.PushResult) {
+	r := res.Replaced
+	if res.Outcome != store.PushCommitted || r == nil {
+		return
+	}
+	what := fmt.Sprintf("%s %q", r.Type, r.Name)
+	if r.Name == "" {
+		what = fmt.Sprintf("%s %s", r.Type, r.ItemID)
+	}
+	msg := fmt.Sprintf("%s: this device's edit of its %s replaced a different value another device had saved first "+
+		"(for this field the last change to reach the server wins)", what, strings.Join(r.Fields, ", "))
+	e.d.logf("sync: %s", msg)
+	e.set(func() {
+		e.replaced = append(e.replaced, msg)
+		if len(e.replaced) > maxReplacedNotes {
+			e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
+		}
+	})
 }
 
 func (e *syncer) noteHalt(why string, equivocation bool) {
@@ -748,6 +801,30 @@ func (e *syncer) remoteFor(gen uint64) (*syncclient.Remote, error) {
 	return r, nil
 }
 
+// devicesSeen asks the server when each of the account's devices last made
+// a request, for devices.list. Nil when it can't say (the vault is
+// local-only or locked, or the server does not answer in time): the
+// listing then goes by the log alone.
+func (e *syncer) devicesSeen(ctx context.Context) map[model.ID]time.Time {
+	r, err := e.remoteFor(e.st.Generation())
+	if err != nil || r == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, devicesSeenTimeout)
+	defer cancel()
+	rctx, _, done, err := e.st.RequestContext(ctx)
+	if err != nil {
+		return nil
+	}
+	defer done()
+	seen, err := r.DevicesSeen(rctx)
+	if err != nil {
+		e.d.logf("asking the server when each device was last seen: %v", err)
+		return nil
+	}
+	return seen
+}
+
 // request asks the loop to run kind and waits for it, or for ctx.
 func (e *syncer) request(ctx context.Context, kind int) error {
 	r := &syncReq{ctx: ctx, kind: kind, done: make(chan error, 1)}
@@ -823,6 +900,7 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 			if res.Outcome != store.PushEmpty {
 				e.d.outboxGen.Add(1)
 			}
+			e.noteReplaced(res)
 			if res.Outcome == store.PushEmpty || res.Outcome == store.PushHeld {
 				break
 			}
@@ -891,5 +969,6 @@ func (e *syncer) status() SyncStatusResult {
 		out.Backoff = &SyncBackoff{Attempt: e.attempt, RetryAt: e.retryAt}
 	}
 	out.Warnings = append(out.Warnings, e.notes...)
+	out.Warnings = append(out.Warnings, e.replaced...)
 	return out
 }

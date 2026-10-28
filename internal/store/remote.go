@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -481,6 +482,39 @@ type PushResult struct {
 	N       uint64    // the head record's number; 0 for PushEmpty
 	Hold    *HoldInfo // for PushHeld
 	Head    Head      // the verified head afterwards
+	// Replaced, for PushCommitted, says what the committed change
+	// replaced of another device's: nil when nothing.
+	Replaced *Replacement
+}
+
+// Replacement is a change that replaced, in free members (a host's or a
+// snippet's description, §5.4), a different value another device had
+// committed since this device's edit was made. The last change to reach
+// the server wins there and nothing is held, so the other value is lost.
+// It names the item and the members, never the values.
+type Replacement struct {
+	ItemID model.ID
+	Type   model.Type
+	Name   string // the item's name, if it has one
+	Fields []string
+}
+
+// replacementOf describes what res, a write of rec's intent, replaced, or
+// is nil.
+func replacementOf(rec *record, res merge.Result) *Replacement {
+	if res.Kind != merge.KindWrite || len(res.Replaced) == 0 {
+		return nil
+	}
+	r := &Replacement{ItemID: rec.Intent.ItemID, Type: rec.Intent.Type, Fields: res.Replaced}
+	if res.Plaintext != nil {
+		if raw, ok := res.Plaintext.Member("name"); ok {
+			var name string
+			if json.Unmarshal(raw, &name) == nil {
+				r.Name = name
+			}
+		}
+	}
+	return r
 }
 
 // HoldInfo says why a record is held: the §5.4 cause, the guarded members
@@ -525,6 +559,7 @@ func (s *Store) PushHead(ctx context.Context, r Remote) (PushResult, error) {
 	}
 	defer s.syncMu.Unlock()
 	pushed := uint64(0)
+	var replaced *Replacement // what the candidate posted last replaces
 	for attempt := 0; attempt < maxPushAttempts; attempt++ {
 		if err := s.pullLocked(ctx, r); err != nil {
 			return PushResult{}, err
@@ -536,9 +571,12 @@ func (s *Store) PushHead(ctx context.Context, r Remote) (PushResult, error) {
 		res, w, err := s.prepareHead(gen, pushed)
 		if err != nil || w == nil {
 			done()
+			if res.Outcome == PushCommitted {
+				res.Replaced = replaced
+			}
 			return res, err
 		}
-		pushed = res.N
+		pushed, replaced = res.N, res.Replaced
 		if err := s.hook("push:post"); err != nil {
 			done()
 			return PushResult{}, err
@@ -624,6 +662,7 @@ func (s *Store) prepareHead(gen, pushed uint64) (PushResult, *vaultlog.Wire, err
 	}
 	// Journal the candidate before posting it (§11.1).
 	w := ev.wire
+	out.Replaced = replacementOf(rec, ev.res)
 	h, err := w.Entry.Hash()
 	if err != nil {
 		return out, nil, err

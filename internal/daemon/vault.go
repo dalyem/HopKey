@@ -33,6 +33,7 @@ type Vault interface {
 	Info() store.Info
 	Lock()
 	Unlock(ctx context.Context) error
+	UnlockWithPassphrase(ctx context.Context, passphrase []byte) error
 	UnlockWithPassword(ctx context.Context, password []byte, secretKey string) error
 	ChangePassword(ctx context.Context, current, next []byte) (store.Kit, error)
 	PendingKit() *store.Kit
@@ -41,10 +42,14 @@ type Vault interface {
 
 // UnlockParams is the request for OpUnlock. With no password, the device
 // key unlocks; with one, pw_blob does (hop unlock --password), using
-// SecretKey when the device has none stored.
+// SecretKey when the device has none stored. DevicePassphrase opens a
+// sealed device key file in place of the daemon's own
+// HOP_DEVICE_PASSPHRASE, which a daemon started by hop mcp or the login
+// service does not have; it is used for this unlock and not kept.
 type UnlockParams struct {
-	Password  string `json:"password,omitempty"`
-	SecretKey string `json:"secret_key,omitempty"`
+	Password         string `json:"password,omitempty"`
+	SecretKey        string `json:"secret_key,omitempty"`
+	DevicePassphrase string `json:"device_passphrase,omitempty"`
 }
 
 // PasswdParams is the request for OpPasswd.
@@ -206,9 +211,14 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var err error
-	if p.Password != "" {
+	switch {
+	case p.Password != "":
 		err = v.UnlockWithPassword(ctx, []byte(p.Password), p.SecretKey)
-	} else {
+	case p.DevicePassphrase != "":
+		pass := []byte(p.DevicePassphrase)
+		err = v.UnlockWithPassphrase(ctx, pass)
+		clear(pass)
+	default:
 		err = v.Unlock(ctx)
 	}
 	if err != nil {

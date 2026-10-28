@@ -14,6 +14,7 @@ import (
 	"github.com/dalyem/hopkey/internal/authflow"
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/syncclient"
 )
@@ -990,6 +991,9 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if s == nil {
+		// A logout that deleted the vault but could not empty the ssh
+		// config said to run it again: this is that retry.
+		wipeSSHConfig(e, o.asJSON)
 		return failf("there is no vault on this device, so there is nothing to log out of")
 	}
 	defer s.Close()
@@ -1014,6 +1018,9 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return authFailure(err)
 	}
 	s.Close()
+	if res.Done {
+		wipeSSHConfig(e, o.asJSON)
+	}
 	if o.asJSON {
 		return printJSON(e, logoutReport{LogoutResult: res, DeviceID: id})
 	}
@@ -1028,6 +1035,18 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	}
 	e.printf("Logged out: this device left the account, and its keys and vault are deleted.\n")
 	return nil
+}
+
+// wipeSSHConfig removes what the vault decrypted into the ssh config
+// directory (§5.5), as the daemon does for a logout it finishes: the
+// config is left with no hosts, and the key files and pins go
+// (sshconfig.Wipe). Files hop did not write are left alone. A failure is
+// a warning, and hop logout run again retries it.
+func wipeSSHConfig(e *Env, asJSON bool) {
+	err := sshconfig.Wipe(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()})
+	if err != nil {
+		warn(e, asJSON, fmt.Sprintf("the ssh config in %s could not be emptied (%v) and may still name the vault's hosts; run hop logout again to retry", e.Paths.ConfigDir, err))
+	}
 }
 
 // ---- merge ----

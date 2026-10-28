@@ -265,6 +265,10 @@ type Store struct {
 
 	owner *os.File // vault/owner.lock, held from Open (or Commit) to Close
 
+	// passphrase opens a sealed device key file in place of
+	// HOP_DEVICE_PASSPHRASE, during one UnlockWithPassphrase only.
+	passphrase atomic.Pointer[[]byte]
+
 	testHook func(stage string) error // simulates crashes in tests
 	// testSignIn sees a merge sign-in's secrets once its device record is
 	// made, so tests can check they are zeroed.
@@ -281,10 +285,20 @@ func (s *Store) ring() Keyring {
 }
 
 func (s *Store) getenv() func(string) string {
-	if s.cfg.Getenv != nil {
-		return s.cfg.Getenv
+	get := s.cfg.Getenv
+	if get == nil {
+		get = os.Getenv
 	}
-	return os.Getenv
+	if p := s.passphrase.Load(); p != nil {
+		pass := string(*p)
+		return func(k string) string {
+			if k == PassphraseEnv {
+				return pass
+			}
+			return get(k)
+		}
+	}
+	return get
 }
 
 func (s *Store) now() model.Timestamp {
@@ -490,6 +504,24 @@ func (s *Store) IsRevoked() bool { return s.isRevoked.Load() }
 func (s *Store) Unlock(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.unlockDevice()
+}
+
+// UnlockWithPassphrase is Unlock with the passphrase of a sealed device
+// key file, for a process whose own environment has none (a daemon that
+// hop mcp or the login service started): hop unlock sends the caller's.
+// It is used in place of HOP_DEVICE_PASSPHRASE for this unlock only, and
+// is not kept; the caller zeroes it.
+func (s *Store) UnlockWithPassphrase(ctx context.Context, passphrase []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.passphrase.Store(&passphrase)
+	defer s.passphrase.Store(nil)
+	return s.unlockDevice()
+}
+
+// unlockDevice is Unlock. The caller holds s.mu.
+func (s *Store) unlockDevice() error {
 	if s.state != nil {
 		return nil
 	}

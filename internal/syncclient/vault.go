@@ -190,6 +190,29 @@ func (r *Remote) Object(ctx context.Context, h crypto.Hash) (b []byte, err error
 	return b, err
 }
 
+// DevicesSeen is GET /v1/vaults/{id}/devices/seen: when each of the
+// account's devices last made a request with its session, to within a
+// minute, as the server saw it. A device that never did is absent.
+func (r *Remote) DevicesSeen(ctx context.Context) (map[model.ID]time.Time, error) {
+	var resp struct {
+		Devices []struct {
+			DeviceID model.ID        `json:"device_id"`
+			SeenAt   model.Timestamp `json:"seen_at"`
+		} `json:"devices"`
+	}
+	err := r.c.withSession(ctx, r.dev, func(tok string) error {
+		return r.c.do(ctx, &call{method: http.MethodGet, path: vaultPath(r.vault, "/devices/seen"), token: tok}, &resp)
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[model.ID]time.Time, len(resp.Devices))
+	for _, d := range resp.Devices {
+		out[d.DeviceID] = d.SeenAt.Time()
+	}
+	return out, nil
+}
+
 // TokenRemote is a vault under a login or recovery token (R6): the three
 // vault reads and one bootstrap post. It is store.SignInRemote. The token
 // lasts 10 minutes and is never refreshed: a 401 is an *APIError matching

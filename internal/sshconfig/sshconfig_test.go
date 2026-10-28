@@ -856,3 +856,50 @@ func TestKeylessHostOffersNothing(t *testing.T) {
 		t.Error("a host with neither key nor Keyless was accepted")
 	}
 }
+
+// Wipe leaves a config with no hosts and removes every key file and pins
+// file at once, the previous generation's and those within the grace
+// period too, and nothing else in the directory.
+func TestWipeRemovesEverythingGeneratedAtOnce(t *testing.T) {
+	opts := testOpts(t)
+	dir := opts.Dir
+	pub := newPub(t)
+	mustWrite(t, opts, Host{Alias: "a", HostName: "10.0.0.1", PublicKey: pub, HostKeys: []ssh.PublicKey{pub}})
+	mustWrite(t, opts, Host{Alias: "b", HostName: "10.0.0.2", PublicKey: newPub(t), HostKeys: []ssh.PublicKey{newPub(t)}})
+	if len(names(t, dir, "known_hosts-*")) < 2 || len(names(t, filepath.Join(dir, "keys"), "*.pub")) < 2 {
+		t.Fatal("setup: two generations of files are not on disk")
+	}
+	mine := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(mine, []byte("the user's own"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Wipe(opts); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatalf("the config is gone: %v", err)
+	}
+	if string(cfg) != configHeader {
+		t.Errorf("the config after Wipe:\n%s", cfg)
+	}
+	if left := append(names(t, dir, "known_hosts*"), names(t, filepath.Join(dir, "keys"), "*")...); len(left) != 0 {
+		t.Errorf("left behind: %q", left)
+	}
+	if b, err := os.ReadFile(mine); err != nil || string(b) != "the user's own" {
+		t.Errorf("a file hop did not write changed: %v %q", err, b)
+	}
+	// Again, and on a directory that was never made: nothing to do.
+	if err := Wipe(opts); err != nil {
+		t.Errorf("a second Wipe: %v", err)
+	}
+	gone := opts
+	gone.Dir = filepath.Join(t.TempDir(), "never")
+	if err := Wipe(gone); err != nil {
+		t.Errorf("Wipe of a missing directory: %v", err)
+	}
+	if _, err := os.Stat(gone.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Wipe made the missing directory: %v", err)
+	}
+}
