@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"cmp"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -80,7 +81,8 @@ func IsTailnetAddr(addr, magicDNSSuffix string) bool {
 
 // ChooseRoute picks the address for h. ts may be nil or unavailable.
 //
-//   - direct: the first stored address that is not on the tailnet.
+//   - direct: the first stored address that is not on the tailnet. A
+//     single-label name is a direct address unless a link says otherwise.
 //   - tailnet: the host's tailnet address and never a direct one. If Tailscale
 //     is not available here the route is Blocked, so the connection fails with
 //     a message that says why, rather than going around the restriction.
@@ -100,18 +102,10 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	if port == 0 {
 		port = 22
 	}
-	suffix := ""
-	if ts != nil {
-		suffix = ts.MagicDNSSuffix
-	}
 
-	var direct []string
-	for _, a := range h.Addresses {
-		if !IsTailnetAddr(a, suffix) {
-			direct = append(direct, a)
-		}
-	}
-	tailnet, node, haveNode := tailnetAddress(h, ts)
+	p := place(h, ts)
+	direct := p.direct
+	tailnet, node, haveNode := tailnetAddress(h, p)
 
 	r := Route{Setting: setting, Port: port}
 	unavailable := ts == nil || !ts.Available
@@ -190,40 +184,83 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	return Route{}, fmt.Errorf("host %q has no addresses", h.Name)
 }
 
-// tailnetAddress finds the host's tailnet address and, when the host is
-// linked to a node the local Tailscale knows, that node. A live status wins:
-// its IPv4 address, then a stored tailnet address, then a MagicDNS name, then
-// IPv6.
-func tailnetAddress(h model.Host, ts *tailscale.Status) (addr string, node tailscale.Node, haveNode bool) {
+// placement is how a host's stored addresses divide, and the node the host
+// is on the local tailnet, if any.
+type placement struct {
+	tailnet, direct []string
+	node            tailscale.Node
+	haveNode        bool
+}
+
+// place sorts h's addresses into the tailnet's and the direct ones. Routing
+// never asks DNS: a node is the host's only through a link, in the order
+// HostOwnsNode trusts them (see linkedNodes): the stable node ID, the stored
+// MagicDNS name, and an address that is a Tailscale IP or an exact MagicDNS
+// name. A single-label name, even one that matches a node's host name, is
+// only a direct address: it may be a LAN name, and a host behind a jump host
+// is resolved by the bastion. SuggestLink points at such a name instead.
+func place(h model.Host, ts *tailscale.Status) placement {
+	var p placement
 	suffix := ""
 	if ts != nil {
 		suffix = ts.MagicDNSSuffix
 	}
-	var cands []string
-	if h.Tailscale != nil {
-		if n, ok := ts.NodeByID(h.Tailscale.StableNodeID); ok {
-			node, haveNode = n, true
-			cands = append(cands, n.IPs...)
-		}
+	if linked := linkedNodes(h, ts.Nodes()); len(linked) > 0 {
+		p.node, p.haveNode = linked[0], true
 	}
-	var stored []string
 	for _, a := range h.Addresses {
 		if IsTailnetAddr(a, suffix) {
-			stored = append(stored, a)
+			p.tailnet = append(p.tailnet, a)
+		} else {
+			p.direct = append(p.direct, a)
 		}
 	}
-	cands = append(cands, stored...)
-	if !haveNode {
-		// Not linked by node ID: a stored tailnet address may still name
-		// exactly one node.
-		for _, a := range stored {
-			if found := ts.Find(a); len(found) == 1 {
-				node, haveNode = found[0], true
-				cands = append(cands, node.IPs...)
-				break
-			}
+	return p
+}
+
+// SuggestLink is the hint for a host whose single-label address names
+// exactly one tailnet node by host name or first MagicDNS label, when the
+// host has no link and no jump host: "to route over Tailscale, link it". It
+// reports the node and the hint; ok is false when there is nothing to
+// suggest. It uses only the Tailscale status, never DNS.
+func SuggestLink(h model.Host, ts *tailscale.Status) (node tailscale.Node, hint string, ok bool) {
+	if !h.JumpHostID.IsZero() || ts == nil || !ts.Available {
+		return tailscale.Node{}, "", false
+	}
+	// A stored link counts even when its node is not in this status:
+	// hop ts link would refuse to replace it without --force.
+	if h.Tailscale != nil || len(linkedNodes(h, ts.Nodes())) > 0 {
+		return tailscale.Node{}, "", false
+	}
+	for _, a := range h.Addresses {
+		k := normAddr(a)
+		if k == "" || strings.Contains(k, ".") {
+			continue
+		}
+		if _, err := netip.ParseAddr(k); err == nil {
+			continue
+		}
+		if found := ts.Find(k); len(found) == 1 {
+			n := found[0]
+			// The command names the node by its stable ID: a name could
+			// also match another node, and hop ts link would refuse it.
+			name := cmp.Or(n.ShortName(), n.HostName)
+			return n, fmt.Sprintf("%s matches tailnet node %s; to route over Tailscale: hop ts link %s %s", a, name, h.Name, cmp.Or(n.ID, name)), true
 		}
 	}
+	return tailscale.Node{}, "", false
+}
+
+// tailnetAddress finds the host's tailnet address from its placement. A live
+// status wins: the node's IPv4 address, then a stored tailnet address, then a
+// MagicDNS name, then IPv6.
+func tailnetAddress(h model.Host, p placement) (addr string, node tailscale.Node, haveNode bool) {
+	node, haveNode = p.node, p.haveNode
+	var cands []string
+	if haveNode {
+		cands = append(cands, node.IPs...)
+	}
+	cands = append(cands, p.tailnet...)
 	if h.Tailscale != nil && h.Tailscale.DNSName != "" {
 		cands = append(cands, strings.TrimSuffix(h.Tailscale.DNSName, "."))
 	}

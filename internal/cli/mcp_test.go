@@ -1379,6 +1379,39 @@ func TestMCPResolveHidesNodesDeniedHostsNameByDNS(t *testing.T) {
 	}
 }
 
+// A host's short-name address that a denied host owns does not move its
+// route onto the denied host's node. The exact MagicDNS name beside it
+// decides, as daemon.HostOwnsNode decides who owns a node: resolve_host and
+// exec never show the denied node's IP or name, in the route or elsewhere.
+func TestMCPRouteIgnoresADeniedHostsShortNameBesideAnFQDN(t *testing.T) {
+	// The allowed host's node is the local test server, so exec reaches it.
+	nodeA := tailscale.Node{ID: "nA", HostName: "a", DNSName: "a.tn.ts.net", Online: true, IPs: []string{"127.0.0.1"}}
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Self:  tailscale.Node{ID: "nSELF", HostName: "me", DNSName: "me.tn.ts.net", Online: true, IPs: []string{"100.64.0.1"}},
+		Peers: []tailscale.Node{nodeA, tsNode("nB", "b", "100.64.0.3")}}
+	e := newE2EWith(t, staticTS{ts})
+	e.addHost(t, "web", func(h *model.Host) { h.Addresses = []string{"b", "a.tn.ts.net"} })
+	e.addHost(t, "b-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"b"} })
+	m := e.startMCP(t)
+
+	r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "web"})
+	if r.Status != "matched" || r.Route == nil || r.Route.Address != "127.0.0.1" {
+		t.Fatalf("resolve_host web = %+v, route %+v: want the route to node a", r, r.Route)
+	}
+	out := mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": "web", "command": "echo ok"})
+	for name, v := range map[string]any{"resolve_host": r, "exec": out} {
+		b, _ := json.Marshal(v)
+		for _, leak := range []string{"100.64.0.3", `"nB"`, "b.tn.ts.net", "b-secret"} {
+			if strings.Contains(string(b), leak) {
+				t.Errorf("%s names the denied host's %s: %s", name, leak, b)
+			}
+		}
+	}
+	if res := execResults(t, out)["web"]; res.ExitCode != 0 || res.Error != "" || !strings.Contains(res.Stdout, "ok") {
+		t.Errorf("exec web = %+v: want it to reach node a", res)
+	}
+}
+
 // A denied host can still be another host's jump host. Its name, aliases
 // and address appear in no answer: not in ssh_problem when it has no usable
 // key, and not in check steps, errors or ssh's stderr when the connection

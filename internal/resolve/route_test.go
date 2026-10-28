@@ -37,6 +37,7 @@ func TestChooseRoute(t *testing.T) {
 	online := tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2", "fd7a:115c:a1e0::2"))
 	offline := tsStatus(node("nA", "prod", "prod.tn.ts.net", false, "100.64.0.2"))
 	stopped := tailscale.Unavailable("tailscale is Stopped")
+	twoNodes := tsStatus(node("nA", "a", "a.tn.ts.net", true, "100.64.0.2"), node("nB", "b", "b.tn.ts.net", true, "100.64.0.3"))
 
 	both := func(route string) model.Host {
 		return host(1, "prod", func(h *model.Host) {
@@ -98,6 +99,71 @@ func TestChooseRoute(t *testing.T) {
 		{
 			name: "the link's DNS name is used when the node is not in the status", ts: stopped, chosen: "tailnet", address: "prod.tn.ts.net",
 			host: host(1, "p", func(h *model.Host) { linked("nA", "prod.tn.ts.net.")(h) }),
+		},
+		{
+			name: "a short name that matches a node stays direct, with no DNS asked", ts: online, chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "a short name beside another direct address is the first direct address", ts: online, chosen: "direct", address: "PROD",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"PROD", "203.0.113.10"} }),
+		},
+		{
+			name: "a short name of an unknown node stays direct", ts: online, chosen: "direct", address: "other", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"other"} }),
+		},
+		{
+			name: "a short name two nodes share stays direct", ts: tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2"), node("nB", "prod", "prod.tn.ts.net", true, "100.64.0.3")),
+			chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "a short name with tailscale stopped stays direct", ts: stopped, chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "route direct keeps a short name that shares a node's name", ts: online,
+			chosen: "direct", address: "prod",
+			host: host(1, "p", func(h *model.Host) { h.Route = "direct"; h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "route direct with a short name and a tailnet link", ts: online,
+			chosen: "direct", address: "prod",
+			host: host(1, "p", func(h *model.Host) {
+				h.Route = "direct"
+				h.Addresses = []string{"prod"}
+				linked("nA", "prod.tn.ts.net")(h)
+			}),
+		},
+		{
+			name: "auto keeps the short name as the fallback of a linked node", ts: online,
+			chosen: "tailnet", address: "100.64.0.2", fallback: "prod",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"}; linked("nA", "prod.tn.ts.net")(h) }),
+		},
+		{
+			name: "an exact FQDN beats a short name of another node", ts: twoNodes,
+			chosen: "tailnet", address: "100.64.0.2", fallback: "b",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b", "a.tn.ts.net"} }),
+		},
+		{
+			name: "route direct with a short name beside an FQDN", ts: twoNodes,
+			chosen: "direct", address: "b",
+			host: host(1, "p", func(h *model.Host) { h.Route = "direct"; h.Addresses = []string{"b", "a.tn.ts.net"} }),
+		},
+		{
+			name: "a Tailscale IP beats a short name of another node", ts: twoNodes,
+			chosen: "tailnet", address: "100.64.0.2", fallback: "b",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b", "100.64.0.2"} }),
+		},
+		{
+			name: "the stable node ID beats a short name of another node", ts: twoNodes,
+			chosen: "tailnet", address: "100.64.0.2", fallback: "b",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b"}; linked("nA", "")(h) }),
+		},
+		{
+			name: "a short name alone stays direct", ts: twoNodes,
+			chosen: "direct", address: "b",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b"} }),
 		},
 	}
 	for _, tt := range tests {
@@ -196,6 +262,48 @@ func TestTailscaleSSHOnlyRoutes(t *testing.T) {
 			}
 			if tt.only && r.Label() != "tailnet (Tailscale SSH)" {
 				t.Errorf("label = %q", r.Label())
+			}
+		})
+	}
+}
+
+func TestSuggestLink(t *testing.T) {
+	online := tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2"))
+	twins := tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2"), node("nB", "prod", "prod-1.tn.ts.net", true, "100.64.0.3"))
+	with := func(mod func(*model.Host), addrs ...string) model.Host {
+		return host(1, "web", func(h *model.Host) {
+			h.Addresses = addrs
+			if mod != nil {
+				mod(h)
+			}
+		})
+	}
+	const hint = "prod matches tailnet node prod; to route over Tailscale: hop ts link web nA"
+	tests := []struct {
+		name string
+		host model.Host
+		ts   *tailscale.Status
+		want string
+	}{
+		{name: "a short name of one node", host: with(nil, "prod"), ts: online, want: hint},
+		{name: "case does not matter", host: with(nil, "PROD", "203.0.113.10"), ts: online, want: "PROD matches tailnet node prod; to route over Tailscale: hop ts link web nA"},
+		{name: "a host name that is not the first label names the label", host: with(nil, "prod"), ts: tsStatus(node("nA", "prod", "prod-1.tn.ts.net", true, "100.64.0.2")), want: "prod matches tailnet node prod-1; to route over Tailscale: hop ts link web nA"},
+		{name: "a node name two nodes share says nothing", host: with(nil, "prod"), ts: twins},
+		{name: "a name no node has says nothing", host: with(nil, "other"), ts: online},
+		{name: "an FQDN is not a short name", host: with(nil, "prod.example.com"), ts: online},
+		{name: "an IP says nothing", host: with(nil, "203.0.113.10"), ts: online},
+		{name: "a linked host says nothing", host: with(linked("nA", "prod.tn.ts.net"), "prod"), ts: online},
+		{name: "a link to a node not in the status says nothing", host: with(linked("nGone", "gone.tn.ts.net"), "prod"), ts: online},
+		{name: "a host with a tailnet address says nothing", host: with(nil, "prod", "100.64.0.2"), ts: online},
+		{name: "a host behind a jump host says nothing", host: with(func(h *model.Host) { h.JumpHostID = id(7) }, "prod"), ts: online},
+		{name: "tailscale stopped says nothing", host: with(nil, "prod"), ts: tailscale.Unavailable("tailscale is Stopped")},
+		{name: "no status says nothing", host: with(nil, "prod")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got, ok := SuggestLink(tt.host, tt.ts)
+			if got != tt.want || ok != (tt.want != "") {
+				t.Errorf("SuggestLink = %q, %v; want %q", got, ok, tt.want)
 			}
 		})
 	}

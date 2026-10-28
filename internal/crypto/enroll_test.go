@@ -566,6 +566,13 @@ func TestApprovalBudgetAcrossRestart(t *testing.T) {
 	if _, err := StartApproval(b2, &memPersister{}, fixedID(0x84), acct.Pin(), fixedID(0x40)); !errors.Is(err, ErrBudgetExhausted) {
 		t.Fatalf("fourth attempt within the hour after restart: %v", err)
 	}
+	// The error says when to try again: the first reservation, made 30
+	// minutes ago, leaves the window in 30 more.
+	_, err = StartApproval(b2, &memPersister{}, fixedID(0x84), acct.Pin(), fixedID(0x40))
+	var be *BudgetExhaustedError
+	if !errors.As(err, &be) || be.RetryAfter != 30*time.Minute || !strings.Contains(err.Error(), "about 30 minute") {
+		t.Fatalf("exhausted budget error = %v (%+v), want one that says to try again in 30 minutes", err, be)
+	}
 	// The first reservation leaves the window an hour after it was made.
 	clock.advance(30 * time.Minute) // 60 minutes after the first
 	if _, err := StartApproval(b2, &memPersister{}, fixedID(0x85), acct.Pin(), fixedID(0x40)); err != nil {

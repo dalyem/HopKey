@@ -37,7 +37,7 @@ var authCommands map[string]authCommand
 func init() {
 	authCommands = map[string]authCommand{
 		"devices": {runAuthDevices, "hop auth devices [--json] | hop auth devices revoke <name|id>... [--keep D]... [--yes] [--kit-file PATH] [--password-stdin] [--json]"},
-		"login":   {runAuthLogin, "hop auth login [--server URL] [--email E] [--method approve|password|recovery] [--name DEVICE] [--merge] [--device-key-store keychain|file] [--keep D]... [--yes] [--kit-file PATH] [--password-stdin] [--json]"},
+		"login":   {runAuthLogin, "hop auth login [--server URL] [--email E] [--method approve|password|recovery] [--name DEVICE] [--merge] [--device-key-store keychain|file] [--keep D]... [--yes] [--kit-file PATH] [--password-stdin] [--json] | hop auth login --discard [--yes] [--json]"},
 		"signup":  {runAuthSignup, "hop auth signup [--server URL] [--email E] [--code CODE] [--device-key-store keychain|file] [--kit-file PATH] [--json]"},
 		"approve": {runAuthApprove, "hop auth approve [CODE] [--sas DIGITS] | hop auth approve --abort [--json]"},
 		"logout":  {runAuthLogout, "hop auth logout [--discard-pending] [--local-only] [--yes] [--json]"},
@@ -341,6 +341,11 @@ type loginReport struct {
 	Recovery   *checkpointReport  `json:"recovery,omitempty"`
 }
 
+// discardReport is the --json shape of hop auth login --discard.
+type discardReport struct {
+	Discarded bool `json:"discarded"`
+}
+
 const (
 	methodApprove  = "approve"
 	methodPassword = "password"
@@ -359,12 +364,16 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	mergeLocal := fs.Bool("merge", false, "merge this device's local-only vault into the account")
 	devStore := fs.String("device-key-store", "", "where the device key lives: keychain (the default) or file")
 	withToken := fs.Bool("with-token", false, "store a hop1_ token read from stdin (not available yet)")
+	discard := fs.Bool("discard", false, "discard an enrollment by approval that is in progress on this device (--yes skips the question)")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
 		return err
 	}
 	if err := noArgs(fs, pos); err != nil {
 		return err
+	}
+	if *discard {
+		return runLoginDiscard(ctx, e, &o)
 	}
 	if *withToken {
 		return failf("hop auth login --with-token is not available yet in this version of hop (tokens for cloud agents come in a later version)")
@@ -381,8 +390,11 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	if err := o.checkKitFile(); err != nil {
 		return err
 	}
+	ctx, stopWatch := hangupContext(ctx, e)
+	defer stopWatch()
 	u := o.ui(e)
 	u.role = roleLogin
+	defer u.stopWaitHint()
 	srv, err := u.need(*server, "server", "Server URL (https://...): ")
 	if err != nil {
 		return err
@@ -433,9 +445,48 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 		return failf("signed in with the Recovery Key, but the recovery is not finished (%v); run hop auth resume to finish it", err)
 	}
 	if err != nil {
+		if errors.Is(context.Cause(ctx), errStdinClosed) {
+			return failf("stdin closed, so the login was cancelled")
+		}
 		return authFailure(err)
 	}
 	return printLogin(e, o.asJSON, *method, res)
+}
+
+// runLoginDiscard is hop auth login --discard: it deletes the enrollment by
+// approval in progress on this device, the one that otherwise makes every
+// other login fail, and its keys.
+func runLoginDiscard(ctx context.Context, e *Env, o *authOpts) error {
+	if !o.yes {
+		if !e.StdinTTY || o.asJSON {
+			return failf("hop auth login --discard deletes this device's unfinished enrollment and its keys, and there is no terminal to confirm on: pass --yes")
+		}
+		ok, err := confirm(e, false, "Discard the enrollment in progress on this device? Its keys are deleted; a device the approver already added stays in the account until it is revoked.")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return failf("not discarded")
+		}
+	}
+	h, err := holdVault(ctx, e, o.asJSON)
+	if err != nil {
+		return err
+	}
+	defer h.release(ctx)
+	switch err := store.DiscardEnrollment(h.cfg); {
+	case errors.Is(err, store.ErrNoEnrollment):
+		return failf("no enrollment is in progress on this device, so there is nothing to discard")
+	case errors.Is(err, store.ErrEnrollmentInstalling):
+		return failf("this device's enrollment was approved and is being installed, so it cannot be discarded: run hop auth login to finish it")
+	case err != nil:
+		return failf("%v", err)
+	}
+	if o.asJSON {
+		return printJSON(e, discardReport{Discarded: true})
+	}
+	e.printf("The enrollment was discarded. hop auth login can start again.\n")
+	return nil
 }
 
 // maxEnrollResumes bounds how often one hop auth login resumes an
@@ -552,6 +603,8 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 	if *abort && len(pos) != 0 {
 		return failf("--abort takes no code")
 	}
+	ctx, stopWatch := hangupContext(ctx, e)
+	defer stopWatch()
 	u := o.ui(e)
 	u.role, u.sas = roleApprove, *sas
 	h, err := holdVault(ctx, e, o.asJSON)
@@ -612,9 +665,15 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 	if err != nil {
+		if errors.Is(context.Cause(ctx), errStdinClosed) {
+			return failf("stdin closed, so the approval was cancelled; hop auth approve --abort ends it")
+		}
+		if errors.Is(err, crypto.ErrBudgetExhausted) {
+			return budgetFailure(err)
+		}
 		switch {
 		case isUIError(err), errors.Is(err, authflow.ErrSASMismatch), errors.Is(err, authflow.ErrApprovalFailed),
-			errors.Is(err, crypto.ErrEnrollExpired), errors.Is(err, crypto.ErrBudgetExhausted):
+			errors.Is(err, crypto.ErrEnrollExpired):
 			return authFailure(err)
 		}
 		return failf("%v. Run hop auth approve with the same code to resume the approval, or hop auth approve --abort to end it", err)
@@ -628,6 +687,14 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 	}
 	e.printf("Approved %s. It receives the vault now.\n", name)
 	return nil
+}
+
+// budgetFailure is the approver's refusal when its hourly approvals are used
+// up. The error says when one frees up; the new device is not told, so this
+// names what it can do meanwhile. The new device's login is unfinished, which
+// blocks every other method until it is discarded.
+func budgetFailure(err error) error {
+	return failf("%v; or the new device can cancel its login (Ctrl-C), run hop auth login --discard, then sign in with hop auth login --method password", err)
 }
 
 // ---- status ----

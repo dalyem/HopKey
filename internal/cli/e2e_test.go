@@ -1195,6 +1195,53 @@ func TestHostBehindAJumpHost(t *testing.T) {
 	}
 }
 
+// hop trust cannot read the key of a host behind a jump host, so every hint
+// about an unpinned one says to pin it by hand with hop edit.
+func TestUnpinnedHostBehindAJumpHostSaysHopEdit(t *testing.T) {
+	e := newE2E(t)
+	ctx := context.Background()
+	snap, _ := e.store.Snapshot(ctx)
+	var bastion model.Host
+	for _, h := range snap.Hosts {
+		if h.Name == "web-1" {
+			bastion = h
+		}
+	}
+	inner := bastion
+	inner.Header, inner.Name, inner.JumpHostID, inner.HostKeys = model.Header{}, "inner", bastion.ItemID, nil
+	inner.Addresses = []string{"127.0.0.1"}
+	if _, err := e.store.PutHost(ctx, inner); err != nil {
+		t.Fatal(err)
+	}
+	const fix = "hop edit inner --host-key"
+	notTrust := func(what, out string) {
+		t.Helper()
+		if !strings.Contains(out, fix) || strings.Contains(out, "hop trust inner") {
+			t.Errorf("%s: want the hint %q and no hop trust inner in:\n%s", what, fix, out)
+		}
+	}
+	_, stdout, _ := e.hop(t, "check", "--json", "inner")
+	for _, s := range decodeCheck(t, stdout).Steps {
+		if s.Name == "host_key_pinned" {
+			notTrust("hop check", s.Detail)
+		}
+	}
+	_, stdout, _ = e.hop(t, "info", "inner")
+	notTrust("hop info", stdout)
+	_, _, stderr := e.hop(t, "exec", "inner", "--", "echo", "ok")
+	if strings.Contains(stderr, "hop trust inner") {
+		t.Errorf("hop exec: hop trust hint behind a jump host:\n%s", stderr)
+	}
+	_, _, stderr = e.hop(t, "add", "inner2", "--address", "127.0.0.1", "--key", "deploy-key", "--user", "deploy", "--jump", "web-1")
+	if !strings.Contains(stderr, "hop edit inner2 --host-key") || strings.Contains(stderr, "hop trust inner2") {
+		t.Errorf("hop add: want the hop edit hint in:\n%s", stderr)
+	}
+	// A host that is not behind a jump host still gets hop trust.
+	if _, _, stderr := e.hop(t, "add", "direct2", "--address", "127.0.0.1", "--key", "deploy-key", "--user", "deploy"); !strings.Contains(stderr, "hop trust direct2") {
+		t.Errorf("hop add without a jump host: want hop trust in:\n%s", stderr)
+	}
+}
+
 func writeKey(t *testing.T, path string, passphrase string) ssh.PublicKey {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)

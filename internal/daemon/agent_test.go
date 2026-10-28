@@ -307,3 +307,34 @@ func TestPutSnippetDerivesParamsAndRefusesBadInput(t *testing.T) {
 		t.Errorf("updated = %+v", again)
 	}
 }
+
+// A host whose bare address names a tailnet node gets the hop ts link hint
+// from a plain resolution, and never from an agent_only one, or from a host
+// behind a jump host.
+func TestResolveRouteHintIsNotForAgents(t *testing.T) {
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Peers: []tailscale.Node{{ID: "nOPEN", HostName: "openbox", DNSName: "openbox.tn.ts.net.", Online: true, IPs: []string{"100.64.0.11"}}}}
+	f := newFixture(t, fakeTS{ts})
+	bastion := f.put(f.host("bastion", func(h *model.Host) { h.Addresses = []string{"203.0.113.1"} }))
+	f.put(f.host("web", func(h *model.Host) { h.Addresses = []string{"openbox"} }))
+	f.put(f.host("inner", func(h *model.Host) { h.Addresses = []string{"openbox"}; h.JumpHostID = bastion.ItemID }))
+	c := f.client()
+	resolve := func(target string, agentOnly bool) ResolveResult {
+		t.Helper()
+		var rr ResolveResult
+		if err := c.Call(context.Background(), OpResolve, ResolveParams{Target: target, AgentOnly: agentOnly}, &rr); err != nil {
+			t.Fatal(err)
+		}
+		return rr
+	}
+	const want = "openbox matches tailnet node openbox; to route over Tailscale: hop ts link web nOPEN"
+	if rr := resolve("web", false); rr.RouteHint != want || rr.Route == nil || rr.Route.Chosen != "direct" {
+		t.Errorf("plain resolve: hint %q, route %+v; want %q and a direct route", rr.RouteHint, rr.Route, want)
+	}
+	if rr := resolve("web", true); rr.Host == nil || rr.RouteHint != "" {
+		t.Errorf("agent_only resolve: host %v, hint %q; want the host and no hint", rr.Host, rr.RouteHint)
+	}
+	if rr := resolve("inner", false); rr.Host == nil || rr.RouteHint != "" {
+		t.Errorf("jump host: host %v, hint %q; want the host and no hint", rr.Host, rr.RouteHint)
+	}
+}

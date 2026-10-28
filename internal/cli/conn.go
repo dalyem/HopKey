@@ -85,7 +85,7 @@ func startDaemon(ctx context.Context, e *Env) error {
 	// Composed: the log tail's line breaks are layout (logTail sanitizes
 	// each line), so the report keeps them.
 	failure := func(what string) error {
-		return &exitError{code: ExitFailure, composed: true, msg: fmt.Sprintf("%s; see %s%s", what, oneLine(e.Paths.LogFile()), logTail(e.Paths.LogFile(), logFrom))}
+		return &exitError{code: ExitFailure, composed: true, msg: fmt.Sprintf("%s; %s%s", what, daemonLogNote(e), logTail(e.Paths.LogFile(), logFrom))}
 	}
 	deadline := time.Now().Add(wait)
 	for {

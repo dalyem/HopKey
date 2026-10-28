@@ -43,6 +43,19 @@ var (
 	ErrSASRejected          = errors.New("crypto: the user rejected the SAS; this enrollment is over")
 )
 
+// BudgetExhaustedError is ErrBudgetExhausted with the time the next attempt
+// frees up. errors.Is(err, ErrBudgetExhausted) holds for it.
+type BudgetExhaustedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *BudgetExhaustedError) Error() string {
+	mins := int((e.RetryAfter + time.Minute - 1) / time.Minute)
+	return fmt.Sprintf("%s; the next attempt is free in about %d minute(s)", ErrBudgetExhausted.Error(), max(mins, 1))
+}
+
+func (e *BudgetExhaustedError) Is(target error) bool { return target == ErrBudgetExhausted }
+
 // EnrollDeadline bounds an attempt (§7): 10 minutes from COMMITTED on D and
 // from CHALLENGED on A. When it passes, the attempt is a failure, its budget
 // slot stays spent, and A's outstanding-challenge slot is released.
@@ -144,7 +157,11 @@ func (b *ApprovalBudget) Reserve(enrollID model.ID) error {
 	}
 	live := b.live(now)
 	if len(live) >= budgetAttempts {
-		return ErrBudgetExhausted
+		// An attempt frees up when the (len-budgetAttempts+1)th oldest live
+		// reservation leaves the window.
+		sorted := slices.SortedFunc(slices.Values(live), func(a, c model.Timestamp) int { return a.Time().Compare(c.Time()) })
+		free := sorted[len(sorted)-budgetAttempts].Time().Add(budgetWindow)
+		return &BudgetExhaustedError{RetryAfter: free.Sub(now)}
 	}
 	next := budgetRecord{V: Version, Reservations: append(live, model.TimestampOf(now)), Outstanding: enrollID,
 		Deadline: deadlineFrom(now)}

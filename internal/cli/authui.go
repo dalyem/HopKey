@@ -8,7 +8,9 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/dalyem/hopkey/internal/authflow"
 	"github.com/dalyem/hopkey/internal/model"
@@ -53,6 +55,54 @@ type termUI struct {
 	// kit is the last kit shown, and wroteKit the --kit-file it went to.
 	kit      *store.Kit
 	wroteKit string
+
+	// hint is the timer of the hint printed when the approval takes long
+	// (ShowRoutingCode); waitHintAfter overrides defaultWaitHint in tests.
+	hintMu        sync.Mutex
+	hint          *time.Timer
+	waitHintAfter time.Duration
+}
+
+// defaultWaitHint is how long the new device waits for an approval before it
+// says what else can be done.
+const defaultWaitHint = 60 * time.Second
+
+// waitHintText is the line printed when the approval takes long. The new
+// device cannot see why: an approving device that used its 3 attempts of the
+// hour refuses with an error that only it shows. This login is unfinished,
+// which blocks every other method, so the way out starts by ending it.
+const waitHintText = "Still waiting. If the approving device refused because it used its 3 approval attempts of the hour, " +
+	"it can try again later; or cancel this login (Ctrl-C), run hop auth login --discard, " +
+	"then sign in with hop auth login --method password"
+
+// startWaitHint prints waitHintText once, after the wait has lasted a while.
+func (u *termUI) startWaitHint() {
+	d := u.waitHintAfter
+	if d <= 0 {
+		d = defaultWaitHint
+	}
+	u.hintMu.Lock()
+	defer u.hintMu.Unlock()
+	if u.hint != nil {
+		u.hint.Stop()
+	}
+	u.hint = time.AfterFunc(d, func() {
+		u.hintMu.Lock()
+		defer u.hintMu.Unlock()
+		if u.hint != nil {
+			u.say("%s\n", waitHintText)
+		}
+	})
+}
+
+// stopWaitHint cancels the hint, and waits for one being printed.
+func (u *termUI) stopWaitHint() {
+	u.hintMu.Lock()
+	defer u.hintMu.Unlock()
+	if u.hint != nil {
+		u.hint.Stop()
+		u.hint = nil
+	}
 }
 
 const (
@@ -288,6 +338,7 @@ func (u *termUI) ShowRoutingCode(ctx context.Context, code string) error {
 	u.say("\nTo approve this device, run this on a device that is already signed in:\n\n")
 	u.say("    hop auth approve %s\n\n", groupCode(code))
 	u.say("Waiting for the approval...\n")
+	u.startWaitHint()
 	return nil
 }
 
@@ -338,6 +389,7 @@ func normalizeDigits(s string) string {
 // memory, so a later run can't confirm what an earlier one showed.
 // runAuthLogin refuses first; this is the backstop.
 func (u *termUI) ConfirmSAS(ctx context.Context, sas, deviceName string) (bool, error) {
+	u.stopWaitHint()
 	sas, deviceName = oneLine(sas), oneLine(deviceName)
 	if !u.interactive {
 		if u.role == roleApprove {
