@@ -1005,6 +1005,12 @@ func TestMCPInstall(t *testing.T) {
 		!strings.Contains(stderr, "not on PATH") || !strings.Contains(stdout, `args = ["mcp", "--read-only"]`) {
 		t.Errorf("codex not found: %d %v %q %q", code, ran, stdout, stderr)
 	}
+	// With --json no config is printed, so the error must not point "above".
+	code, stdout, stderr, _ = run("--client", "codex", "--read-only", "--json")
+	if out := stdout + stderr; code != 255 || !strings.Contains(out, "hop mcp install --client print --json") ||
+		strings.Contains(out, "config above") || strings.Contains(stdout, "[mcp_servers.hop]") {
+		t.Errorf("codex not found, --json: %d %q %q", code, stdout, stderr)
+	}
 	if code, _, stderr, _ := run("--client", "vim"); code != 255 || !strings.Contains(stderr, "unknown client") {
 		t.Errorf("unknown client: %d %q", code, stderr)
 	}

@@ -131,9 +131,12 @@ func runClientCLI(ctx context.Context, e *Env, asJSON bool, name, client string,
 		fmt.Fprintf(e.Stderr, "%s\n", displaySafe(strings.TrimRight(string(out), "\n")))
 	}
 	if errors.Is(err, exec.ErrNotFound) {
-		if !asJSON {
-			printMCPConfig(e, server)
+		if asJSON {
+			// The config is not printed with --json, so point to the
+			// command that gives it as JSON.
+			return failf("%s is not on PATH; add hop to %s by hand with the config from: hop mcp install --client print --json", argv[0], name)
 		}
+		printMCPConfig(e, server)
 		return failf("%s is not on PATH; add hop to %s by hand with the config above", argv[0], name)
 	}
 	if err != nil {
