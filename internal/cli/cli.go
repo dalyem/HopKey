@@ -283,7 +283,7 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop auth signup|login|approve|status|devices|logout|rotate|passwd|merge|resume
        hop login | logout       aliases of hop auth login and hop auth logout
 
-Every command takes --json. Run "hop <command> -h" for its flags.
+Most commands take --json (not hop <target>, daemon, mcp or passwd). Run "hop <command> -h" for its flags.
 `
 
 // Run executes hop with args (without the program name) and returns the exit
@@ -438,6 +438,9 @@ func dispatch(ctx context.Context, e *Env, args []string) error {
 	if strings.HasPrefix(args[0], "-") {
 		fmt.Fprint(e.Stderr, usageText)
 		return failf("unknown flag %s", args[0])
+	}
+	if len(args) > 1 && !strings.HasPrefix(args[1], "-") {
+		return unknownCommand(args[0])
 	}
 	// Anything else is a target: hop <target>.
 	return runConnect(ctx, e, args)

@@ -70,7 +70,17 @@ func unpinnedNote(rr *daemon.ResolveResult) string {
 	if pins, _ := parsePins(rr.Host.HostKeys); len(pins) > 0 {
 		return ""
 	}
-	return safef("no host key is pinned for %s, so ssh will refuse it; pin the server's key with: hop trust %s", rr.Result.HostName, rr.Result.HostName)
+	return safef("no host key is pinned for %s, so ssh will refuse it; pin the server's key with: %s", rr.Result.HostName, pinCommand(rr.Result.HostName, !rr.Host.JumpHostID.IsZero()))
+}
+
+// pinCommand is the command that pins a host key. hop trust reads the key
+// from the server, which it cannot do for a host reached through a jump host,
+// so that host's key is pinned by hand with hop edit.
+func pinCommand(name string, viaJump bool) string {
+	if viaJump {
+		return safef("hop edit %s --host-key '<ssh-ed25519 AAAA...>'", name)
+	}
+	return safef("hop trust %s", name)
 }
 
 func orUnknown(s string) string {
@@ -778,7 +788,7 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		case len(pins) > 0:
 			return stepPass, safef("%d host key(s) pinned: %s", len(pins), fingerprints(pins))
 		}
-		return stepFail, safef("no host key is pinned for %s, so ssh refuses it; pin the server's key with: hop trust %s", res.HostName, res.HostName)
+		return stepFail, safef("no host key is pinned for %s, so ssh refuses it; pin the server's key with: %s", res.HostName, pinCommand(res.HostName, viaJump))
 	})
 
 	probe("host_key_matches", []string{"tcp_reachable", "host_key_pinned"}, func() (string, string) {
@@ -870,7 +880,7 @@ func runTrust(ctx context.Context, e *Env, args []string) error {
 	}
 	host := *rr.Host
 	if !host.JumpHostID.IsZero() {
-		return failf("%s is reached through a jump host, so hop cannot read its host key directly; pin it with: hop edit %s --host-key '<ssh-ed25519 AAAA...>'", host.Name, host.Name)
+		return failf("%s is reached through a jump host, so hop cannot read its host key directly; pin it with: %s", host.Name, pinCommand(host.Name, true))
 	}
 	pins, _ := parsePins(host.HostKeys)
 	r := rr.Route

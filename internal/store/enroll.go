@@ -80,8 +80,8 @@ var (
 	// directory.
 	ErrNoEnrollment = errors.New("store: no enrollment is in progress on this device; start one with hop auth login")
 	// ErrEnrollmentPending means an enrollment is already in progress:
-	// continue it, or discard it.
-	ErrEnrollmentPending = errors.New("store: an enrollment by approval is in progress on this device; continue it or discard it")
+	// start it again, or discard it (hop auth login --discard).
+	ErrEnrollmentPending = errors.New("store: an enrollment by approval is in progress on this device; start it again with hop auth login, or discard it with hop auth login --discard")
 	// ErrEnrollmentInstalling means the enrollment's delivery was accepted
 	// and its device is being installed: only Install finishes it.
 	ErrEnrollmentInstalling = errors.New("store: this device's enrollment was approved and is being installed; run hop auth login again to finish it")

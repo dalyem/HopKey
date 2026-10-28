@@ -285,7 +285,7 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 		e.printf("tailscale:    %s, %s, node %s, ssh %s\n", oneLine(t.DNSName), state, oneLine(t.StableNodeID), oneLine(t.SSH))
 	}
 	if len(v.HostKeys) == 0 {
-		e.printf("host keys:    none pinned (ssh will refuse this host until you run hop trust %s)\n", oneLine(v.Name))
+		e.printf("host keys:    none pinned (ssh will refuse this host until you run %s)\n", oneLine(pinCommand(v.Name, v.JumpHost != "")))
 	}
 	for _, p := range v.HostKeys {
 		e.printf("host key:     %s %s\n", oneLine(p.Type), oneLine(p.Fingerprint))
@@ -490,7 +490,7 @@ func reportHost(ctx context.Context, e *Env, asJSON bool, h model.Host, verb str
 	if v.SSHProblem != "" {
 		fmt.Fprintf(e.Stderr, "hop: note: %s is not usable with ssh yet: %s\n", oneLine(v.Name), oneLine(v.SSHProblem))
 	} else if len(v.HostKeys) == 0 {
-		fmt.Fprintf(e.Stderr, "hop: note: no host key is pinned for %s; pin it with: hop trust %s\n", oneLine(v.Name), oneLine(v.Name))
+		fmt.Fprintf(e.Stderr, "hop: note: no host key is pinned for %s; pin it with: %s\n", oneLine(v.Name), oneLine(pinCommand(v.Name, v.JumpHost != "")))
 	}
 	return nil
 }

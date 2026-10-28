@@ -108,6 +108,32 @@ func (e *Env) runCommand(ctx context.Context, argv []string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
+// systemdUserDir is where the systemd user unit goes.
+func (e *Env) systemdUserDir() string {
+	cfg := ""
+	if e.Getenv != nil {
+		cfg = e.Getenv("XDG_CONFIG_HOME")
+	}
+	if !filepath.IsAbs(cfg) {
+		cfg = filepath.Join(e.Home, ".config")
+	}
+	return filepath.Join(cfg, "systemd", "user")
+}
+
+// daemonLogNote says where the daemon's output went, for a message about a
+// daemon that did not start or is not running. It is daemon.log, except for
+// the daemon of the login service on Linux: systemd sends that to the
+// journal. (The launchd agent writes daemon.log itself.)
+func daemonLogNote(e *Env) string {
+	note := safef("see %s", e.Paths.LogFile())
+	if e.goos() == "linux" {
+		if _, err := os.Lstat(filepath.Join(e.systemdUserDir(), "hopkey.service")); err == nil {
+			note += "; the login service (hop setup --service) logs to the journal instead: journalctl --user -u hopkey"
+		}
+	}
+	return note
+}
+
 // serviceFor builds the unit or agent for this system.
 func serviceFor(e *Env) (*serviceSpec, error) {
 	exe := e.Executable
@@ -125,10 +151,6 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 	}
 	switch e.goos() {
 	case "linux":
-		cfg := e.Getenv("XDG_CONFIG_HOME")
-		if !filepath.IsAbs(cfg) {
-			cfg = filepath.Join(e.Home, ".config")
-		}
 		const unit = "hopkey.service"
 		var b strings.Builder
 		fmt.Fprintf(&b, "# %s: it runs the hop daemon from login, so the vault\n", unitMarker)
@@ -140,7 +162,7 @@ func serviceFor(e *Env) (*serviceSpec, error) {
 		}
 		b.WriteString("Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n")
 		return &serviceSpec{
-			kind: "systemd", dir: filepath.Join(cfg, "systemd", "user"), name: unit, markers: []string{unitMarker}, body: b.String(),
+			kind: "systemd", dir: e.systemdUserDir(), name: unit, markers: []string{unitMarker}, body: b.String(),
 			active: "reloaded, enabled and restarted",
 			// restart starts a stopped service too, and makes a running
 			// one run the unit as daemon-reload just read it.

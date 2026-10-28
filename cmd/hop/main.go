@@ -21,12 +21,12 @@ func main() {
 	}
 	exe, _ := os.Executable()
 
-	// SIGINT and SIGTERM cancel the context; cli.Run decides what else
+	// SIGINT, SIGTERM and SIGHUP (the terminal went away) cancel the context; cli.Run decides what else
 	// happens (a hop auth flow hands the vault back to the daemon). A
 	// second signal is not caught: it ends the process at once.
 	ctx, cancel := context.WithCancelCause(context.Background())
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sigs
 		signal.Stop(sigs)

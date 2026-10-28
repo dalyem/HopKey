@@ -99,6 +99,27 @@ func TestChooseRoute(t *testing.T) {
 			name: "the link's DNS name is used when the node is not in the status", ts: stopped, chosen: "tailnet", address: "prod.tn.ts.net",
 			host: host(1, "p", func(h *model.Host) { linked("nA", "prod.tn.ts.net.")(h) }),
 		},
+		{
+			name: "a short MagicDNS name is the node's FQDN", ts: online, chosen: "tailnet", address: "100.64.0.2",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "a short name with another direct address keeps it as the fallback", ts: online, chosen: "tailnet", address: "100.64.0.2", fallback: "203.0.113.10",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"PROD", "203.0.113.10"} }),
+		},
+		{
+			name: "a short name of an unknown node stays direct", ts: online, chosen: "direct", address: "other", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"other"} }),
+		},
+		{
+			name: "a short name two nodes share stays direct", ts: tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2"), node("nB", "prod", "prod.tn.ts.net", true, "100.64.0.3")),
+			chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "a short name with tailscale stopped stays direct", ts: stopped, chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -78,6 +78,28 @@ func IsTailnetAddr(addr, magicDNSSuffix string) bool {
 	return suffix != "" && strings.HasSuffix(a, "."+suffix)
 }
 
+// onTailnet is IsTailnetAddr, plus a single-label name that names exactly one
+// node in ts by its host name or the first label of its MagicDNS name: ssh
+// resolves such a name through MagicDNS, so it is the FQDN under another
+// spelling. A name two nodes share, or one ts does not know, stays direct.
+func onTailnet(addr string, ts *tailscale.Status) bool {
+	suffix := ""
+	if ts != nil {
+		suffix = ts.MagicDNSSuffix
+	}
+	if IsTailnetAddr(addr, suffix) {
+		return true
+	}
+	a := normAddr(addr)
+	if a == "" || strings.Contains(a, ".") {
+		return false
+	}
+	if _, err := netip.ParseAddr(a); err == nil {
+		return false
+	}
+	return len(ts.Find(a)) == 1
+}
+
 // ChooseRoute picks the address for h. ts may be nil or unavailable.
 //
 //   - direct: the first stored address that is not on the tailnet.
@@ -100,14 +122,10 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 	if port == 0 {
 		port = 22
 	}
-	suffix := ""
-	if ts != nil {
-		suffix = ts.MagicDNSSuffix
-	}
 
 	var direct []string
 	for _, a := range h.Addresses {
-		if !IsTailnetAddr(a, suffix) {
+		if !onTailnet(a, ts) {
 			direct = append(direct, a)
 		}
 	}
@@ -195,10 +213,6 @@ func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
 // its IPv4 address, then a stored tailnet address, then a MagicDNS name, then
 // IPv6.
 func tailnetAddress(h model.Host, ts *tailscale.Status) (addr string, node tailscale.Node, haveNode bool) {
-	suffix := ""
-	if ts != nil {
-		suffix = ts.MagicDNSSuffix
-	}
 	var cands []string
 	if h.Tailscale != nil {
 		if n, ok := ts.NodeByID(h.Tailscale.StableNodeID); ok {
@@ -208,7 +222,7 @@ func tailnetAddress(h model.Host, ts *tailscale.Status) (addr string, node tails
 	}
 	var stored []string
 	for _, a := range h.Addresses {
-		if IsTailnetAddr(a, suffix) {
+		if onTailnet(a, ts) {
 			stored = append(stored, a)
 		}
 	}

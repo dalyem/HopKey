@@ -206,7 +206,7 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 				return err
 			}
 		} else {
-			e.printf("hop daemon is not running; hop sync starts it\n")
+			e.printf("hop daemon is not running. hop daemon starts it in the foreground, and any command that needs it, such as hop ls, starts it in the background (%s)\n", daemonLogNote(e))
 		}
 		return silent(ExitFailure)
 	}
