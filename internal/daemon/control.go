@@ -14,6 +14,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/resolve"
+	"github.com/dalyem/hopkey/internal/shellcmd"
 	"github.com/dalyem/hopkey/internal/sshagent"
 	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/sshkeys"
@@ -220,6 +221,12 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 			return nil, err
 		}
 		return d.opPutKey(ctx, p)
+	case OpPutSnippet:
+		var p PutSnippetParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return d.opPutSnippet(ctx, p)
 	case OpDelete:
 		var p DeleteParams
 		if err := decode(&p); err != nil {
@@ -321,7 +328,7 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		return nil, d.configStale(st.configErr)
 	}
 	ts := d.tsStatus(ctx)
-	in := resolve.Input{Target: p.Target, Hosts: snap.Hosts, Tailscale: ts, Interactive: p.Interactive}
+	in := resolve.Input{Target: p.Target, Hosts: resolvable(snap.Hosts, p.AgentOnly), Tailscale: ts, Interactive: p.Interactive}
 	res, err := resolve.Resolve(ctx, in)
 	if err != nil {
 		return nil, invalidf("%v", err)
@@ -337,7 +344,7 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		if st.configErr != "" {
 			return nil, d.configStale(st.configErr)
 		}
-		in.Hosts = snap.Hosts
+		in.Hosts = resolvable(snap.Hosts, p.AgentOnly)
 		if res, err = resolve.Resolve(ctx, in); err != nil {
 			return nil, invalidf("%v", err)
 		}
@@ -362,6 +369,18 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		out.Mark = snap.Marks[h.ItemID]
 	}
 	return out, nil
+}
+
+// resolvable is the hosts a resolution may match: all of them, or with
+// agentOnly only those whose agent_access allows local agents. Only
+// "allow", and the empty value it defaults to, lets an agent in.
+func resolvable(hosts []model.Host, agentOnly bool) []model.Host {
+	if !agentOnly {
+		return hosts
+	}
+	return slices.DeleteFunc(slices.Clone(hosts), func(h model.Host) bool {
+		return h.AgentAccess != "allow" && h.AgentAccess != ""
+	})
 }
 
 // checkHostInput fills defaults and refuses a host the ssh config could not
@@ -489,6 +508,55 @@ func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error)
 	d.localWrite()
 	info := keyInfo(saved)
 	return &info, d.reloadAfter(ctx, "saved")
+}
+
+// checkSnippetInput derives the snippet's parameters from its command and
+// refuses one hop could not run, or that would share a name with another
+// snippet.
+func checkSnippetInput(s model.Snippet, all []model.Snippet) (model.Snippet, error) {
+	s.Name = strings.TrimSpace(s.Name)
+	if !sshconfig.ValidAlias(s.Name) {
+		return s, invalidf("%q is not a valid snippet name: use letters, digits, '.', '_' and '-', starting with a letter or digit, up to 64 characters", s.Name)
+	}
+	if strings.TrimSpace(s.Command) == "" {
+		return s, invalidf("a snippet needs a command")
+	}
+	if len(s.Command) > 8192 {
+		return s, invalidf("the command is longer than 8192 bytes")
+	}
+	if len(s.Description) > 1024 {
+		return s, invalidf("the description is longer than 1024 bytes")
+	}
+	params, err := shellcmd.Placeholders(s.Command)
+	if err != nil {
+		return s, invalidf("%v", err)
+	}
+	s.Params = params
+	for _, o := range all {
+		if o.ItemID != s.ItemID && strings.EqualFold(o.Name, s.Name) {
+			return s, invalidf("a snippet named %q already exists", o.Name)
+		}
+	}
+	return s, nil
+}
+
+func (d *Daemon) opPutSnippet(ctx context.Context, p PutSnippetParams) (*model.Snippet, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	snap, err := d.store.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sn, err := checkSnippetInput(p.Snippet, snap.Snippets)
+	if err != nil {
+		return nil, err
+	}
+	saved, err := d.store.PutSnippet(ctx, sn)
+	if err != nil {
+		return nil, storeError(err)
+	}
+	d.localWrite()
+	return &saved, d.reloadAfter(ctx, "saved")
 }
 
 func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {

@@ -1,0 +1,191 @@
+// Package shellcmd builds POSIX shell command lines: it quotes words, and
+// it finds and fills the {{name}} parameters of a saved snippet. The daemon
+// uses it to check a snippet before saving it, and the CLI to run one, so
+// both read a command the same way.
+package shellcmd
+
+import (
+	"fmt"
+	"regexp"
+	"slices"
+	"strings"
+)
+
+// Quote quotes one word for a POSIX shell. A word made only of characters
+// no shell treats specially is returned as it is.
+func Quote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_@%+=:,./-", r)) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// MaxParams and MaxParamName bound a snippet's parameters, as the vault
+// schema does (crypto spec §6.5: params has string items of up to 32
+// characters).
+const (
+	MaxParams    = 32
+	MaxParamName = 32
+)
+
+// placeholderRe matches {{name}}, with optional spaces inside the braces.
+var placeholderRe = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}`)
+
+// Placeholders returns the parameter names in command, each once, in the
+// order they first appear. A placeholder must stand outside quotes and not
+// after a backslash: Render puts a quoted word in its place, and inside
+// quotes that word would not be one word any more.
+func Placeholders(command string) ([]string, error) {
+	quoted := quotedBytes(command)
+	var names []string
+	seen := map[string]bool{}
+	for _, m := range placeholderRe.FindAllStringSubmatchIndex(command, -1) {
+		name := command[m[2]:m[3]]
+		if quoted[m[0]] {
+			return nil, fmt.Errorf("{{%s}} is inside quotes or after a backslash; write it bare, since hop quotes each value itself", name)
+		}
+		if len(name) > MaxParamName {
+			return nil, fmt.Errorf("parameter name %q is longer than %d characters", name, MaxParamName)
+		}
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	if len(names) > MaxParams {
+		return nil, fmt.Errorf("a snippet can have at most %d parameters, not %d", MaxParams, len(names))
+	}
+	return names, nil
+}
+
+// quotedBytes reports, for each byte of s, whether a POSIX shell reads it
+// inside single or double quotes or right after a backslash. It follows the
+// quoting rules only, which is all Placeholders needs.
+func quotedBytes(s string) []bool {
+	out := make([]bool, len(s))
+	const (
+		none = iota
+		single
+		double
+	)
+	state := none
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch state {
+		case none:
+			switch c {
+			case '\\':
+				if i+1 < len(s) {
+					out[i+1] = true
+					i++
+				}
+			case '\'':
+				state = single
+			case '"':
+				state = double
+			}
+		case single:
+			out[i] = true
+			if c == '\'' {
+				state = none
+			}
+		case double:
+			out[i] = true
+			switch c {
+			case '\\':
+				if i+1 < len(s) {
+					out[i+1] = true
+					i++
+				}
+			case '"':
+				state = none
+			}
+		}
+	}
+	return out
+}
+
+// Render fills command's placeholders from values, each value quoted as one
+// word. Every placeholder needs a value and every value a placeholder:
+// anything else is refused, so a misspelt name never runs a half-filled
+// command.
+func Render(command string, values map[string]string) (string, error) {
+	names, err := Placeholders(command)
+	if err != nil {
+		return "", err
+	}
+	want := map[string]bool{}
+	var missing []string
+	for _, n := range names {
+		want[n] = true
+		if _, ok := values[n]; !ok {
+			missing = append(missing, n)
+		}
+	}
+	var unknown []string
+	for n := range values {
+		if !want[n] {
+			unknown = append(unknown, n)
+		}
+	}
+	if len(unknown) > 0 {
+		return "", fmt.Errorf("unknown parameter(s) %s; this snippet takes %s", strings.Join(slices.Sorted(slices.Values(unknown)), ", "), paramList(names))
+	}
+	if len(missing) > 0 {
+		return "", fmt.Errorf("missing parameter(s) %s; this snippet takes %s", strings.Join(missing, ", "), paramList(names))
+	}
+	for n, v := range values {
+		if strings.ContainsRune(v, 0) {
+			return "", fmt.Errorf("the value of %s contains a NUL byte", n)
+		}
+	}
+	return placeholderRe.ReplaceAllStringFunc(command, func(m string) string {
+		name := placeholderRe.FindStringSubmatch(m)[1]
+		return Quote(values[name])
+	}), nil
+}
+
+func paramList(names []string) string {
+	if len(names) == 0 {
+		return "no parameters"
+	}
+	return strings.Join(names, ", ")
+}
+
+// Join builds a snippet's command line from words given on a command line
+// (hop snippet add NAME -- WORDS...). One word is a shell command line as it
+// is, like ssh's. Several words are quoted one by one, except that their
+// placeholders stay bare so they can be filled: "--unit={{u}}" stays as it
+// is, and "a b{{x}}" becomes 'a b'{{x}}.
+func Join(words []string) string {
+	if len(words) == 1 {
+		return words[0]
+	}
+	q := make([]string, len(words))
+	for i, w := range words {
+		var sb strings.Builder
+		last := 0
+		for _, m := range placeholderRe.FindAllStringIndex(w, -1) {
+			if m[0] > last {
+				sb.WriteString(Quote(w[last:m[0]]))
+			}
+			sb.WriteString(w[m[0]:m[1]])
+			last = m[1]
+		}
+		if last < len(w) || len(w) == 0 {
+			sb.WriteString(Quote(w[last:]))
+		}
+		q[i] = sb.String()
+	}
+	return strings.Join(q, " ")
+}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -175,8 +176,21 @@ func (f *fakeDaemon) hop(t *testing.T, args ...string) (code int, stdout, stderr
 func (f *fakeDaemon) hopWith(t *testing.T, adjust func(*cli.Env), args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	var so, se bytes.Buffer
-	env := &cli.Env{
-		Stdin: strings.NewReader(f.stdin), Stdout: &so, Stderr: &se,
+	env := f.env(t, strings.NewReader(f.stdin), &so, &se)
+	if adjust != nil {
+		adjust(env)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	code = cli.Run(ctx, args, env)
+	f.stdin = ""
+	return code, so.String(), se.String()
+}
+
+// env is the environment hop runs in against the fake daemon.
+func (f *fakeDaemon) env(t *testing.T, stdin io.Reader, stdout, stderr io.Writer) *cli.Env {
+	return &cli.Env{
+		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 		Getenv: func(string) string { return "" },
 		Home:   f.home, Paths: f.paths,
 		StdoutTTY: f.tty, StdinTTY: f.tty,
@@ -195,14 +209,6 @@ func (f *fakeDaemon) hopWith(t *testing.T, adjust func(*cli.Env), args ...string
 		Now:         func() time.Time { return f.now },
 		DialTimeout: 2 * time.Second,
 	}
-	if adjust != nil {
-		adjust(env)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	code = cli.Run(ctx, args, env)
-	f.stdin = ""
-	return code, so.String(), se.String()
 }
 
 // hostile is vault, server or filesystem text that tries to break a line,

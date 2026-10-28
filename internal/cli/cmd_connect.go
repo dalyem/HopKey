@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/resolve"
+	"github.com/dalyem/hopkey/internal/shellcmd"
 	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/sshkeys"
 	"github.com/dalyem/hopkey/internal/store"
@@ -241,24 +243,6 @@ func (t *tailBuffer) Bytes() []byte {
 	return t.buf
 }
 
-// shellQuote quotes one word for a POSIX shell.
-func shellQuote(s string) string {
-	if s == "" {
-		return "''"
-	}
-	safe := true
-	for _, r := range s {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_@%+=:,./-", r)) {
-			safe = false
-			break
-		}
-	}
-	if safe {
-		return s
-	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 // remoteCommand turns the words after -- into the string ssh sends. Several
 // words are quoted individually, so each stays one argument on the remote
 // side. A single word is a shell command line, as with ssh itself
@@ -269,7 +253,7 @@ func remoteCommand(words []string, sudo bool) string {
 	if len(words) > 1 {
 		q := make([]string, len(words))
 		for i, w := range words {
-			q[i] = shellQuote(w)
+			q[i] = shellcmd.Quote(w)
 		}
 		line = strings.Join(q, " ")
 		if sudo {
@@ -278,7 +262,7 @@ func remoteCommand(words []string, sudo bool) string {
 		return line
 	}
 	if sudo {
-		return "sudo -n sh -c " + shellQuote(line)
+		return "sudo -n sh -c " + shellcmd.Quote(line)
 	}
 	return line
 }
@@ -323,51 +307,18 @@ func runExec(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintf(e.Stderr, "hop: %s\n", note)
 	}
 
-	connectTimeout := 10
-	if *timeout > 0 && *timeout < 10*time.Second {
-		connectTimeout = int((*timeout + time.Second - 1) / time.Second)
-	}
-	sshArgs := e.sshArgs(t, addr, "-T", "-o", "BatchMode=yes", "-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout))
-	sshArgs = append(sshArgs, remoteCommand(words, *sudo))
-
-	runCtx := ctx
-	if *timeout > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(ctx, *timeout)
-		defer cancel()
-	}
-	cmd := exec.CommandContext(runCtx, e.sshBinary(), sshArgs...)
-	cmd.Env = e.sshEnviron()
-	cmd.Stdin = e.Stdin
-	cmd.WaitDelay = time.Second
-	var outTail, errTail tailBuffer
-	outTail.max, errTail.max = tailLimit, tailLimit
-	if *asJSON {
-		cmd.Stdout, cmd.Stderr = &outTail, &errTail
-	} else {
+	r := remoteRun{command: remoteCommand(words, *sudo), timeout: *timeout, stdin: e.Stdin}
+	if !*asJSON {
 		// The remote command's output goes straight through, not sanitized, on
 		// purpose: it is the user's own terminal session. With --json it is
-		// captured above and JSON-encoded (escapeJSONControls in printJSON).
-		cmd.Stdout, cmd.Stderr = e.Stdout, e.Stderr
+		// captured and JSON-encoded (escapeJSONControls in printJSON).
+		r.stdout, r.stderr = e.Stdout, e.Stderr
 	}
-
-	start := time.Now()
-	runErr := cmd.Run()
-	res := ExecResult{Host: rr.Result.HostName, DurationMS: time.Since(start).Milliseconds()}
-	var ee *exec.ExitError
-	switch {
-	case runErr == nil:
-	case *timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded):
-		res.ExitCode = ExitFailure
-		res.Error = fmt.Sprintf("timed out after %s", *timeout)
-	case errors.As(runErr, &ee):
-		res.ExitCode = exitCode(ee)
-	default:
-		return failf("cannot run ssh: %v", runErr)
+	res, err := e.runRemote(ctx, t, addr, r)
+	if err != nil {
+		return err
 	}
 	if *asJSON {
-		res.Stdout, res.Stderr = string(outTail.Bytes()), string(errTail.Bytes())
-		res.Truncated = outTail.dropped || errTail.dropped
 		if err := printJSON(e, res); err != nil {
 			return err
 		}
@@ -378,6 +329,76 @@ func runExec(ctx context.Context, e *Env, args []string) error {
 		return silent(res.ExitCode)
 	}
 	return nil
+}
+
+// remoteRun is one command for runRemote.
+type remoteRun struct {
+	command string
+	timeout time.Duration // 0 means no limit
+	// stdin feeds the remote command. Nil means it gets none: ssh -n, so
+	// a remote prompt reads end-of-file instead of waiting.
+	stdin io.Reader
+	// stdout and stderr receive the output as it comes. Nil keeps the last
+	// tailLimit bytes of that stream in the result instead.
+	stdout, stderr io.Writer
+}
+
+// runRemote runs one command on t at addr with ssh: no PTY, and BatchMode,
+// so ssh fails instead of asking for a password or a host key. The remote
+// exit status is in the result; a timeout is ExitFailure with Error set.
+// The error is for ssh not running at all.
+func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun) (ExecResult, error) {
+	connectTimeout := 10
+	if r.timeout > 0 && r.timeout < 10*time.Second {
+		connectTimeout = int((r.timeout + time.Second - 1) / time.Second)
+	}
+	opts := []string{"-T", "-o", "BatchMode=yes", "-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout)}
+	if r.stdin == nil {
+		opts = append(opts, "-n")
+	}
+	sshArgs := append(e.sshArgs(t, addr, opts...), r.command)
+
+	runCtx := ctx
+	if r.timeout > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, r.timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(runCtx, e.sshBinary(), sshArgs...)
+	cmd.Env = e.sshEnviron()
+	cmd.Stdin = r.stdin
+	cmd.WaitDelay = time.Second
+	outTail, errTail := &tailBuffer{max: tailLimit}, &tailBuffer{max: tailLimit}
+	cmd.Stdout, cmd.Stderr = r.stdout, r.stderr
+	if r.stdout == nil {
+		cmd.Stdout = outTail
+	}
+	if r.stderr == nil {
+		cmd.Stderr = errTail
+	}
+
+	start := time.Now()
+	runErr := cmd.Run()
+	res := ExecResult{Host: t.rr.Result.HostName, DurationMS: time.Since(start).Milliseconds()}
+	var ee *exec.ExitError
+	switch {
+	case runErr == nil:
+	case r.timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded):
+		res.ExitCode = ExitFailure
+		res.Error = fmt.Sprintf("timed out after %s", r.timeout)
+	case errors.As(runErr, &ee):
+		res.ExitCode = exitCode(ee)
+	default:
+		return res, failf("cannot run ssh: %v", runErr)
+	}
+	if r.stdout == nil {
+		res.Stdout = string(outTail.Bytes())
+	}
+	if r.stderr == nil {
+		res.Stderr = string(errTail.Bytes())
+	}
+	res.Truncated = outTail.dropped || errTail.dropped
+	return res, nil
 }
 
 // ---- hop which ----
@@ -606,9 +627,6 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		fs.Usage()
 		return failf("expected exactly one target")
 	}
-	out := CheckResult{Target: pos[0]}
-	var c checker
-
 	rr, err := resolveTarget(ctx, e, pos[0], interactiveResolution(e, *asJSON))
 	if err != nil {
 		return err
@@ -616,6 +634,29 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 	if interactiveResolution(e, *asJSON) {
 		syncNotice(ctx, e)
 	}
+	out := CheckResult{Target: pos[0], Host: rr.Result.HostName}
+	out.Steps, out.OK = e.diagnose(ctx, rr, true)
+	if *asJSON {
+		if err := printJSON(e, out); err != nil {
+			return err
+		}
+	} else {
+		e.printf("check %s\n", oneLine(pos[0]))
+		for _, s := range out.Steps {
+			e.printf("  [%s] %-16s %s\n", s.Status, s.Name, strings.ReplaceAll(s.Detail, "\n", "\n"+strings.Repeat(" ", 28)))
+		}
+	}
+	if !out.OK {
+		return silent(ExitFailure)
+	}
+	return nil
+}
+
+// diagnose runs hop check's steps for rr, in order, and says whether they
+// all passed. Without login the last step, which logs in with ssh and runs
+// true there, is skipped.
+func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool) ([]Step, bool) {
+	var c checker
 	res := rr.Result
 	c.run("resolved", nil, func() (string, string) {
 		if res.Status != resolve.StatusMatched {
@@ -623,7 +664,6 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		}
 		return stepPass, safef("host %q by rule %s (%s)", res.HostName, res.Rule, res.Matched)
 	})
-	out.Host = res.HostName
 
 	// A host behind a jump host is not expected to be reachable directly, so
 	// the direct probes (TCP, host key) cannot say anything about it. ssh
@@ -700,6 +740,10 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		return stepFail, safef("the server presents %s %s, which is not pinned (pinned: %s); the machine may have been rebuilt, or something is intercepting the connection", key.Type(), sshkeys.Fingerprint(key), fingerprints(pins))
 	})
 
+	if !login {
+		c.skip("auth_ok", "skipped: logging in runs a command (true) on the host, and this check may not run commands")
+		return c.steps, c.ok()
+	}
 	c.run("auth_ok", []string{"host_key_pinned", "host_key_matches"}, func() (string, string) {
 		t, err := connectable(rr)
 		if err != nil {
@@ -723,21 +767,7 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		return stepPass, safef("logged in with ssh %s", t.alias)
 	})
 
-	out.Steps, out.OK = c.steps, c.ok()
-	if *asJSON {
-		if err := printJSON(e, out); err != nil {
-			return err
-		}
-	} else {
-		e.printf("check %s\n", oneLine(pos[0]))
-		for _, s := range out.Steps {
-			e.printf("  [%s] %-16s %s\n", s.Status, s.Name, strings.ReplaceAll(s.Detail, "\n", "\n"+strings.Repeat(" ", 28)))
-		}
-	}
-	if !out.OK {
-		return silent(ExitFailure)
-	}
-	return nil
+	return c.steps, c.ok()
 }
 
 func lastLines(s string, n int) string {
