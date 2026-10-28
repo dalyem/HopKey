@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/syncclient"
 )
 
 // Status says online once the server has answered, not only when the
@@ -230,6 +231,103 @@ func TestReplacedNoteSurvivesAnUncertainPush(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The push of an edit that replaced another device's value loses its
+// answer, and before the daemon tries again an auth command stops it (hop
+// auth rotate does): the command's own pull finds the edit committed and
+// settles it. The note is not the command's to give; it waits in the
+// vault, and the next daemon gives it.
+func TestReplacedNoteSurvivesAnAuthFlowThatSettlesIt(t *testing.T) {
+	x := newSyncSetup(t)
+	ctx := context.Background()
+	remote := func(n *node) store.Remote {
+		dev, err := syncclient.StoreDevice(n.st.DeviceAuth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return x.w.client(t).Remote(x.pub.VaultID, dev)
+	}
+	r1, r2 := remote(x.n1), remote(x.n2)
+	pushAll := func(s *store.Store, r store.Remote) {
+		t.Helper()
+		for range 10 {
+			res, err := s.PushHead(ctx, r)
+			if err != nil {
+				t.Fatalf("push: %v", err)
+			}
+			if res.Outcome == store.PushEmpty {
+				return
+			}
+		}
+		t.Fatal("the outbox never drained")
+	}
+	edit := func(s *store.Store, desc string) {
+		t.Helper()
+		snap, err := s.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, h := range snap.Hosts {
+			if h.Name == "web1" {
+				h.Description = desc
+				if _, err := s.PutHost(ctx, h); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+		}
+		t.Fatal("no web1")
+	}
+	h := webHost("web1", x.keyID, "203.0.113.10")
+	h.Description = "base"
+	if _, err := x.n1.st.PutHost(ctx, h); err != nil {
+		t.Fatal(err)
+	}
+	pushAll(x.n1.st, r1)
+	if err := x.n2.st.Pull(ctx, r2); err != nil {
+		t.Fatal(err)
+	}
+	edit(x.n1.st, "from the desk")
+	pushAll(x.n1.st, r1)
+	edit(x.n2.st, "from the laptop")
+
+	// The laptop's post commits, and its answer is lost.
+	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		if req.Method != http.MethodPost {
+			return false
+		}
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, req)
+		if rec.Code/100 != 2 {
+			t.Errorf("the post did not commit: %d %s", rec.Code, rec.Body)
+		}
+		http.Error(rw, "the answer was lost", http.StatusBadGateway)
+		return true
+	})
+	if _, err := x.n2.st.PushHead(ctx, r2); err == nil {
+		t.Fatal("a push whose answer was lost worked")
+	}
+	x.w.intercept.Store(nil)
+
+	// The auth command's pull settles the edit, and the command ends.
+	if err := x.n2.st.Pull(ctx, r2); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := x.n2.st.Status(); err != nil || st.Pending != 0 {
+		t.Fatalf("the edit is not settled: %+v %v", st, err)
+	}
+	x.n2.st.Close()
+
+	s2, err := store.Open(ctx, x.n2.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x.n2.st = s2
+	x.w.start(x.n2, s2, SyncOptions{})
+	eventually(t, 10*time.Second, "the laptop's next daemon notes what its edit replaced", func() bool {
+		return hasWarning(x.n2.status().Warnings, "web1", "description", "another device")
+	})
 }
 
 func countWarnings(ws []string, sub string) int {

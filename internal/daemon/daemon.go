@@ -83,9 +83,10 @@ type Options struct {
 	Logf func(format string, args ...any)
 
 	// Test hooks: writeConfig replaces sshconfig.Write, wipeConfig
-	// sshconfig.Wipe, and configRetry configRetryInterval.
+	// sshconfig.WipeIf with no condition, and configRetry
+	// configRetryInterval.
 	writeConfig func(sshconfig.Options, []sshconfig.Host) error
-	wipeConfig  func(sshconfig.Options) error
+	wipeConfig  func(o sshconfig.Options, done func() error) error
 	configRetry time.Duration
 }
 
@@ -102,9 +103,10 @@ type Daemon struct {
 	control *controlListener
 
 	// writeConfig writes the ssh config (sshconfig.Write), and wipeConfig
-	// empties it and removes its files (sshconfig.Wipe).
+	// empties it and removes its files, and then runs done under the same
+	// hold of config.lock (sshconfig.WipeIf).
 	writeConfig func(sshconfig.Options, []sshconfig.Host) error
-	wipeConfig  func(sshconfig.Options) error
+	wipeConfig  func(o sshconfig.Options, done func() error) error
 
 	// mu serializes changes to the vault and reloads, so the keyring and the
 	// ssh config always come from one snapshot, newest last.
@@ -184,7 +186,7 @@ func Start(opts Options) (*Daemon, error) {
 		d.writeConfig = sshconfig.Write
 	}
 	if d.wipeConfig == nil {
-		d.wipeConfig = sshconfig.Wipe
+		d.wipeConfig = func(o sshconfig.Options, done func() error) error { return sshconfig.WipeIf(o, nil, done) }
 	}
 	if err := d.reload(ctx); (errors.Is(err, model.ErrLocked) || errors.Is(err, store.ErrDeviceRevoked)) && d.canUnlock() {
 		// A locked vault (its device key unreadable, say) still gets a

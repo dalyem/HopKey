@@ -334,15 +334,17 @@ type logoutCleaner interface{ ClearLogoutCleanup() error }
 
 // clearConfigLocked wipes what the vault decrypted into the ssh config
 // directory, so nothing of it stays behind (§5.5): a config with no hosts,
-// and no key files or pins (sshconfig.Wipe). Once that worked, the store's
-// mark of a logout that owes it is cleared, so no later start wipes again.
-// A failure is kept in clearErr, shown in status and retried by
-// retryConfig. The caller holds d.mu.
+// and no key files or pins (sshconfig.Wipe). Once that worked, and while
+// config.lock is still held, the store's mark of a logout that owes it is
+// cleared, so no later start wipes again (sshconfig.WipeIf). A failure is
+// kept in clearErr, shown in status and retried by retryConfig. The
+// caller holds d.mu.
 func (d *Daemon) clearConfigLocked() {
-	err := d.wipeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()})
-	if c, ok := d.store.(logoutCleaner); ok && err == nil {
-		err = c.ClearLogoutCleanup()
+	var done func() error
+	if c, ok := d.store.(logoutCleaner); ok {
+		done = c.ClearLogoutCleanup
 	}
+	err := d.wipeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, done)
 	if err != nil {
 		why := err.Error()
 		d.clearErr.Store(&why)

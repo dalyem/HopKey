@@ -81,7 +81,8 @@ type syncStore interface {
 	RequestContext(ctx context.Context) (context.Context, uint64, func(), error)
 	Pull(ctx context.Context, r store.Remote) error
 	PushHead(ctx context.Context, r store.Remote) (store.PushResult, error)
-	TakeReplacements() []store.Replacement
+	Replacements() (store.Replacements, error)
+	AckReplacements(r store.Replacements) error
 	Lock()
 
 	Retirement() (string, error)
@@ -173,6 +174,12 @@ type syncer struct {
 	// replaced are the newest notes of pushed changes that replaced
 	// another device's (noteReplaced), at most maxReplacedNotes.
 	replaced []string
+	// notesErr is the last error reading or acknowledging the store's
+	// notes, logged once.
+	notesErr string
+	// noteMu makes each noteReplaced's read, record and acknowledgement
+	// one step, so no note is recorded twice.
+	noteMu sync.Mutex
 	// retired is the server's unverified word that this device left the
 	// account (sessionEnded).
 	retired *ServerRetirement
@@ -524,23 +531,48 @@ func (e *syncer) fail(ctx context.Context, err error) time.Duration {
 // holds nothing (§5.4), so the other device's value is gone and this is
 // where the user hears of it. It runs after every pull and push, worked or
 // not, since the one that settles a change need not be the push that
-// posted it (an answer lost, a post repeated). The note names the item and
-// the members, never a value; it goes to the log and to sync.status.
+// posted it (an answer lost, a post repeated), nor this daemon's (an auth
+// command's pull, while the daemon was stopped). The store keeps each note
+// until it is recorded here, in the log and in sync.status, and only then
+// is it acknowledged. The note names the item and the members, never a
+// value.
 func (e *syncer) noteReplaced() {
-	for _, r := range e.st.TakeReplacements() {
-		what := fmt.Sprintf("%s %q", r.Type, r.Name)
-		if r.Name == "" {
-			what = fmt.Sprintf("%s %s", r.Type, r.ItemID)
+	e.noteMu.Lock()
+	defer e.noteMu.Unlock()
+	rs, err := e.st.Replacements()
+	if err == nil {
+		if rs.Evicted > 0 {
+			e.d.logf("sync: %d older notes of this device's edits that replaced another device's value were dropped before they were shown "+
+				"(the vault keeps the newest ones until the daemon shows them)", rs.Evicted)
 		}
-		msg := fmt.Sprintf("%s: this device's edit of its %s replaced a different value another device had saved first "+
-			"(for this field the last change to reach the server wins)", what, strings.Join(r.Fields, ", "))
-		e.d.logf("sync: %s", msg)
-		e.set(func() {
-			e.replaced = append(e.replaced, msg)
-			if len(e.replaced) > maxReplacedNotes {
-				e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
+		for _, r := range rs.Notes {
+			what := fmt.Sprintf("%s %q", r.Type, r.Name)
+			if r.Name == "" {
+				what = fmt.Sprintf("%s %s", r.Type, r.ItemID)
 			}
-		})
+			msg := fmt.Sprintf("%s: this device's edit of its %s replaced a different value another device had saved first "+
+				"(for this field the last change to reach the server wins)", what, strings.Join(r.Fields, ", "))
+			e.d.logf("sync: %s", msg)
+			e.set(func() {
+				e.replaced = append(e.replaced, msg)
+				if len(e.replaced) > maxReplacedNotes {
+					e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
+				}
+			})
+		}
+		err = e.st.AckReplacements(rs)
+	}
+	// A locked store keeps its notes for after the next unlock.
+	why := ""
+	if err != nil && !errors.Is(err, model.ErrLocked) {
+		why = err.Error()
+	}
+	e.mu.Lock()
+	first := why != "" && why != e.notesErr
+	e.notesErr = why
+	e.mu.Unlock()
+	if first {
+		e.d.logf("sync: the notes of replaced edits: %s", why)
 	}
 }
 

@@ -48,7 +48,7 @@ Once a vault is signed in to a server (`hop auth signup` or `hop auth login`), t
 When two devices change the same item before either sees the other's change, the merge goes by field:
 
 - Protected fields (every field but a host's or a snippet's description) are held: the change that reaches the server second waits in `hop sync resolve` until you keep yours, edit it, or take theirs. Two changes to different protected fields of one item are held too.
-- The description is merged on its own, and the last change to reach the server wins. Nothing is held, so the other device's description is lost. The device whose change won says so in `hop status`, `hop sync` and its daemon log, naming the item and the field (never the values), until its daemon restarts. It does so even when the server's answer to its push was lost and a later sync found the change committed.
+- The description is merged on its own, and the last change to reach the server wins. Nothing is held, so the other device's description is lost. The device whose change won says so in `hop status`, `hop sync` and its daemon log, naming the item and the field (never the values), until its daemon restarts. It does so even when the server's answer to its push was lost and a later sync, or a `hop auth` command run meanwhile, found the change committed: the vault keeps the note, sealed, until the daemon has shown it (the newest 50; older ones are dropped with a line in the daemon log).
 
 `hop auth devices` shows, under LAST SEEN, when each device last wrote to the vault or made any request to the server, whichever is later. The server records a device's requests at most once a minute.
 

@@ -904,6 +904,63 @@ func TestWipeRemovesEverythingGeneratedAtOnce(t *testing.T) {
 	}
 }
 
+// WipeIf asks whether the wipe is owed, wipes and runs done in one hold of
+// config.lock: a Write can't come between them. Not owed, it touches
+// nothing and done does not run.
+func TestWipeIfDecidesAndFinishesUnderTheLock(t *testing.T) {
+	opts := testOpts(t)
+	pub := newPub(t)
+	mustWrite(t, opts, Host{Alias: "a", HostName: "10.0.0.1", PublicKey: pub, HostKeys: []ssh.PublicKey{pub}})
+	cfgPath := filepath.Join(opts.Dir, "config")
+	before, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := func() bool {
+		f, err := filelock.TryLock(filepath.Join(opts.Dir, lockName))
+		if err == nil {
+			f.Close()
+		}
+		return errors.Is(err, filelock.ErrLocked)
+	}
+
+	doneRan := false
+	err = WipeIf(opts, func() (bool, error) {
+		if !locked() {
+			t.Error("owed ran without config.lock")
+		}
+		return false, nil
+	}, func() error { doneRan = true; return nil })
+	if err != nil || doneRan {
+		t.Fatalf("not owed: %v, done ran %v", err, doneRan)
+	}
+	if after, _ := os.ReadFile(cfgPath); !bytes.Equal(after, before) {
+		t.Fatalf("not owed, yet the config changed:\n%s", after)
+	}
+
+	err = WipeIf(opts, func() (bool, error) { return true, nil }, func() error {
+		if !locked() {
+			t.Error("done ran without config.lock")
+		}
+		if b, _ := os.ReadFile(cfgPath); string(b) != configHeader {
+			t.Errorf("done ran before the wipe:\n%s", b)
+		}
+		doneRan = true
+		return nil
+	})
+	if err != nil || !doneRan {
+		t.Fatalf("owed: %v, done ran %v", err, doneRan)
+	}
+
+	// A directory that was never made: done still runs, if owed.
+	gone := opts
+	gone.Dir = filepath.Join(t.TempDir(), "never")
+	doneRan = false
+	if err := WipeIf(gone, func() (bool, error) { return true, nil }, func() error { doneRan = true; return nil }); err != nil || !doneRan {
+		t.Errorf("a missing directory: %v, done ran %v", err, doneRan)
+	}
+}
+
 // planted is a file hop did not write but whose name looks like one of
 // its own: a key the user keeps in keys/, a pins backup, an old-style
 // known_hosts, a temp file of the user's.

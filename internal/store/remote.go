@@ -356,13 +356,13 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 	t := &txn{}
 	t.create(entryRel(w.Entry.Seq), eb)
 	t.put(stateRel, sb)
-	replaced, err := s.settle(t, w.Entry.Seq, func(seq uint64) (crypto.Hash, error) {
+	hashAt := func(seq uint64) (crypto.Hash, error) {
 		if seq == w.Entry.Seq {
 			return h, nil
 		}
 		return s.entryHash(seq)
-	}, rec, st.VaultID)
-	if err != nil {
+	}
+	if err := s.settle(t, w.Entry.Seq, hashAt, rec, st.VaultID); err != nil {
 		return err
 	}
 	// A journaled checkpoint's candidate at this seq is settled in the same
@@ -370,11 +370,7 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 	if err := s.settleCheckpointJournal(t, w, h, st, rec); err != nil {
 		return err
 	}
-	if err := s.commitTxn(t); err != nil {
-		return err
-	}
-	s.noteReplacedLocked(replaced)
-	return nil
+	return s.commitTxn(t)
 }
 
 // transition is vaultlog.Transition. With no dev (a password unlock, whose
@@ -409,18 +405,18 @@ func (s *Store) entryHash(seq uint64) (crypto.Hash, error) {
 // settle adds to t the outbox changes that verified history up to head
 // decides: every live candidate at a seq ≤ head is committed if the
 // verified entry there has its H, and dead otherwise. A record with a
-// committed candidate is deleted. Nothing else ever settles a candidate.
-// rec's local_key opens the outbox of vault vaultID. It returns what the
-// committed candidates replaced of other devices' values, for the caller
-// to report once t is committed (noteReplacedLocked). The caller holds the
-// file lock.
-func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, error), rec *deviceRecord, vaultID model.ID) ([]Replacement, error) {
+// committed candidate is deleted, and the note of what that candidate
+// replaced of other devices' values, if anything, is added in the same
+// commit (addNotes), for the daemon to deliver. Nothing else ever settles
+// a candidate. rec's local_key opens the outbox of vault vaultID. The
+// caller holds the file lock.
+func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, error), rec *deviceRecord, vaultID model.ID) error {
 	if ns, err := s.l.outboxNumbers(); err != nil || len(ns) == 0 {
-		return nil, err
+		return err
 	}
 	recs, err := s.readOutboxAs(rec, vaultID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var replaced []Replacement
 	receipts := map[model.ID][]mergeReceipt{}
@@ -431,7 +427,7 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 		}
 		h, err := hashAt(c.Seq)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if h.Equal(c.H) {
 			t.remove(outboxRel(r.N))
@@ -449,15 +445,15 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 		delete(r.Wires, c.H)
 		delete(r.Replaced, c.H)
 		if err := s.putRecordAs(t, r, rec, vaultID); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	for txnID, rs := range receipts {
 		if err := s.addReceipts(t, rec, txnID, rs); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return replaced, nil
+	return s.addNotes(t, rec, vaultID, replaced)
 }
 
 // settleAtUnlock settles candidates that verified history already decides.
@@ -466,40 +462,10 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 // and the file lock.
 func (s *Store) settleAtUnlock() error {
 	t := &txn{}
-	replaced, err := s.settle(t, s.state.Head.Seq, s.entryHash, s.rec, s.state.VaultID)
-	if err != nil {
+	if err := s.settle(t, s.state.Head.Seq, s.entryHash, s.rec, s.state.VaultID); err != nil {
 		return err
 	}
-	if err := s.commitTxn(t); err != nil {
-		return err
-	}
-	s.noteReplacedLocked(replaced)
-	return nil
-}
-
-// maxReplaced bounds the replacements a store keeps for TakeReplacements.
-const maxReplaced = 64
-
-// noteReplacedLocked keeps what settled candidates replaced, the newest
-// maxReplaced, until TakeReplacements. The caller holds s.mu.
-func (s *Store) noteReplacedLocked(rs []Replacement) {
-	s.replaced = append(s.replaced, rs...)
-	if len(s.replaced) > maxReplaced {
-		s.replaced = slices.Clone(s.replaced[len(s.replaced)-maxReplaced:])
-	}
-}
-
-// TakeReplacements returns, oldest first, and forgets what this device's
-// committed changes replaced of other devices' values (Replacement), as
-// verified history settled them: whichever pull or push found the
-// candidate committed, and whether its post's answer was lost or the
-// candidate was posted again after a restart. A lock forgets them too.
-func (s *Store) TakeReplacements() []Replacement {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := s.replaced
-	s.replaced = nil
-	return out
+	return s.commitTxn(t)
 }
 
 // PushOutcome says what PushHead did.
@@ -532,9 +498,12 @@ type PushResult struct {
 // committed since this device's edit was made. The last change to reach
 // the server wins there and nothing is held, so the other value is lost.
 // It names the item and the members, never the values. It is journaled
-// with the candidate it describes and reported (TakeReplacements) once
-// verified history shows that candidate committed.
+// with the candidate it describes and, once verified history shows that
+// candidate committed, kept as a note until the daemon has delivered it
+// (Replacements, AckReplacements).
 type Replacement struct {
+	// N numbers a note (Replacements); it is 0 elsewhere.
+	N      uint64
 	ItemID model.ID
 	Type   model.Type
 	Name   string // the item's name, if it has one

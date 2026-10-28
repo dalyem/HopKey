@@ -32,12 +32,12 @@ func failingWrites(fail *atomic.Bool) func(sshconfig.Options, []sshconfig.Host) 
 }
 
 // failingWipes is a wipeConfig hook that fails while it is set.
-func failingWipes(fail *atomic.Bool) func(sshconfig.Options) error {
-	return func(o sshconfig.Options) error {
+func failingWipes(fail *atomic.Bool) func(sshconfig.Options, func() error) error {
+	return func(o sshconfig.Options, done func() error) error {
 		if fail.Load() {
 			return errors.New("the directory is read-only")
 		}
-		return sshconfig.Wipe(o)
+		return sshconfig.WipeIf(o, nil, done)
 	}
 }
 
