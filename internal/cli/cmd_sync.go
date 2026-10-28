@@ -212,8 +212,10 @@ func printSyncBlock(e *Env, w io.Writer, s *daemon.SyncStatusResult, o syncBlock
 	if b := s.Backoff; b != nil && s.State == daemon.SyncBackingOff {
 		line("next try", "%s (attempt %d)", e.when(b.RetryAt), b.Attempt)
 	}
-	if r := s.ServerRetirement; r != nil {
-		line("retirement", "server-reported, unverified: the server says this device was %s at seq %d", oneLine(r.How), r.Seq)
+	if r := s.ServerRetirement; r != nil && r.Wiped {
+		line("retirement", "verified: this device was %s at seq %d, and its copy of the vault was wiped", oneLine(r.How), r.Seq)
+	} else if r != nil {
+		line("retirement", "server-reported, unverified: the server says this device was %s at seq %d; the vault stays locked", oneLine(r.How), r.Seq)
 	}
 	for _, msg := range s.Warnings {
 		if o.shown[msg] {

@@ -212,6 +212,21 @@ func ValidateSnippet(s *model.Snippet) error {
 	return CheckText("description", s.Description, 1024)
 }
 
+// MaxPolicyOffline is the longest max_offline a policy may set: ten years.
+const MaxPolicyOffline = 10 * 366 * 24 * 3600
+
+// ValidatePolicy checks a policy plaintext: max_offline is 0 (off) or at
+// least a minute and at most MaxPolicyOffline seconds.
+func ValidatePolicy(p *model.Policy) error {
+	if err := checkHeader(p.Header, model.TypePolicy); err != nil {
+		return err
+	}
+	if p.MaxOffline != 0 && (p.MaxOffline < 60 || p.MaxOffline > MaxPolicyOffline) {
+		return schemaErr("max_offline", "%d seconds is not 0 or between a minute and ten years", p.MaxOffline)
+	}
+	return nil
+}
+
 // ValidateGrant checks a grant record plaintext against §6.5. Rules that
 // need the other items (item types, §8.7) are in CheckGrantRecord.
 func ValidateGrant(g *model.Grant) error {
@@ -247,7 +262,7 @@ func ValidateGrant(g *model.Grant) error {
 }
 
 // Item is one decoded §6.5 plaintext: *model.Host, *model.Key,
-// *model.Credential, *model.Snippet or *model.Grant.
+// *model.Credential, *model.Snippet, *model.Grant or *model.Policy.
 type Item any
 
 // ItemHeader returns the shared header of an Item.
@@ -262,6 +277,8 @@ func ItemHeader(it Item) (model.Header, error) {
 	case *model.Snippet:
 		return v.Header, nil
 	case *model.Grant:
+		return v.Header, nil
+	case *model.Policy:
 		return v.Header, nil
 	default:
 		return model.Header{}, fmt.Errorf("crypto: %T is not an item plaintext", it)
@@ -281,6 +298,8 @@ func ValidateItem(it Item) error {
 		return ValidateSnippet(v)
 	case *model.Grant:
 		return ValidateGrant(v)
+	case *model.Policy:
+		return ValidatePolicy(v)
 	default:
 		return fmt.Errorf("crypto: %T is not an item plaintext", it)
 	}
@@ -301,6 +320,8 @@ func ParseItem(t model.Type, b []byte) (Item, error) {
 		it = new(model.Snippet)
 	case model.TypeGrant:
 		it = new(model.Grant)
+	case model.TypePolicy:
+		it = new(model.Policy)
 	default:
 		return nil, schemaErr("type", "unknown item type %q", t)
 	}

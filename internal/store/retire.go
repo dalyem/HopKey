@@ -423,7 +423,7 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 	unlock()
 	// The candidate is built from the vault as verified on disk, by the same
 	// load a resumed logout uses.
-	v, unlock, err := s.loadVault(true)
+	v, unlock, err := s.loadVault(true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -704,7 +704,7 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 	pending := LogoutResult{State: StateRetiring}
 	ctx, _, untrack := s.trackRequest(ctx)
 	defer untrack()
-	v, unlock, err := s.loadVault(true)
+	v, unlock, err := s.loadVault(true, false)
 	if err != nil {
 		return pending, err
 	}

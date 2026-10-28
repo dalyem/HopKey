@@ -264,7 +264,7 @@ func init() {
 		"unlock":  {runUnlock, "hop unlock [--password] [--json]"},
 		"passwd":  {runPasswd, "hop passwd [--kit-file PATH] (on a server: the flags of hop auth passwd)"},
 		"sync":    {runSync, "hop sync [--json] | hop sync resolve [N] [--keep-mine [--confirm TOKEN] | --edit --set FIELD=VALUE... [--confirm TOKEN] | --take-theirs [--yes] | --retry] [--json]"},
-		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|logout|rotate|passwd|merge|resume> [--json]"},
+		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|policy|logout|rotate|passwd|merge|resume> [--json]"},
 		"login":   {runLogin, "hop login [flags of hop auth login]"},
 		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
 	}

@@ -102,6 +102,9 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if err := s.refuseRetiring(); err != nil {
 		return err
 	}
+	if err := s.refuseReported(); err != nil {
+		return err
+	}
 	if r != nil && s.state != nil {
 		return ErrAlreadyUnlocked
 	}

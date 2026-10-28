@@ -88,6 +88,8 @@ type Options struct {
 	writeConfig func(sshconfig.Options, []sshconfig.Host) error
 	wipeConfig  func(o sshconfig.Options, done func() error) error
 	configRetry time.Duration
+	// offlineEvery replaces offlineEvery (revocation.go).
+	offlineEvery time.Duration
 }
 
 // Daemon is a running daemon.
@@ -121,6 +123,8 @@ type Daemon struct {
 	clearErr atomic.Pointer[string]
 
 	sync *syncer // nil for a store that does not sync
+	// proving is set while a revocation proof is fetched (prove).
+	proving atomic.Bool
 
 	tsMu     sync.Mutex
 	tsCached *tailscale.Status
@@ -188,6 +192,10 @@ func Start(opts Options) (*Daemon, error) {
 	if d.wipeConfig == nil {
 		d.wipeConfig = func(o sshconfig.Options, done func() error) error { return sshconfig.WipeIf(o, nil, done) }
 	}
+	d.newSync()
+	// Nothing is in the agent yet: a signed-in device asks the server
+	// whether it is still in the account first (revocation.go).
+	d.preflight(ctx)
 	if err := d.reload(ctx); (errors.Is(err, model.ErrLocked) || errors.Is(err, store.ErrDeviceRevoked)) && d.canUnlock() {
 		// A locked vault (its device key unreadable, say) still gets a
 		// daemon, so hop unlock can reach it, and a revoked one so hop
@@ -204,6 +212,7 @@ func Start(opts Options) (*Daemon, error) {
 	d.watchRevoked()
 	d.startSync()
 	d.retryConfig()
+	d.watchOffline()
 
 	d.wg.Add(2)
 	go func() {

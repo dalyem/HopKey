@@ -54,6 +54,7 @@ const (
 	CodeStillHeld    = "still_held"    // a retry found the change still held
 	CodeStaleConfirm = "stale_confirm" // the confirmation token no longer matches the proposal
 	CodeConfirm      = "confirm"       // keep-mine and edit need the proposal's confirmation token
+	CodeOffline      = "offline"       // the account's max-offline policy locked the vault
 
 	// CodeConfigStale refuses a resolve while the ssh config could not be
 	// written from the vault: ssh would use the settings it had before.
@@ -255,9 +256,22 @@ type SyncStatusResult struct {
 	Equivocation bool   `json:"equivocation,omitempty"`
 	// ServerRetirement is set when the server refused this device a
 	// session and its retire-status said the device left the account.
-	// That is server-reported and unverified: the vault was locked and
-	// the agent emptied in memory only, and nothing on disk was changed.
+	// Until its proof verifies that is the server's word only: the report
+	// is recorded on disk and the vault stays locked, after a restart too,
+	// until the server authenticates the device again, and nothing is
+	// deleted. Once the proof verifies (Wiped), this device's copy of the
+	// vault is gone.
 	ServerRetirement *ServerRetirement `json:"server_retirement,omitempty"`
+	// CheckSkipped says why the question to the server before the keys
+	// loaded (at start or unlock) went unanswered, so they loaded without
+	// it; "" once one is answered.
+	CheckSkipped string `json:"check_skipped,omitempty"`
+	// MaxOffline is the account's max-offline policy in seconds (0: off);
+	// LastContact is the last time the server authenticated this device,
+	// as last read; OfflineLocked says why the policy locked the vault.
+	MaxOffline    int64      `json:"max_offline,omitempty"`
+	LastContact   *time.Time `json:"last_contact,omitempty"`
+	OfflineLocked string     `json:"offline_locked,omitempty"`
 	// What still needs the user, each also a sentence in Warnings.
 	LostIntents        uint64                  `json:"lost_intents,omitempty"`
 	LostJournals       *store.LostJournals     `json:"lost_journals,omitempty"`
@@ -271,12 +285,17 @@ type SyncStatusResult struct {
 	Warnings           []string                `json:"warnings,omitempty"`
 }
 
-// ServerRetirement is the server's unverified report that this device
-// left the account (SyncStatusResult.ServerRetirement).
+// ServerRetirement is the server's report that this device left the
+// account (SyncStatusResult.ServerRetirement).
 type ServerRetirement struct {
 	How        string `json:"how"`        // "retired" or "revoked"
 	Seq        uint64 `json:"seq"`        // the entry the server says removed it
-	Unverified bool   `json:"unverified"` // always true: the log can't show it to a device that left
+	Unverified bool   `json:"unverified"` // the proof has not verified (yet): nothing was deleted
+	// Wiped means the proof verified and this device's copy of the vault,
+	// its device key and the ssh files hop wrote are gone.
+	Wiped bool `json:"wiped,omitempty"`
+	// ProofError says why the proof did not verify, or could not be had.
+	ProofError string `json:"proof_error,omitempty"`
 }
 
 // SyncBackoff is the retry schedule after a failure.

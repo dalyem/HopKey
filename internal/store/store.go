@@ -184,6 +184,13 @@ type Info struct {
 	// Merge is the state of a login merge in progress (§4.4), or "present"
 	// while the vault is locked and its journal can't be read.
 	Merge string `json:"merge,omitempty"`
+	// ServerReport is the server's report that this device left the
+	// account: the vault stays locked until the server authenticates the
+	// device again (ErrServerRevoked).
+	ServerReport *ServerReport `json:"server_report,omitempty"`
+	// OfflineTooLong means the account's max-offline policy locked the
+	// vault (ErrOfflineTooLong); LockReason says more.
+	OfflineTooLong bool `json:"offline_too_long,omitempty"`
 	// Warnings are for the user, one sentence each.
 	Warnings []string `json:"warnings,omitempty"`
 }
@@ -343,7 +350,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) &&
-		!errors.Is(err, ErrKeyStoreUnavailable) && !errors.Is(err, ErrLoggingOut) {
+		!errors.Is(err, ErrKeyStoreUnavailable) && !errors.Is(err, ErrLoggingOut) && !errors.Is(err, ErrServerRevoked) {
 		s.Close()
 		return nil, err
 	}
@@ -353,6 +360,13 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		s.Close()
 		return nil, err
 	}
+	// The record a revocation that wiped this machine left belongs to the
+	// vault before this one.
+	s.mu.Lock()
+	if s.revoked == nil && s.refuseReported() == nil {
+		ClearRevocation(s.l.data)
+	}
+	s.mu.Unlock()
 	return s, nil
 }
 
@@ -536,12 +550,13 @@ func (s *Store) unlockDevice() error {
 }
 
 func (s *Store) unlockLocked() error {
-	v, unlock, err := s.loadVault(false)
+	v, unlock, err := s.loadVault(false, false)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	s.state, s.sec, s.dev, s.rec, s.repaired, s.server = v.st, v.sec, v.dev, v.rec, v.repaired, v.server
+	s.lockErr = nil
 	s.gen.Add(1)
 	return s.finishUnlock()
 }
@@ -579,9 +594,11 @@ func (v *loaded) zero() {
 // result without installing it. It returns holding the file lock, with the
 // func that releases it. A vault with a retirement journal (retire.go) is
 // refused with ErrLoggingOut unless forRetirement: only a logout's own
-// resolution may load it, and never for application use. The caller holds
-// s.mu.
-func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
+// resolution may load it, and never for application use. So is one the
+// server reported revoked (ErrServerRevoked), unless forRetirement or
+// ignoreReport: CheckServer and ProveRevocation load it to authenticate,
+// and never install it. The caller holds s.mu.
+func (s *Store) loadVault(forRetirement, ignoreReport bool) (*loaded, func(), error) {
 	if s.owner == nil {
 		return nil, nil, ErrClosed
 	}
@@ -593,6 +610,11 @@ func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
 	if !forRetirement {
 		if err := s.refuseRetiring(); err != nil {
 			return nil, nil, err
+		}
+		if !ignoreReport {
+			if err := s.refuseReported(); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 	cfg, err := s.readDeviceConfig()
@@ -971,6 +993,12 @@ func (s *Store) lockedErr() error {
 	if s.revoked != nil {
 		return s.revoked
 	}
+	if s.refuseReported() != nil {
+		return ErrServerRevoked
+	}
+	if errors.Is(s.lockErr, ErrOfflineTooLong) {
+		return s.lockErr
+	}
 	return errLocked
 }
 
@@ -1174,6 +1202,7 @@ func (s *Store) Info() Info {
 	}
 	if s.lockErr != nil {
 		info.LockReason = s.lockErr.Error()
+		info.OfflineTooLong = s.state == nil && errors.Is(s.lockErr, ErrOfflineTooLong)
 	}
 	if s.state != nil {
 		info.Head = &Head{Seq: s.state.Head.Seq, H: s.state.Head.H.String()}
@@ -1233,6 +1262,9 @@ func (s *Store) Info() Info {
 	}
 	if j, err := s.readRetireFile(); err == nil && j != nil {
 		info.Logout = j.State
+	}
+	if r, err := s.readReport(); err == nil && r != nil {
+		info.ServerReport = r
 	}
 	if exists, _ := s.l.mergeExists(); exists {
 		info.Merge = "present"
@@ -1370,6 +1402,8 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 			c := *v
 			c.Params = slices.Clone(v.Params)
 			snap.Snippets = append(snap.Snippets, c)
+		case *model.Policy:
+			snap.Policies = append(snap.Policies, *v)
 		}
 	}
 	byName := func(a, b model.Header, an, bn string) int {
@@ -1382,6 +1416,7 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 	slices.SortFunc(snap.Keys, func(a, b model.Key) int { return byName(a.Header, b.Header, a.Name, b.Name) })
 	slices.SortFunc(snap.Credentials, func(a, b model.Credential) int { return byName(a.Header, b.Header, a.Name, b.Name) })
 	slices.SortFunc(snap.Snippets, func(a, b model.Snippet) int { return byName(a.Header, b.Header, a.Name, b.Name) })
+	slices.SortFunc(snap.Policies, func(a, b model.Policy) int { return byName(a.Header, b.Header, "", "") })
 	return snap
 }
 
@@ -1441,6 +1476,15 @@ func (s *Store) PutSnippet(_ context.Context, sn model.Snippet) (model.Snippet, 
 	return c, nil
 }
 
+// PutPolicy creates or replaces a policy item (model.Policy).
+func (s *Store) PutPolicy(_ context.Context, p model.Policy) (model.Policy, error) {
+	out, err := put(s, &p, model.TypePolicy)
+	if err != nil {
+		return model.Policy{}, err
+	}
+	return *out, nil
+}
+
 // header returns the shared header of an item pointer.
 func header(it crypto.Item) *model.Header {
 	switch v := it.(type) {
@@ -1451,6 +1495,8 @@ func header(it crypto.Item) *model.Header {
 	case *model.Credential:
 		return &v.Header
 	case *model.Snippet:
+		return &v.Header
+	case *model.Policy:
 		return &v.Header
 	}
 	return nil

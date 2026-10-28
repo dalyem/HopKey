@@ -331,6 +331,7 @@ func (s *Server) routes() {
 		{pattern: "GET /v1/enroll/{enroll}/msg", ipRate: s.rates.IP, poll: true, h: s.enrollGet},
 		{pattern: "POST /v1/retire-status", ipRate: s.rates.IP, body: lim.MaxBody, h: s.retireStatus},
 		{pattern: "POST /v1/retire-status/post", ipRate: s.rates.IP, body: lim.MaxBody, h: s.retirePost},
+		{pattern: "POST /v1/retire-status/proof", ipRate: s.rates.IP, body: lim.MaxBody, h: s.retireProof},
 	} {
 		s.mux.Handle(rt.pattern, s.wrap(rt))
 	}

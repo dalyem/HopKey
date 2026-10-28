@@ -73,6 +73,7 @@ const (
 	TypeCredential Type = "credential"
 	TypeSnippet    Type = "snippet"
 	TypeGrant      Type = "grant"
+	TypePolicy     Type = "policy"
 )
 
 // Header is the part every item plaintext shares. ItemVersion is a u64
@@ -137,6 +138,28 @@ type Snippet struct {
 	Description string   `json:"description"`
 }
 
+// Policy is an account setting every device follows (type "policy"). A
+// device that has not reached the server for longer than MaxOffline
+// seconds locks and refuses to unlock until it does; 0 turns that off. A
+// local-only vault ignores it. Should two devices each create one, the
+// strictest applies (EffectiveMaxOffline).
+type Policy struct {
+	Header
+	MaxOffline uint64 `json:"max_offline,string"`
+}
+
+// EffectiveMaxOffline is the strictest max_offline of ps, in seconds, or 0
+// when none sets one.
+func EffectiveMaxOffline(ps []Policy) uint64 {
+	var out uint64
+	for _, p := range ps {
+		if p.MaxOffline > 0 && (out == 0 || p.MaxOffline < out) {
+			out = p.MaxOffline
+		}
+	}
+	return out
+}
+
 // Grant is the management record for a token grant (spec §6.5, type
 // "grant"). It never holds the token seed or the token's KEM private key.
 // TokenKEMPK is a b64 member: encode grants with internal/canonjson, which
@@ -199,6 +222,7 @@ type Snapshot struct {
 	Keys        []Key
 	Credentials []Credential
 	Snippets    []Snippet
+	Policies    []Policy
 	Marks       map[ID]Mark
 }
 

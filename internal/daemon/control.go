@@ -237,6 +237,15 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 		return nil, d.opDelete(ctx, p)
 	case OpReload:
 		return nil, d.reload(ctx)
+	case OpPolicy:
+		if len(req.Params) == 0 || string(req.Params) == "null" {
+			return d.opPolicy(ctx, nil)
+		}
+		var p PolicyParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return d.opPolicy(ctx, &p)
 	case OpShutdown:
 		return nil, nil
 	}

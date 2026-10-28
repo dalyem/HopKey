@@ -423,6 +423,14 @@ func (s *mcpServer) daemonError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if daemon.IsCode(err, daemon.CodeRevoked) {
+		return errors.New("this device was revoked from the account, so hop serves no hosts or keys here; " +
+			"the user can check hop auth status from a terminal, and sign in again with hop auth login")
+	}
+	if daemon.IsCode(err, daemon.CodeOffline) {
+		return errors.New("the vault is locked because this device has been offline too long; the user connects it to the server, " +
+			"then unlocks it from a terminal with hop unlock")
+	}
 	if daemon.IsCode(err, daemon.CodeLocked) {
 		return errors.New("the vault is locked; the user unlocks it from a terminal with hop unlock, then this can be tried again")
 	}

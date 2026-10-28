@@ -217,6 +217,8 @@ func (s *Store) applyPulled(gen uint64, entries []Committed, head vaultlog.Head)
 	if err := s.current(gen); err != nil {
 		return false, err
 	}
+	// The server answered this device's session: a contact.
+	s.noteContact()
 	unlock, err := s.lockFile()
 	if err != nil {
 		return false, err

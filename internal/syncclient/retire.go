@@ -159,3 +159,51 @@ func (r *Retirer) RetirePost(ctx context.Context, auth store.DeviceAuth, w *vaul
 	}, &head)
 	return head, err
 }
+
+type retireProofRequest struct {
+	AccountID model.ID `json:"account_id"`
+	After     uint64   `json:"after,string"`
+	Challenge []byte   `json:"challenge"`
+	DeviceID  model.ID `json:"device_id"`
+	Sig       []byte   `json:"sig"`
+}
+
+type retireProofResponse struct {
+	Entries []wireEntry `json:"entries"`
+	Receipt receiptJSON `json:"receipt"`
+}
+
+// RevocationProof is store.ServerChecker.RevocationProof: POST
+// /v1/retire-status/proof, one page of the entries after after up to the
+// one this device's receipt names, each without its objects. A device
+// with no receipt gets ErrNotFound.
+func (r *Retirer) RevocationProof(ctx context.Context, auth store.DeviceAuth, after uint64) ([]store.Committed, store.DeviceReceipt, error) {
+	dev := deviceOf(auth)
+	chal, sig, err := r.retireAuth(ctx, dev)
+	if err != nil {
+		return nil, store.DeviceReceipt{}, err
+	}
+	var resp retireProofResponse
+	err = r.c.do(ctx, &call{
+		method: http.MethodPost, path: "/v1/retire-status/proof", maxResp: maxLogResponse,
+		body: retireProofRequest{AccountID: dev.AccountID, After: after, Challenge: chal, DeviceID: dev.DeviceID, Sig: sig},
+	}, &resp)
+	if err != nil {
+		return nil, store.DeviceReceipt{}, err
+	}
+	rc := store.DeviceReceipt{DeviceID: resp.Receipt.DeviceID, How: resp.Receipt.How, Seq: resp.Receipt.Seq, H: resp.Receipt.H}
+	out := make([]store.Committed, 0, len(resp.Entries))
+	next := after + 1
+	for _, e := range resp.Entries {
+		if e.Seq != next || e.Seq > rc.Seq {
+			return nil, store.DeviceReceipt{}, fmt.Errorf("%w: proof entry %d, want %d", ErrMalformedResponse, e.Seq, next)
+		}
+		cm, err := e.committed()
+		if err != nil {
+			return nil, store.DeviceReceipt{}, err
+		}
+		out = append(out, cm)
+		next++
+	}
+	return out, rc, nil
+}

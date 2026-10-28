@@ -53,7 +53,7 @@ func IsGuarded(t model.Type, member string) bool {
 
 func validType(t model.Type) error {
 	switch t {
-	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet:
+	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypePolicy:
 		return nil
 	case model.TypeGrant:
 		return ErrGrant
@@ -96,7 +96,7 @@ func ParseItem(plaintext []byte) (*Item, error) {
 func ItemOf(v any) (*Item, error) {
 	switch x := v.(type) {
 	case model.Host, *model.Host, model.Key, *model.Key,
-		model.Credential, *model.Credential, model.Snippet, *model.Snippet:
+		model.Credential, *model.Credential, model.Snippet, *model.Snippet, model.Policy, *model.Policy:
 		j, err := canonjson.Marshal(x)
 		if err != nil {
 			return nil, fmt.Errorf("merge: %w", err)
