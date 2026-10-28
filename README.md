@@ -11,7 +11,7 @@ hop <target>                      shell on a vault host: alias, hostname, IP, Ta
 hop exec <target> [--timeout D] [--sudo] [--json] -- <cmd...>
 hop check|which|trust <target>    diagnose, explain resolution, pin the server's host key
 hop ls [tag] | info <target> | add | edit | rm
-hop key add <path> | ls | rm
+hop key add <path> | ls | rm | rotate <key>|--all [--hosts h1,h2] [--type ed25519|ecdsa|rsa] [--dry-run] [--yes] [--keep-old]
 hop snippet add <name> [--description D] -- <cmd...> | ls | rm <name>
 hop import ssh-config [path] [--with-keys] [--dry-run] [--yes]
 hop ts import [--dry-run] | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
@@ -57,6 +57,31 @@ When two devices change the same item before either sees the other's change, the
 `hop auth devices` shows, under LAST SEEN, when each device last wrote to the vault or made any request to the server, whichever is later. The server records a device's requests at most once a minute.
 
 `hop auth logout` deletes this device's keys and its copy of the vault, and with them what the vault decrypted into `~/.ssh/hop`: the config is left with no hosts (so an `Include` of it still works), and the key files and pinned host keys there are removed. A revoked device's daemon does the same. hop removes only the names it generates there (`keys/<id>.pub`, `known_hosts-<id>`, where `<id>` is 16 hex digits, and its own temp files), so a file of yours in `~/.ssh/hop`, such as `keys/company.pub`, stays. It leaves your own `~/.ssh/config`, `~/.ssh/known_hosts` and key files alone. If a logout is cut short after it was recorded (a crash, say), the next hop command finishes it, `~/.ssh/hop` included, and if `~/.ssh/hop` cannot be emptied then, every later start of the daemon tries again until it can.
+
+## Rotating keys
+
+`hop key rotate <key>` replaces an SSH key on every host that uses it, over the access hop still has. `--all` does it for every key in the vault, and `--hosts h1,h2` limits it to those hosts. It is the step that actually locks out a lost, stolen or tampered device. Revoking the device stops it from syncing, but it may have kept a copy of every key it could decrypt, so `hop auth devices revoke` ends by naming those keys and offering to run `hop key rotate --all` (with `--json`, its report has a `rotate_command` field instead).
+
+hop shows the plan first: the new key (`<name>-rotated-<date>`, of the old key's type unless `--type` says otherwise), the hosts it will change, and the hosts it skips with the reason. A host is skipped when hop cannot log in to it safely: no pinned host key, a jump host that is missing or unpinned, a password-only host, or a host reached through Tailscale SSH, which does not use the key. `agent_access: deny` does not stop it, since you run it, not an agent. `--dry-run` stops after the plan. Without a terminal, hop refuses unless you pass `--yes`.
+
+The new key goes into the vault first. Then, one host at a time:
+
+1. hop logs in with the old key the usual way (pinned host key, jump hosts) and reads `~/.ssh/authorized_keys`.
+2. For each line that holds the old key, hop adds the new key with the same options (`from=`, `command=`, `restrict` and so on) and the comment `hop-rotated <date>`. It never adds a line that is already there. The file is replaced in one step: a temp file in `~/.ssh` that copies the old file's mode and owner, then a rename. A file that changed since hop read it is not overwritten.
+3. hop logs in again on a new connection that offers only the new key: an agent that holds nothing else, and none of hop's other keys.
+4. Only then does it remove the old key's lines, matched by the key itself, and no other line. It checks that the old key is now refused, then points the host at the new key in the vault.
+
+If any step fails, hop puts that host's `authorized_keys` back as it was: the added lines go and the old ones stay. The host is reported as failed and keeps the old key in the vault. The old key is deleted from the vault only when no host uses it any more, and never with `--keep-old`. The changes sync like any other edit. hop prints one row per host (`rotated`, `failed` or `skipped`, with the reason; `--json` gives the same) and exits non-zero if a host failed, or if hop could not confirm that the old key is refused once its lines were removed.
+
+The new private key is made in the hop process. It goes to the daemon the way `hop key add` sends a key, and to ssh only through that one-key agent, on a socket in hop's private run directory, for as long as the command runs. No private key is written to disk.
+
+Limits:
+
+- The host needs a POSIX `sh`, `cksum`, `cp -p` and `mv`, as the rest of hop needs a POSIX shell. hop edits only `~/.ssh/authorized_keys`. If the server reads keys from somewhere else (`AuthorizedKeysFile`, `authorized_keys2`, a forced `command=` on the old key's line), hop finds the old key missing, or sees the new key fail to log in, and changes nothing. If the old key still logs in after the rotation, hop reports it, and you need to remove the key from that other place yourself.
+- A symlinked `authorized_keys` is not edited. hop does not edit system files or keys trusted as a `cert-authority`. On SELinux hosts, hop runs `restorecon` on the new file when it is there. A file managed by configuration management (Ansible, Puppet, cloud-init) may be rewritten with the old key the next time that tool runs. Change it there too.
+- hop rotates only keys in the vault, on hosts in the vault. Key files of your own on other machines (the file you once ran `hop key add` on, say) are not touched. Delete them yourself if the old key should be gone everywhere.
+- A token grant's dedicated key is not rotated. Reissue the grant instead.
+- `hop mcp` does not offer this to agents.
 
 ## Using hop with AI agents (MCP)
 

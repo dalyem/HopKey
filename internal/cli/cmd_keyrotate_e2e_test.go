@@ -1,0 +1,691 @@
+package cli_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+
+	"github.com/dalyem/hopkey/internal/cli"
+	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/model/modeltest"
+)
+
+// The hop key rotate tests run the system ssh client against akServer, an
+// in-process SSH server that decides logins as sshd does from the
+// ~/.ssh/authorized_keys of a home of its own (from= included) and runs
+// every command with the real sh in that home. The check image has no
+// sshd, so this is as close to one as the tests get.
+
+type akServer struct {
+	ln      net.Listener
+	port    int
+	home    string
+	hostKey ssh.PublicKey
+	cfg     *ssh.ServerConfig
+
+	mu sync.Mutex
+	// refuse, if set, turns away a key whose authorized_keys line has it
+	// in the comment: a server that does not read what hop wrote.
+	refuse string
+}
+
+func startAKServer(t *testing.T, home string) *akServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &akServer{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, home: home}
+	signer := newSigner(t)
+	s.hostKey = signer.PublicKey()
+	s.cfg = &ssh.ServerConfig{PublicKeyCallback: s.authorize}
+	s.cfg.AddHostKey(signer)
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go s.serve(c)
+		}
+	}()
+	return s
+}
+
+func (s *akServer) addr() string { return net.JoinHostPort("127.0.0.1", strconv.Itoa(s.port)) }
+
+func (s *akServer) setRefuse(comment string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refuse = comment
+}
+
+func (s *akServer) authorize(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
+	data, err := os.ReadFile(filepath.Join(s.home, ".ssh", "authorized_keys"))
+	if err != nil {
+		return nil, err
+	}
+	ip, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+	s.mu.Lock()
+	refuse := s.refuse
+	s.mu.Unlock()
+	for _, line := range strings.Split(string(data), "\n") {
+		pub, comment, opts, _, err := ssh.ParseAuthorizedKey([]byte(line))
+		if err != nil || !bytes.Equal(pub.Marshal(), k.Marshal()) {
+			continue
+		}
+		if refuse != "" && strings.Contains(comment, refuse) {
+			continue
+		}
+		allowed := true
+		for _, o := range opts {
+			if v, ok := strings.CutPrefix(o, "from="); ok && !fromAllows(strings.Trim(v, `"`), ip) {
+				allowed = false
+			}
+			if strings.EqualFold(o, "cert-authority") {
+				allowed = false
+			}
+		}
+		if allowed {
+			return nil, nil
+		}
+	}
+	return nil, errors.New("key not in authorized_keys")
+}
+
+// fromAllows is sshd's from= pattern list: globs, '!' negates.
+func fromAllows(patterns, ip string) bool {
+	ok := false
+	for _, p := range strings.Split(patterns, ",") {
+		neg := strings.HasPrefix(p, "!")
+		if m, _ := path.Match(strings.TrimPrefix(p, "!"), ip); m {
+			if neg {
+				return false
+			}
+			ok = true
+		}
+	}
+	return ok
+}
+
+func (s *akServer) serve(c net.Conn) {
+	defer c.Close()
+	conn, chans, reqs, err := ssh.NewServerConn(c, s.cfg)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	go ssh.DiscardRequests(reqs)
+	for nc := range chans {
+		switch nc.ChannelType() {
+		case "session":
+			ch, creqs, err := nc.Accept()
+			if err != nil {
+				return
+			}
+			go s.session(ch, creqs)
+		case "direct-tcpip":
+			go forwardTCP(nc)
+		default:
+			nc.Reject(ssh.UnknownChannelType, "session only")
+		}
+	}
+}
+
+func (s *akServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
+	defer ch.Close()
+	for req := range reqs {
+		if req.Type != "exec" {
+			req.Reply(false, nil)
+			continue
+		}
+		var p struct{ Command string }
+		if err := ssh.Unmarshal(req.Payload, &p); err != nil {
+			req.Reply(false, nil)
+			continue
+		}
+		req.Reply(true, nil)
+		cmd := exec.Command("sh", "-c", p.Command)
+		cmd.Dir = s.home
+		cmd.Env = []string{"HOME=" + s.home, "PATH=" + os.Getenv("PATH")}
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = ch, ch, ch.Stderr()
+		cmd.WaitDelay = 2 * time.Second
+		status := uint32(0)
+		if err := cmd.Run(); err != nil {
+			status = 1
+			var ee *exec.ExitError
+			if errors.As(err, &ee) && ee.ExitCode() >= 0 {
+				status = uint32(ee.ExitCode())
+			}
+		}
+		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+		return
+	}
+}
+
+// forwardTCP answers ssh -W (ProxyJump) through this server.
+func forwardTCP(nc ssh.NewChannel) {
+	var p struct {
+		Host       string
+		Port       uint32
+		OriginHost string
+		OriginPort uint32
+	}
+	if err := ssh.Unmarshal(nc.ExtraData(), &p); err != nil {
+		nc.Reject(ssh.ConnectionFailed, "bad request")
+		return
+	}
+	dst, err := net.Dial("tcp", net.JoinHostPort(p.Host, strconv.Itoa(int(p.Port))))
+	if err != nil {
+		nc.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+	ch, reqs, err := nc.Accept()
+	if err != nil {
+		dst.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+	go func() { io.Copy(dst, ch); dst.(*net.TCPConn).CloseWrite() }()
+	io.Copy(ch, dst)
+	ch.CloseWrite()
+	ch.Close()
+	dst.Close()
+}
+
+type rotWorld struct {
+	*e2e
+	srv    []*akServer
+	oldKey ssh.Signer
+	hosts  map[string]model.ID
+	// original authorized_keys of each server, and its other key lines
+	orig []string
+}
+
+type rotWorldOpts struct {
+	jump     bool // web-2 is reached through web-1
+	unpinned bool // also web-3, with no pinned host key
+}
+
+func authorizedKeysLine(k ssh.PublicKey) string {
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(k)))
+}
+
+const rotOptions = `from="127.0.0.1,10.1.2.3",no-agent-forwarding`
+
+func newRotWorld(t *testing.T, o rotWorldOpts) *rotWorld {
+	t.Helper()
+	requireSSH(t)
+	base, err := os.MkdirTemp("", "hkr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	// Everything hop and ssh write, temp files included, lands under base,
+	// where the tests look for private keys.
+	tmp := filepath.Join(base, "tmp")
+	if err := os.Mkdir(tmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", tmp)
+	home := filepath.Join(base, "home")
+	paths := daemon.Paths{
+		RunDir:    filepath.Join(base, "run"),
+		ConfigDir: filepath.Join(home, ".ssh", "hop"),
+		StateDir:  filepath.Join(base, "state"),
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldKey, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := modeltest.New()
+	ctx := context.Background()
+	key, err := st.PutKey(ctx, model.Key{
+		Name: "deploy-key", KeyType: "ed25519",
+		PrivateKey: string(pem.EncodeToMemory(block)), PublicKey: authorizedKeysLine(oldKey.PublicKey()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := &rotWorld{oldKey: oldKey, hosts: map[string]model.ID{}}
+	for i := range 2 {
+		rhome := filepath.Join(base, fmt.Sprintf("remote%d", i+1))
+		if err := os.MkdirAll(filepath.Join(rhome, ".ssh"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		content := "# hop test\n" +
+			authorizedKeysLine(newSigner(t).PublicKey()) + " alice@laptop\n" +
+			rotOptions + " " + authorizedKeysLine(oldKey.PublicKey()) + " deploy@old\n" +
+			`command="/bin/false",restrict ` + authorizedKeysLine(newSigner(t).PublicKey()) + " backup\n"
+		f := filepath.Join(rhome, ".ssh", "authorized_keys")
+		if err := os.WriteFile(f, []byte(content), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		os.Chmod(f, 0o640)
+		w.srv = append(w.srv, startAKServer(t, rhome))
+		w.orig = append(w.orig, content)
+	}
+
+	put := func(h model.Host) model.Host {
+		t.Helper()
+		saved, err := st.PutHost(ctx, h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.hosts[h.Name] = saved.ItemID
+		return saved
+	}
+	host := func(name string, s *akServer, pinned bool) model.Host {
+		h := model.Host{
+			Name: name, Addresses: []string{"127.0.0.1"}, Port: uint32(s.port), User: "deploy",
+			KeyID: key.ItemID, Route: "auto", AgentAccess: "allow",
+		}
+		if pinned {
+			h.HostKeys = []string{authorizedKeysLine(s.hostKey)}
+		}
+		return h
+	}
+	web1 := put(host("web-1", w.srv[0], true))
+	web2 := host("web-2", w.srv[1], true)
+	if o.jump {
+		web2.JumpHostID = web1.ItemID
+	}
+	web2.AgentAccess = "deny" // the user may rotate it; only agents are kept away
+	put(web2)
+	if o.unpinned {
+		put(host("web-3", w.srv[1], false))
+	}
+
+	d, err := daemon.Start(daemon.Options{Paths: paths, Store: st, Version: "test", Tailscale: noTailscale{}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	w.e2e = &e2e{base: base, home: home, paths: paths, store: st, daemon: d, keyID: key.ItemID}
+	return w
+}
+
+func (w *rotWorld) authorizedKeys(t *testing.T, i int) (string, os.FileMode) {
+	t.Helper()
+	f := filepath.Join(w.srv[i].home, ".ssh", "authorized_keys")
+	b, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b), fi.Mode().Perm()
+}
+
+func (w *rotWorld) snapshot(t *testing.T) model.Snapshot {
+	t.Helper()
+	snap, err := w.store.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+func (w *rotWorld) hostKeyID(t *testing.T, name string) model.ID {
+	t.Helper()
+	for _, h := range w.snapshot(t).Hosts {
+		if h.Name == name {
+			return h.KeyID
+		}
+	}
+	t.Fatalf("no host %s", name)
+	return model.ID{}
+}
+
+func (w *rotWorld) keyNamed(t *testing.T, name string) *model.Key {
+	t.Helper()
+	for _, k := range w.snapshot(t).Keys {
+		if k.Name == name {
+			return &k
+		}
+	}
+	return nil
+}
+
+// login tries the server with exactly signer, as a plain client.
+func login(s *akServer, signer ssh.Signer) error {
+	c, err := ssh.Dial("tcp", s.addr(), &ssh.ClientConfig{
+		User: "deploy", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.FixedHostKey(s.hostKey), Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		return err
+	}
+	return c.Close()
+}
+
+func decodeRotate(t *testing.T, stdout string) cli.RotateResult {
+	t.Helper()
+	var res cli.RotateResult
+	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	return res
+}
+
+func hostStatus(res cli.RotateResult) map[string]cli.RotateHost {
+	out := map[string]cli.RotateHost{}
+	for _, k := range res.Keys {
+		for _, h := range k.Hosts {
+			out[h.Host] = h
+		}
+	}
+	return out
+}
+
+// scanForPrivateKeys reports every regular file under root that holds a
+// private key, from now until stop is called.
+func scanForPrivateKeys(t *testing.T, root string) (stop func() []string) {
+	found := map[string]bool{}
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	scan := func() {
+		filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || !d.Type().IsRegular() {
+				return nil
+			}
+			b, err := os.ReadFile(p)
+			if err == nil && bytes.Contains(b, []byte("PRIVATE KEY")) {
+				found[p] = true
+			}
+			return nil
+		})
+	}
+	go func() {
+		defer close(finished)
+		for {
+			scan()
+			select {
+			case <-done:
+				scan()
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}()
+	return func() []string {
+		close(done)
+		<-finished
+		var out []string
+		for p := range found {
+			out = append(out, p)
+		}
+		return out
+	}
+}
+
+func TestKeyRotateTwoHosts(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	stop := scanForPrivateKeys(t, w.base)
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--yes", "--json")
+	leaked := stop()
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	res := decodeRotate(t, stdout)
+	if !res.OK || len(res.Keys) != 1 {
+		t.Fatalf("result %+v", res)
+	}
+	rk := res.Keys[0]
+	for _, name := range []string{"web-1", "web-2"} {
+		if h := hostStatus(res)[name]; h.Status != "rotated" || h.Warning != "" {
+			t.Errorf("%s: %+v", name, h)
+		}
+	}
+	if rk.OldKey != "deleted" || rk.NewKey != "deploy-key-rotated-"+time.Now().UTC().Format("2006-01-02") || rk.NewKeyID == "" {
+		t.Errorf("key report %+v", rk)
+	}
+
+	// The vault: the new key, both hosts on it, the old key gone.
+	newKey := w.keyNamed(t, rk.NewKey)
+	if newKey == nil || w.keyNamed(t, "deploy-key") != nil {
+		t.Fatalf("vault keys: %+v", w.snapshot(t).Keys)
+	}
+	for _, name := range []string{"web-1", "web-2"} {
+		if w.hostKeyID(t, name) != newKey.ItemID {
+			t.Errorf("%s still on key %v", name, w.hostKeyID(t, name))
+		}
+	}
+	newSignerKey, err := ssh.ParsePrivateKey([]byte(newKey.PrivateKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stamp := "hop-rotated " + time.Now().UTC().Format("2006-01-02")
+	for i, s := range w.srv {
+		// Every other line as it was, in order; the old line replaced by
+		// the new key with the same options; the file's mode kept.
+		got, mode := w.authorizedKeys(t, i)
+		lines := strings.Split(w.orig[i], "\n")
+		want := strings.Join([]string{lines[0], lines[1], lines[3],
+			rotOptions + " " + authorizedKeysLine(newSignerKey.PublicKey()) + " " + stamp}, "\n") + "\n"
+		if got != want {
+			t.Errorf("server %d authorized_keys:\n%s\nwant:\n%s", i+1, got, want)
+		}
+		if mode != 0o640 {
+			t.Errorf("server %d authorized_keys mode %v, want 0640", i+1, mode)
+		}
+		if err := login(s, w.oldKey); err == nil {
+			t.Errorf("server %d still accepts the old key", i+1)
+		}
+		if err := login(s, newSignerKey); err != nil {
+			t.Errorf("server %d refuses the new key: %v", i+1, err)
+		}
+		entries, _ := os.ReadDir(filepath.Join(s.home, ".ssh"))
+		if len(entries) != 1 {
+			t.Errorf("server %d ~/.ssh has %d entries, want only authorized_keys", i+1, len(entries))
+		}
+	}
+	// And hop itself now logs in with the new key.
+	if code, out, errOut := w.hop(t, "exec", "web-1", "--", "echo", "ok"); code != 0 || out != "ok\n" {
+		t.Errorf("hop exec after the rotation: %d %q %q", code, out, errOut)
+	}
+
+	// No private key was ever on disk: not during the run, not after.
+	if len(leaked) > 0 {
+		t.Errorf("files holding a private key during the rotation: %v", leaked)
+	}
+	body := strings.Split(strings.TrimSpace(newKey.PrivateKey), "\n")
+	chunk := body[len(body)/2]
+	filepath.WalkDir(w.base, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			if b, _ := os.ReadFile(p); bytes.Contains(b, []byte(chunk)) {
+				t.Errorf("%s holds the new private key", p)
+			}
+		}
+		return nil
+	})
+	// The agent directory is gone.
+	if m, _ := filepath.Glob(filepath.Join(w.paths.RunDir, "rotate-*")); len(m) != 0 {
+		t.Errorf("left behind: %v", m)
+	}
+}
+
+func TestKeyRotateVerifyFailureRollsBackThatHostOnly(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	// web-2's server does not take the new line: the new key cannot log in.
+	w.srv[1].setRefuse("hop-rotated")
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	if code != 255 {
+		t.Errorf("exit %d, want 255", code)
+	}
+	res := decodeRotate(t, stdout)
+	st := hostStatus(res)
+	if st["web-1"].Status != "rotated" {
+		t.Errorf("web-1: %+v", st["web-1"])
+	}
+	if h := st["web-2"]; h.Status != "failed" || !strings.Contains(h.Reason, "did not log in (deploy@127.0.0.1: Permission denied (publickey).)") ||
+		!strings.Contains(h.Reason, "put back as it was") || strings.Contains(h.Reason, "no such identity") {
+		t.Errorf("web-2: %+v", h)
+	}
+	if res.OK || res.Keys[0].OldKey != "kept" || !strings.Contains(res.Keys[0].OldKeyReason, "web-2") {
+		t.Errorf("result %+v", res)
+	}
+
+	// web-2: exactly as before, and still on the old key in the vault.
+	if got, mode := w.authorizedKeys(t, 1); got != w.orig[1] || mode != 0o640 {
+		t.Errorf("web-2 authorized_keys after rollback (mode %v):\n%s\nwant:\n%s", mode, got, w.orig[1])
+	}
+	if w.hostKeyID(t, "web-2") != w.keyID || w.keyNamed(t, "deploy-key") == nil {
+		t.Error("web-2 lost the old key in the vault")
+	}
+	if err := login(w.srv[1], w.oldKey); err != nil {
+		t.Errorf("web-2 refuses the old key after the rollback: %v", err)
+	}
+	if w.hostKeyID(t, "web-1") == w.keyID {
+		t.Error("web-1 still on the old key")
+	}
+	if code, _, errOut := w.hop(t, "exec", "web-2", "--", "true"); code != 0 {
+		t.Errorf("hop exec web-2 after the failure: %d %s", code, errOut)
+	}
+}
+
+func TestKeyRotateThroughAJumpHost(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{jump: true})
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--yes")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(stdout, "rotated") || strings.Contains(stdout, "failed") {
+		t.Errorf("stdout:\n%s", stdout)
+	}
+	for i, s := range w.srv {
+		if err := login(s, w.oldKey); err == nil {
+			t.Errorf("server %d still accepts the old key", i+1)
+		}
+	}
+	if code, out, errOut := w.hop(t, "exec", "web-2", "--", "echo", "ok"); code != 0 || out != "ok\n" {
+		t.Errorf("hop exec web-2 through the jump host: %d %q %q", code, out, errOut)
+	}
+}
+
+func TestKeyRotateDryRunChangesNothing(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{unpinned: true})
+	before := w.snapshot(t)
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--dry-run")
+	t.Logf("hop key rotate --dry-run (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	for _, want := range []string{"web-1", "rotate", "web-3", "skip: no host key is pinned", "Dry run: nothing was changed", "the old key stays in the vault"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("plan lacks %q:\n%s", want, stdout)
+		}
+	}
+	code, stdout, _ = w.hop(t, "key", "rotate", "--all", "--dry-run", "--json")
+	res := decodeRotate(t, stdout)
+	if code != 0 || !res.DryRun || hostStatus(res)["web-1"].Status != "planned" || hostStatus(res)["web-3"].Status != "skipped" {
+		t.Errorf("dry run JSON (exit %d): %s", code, stdout)
+	}
+
+	// Without a terminal or --yes, the plan is shown and nothing happens.
+	code, stdout, stderr = w.hop(t, "key", "rotate", "deploy-key")
+	if code != 255 || !strings.Contains(stderr, "--yes") || !strings.Contains(stdout, "web-1") {
+		t.Errorf("no --yes: exit %d\n%s\n%s", code, stdout, stderr)
+	}
+
+	after := w.snapshot(t)
+	if len(after.Keys) != len(before.Keys) || len(after.Hosts) != len(before.Hosts) {
+		t.Fatalf("the vault changed: %+v", after)
+	}
+	for i := range after.Hosts {
+		if after.Hosts[i].ItemVersion != before.Hosts[i].ItemVersion || after.Hosts[i].KeyID != before.Hosts[i].KeyID {
+			t.Errorf("host %s changed", after.Hosts[i].Name)
+		}
+	}
+	for i := range w.srv {
+		if got, _ := w.authorizedKeys(t, i); got != w.orig[i] {
+			t.Errorf("server %d authorized_keys changed:\n%s", i+1, got)
+		}
+	}
+}
+
+func TestKeyRotateKeepsTheOldKeyForASkippedHost(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{unpinned: true})
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	res := decodeRotate(t, stdout)
+	st := hostStatus(res)
+	if code != 0 || st["web-1"].Status != "rotated" || st["web-2"].Status != "rotated" || st["web-3"].Status != "skipped" {
+		t.Errorf("exit %d, %+v", code, st)
+	}
+	if res.Keys[0].OldKey != "kept" || w.hostKeyID(t, "web-3") != w.keyID || w.keyNamed(t, "deploy-key") == nil {
+		t.Errorf("the old key should stay for web-3: %+v", res.Keys[0])
+	}
+}
+
+func TestKeyRotateOfferAfterRevoke(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	var out, errOut bytes.Buffer
+	env := w.env(t, strings.NewReader(""), &out, &errOut)
+	if err := cli.OfferKeyRotation(context.Background(), env, false); err != nil {
+		t.Fatal(err)
+	}
+	if s := out.String(); !strings.Contains(s, "these 1 keys: deploy-key") || !strings.Contains(s, "`hop key rotate --all`") {
+		t.Errorf("offer:\n%s", s)
+	}
+	if strings.Contains(errOut.String(), "[y/N]") {
+		t.Error("asked without a terminal")
+	}
+	// --json: the report carries rotate_command; nothing is printed here.
+	out.Reset()
+	if err := cli.OfferKeyRotation(context.Background(), env, true); err != nil || out.Len() != 0 {
+		t.Errorf("with --json: %v %q", err, out.String())
+	}
+
+	// On a terminal, yes runs the rotation.
+	w.tty = true
+	out.Reset()
+	errOut.Reset()
+	env = w.env(t, strings.NewReader("y\n"), &out, &errOut)
+	if err := cli.OfferKeyRotation(context.Background(), env, false); err != nil {
+		t.Fatalf("%v\n%s\n%s", err, out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "Rotate them now? [y/N]") || strings.Count(out.String(), "rotated") < 2 {
+		t.Errorf("stdout:\n%s\nstderr:\n%s", out.String(), errOut.String())
+	}
+	if w.keyNamed(t, "deploy-key") != nil {
+		t.Error("the old key is still in the vault")
+	}
+}
