@@ -227,8 +227,9 @@ func SuggestLink(h model.Host, ts *tailscale.Status) (node tailscale.Node, hint 
 	if !h.JumpHostID.IsZero() || ts == nil || !ts.Available {
 		return tailscale.Node{}, "", false
 	}
-	all := ts.Nodes()
-	if len(linkedNodes(h, all)) > 0 {
+	// A stored link counts even when its node is not in this status:
+	// hop ts link would refuse to replace it without --force.
+	if h.Tailscale != nil || len(linkedNodes(h, ts.Nodes())) > 0 {
 		return tailscale.Node{}, "", false
 	}
 	for _, a := range h.Addresses {
@@ -241,8 +242,10 @@ func SuggestLink(h model.Host, ts *tailscale.Status) (node tailscale.Node, hint 
 		}
 		if found := ts.Find(k); len(found) == 1 {
 			n := found[0]
+			// The command names the node by its stable ID: a name could
+			// also match another node, and hop ts link would refuse it.
 			name := cmp.Or(n.ShortName(), n.HostName)
-			return n, fmt.Sprintf("%s matches tailnet node %s; to route over Tailscale: hop ts link %s %s", a, name, h.Name, name), true
+			return n, fmt.Sprintf("%s matches tailnet node %s; to route over Tailscale: hop ts link %s %s", a, name, h.Name, cmp.Or(n.ID, name)), true
 		}
 	}
 	return tailscale.Node{}, "", false

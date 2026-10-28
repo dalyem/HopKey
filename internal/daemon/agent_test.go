@@ -327,7 +327,7 @@ func TestResolveRouteHintIsNotForAgents(t *testing.T) {
 		}
 		return rr
 	}
-	const want = "openbox matches tailnet node openbox; to route over Tailscale: hop ts link web openbox"
+	const want = "openbox matches tailnet node openbox; to route over Tailscale: hop ts link web nOPEN"
 	if rr := resolve("web", false); rr.RouteHint != want || rr.Route == nil || rr.Route.Chosen != "direct" {
 		t.Errorf("plain resolve: hint %q, route %+v; want %q and a direct route", rr.RouteHint, rr.Route, want)
 	}

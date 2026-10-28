@@ -278,7 +278,7 @@ func TestSuggestLink(t *testing.T) {
 			}
 		})
 	}
-	const hint = "prod matches tailnet node prod; to route over Tailscale: hop ts link web prod"
+	const hint = "prod matches tailnet node prod; to route over Tailscale: hop ts link web nA"
 	tests := []struct {
 		name string
 		host model.Host
@@ -286,13 +286,14 @@ func TestSuggestLink(t *testing.T) {
 		want string
 	}{
 		{name: "a short name of one node", host: with(nil, "prod"), ts: online, want: hint},
-		{name: "case does not matter", host: with(nil, "PROD", "203.0.113.10"), ts: online, want: "PROD matches tailnet node prod; to route over Tailscale: hop ts link web prod"},
-		{name: "a host name that is not the first label names the label", host: with(nil, "prod"), ts: tsStatus(node("nA", "prod", "prod-1.tn.ts.net", true, "100.64.0.2")), want: "prod matches tailnet node prod-1; to route over Tailscale: hop ts link web prod-1"},
+		{name: "case does not matter", host: with(nil, "PROD", "203.0.113.10"), ts: online, want: "PROD matches tailnet node prod; to route over Tailscale: hop ts link web nA"},
+		{name: "a host name that is not the first label names the label", host: with(nil, "prod"), ts: tsStatus(node("nA", "prod", "prod-1.tn.ts.net", true, "100.64.0.2")), want: "prod matches tailnet node prod-1; to route over Tailscale: hop ts link web nA"},
 		{name: "a node name two nodes share says nothing", host: with(nil, "prod"), ts: twins},
 		{name: "a name no node has says nothing", host: with(nil, "other"), ts: online},
 		{name: "an FQDN is not a short name", host: with(nil, "prod.example.com"), ts: online},
 		{name: "an IP says nothing", host: with(nil, "203.0.113.10"), ts: online},
 		{name: "a linked host says nothing", host: with(linked("nA", "prod.tn.ts.net"), "prod"), ts: online},
+		{name: "a link to a node not in the status says nothing", host: with(linked("nGone", "gone.tn.ts.net"), "prod"), ts: online},
 		{name: "a host with a tailnet address says nothing", host: with(nil, "prod", "100.64.0.2"), ts: online},
 		{name: "a host behind a jump host says nothing", host: with(func(h *model.Host) { h.JumpHostID = id(7) }, "prod"), ts: online},
 		{name: "tailscale stopped says nothing", host: with(nil, "prod"), ts: tailscale.Unavailable("tailscale is Stopped")},
