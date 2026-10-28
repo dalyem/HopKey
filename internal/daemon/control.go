@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -420,64 +419,10 @@ func agentTailnet(ts *tailscale.Status, hosts []model.Host) *tailscale.Status {
 }
 
 // HostOwnsNode reports whether tailnet node n, one of all (the whole
-// tailnet), is host h by another name. A link that names one node only
-// decides: h's stable node ID or MagicDNS name, or an address of h that is
-// one of n's IPs or its MagicDNS name, ignoring case and a trailing dot.
-// Failing that, an address of h that is n's short name (the MagicDNS
-// name's first label) or its host name owns n only when no other node in
-// all has that name, and h is not linked as above to another node: two
-// machines can report the same host name ("build", given the MagicDNS
-// names build and build-1), and such a name does not say which one h is.
+// tailnet), is host h by another name; see resolve.HostOwnsNode.
 func HostOwnsNode(h model.Host, n tailscale.Node, all []tailscale.Node) bool {
-	if hostLinksNode(h, n) {
-		return true
-	}
-	if slices.ContainsFunc(all, func(o tailscale.Node) bool { return o.ID != n.ID && hostLinksNode(h, o) }) {
-		return false
-	}
-	named := func(o tailscale.Node, k string) bool { return k == normDNS(o.ShortName()) || k == normDNS(o.HostName) }
-	for _, a := range h.Addresses {
-		k := normDNS(strings.Trim(strings.TrimSpace(a), "[]"))
-		if k == "" || !named(n, k) {
-			continue
-		}
-		if !slices.ContainsFunc(all, func(o tailscale.Node) bool { return o.ID != n.ID && named(o, k) }) {
-			return true
-		}
-	}
-	return false
+	return resolve.HostOwnsNode(h, n, all)
 }
-
-// hostLinksNode is HostOwnsNode's links that name one node only.
-func hostLinksNode(h model.Host, n tailscale.Node) bool {
-	if t := h.Tailscale; t != nil {
-		if t.StableNodeID != "" && t.StableNodeID == n.ID {
-			return true
-		}
-		if t.DNSName != "" && normDNS(t.DNSName) == normDNS(n.DNSName) {
-			return true
-		}
-	}
-	for _, a := range h.Addresses {
-		a = strings.Trim(strings.TrimSpace(a), "[]")
-		if ip, err := netip.ParseAddr(a); err == nil {
-			ip = ip.Unmap().WithZone("")
-			if slices.ContainsFunc(n.IPs, func(s string) bool {
-				nip, err := netip.ParseAddr(s)
-				return err == nil && nip.Unmap().WithZone("") == ip
-			}) {
-				return true
-			}
-			continue
-		}
-		if k := normDNS(a); k != "" && k == normDNS(n.DNSName) {
-			return true
-		}
-	}
-	return false
-}
-
-func normDNS(s string) string { return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), ".")) }
 
 // checkHostInput fills defaults and refuses a host the ssh config could not
 // represent or that would share a name with another host.

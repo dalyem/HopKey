@@ -24,6 +24,7 @@ func TestWaitingForAnApprovalHintsAtThePasswordMethod(t *testing.T) {
 	if !strings.Contains(out, "Waiting for the approval") || !strings.Contains(out, "--method password") || !strings.Contains(out, "approval attempts of the hour") {
 		t.Errorf("no hint after the wait:\n%s", out)
 	}
+	wantDiscardThenPassword(t, out)
 }
 
 // An approval that arrives in time prints no hint.
@@ -43,6 +44,19 @@ func TestNoHintOnceTheCheckCodeIsShown(t *testing.T) {
 	}
 }
 
+// The password method refuses to start while the approval login is
+// unfinished, so a hint that sends the user straight to it sends them into a
+// refusal: it says to cancel, discard, then sign in.
+func wantDiscardThenPassword(t *testing.T, text string) {
+	t.Helper()
+	cancel := strings.Index(text, "Ctrl-C")
+	discard := strings.Index(text, "hop auth login --discard")
+	password := strings.Index(text, "hop auth login --method password")
+	if cancel < 0 || discard < 0 || password < 0 || !(cancel < discard && discard < password) {
+		t.Errorf("want Ctrl-C, then hop auth login --discard, then hop auth login --method password, in that order:\n%s", text)
+	}
+}
+
 func TestApproverBudgetFailureSaysWhenToTryAgain(t *testing.T) {
 	err := budgetFailure(fmt.Errorf("approving: %w", &crypto.BudgetExhaustedError{RetryAfter: 23*time.Minute + 30*time.Second}))
 	var ee *exitError
@@ -54,6 +68,7 @@ func TestApproverBudgetFailureSaysWhenToTryAgain(t *testing.T) {
 			t.Errorf("%q does not say %q", ee.msg, want)
 		}
 	}
+	wantDiscardThenPassword(t, ee.msg)
 }
 
 func TestClosestCommand(t *testing.T) {

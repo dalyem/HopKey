@@ -691,9 +691,10 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 
 // budgetFailure is the approver's refusal when its hourly approvals are used
 // up. The error says when one frees up; the new device is not told, so this
-// names what it can do meanwhile.
+// names what it can do meanwhile. The new device's login is unfinished, which
+// blocks every other method until it is discarded.
 func budgetFailure(err error) error {
-	return failf("%v; or the new device can sign in now with hop auth login --method password instead", err)
+	return failf("%v; or the new device can cancel its login (Ctrl-C), run hop auth login --discard, then sign in with hop auth login --method password", err)
 }
 
 // ---- status ----

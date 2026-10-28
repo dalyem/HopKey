@@ -69,9 +69,11 @@ const defaultWaitHint = 60 * time.Second
 
 // waitHintText is the line printed when the approval takes long. The new
 // device cannot see why: an approving device that used its 3 attempts of the
-// hour refuses with an error that only it shows.
+// hour refuses with an error that only it shows. This login is unfinished,
+// which blocks every other method, so the way out starts by ending it.
 const waitHintText = "Still waiting. If the approving device refused because it used its 3 approval attempts of the hour, " +
-	"it can try again later; or sign in here with: hop auth login --method password"
+	"it can try again later; or cancel this login (Ctrl-C), run hop auth login --discard, " +
+	"then sign in with hop auth login --method password"
 
 // startWaitHint prints waitHintText once, after the wait has lasted a while.
 func (u *termUI) startWaitHint() {

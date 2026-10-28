@@ -1,6 +1,8 @@
 package resolve
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -33,10 +35,21 @@ func TestIsTailnetAddr(t *testing.T) {
 	}
 }
 
+// dns is a resolver that knows only the names in it.
+type dns map[string][]string
+
+func (d dns) lookup(_ context.Context, host string) ([]string, error) {
+	if ips, ok := d[strings.ToLower(host)]; ok {
+		return ips, nil
+	}
+	return nil, errors.New("no such host")
+}
+
 func TestChooseRoute(t *testing.T) {
 	online := tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2", "fd7a:115c:a1e0::2"))
 	offline := tsStatus(node("nA", "prod", "prod.tn.ts.net", false, "100.64.0.2"))
 	stopped := tailscale.Unavailable("tailscale is Stopped")
+	twoNodes := tsStatus(node("nA", "a", "a.tn.ts.net", true, "100.64.0.2"), node("nB", "b", "b.tn.ts.net", true, "100.64.0.3"))
 
 	both := func(route string) model.Host {
 		return host(1, "prod", func(h *model.Host) {
@@ -50,6 +63,7 @@ func TestChooseRoute(t *testing.T) {
 		name     string
 		host     model.Host
 		ts       *tailscale.Status
+		dns      dns // what the system resolver answers; nil knows nothing
 		chosen   string
 		address  string
 		fallback string
@@ -100,30 +114,89 @@ func TestChooseRoute(t *testing.T) {
 			host: host(1, "p", func(h *model.Host) { linked("nA", "prod.tn.ts.net.")(h) }),
 		},
 		{
-			name: "a short MagicDNS name is the node's FQDN", ts: online, chosen: "tailnet", address: "100.64.0.2",
+			name: "a short MagicDNS name the resolver sends to the node is its FQDN", ts: online, dns: dns{"prod": {"100.64.0.2", "fd7a:115c:a1e0::2"}}, chosen: "tailnet", address: "100.64.0.2",
 			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
 		},
 		{
-			name: "a short name with another direct address keeps it as the fallback", ts: online, chosen: "tailnet", address: "100.64.0.2", fallback: "203.0.113.10",
+			name: "a short name with another direct address keeps it as the fallback", ts: online, dns: dns{"prod": {"100.64.0.2"}}, chosen: "tailnet", address: "100.64.0.2", fallback: "203.0.113.10",
 			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"PROD", "203.0.113.10"} }),
 		},
 		{
-			name: "a short name of an unknown node stays direct", ts: online, chosen: "direct", address: "other", reason: "no tailnet address",
+			name: "a short name of an unknown node stays direct", ts: online, dns: dns{"other": {"100.64.0.2"}}, chosen: "direct", address: "other", reason: "no tailnet address",
 			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"other"} }),
 		},
 		{
-			name: "a short name two nodes share stays direct", ts: tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2"), node("nB", "prod", "prod.tn.ts.net", true, "100.64.0.3")),
+			name: "a short name two nodes share stays direct", dns: dns{"prod": {"100.64.0.2"}}, ts: tsStatus(node("nA", "prod", "prod.tn.ts.net", true, "100.64.0.2"), node("nB", "prod", "prod.tn.ts.net", true, "100.64.0.3")),
 			chosen: "direct", address: "prod", reason: "no tailnet address",
 			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
 		},
 		{
-			name: "a short name with tailscale stopped stays direct", ts: stopped, chosen: "direct", address: "prod", reason: "no tailnet address",
+			name: "a short name with tailscale stopped stays direct", ts: stopped, dns: dns{"prod": {"100.64.0.2"}}, chosen: "direct", address: "prod", reason: "no tailnet address",
 			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "a short name the resolver sends to the LAN stays direct", ts: online, dns: dns{"prod": {"192.0.2.7"}},
+			chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "a short name the resolver cannot resolve stays direct", ts: online,
+			chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "a short name the resolver sends to the node and the LAN stays direct", ts: online, dns: dns{"prod": {"100.64.0.2", "192.0.2.7"}},
+			chosen: "direct", address: "prod", reason: "no tailnet address",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "route direct keeps a LAN short name that shares a node's name", ts: online, dns: dns{"prod": {"192.0.2.7"}},
+			chosen: "direct", address: "prod",
+			host: host(1, "p", func(h *model.Host) { h.Route = "direct"; h.Addresses = []string{"prod"} }),
+		},
+		{
+			name: "route direct with a LAN short name and a tailnet link", ts: online, dns: dns{"prod": {"192.0.2.7"}},
+			chosen: "direct", address: "prod",
+			host: host(1, "p", func(h *model.Host) {
+				h.Route = "direct"
+				h.Addresses = []string{"prod"}
+				linked("nA", "prod.tn.ts.net")(h)
+			}),
+		},
+		{
+			name: "auto keeps the LAN short name as the fallback of a linked node", ts: online, dns: dns{"prod": {"192.0.2.7"}},
+			chosen: "tailnet", address: "100.64.0.2", fallback: "prod",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"prod"}; linked("nA", "prod.tn.ts.net")(h) }),
+		},
+		{
+			name: "an exact FQDN beats a short name of another node", ts: twoNodes, dns: dns{"b": {"100.64.0.3"}},
+			chosen: "tailnet", address: "100.64.0.2", fallback: "b",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b", "a.tn.ts.net"} }),
+		},
+		{
+			name: "route direct with a short name beside an FQDN", ts: twoNodes, dns: dns{"b": {"100.64.0.3"}},
+			chosen: "direct", address: "b",
+			host: host(1, "p", func(h *model.Host) { h.Route = "direct"; h.Addresses = []string{"b", "a.tn.ts.net"} }),
+		},
+		{
+			name: "a Tailscale IP beats a short name of another node", ts: twoNodes, dns: dns{"b": {"100.64.0.3"}},
+			chosen: "tailnet", address: "100.64.0.2", fallback: "b",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b", "100.64.0.2"} }),
+		},
+		{
+			name: "the stable node ID beats a short name of another node", ts: twoNodes, dns: dns{"b": {"100.64.0.3"}},
+			chosen: "tailnet", address: "100.64.0.2", fallback: "b",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b"}; linked("nA", "")(h) }),
+		},
+		{
+			name: "a short name alone, confirmed by the resolver, is the node", ts: twoNodes, dns: dns{"b": {"100.64.0.3"}},
+			chosen: "tailnet", address: "100.64.0.3",
+			host: host(1, "p", func(h *model.Host) { h.Addresses = []string{"b"} }),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r, err := ChooseRoute(tt.host, tt.ts)
+			r, err := ChooseRouteWith(tt.host, tt.ts, tt.dns.lookup)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("err = %v, want one containing %q", err, tt.wantErr)

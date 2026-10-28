@@ -13,6 +13,18 @@ import (
 	"github.com/dalyem/hopkey/internal/daemon"
 )
 
+// stopSignals is the signals that cancel a command: SIGINT, SIGTERM and
+// SIGHUP, the terminal going away. A hop started with SIGHUP ignored (under
+// nohup, or by a parent that meant it to outlive the terminal) keeps
+// ignoring it: catching it would defeat that.
+func stopSignals(hangupIgnored bool) []os.Signal {
+	sigs := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !hangupIgnored {
+		sigs = append(sigs, syscall.SIGHUP)
+	}
+	return sigs
+}
+
 func main() {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -26,7 +38,7 @@ func main() {
 	// second signal is not caught: it ends the process at once.
 	ctx, cancel := context.WithCancelCause(context.Background())
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigs, stopSignals(signal.Ignored(syscall.SIGHUP))...)
 	go func() {
 		<-sigs
 		signal.Stop(sigs)
