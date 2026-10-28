@@ -3,13 +3,16 @@
 // uses it to check a snippet before saving it, and the CLI to run one, so
 // both read a command the same way.
 //
-// A parameter's value never becomes shell source. Render assigns each value,
-// single-quoted, to a variable at the top of the script (HOP_P_unit='...';)
-// and puts "${HOP_P_unit}" where {{unit}} was. The shell expands a variable
-// without reading its value as code, so a value cannot run anything wherever
-// the placeholder stands: in a word, a comment, a here-document or $(...).
-// The remote login shell must be POSIX sh compatible (sh, bash, dash, zsh,
-// ksh); fish and csh quote differently.
+// A parameter's value never becomes shell source text. Render assigns each
+// value, single-quoted, to a variable at the top of the script
+// (HOP_P_unit='...';) and puts "${HOP_P_unit}" where {{unit}} was. The shell
+// expands a variable without reading its value as code: in a word, a
+// comment, a here-document or $(...). A template that itself evaluates a
+// value (eval, sh -c, arithmetic, indirect expansion) can still run it, and
+// that is the snippet author's responsibility. Placeholders refuses the
+// common ways of doing so (evalContext); that check is a lint, not a
+// parser. The remote login shell must be POSIX sh compatible (sh, bash,
+// dash, zsh, ksh); fish and csh quote differently.
 package shellcmd
 
 import (
@@ -60,16 +63,22 @@ func ParamVar(name string) string { return "HOP_P_" + name }
 // order they first appear. A placeholder must stand outside quotes and not
 // after a backslash: Render puts "${HOP_P_name}" in its place, which inside
 // single quotes would not expand, and inside double quotes would nest the
-// quotes.
+// quotes. It must not stand where the shell evaluates text (evalContext).
 func Placeholders(command string) ([]string, error) {
 	quoted := quotedBytes(command)
+	matches := placeholderRe.FindAllStringSubmatchIndex(command, -1)
+	for _, m := range matches {
+		if quoted[m[0]] {
+			return nil, fmt.Errorf("{{%s}} is inside quotes or after a backslash; write it bare, since hop quotes each value itself", command[m[2]:m[3]])
+		}
+	}
+	if err := evalContext(command, quoted); err != nil {
+		return nil, err
+	}
 	var names []string
 	seen := map[string]bool{}
-	for _, m := range placeholderRe.FindAllStringSubmatchIndex(command, -1) {
+	for _, m := range matches {
 		name := command[m[2]:m[3]]
-		if quoted[m[0]] {
-			return nil, fmt.Errorf("{{%s}} is inside quotes or after a backslash; write it bare, since hop quotes each value itself", name)
-		}
 		if strings.Contains(name, "-") {
 			return nil, fmt.Errorf("parameter name %q has a '-'; use letters, digits and '_'", name)
 		}
@@ -166,8 +175,7 @@ func (s Script) String() string { return s.Assign + s.Body }
 // top level of the script, so here-documents, comments, newlines, $(...)
 // and backticks in the template or the value cannot make it run. In a
 // here-document body the double quotes around ${HOP_P_name} are printed
-// with the value; assign it to a variable first (v={{x}}) and use $v there
-// to avoid them.
+// with the value; print it with printf '%s\n' {{x}} instead to avoid them.
 func Render(command string, values map[string]string) (Script, error) {
 	names, err := Placeholders(command)
 	if err != nil {

@@ -394,41 +394,21 @@ func resolvable(hosts []model.Host, agentOnly bool) []model.Host {
 // agentTailnet is ts without the nodes of the hosts local agents may not
 // use, for agent_only resolution: otherwise a denied host's node would come
 // back as an unlinked node, by its Tailscale name or IP, in a note or among
-// the candidates. A node is a denied host's when the host is linked to it
-// (stable node ID or MagicDNS name) or lists one of its Tailscale IPs as an
-// address; such a node is left out even if an allowed host is linked to it
-// too. The route of a matched host is still chosen with the whole of ts.
+// the candidates. A node is left out when a denied host owns it
+// (HostOwnsNode), even if an allowed host is linked to it too. The route of
+// a matched host is still chosen with the whole of ts.
 func agentTailnet(ts *tailscale.Status, hosts []model.Host) *tailscale.Status {
 	if ts == nil || !ts.Available {
 		return ts
 	}
-	ids, names, addrs := map[string]bool{}, map[string]bool{}, map[netip.Addr]bool{}
+	var deniedHosts []model.Host
 	for _, h := range hosts {
-		if h.AgentAccess == "allow" || h.AgentAccess == "" {
-			continue
-		}
-		if t := h.Tailscale; t != nil {
-			if t.StableNodeID != "" {
-				ids[t.StableNodeID] = true
-			}
-			if t.DNSName != "" {
-				names[normDNS(t.DNSName)] = true
-			}
-		}
-		for _, a := range h.Addresses {
-			if ip, err := netip.ParseAddr(strings.Trim(a, "[]")); err == nil {
-				addrs[ip.Unmap().WithZone("")] = true
-			}
+		if h.AgentAccess != "allow" && h.AgentAccess != "" {
+			deniedHosts = append(deniedHosts, h)
 		}
 	}
 	denied := func(n tailscale.Node) bool {
-		if ids[n.ID] || (n.DNSName != "" && names[normDNS(n.DNSName)]) {
-			return true
-		}
-		return slices.ContainsFunc(n.IPs, func(s string) bool {
-			ip, err := netip.ParseAddr(s)
-			return err == nil && addrs[ip.Unmap().WithZone("")]
-		})
+		return slices.ContainsFunc(deniedHosts, func(h model.Host) bool { return HostOwnsNode(h, n) })
 	}
 	out := *ts
 	if denied(out.Self) {
@@ -436,6 +416,39 @@ func agentTailnet(ts *tailscale.Status, hosts []model.Host) *tailscale.Status {
 	}
 	out.Peers = slices.DeleteFunc(slices.Clone(ts.Peers), denied)
 	return &out
+}
+
+// HostOwnsNode reports whether tailnet node n is host h by another name: h
+// is linked to it, by stable node ID or MagicDNS name, or one of h's
+// addresses names it as the resolver's Tailscale step would: one of its
+// IPs, or its MagicDNS name, that name's first label or its host name,
+// ignoring case and a trailing dot.
+func HostOwnsNode(h model.Host, n tailscale.Node) bool {
+	if t := h.Tailscale; t != nil {
+		if t.StableNodeID != "" && t.StableNodeID == n.ID {
+			return true
+		}
+		if t.DNSName != "" && normDNS(t.DNSName) == normDNS(n.DNSName) {
+			return true
+		}
+	}
+	for _, a := range h.Addresses {
+		a = strings.Trim(strings.TrimSpace(a), "[]")
+		if ip, err := netip.ParseAddr(a); err == nil {
+			ip = ip.Unmap().WithZone("")
+			if slices.ContainsFunc(n.IPs, func(s string) bool {
+				nip, err := netip.ParseAddr(s)
+				return err == nil && nip.Unmap().WithZone("") == ip
+			}) {
+				return true
+			}
+			continue
+		}
+		if k := normDNS(a); k != "" && (k == normDNS(n.DNSName) || k == normDNS(n.ShortName()) || k == normDNS(n.HostName)) {
+			return true
+		}
+	}
+	return false
 }
 
 func normDNS(s string) string { return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), ".")) }

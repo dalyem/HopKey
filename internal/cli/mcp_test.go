@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -562,6 +564,10 @@ func TestMCPSnippets(t *testing.T) {
 	if code, _, stderr := e.hop(t, "snippet", "add", "Restart", "--", "true"); code != 255 || !strings.Contains(stderr, "already exists") {
 		t.Errorf("duplicate snippet: %d %q", code, stderr)
 	}
+	if code, _, stderr := e.hop(t, "snippet", "add", "evals", "--", "eval {{x}}"); code != 255 || !strings.Contains(stderr, "argument of eval") {
+		t.Errorf("snippet add with eval {{x}}: %d %q", code, stderr)
+	}
+
 	code, stdout, _ = e.hop(t, "snippet", "ls", "--json")
 	var views []cli.SnippetView
 	decodeJSON(t, stdout, &views)
@@ -574,6 +580,17 @@ func TestMCPSnippets(t *testing.T) {
 	}
 
 	m := e.startMCP(t)
+	// One saved before hop refused it (or by another device) is refused
+	// when it runs.
+	if _, err := e.store.PutSnippet(context.Background(), model.Snippet{Name: "old-arith", Command: "echo $(( {{n}} + 1 ))", Params: []string{"n"}}); err != nil {
+		t.Fatal(err)
+	}
+	if msg := m.mcpError("run_snippet", map[string]any{"name": "old-arith", "hosts": "web-1", "params": map[string]any{"n": "a[$(id)]"}}); !strings.Contains(msg, "arithmetic") {
+		t.Errorf("run_snippet old-arith: %s", msg)
+	}
+	if code, _, stderr := e.hop(t, "snippet", "rm", "old-arith", "--yes"); code != 0 {
+		t.Fatalf("snippet rm old-arith: %d %q", code, stderr)
+	}
 	list := mcpCall[cli.MCPSnippets](m, "list_snippets", nil)
 	if len(list.Snippets) != 1 || list.Snippets[0].Name != "restart" {
 		t.Errorf("list_snippets = %+v", list)
@@ -650,7 +667,7 @@ func readAudit(t *testing.T, path string) []auditLine {
 
 func TestMCPAuditLog(t *testing.T) {
 	e := newE2E(t)
-	if _, err := e.store.PutSnippet(context.Background(), model.Snippet{Name: "say", Command: "PGPASSWORD={{password}} echo {{what}}"}); err != nil {
+	if _, err := e.store.PutSnippet(context.Background(), model.Snippet{Name: "say", Command: "env PGPASSWORD={{password}} echo {{what}}"}); err != nil {
 		t.Fatal(err)
 	}
 	env := e.env(t, nil, nil, nil)
@@ -1122,6 +1139,219 @@ func TestMCPDropsDeniedHostsNodesFromTheDaemonsAnswer(t *testing.T) {
 	r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "twin"})
 	if len(r.Candidates) != 1 || r.Candidates[0].Name != "twin-open" {
 		t.Errorf("resolve_host twin candidates = %+v", r.Candidates)
+	}
+	// What the daemon said of both counts only the one left, and one
+	// candidate left of an ambiguity is still not a match.
+	if r.Status != resolve.StatusAmbiguous || r.Matched != "1 tailscale nodes or hosts match" || r.Host != nil {
+		t.Errorf("resolve_host twin = status %s, matched %q, host %+v", r.Status, r.Matched, r.Host)
+	}
+}
+
+// From a daemon that does not filter: a denied host whose address is its
+// node's MagicDNS name owns the node, and suggestions that were all hidden
+// hosts leave no note that there were some. Each answer is the one for a
+// name that does not exist.
+func TestMCPFallbackHidesDNSNamedNodesAndHiddenSuggestions(t *testing.T) {
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Peers: []tailscale.Node{tsNode("nVAULT", "vaultbox", "100.64.0.9")}}
+	denied := model.Host{Header: model.Header{ItemID: model.ID{2}}, Name: "vault-secret", AgentAccess: "deny", Addresses: []string{"VaultBox.tn.ts.net."}}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: []model.Host{denied}, Snippets: []model.Snippet{}, Tailscale: ts})
+	f.on(daemon.OpResolve, func(params json.RawMessage) (any, error) {
+		var p daemon.ResolveParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		res := &resolve.Result{Target: p.Target, Status: resolve.StatusNoMatch, Rule: resolve.RuleNone}
+		switch p.Target {
+		case "vaultbox":
+			res.Notes = []string{`tailscale node "vaultbox" (nVAULT) is not linked to a vault host; hop ts import or hop ts link links it`}
+		case "vault":
+			res.Candidates = []resolve.Candidate{{HostID: denied.ItemID.String(), Name: "vault-secret", Detail: "name resembles the target"}}
+			res.Notes = []string{"non-interactive: prefix and fuzzy matching are off, so these are suggestions, not a match"}
+		}
+		return daemon.ResolveResult{Result: res}, nil
+	})
+	m := startMCP(t, f.env(t, nil, nil, nil))
+	absent := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "nothing"})
+	for _, target := range []string{"vaultbox", "vault"} {
+		r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": target})
+		r.Target = absent.Target
+		if !reflect.DeepEqual(r, absent) {
+			t.Errorf("resolve_host %s = %+v, want what a name that does not exist gets: %+v", target, r, absent)
+		}
+	}
+}
+
+// An answer about a denied name is the answer about a name that does not
+// exist, however the agent writes it: the target it gave is echoed as it
+// gave it, never masked, while hop's own mentions of the host still are.
+func TestMCPDeniedNameAnswersLikeAnAbsentOne(t *testing.T) {
+	e := newE2E(t)
+	e.addHost(t, "vault-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"192.0.2.9"} })
+	m := e.startMCP(t)
+	const absent = "qqqqq-qqqqqq" // no host's name or address, nor like one
+	answer := func(tool string, args map[string]any) string {
+		t.Helper()
+		b, err := json.Marshal(m.call(tool, args))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	for _, name := range []string{"vault-secret", "VAULT-Secret"} {
+		for _, pattern := range []string{"%s", "%s.", "deploy@%s", "%s:22", "[%s]", "root@%s.:22"} {
+			d, a := fmt.Sprintf(pattern, name), fmt.Sprintf(pattern, absent)
+			for _, c := range []struct {
+				tool string
+				args func(string) map[string]any
+			}{
+				{"resolve_host", func(x string) map[string]any { return map[string]any{"target": x} }},
+				{"check_host", func(x string) map[string]any { return map[string]any{"host": x} }},
+				{"ssh_command", func(x string) map[string]any { return map[string]any{"host": x} }},
+				{"exec", func(x string) map[string]any { return map[string]any{"hosts": x, "command": "echo ok"} }},
+				{"exec", func(x string) map[string]any { return map[string]any{"hosts": "tag:" + x, "command": "echo ok"} }},
+				{"exec", func(x string) map[string]any {
+					return map[string]any{"hosts": []string{"web-1", x}, "command": "echo ok"}
+				}},
+			} {
+				got, want := answer(c.tool, c.args(d)), strings.ReplaceAll(answer(c.tool, c.args(a)), absent, name)
+				got, want = durationRe.ReplaceAllString(got, "${1}:0"), durationRe.ReplaceAllString(want, "${1}:0")
+				if got != want {
+					t.Errorf("%s %q answered\n%s\nbut for a name that does not exist\n%s", c.tool, d, got, want)
+				}
+			}
+		}
+	}
+	// Two names, six ways of writing each, the denied and the absent one:
+	// web-1 ran once for each list.
+	if got := e.server.commands(); len(got) != 2*6*2 {
+		t.Errorf("the server ran %d commands, want one per exec on web-1", len(got))
+	}
+}
+
+// durationRe finds a duration, in the structured answer and in its text
+// (where the quotes are escaped).
+var durationRe = regexp.MustCompile(`(duration_ms\\?"):\d+`)
+
+// Private key blocks are removed before the secrets hop knows and before
+// hidden names, in answers and in the audit log: a device passphrase of
+// "-", other short secrets, or a denied host named PRIVATE would otherwise
+// break the block's marker lines and its body would pass, whole or cut
+// short by the 64 KiB tail.
+func TestMCPRedactsKeysBeforeShortSecretsAndHiddenNames(t *testing.T) {
+	e := newE2E(t)
+	e.addHost(t, "PRIVATE", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"192.0.2.7"} })
+	snap, err := e.store.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pem := snap.Keys[0].PrivateKey
+	pemFile := filepath.Join(e.base, "key.pem")
+	cutFile := filepath.Join(e.base, "cut.pem")
+	if err := os.WriteFile(pemFile, []byte(pem), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cutFile, []byte(pem[strings.Index(pem, "\n")+1:]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// An ssh that prints the key, whole on stdout, and cut short then
+	// whole on stderr (which hop masks hidden names in).
+	fake := filepath.Join(e.base, "key-ssh")
+	script := fmt.Sprintf("#!/bin/sh\ncat %q\ncat %q %q >&2\nexit 0\n", pemFile, cutFile, pemFile)
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var body []string
+	for _, l := range strings.Split(pem, "\n") {
+		if len(l) >= 16 && !strings.HasPrefix(l, "-----") {
+			body = append(body, l)
+		}
+	}
+	if len(body) < 3 {
+		t.Fatalf("only %d body lines", len(body))
+	}
+	for _, secrets := range []map[string]string{
+		{"HOP_DEVICE_PASSPHRASE": "-"},
+		{"HOP_KIT_CONFIRM": "KEY", "HOP_PASSWORD": "BEGIN", "HOP_DEVICE_PASSPHRASE": "-----"},
+		{"HOP_SECRET_KEY": "OPENSSH PRIVATE"},
+	} {
+		env := e.env(t, nil, nil, nil)
+		env.SSHBinary = fake
+		env.Environ = os.Environ()
+		for k, v := range secrets {
+			env.Environ = append(env.Environ, k+"="+v)
+		}
+		m := startMCP(t, env)
+		out := mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": "web-1", "command": "printf '%s' '" + pem + "' > key"})
+		if len(out.Results) != 1 || out.Results[0].ExitCode != 0 || !strings.Contains(out.Results[0].Stderr, "[private key") {
+			t.Errorf("secrets %v: exec = %+v", secrets, out)
+		}
+		audit, _ := os.ReadFile(filepath.Join(e.paths.StateDir, "mcp-audit.jsonl"))
+		m.mu.Lock()
+		texts := append(slices.Clone(m.raw), "audit: "+string(audit))
+		m.mu.Unlock()
+		for _, raw := range texts {
+			for _, l := range body {
+				if strings.Contains(raw, l) {
+					t.Errorf("secrets %v: the key's body passed: %.300s", secrets, raw)
+					break
+				}
+			}
+		}
+	}
+}
+
+// ssh that exits 0 but leaves a process holding its output open is cut
+// off after a second. The exit code stands, and the result says the output
+// may be incomplete: in exec, in hop exec --json, and on stderr for hop
+// exec.
+func TestExecSaysOutputMayBeIncompleteAfterWaitDelay(t *testing.T) {
+	e := newE2E(t)
+	fake := filepath.Join(e.base, "lingering-ssh")
+	script := "#!/bin/sh\necho early\nsleep 5 &\nexit 0\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := e.env(t, nil, nil, nil)
+	env.SSHBinary = fake
+	m := startMCP(t, env)
+	out := mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": "web-1", "command": "echo ok"})
+	if r := out.Results[0]; r.ExitCode != 0 || r.Error != "" || !r.Truncated || !strings.Contains(r.Warning, "may be incomplete") || r.Stdout != "early\n" {
+		t.Errorf("exec = %+v", r)
+	}
+
+	e.sshBin = fake
+	code, stdout, _ := e.hop(t, "exec", "web-1", "--json", "--", "echo", "ok")
+	var r cli.ExecResult
+	decodeJSON(t, stdout, &r)
+	if code != 0 || !r.Truncated || !strings.Contains(r.Warning, "may be incomplete") {
+		t.Errorf("hop exec --json: %d %+v", code, r)
+	}
+	code, stdout, stderr := e.hop(t, "exec", "web-1", "--", "echo", "ok")
+	if code != 0 || stdout != "early\n" || !strings.Contains(stderr, "hop: warning: ") || !strings.Contains(stderr, "may be incomplete") {
+		t.Errorf("hop exec: %d %q %q", code, stdout, stderr)
+	}
+}
+
+// A denied host whose address is its node's MagicDNS name, not linked to
+// it, owns the node: resolve_host by the node's name, IP or short name
+// does not come back with it.
+func TestMCPResolveHidesNodesDeniedHostsNameByDNS(t *testing.T) {
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Peers: []tailscale.Node{tsNode("nVAULT", "vaultbox", "100.64.0.9"), tsNode("nSHORT", "shortbox", "100.64.0.10")}}
+	e := newE2EWith(t, staticTS{ts})
+	e.addHost(t, "vault-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"VaultBox.TN.ts.net."} })
+	e.addHost(t, "short-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"shortbox"} })
+	m := e.startMCP(t)
+	for _, target := range []string{"vaultbox", "vaultbox.tn.ts.net", "100.64.0.9", "shortbox", "shortbox.tn.ts.net", "100.64.0.10"} {
+		r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": target})
+		b, _ := json.Marshal([]any{r.Candidates, r.Notes, r.Matched, r.Host, r.RouteError})
+		for _, h := range []string{"nVAULT", "vaultbox", "100.64.0.9", "nSHORT", "shortbox", "100.64.0.10", "vault-secret", "short-secret"} {
+			if !strings.Contains(target, h) && strings.Contains(string(b), h) {
+				t.Errorf("resolve_host %s names %s: %s", target, h, b)
+			}
+		}
 	}
 }
 

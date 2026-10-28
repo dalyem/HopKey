@@ -128,6 +128,43 @@ func TestResolveAgentOnlyLeavesOutDeniedHostsTailnetNodes(t *testing.T) {
 	}
 }
 
+// A denied host whose address is its node's MagicDNS name, in any case and
+// with a trailing dot, or the name's first label, owns that node though it
+// is not linked to it: agent_only resolution by the node's name or IP does
+// not come back with the node.
+func TestResolveAgentOnlyLeavesOutNodesDeniedHostsNameByDNS(t *testing.T) {
+	node := func(id, name, ip string) tailscale.Node {
+		return tailscale.Node{ID: id, HostName: name + "-host", DNSName: name + ".tn.ts.net.", Online: true, IPs: []string{ip}}
+	}
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Peers: []tailscale.Node{node("nVAULT", "vaultbox", "100.64.0.9"), node("nSHORT", "shortbox", "100.64.0.10"), node("nOPEN", "openbox", "100.64.0.11")}}
+	f := newFixture(t, fakeTS{ts})
+	f.put(f.host("vault-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"VaultBox.TN.ts.net."} }))
+	f.put(f.host("short-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"shortbox"} }))
+	c := f.client()
+	hidden := []string{"nVAULT", "vaultbox", "100.64.0.9", "nSHORT", "shortbox", "100.64.0.10"}
+	for _, target := range []string{"vaultbox", "vaultbox.tn.ts.net", "vaultbox-host", "100.64.0.9", "shortbox", "shortbox-host", "100.64.0.10"} {
+		var rr ResolveResult
+		if err := c.Call(context.Background(), OpResolve, ResolveParams{Target: target, AgentOnly: true}, &rr); err != nil {
+			t.Fatal(err)
+		}
+		b, _ := json.Marshal([]any{rr.Result.Candidates, rr.Result.Notes, rr.Result.Tailscale, rr.Result.Matched, rr.Host})
+		for _, h := range hidden {
+			if !strings.Contains(target, h) && strings.Contains(string(b), h) {
+				t.Errorf("agent_only %q names %s: %s", target, h, b)
+			}
+		}
+	}
+	// A node no denied host names is still found.
+	var rr ResolveResult
+	if err := c.Call(context.Background(), OpResolve, ResolveParams{Target: "openbox", AgentOnly: true}, &rr); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := json.Marshal(rr.Result.Notes); !strings.Contains(string(b), "nOPEN") {
+		t.Errorf("agent_only openbox lost the allowed node: %+v", rr.Result)
+	}
+}
+
 func candidateNames(r *resolve.Result) []string {
 	var out []string
 	for _, c := range r.Candidates {
@@ -167,6 +204,11 @@ func TestPutSnippetDerivesParamsAndRefusesBadInput(t *testing.T) {
 		{model.Snippet{Name: "quoted", Command: "echo '{{x}}'"}, "inside quotes"},
 		{model.Snippet{Name: "dquoted", Command: `echo "{{x}}"`}, "inside quotes"},
 		{model.Snippet{Name: "dashed", Command: "echo {{a-b}}"}, "has a '-'"},
+		{model.Snippet{Name: "evals", Command: "eval {{x}}"}, "eval"},
+		{model.Snippet{Name: "arith", Command: "echo $(( {{x}} + 1 ))"}, "arithmetic"},
+		{model.Snippet{Name: "dbracket", Command: "[[ {{x}} -eq 1 ]]"}, "[[ ... ]]"},
+		{model.Snippet{Name: "shc", Command: "bash -c {{x}}"}, "-c"},
+		{model.Snippet{Name: "assign", Command: "ref={{x}}; echo ${!ref}"}, "assignment"},
 		{model.Snippet{Name: "long", Command: strings.Repeat("x", 8193)}, "longer than 8192"},
 	} {
 		err := c.Call(ctx, OpPutSnippet, PutSnippetParams{Snippet: tc.sn}, nil)

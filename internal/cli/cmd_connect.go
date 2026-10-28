@@ -211,9 +211,13 @@ type ExecResult struct {
 	Stdout     string `json:"stdout"`
 	Stderr     string `json:"stderr"`
 	DurationMS int64  `json:"duration_ms"`
-	Truncated  bool   `json:"truncated"`
+	// Truncated is set when stdout or stderr kept only its last 64 KB, or
+	// may have lost output for the reason in Warning.
+	Truncated bool `json:"truncated"`
 	// Error is set when hop itself failed to run the command, e.g. a timeout.
 	Error string `json:"error,omitempty"`
+	// Warning is set when the command ran but its output may be incomplete.
+	Warning string `json:"warning,omitempty"`
 }
 
 // tailLimit is how much of each output stream --json keeps: the last 64 KB.
@@ -322,8 +326,13 @@ func runExec(ctx context.Context, e *Env, args []string) error {
 		if err := printJSON(e, res); err != nil {
 			return err
 		}
-	} else if res.Error != "" {
-		fmt.Fprintf(e.Stderr, "hop: %s\n", res.Error)
+	} else {
+		if res.Error != "" {
+			fmt.Fprintf(e.Stderr, "hop: %s\n", res.Error)
+		}
+		if res.Warning != "" {
+			fmt.Fprintf(e.Stderr, "hop: warning: %s\n", res.Warning)
+		}
 	}
 	if res.ExitCode != 0 {
 		return silent(res.ExitCode)
@@ -385,7 +394,9 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	case runErr == nil:
 	case errors.Is(runErr, exec.ErrWaitDelay):
 		// ssh exited 0, but something it started (a ProxyJump ssh, say)
-		// still held its output open, and WaitDelay cut that off.
+		// still held its output open, and WaitDelay cut that off. The exit
+		// code stands; what was still to come is lost.
+		res.Warning = "ssh exited 0, but a process it left behind still held its output open and was cut off after 1s, so the output may be incomplete"
 	case r.timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		res.ExitCode = ExitFailure
 		res.Error = fmt.Sprintf("timed out after %s", r.timeout)
@@ -400,7 +411,7 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	if r.stderr == nil {
 		res.Stderr = string(errTail.Bytes())
 	}
-	res.Truncated = outTail.dropped || errTail.dropped
+	res.Truncated = outTail.dropped || errTail.dropped || res.Warning != ""
 	return res, nil
 }
 

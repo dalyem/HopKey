@@ -56,7 +56,8 @@ func runSnippetAdd(ctx context.Context, e *Env, args []string) error {
 	asJSON := fs.Bool("json", false, "print the saved snippet as JSON")
 	helpNote(e, fs, "\nOne word after -- is a shell command line, as with ssh: hop snippet add df -- 'df -h {{path}}'.\n"+
 		"Several words are quoted one by one. A {{name}} placeholder (letters, digits and _) is filled from a shell variable\n"+
-		"when the snippet runs, so its value is never read as shell code; write it bare, outside quotes.\n")
+		"when the snippet runs, so its value never becomes shell source text; write it bare, outside quotes. A snippet that\n"+
+		"evaluates a value itself (eval, sh -c, arithmetic, indirect expansion) can still run it; hop refuses the common cases.\n")
 	pos, rest, err := parseFlags(fs, args)
 	if err != nil {
 		return err

@@ -47,6 +47,58 @@ func TestPlaceholders(t *testing.T) {
 		{"true # it's {{x}}\necho {{y}}", []string{"x", "y"}, ""}, // a comment's apostrophe opens no quote
 		{"echo a#'{{x}}'", nil, "inside quotes"},                  // # inside a word is not a comment
 		{"echo {{" + strings.Repeat("p", 33) + "}}", nil, "longer than 32"},
+		// Where the shell itself evaluates text, the value would run.
+		{"echo $(( {{x}} + 1 ))", nil, "arithmetic"},
+		{"(( {{x}} > 1 )) && echo big", nil, "arithmetic"},
+		{"echo $[ {{x}} + 1 ]", nil, "arithmetic"},
+		{"echo $(( $(printf %s {{x}}) ))", nil, "arithmetic"},
+		{"echo ${a[{{x}}]}", nil, "${...}"},
+		{"echo ${v:{{x}}:2}", nil, "${...}"},
+		{"[[ {{x}} -eq 1 ]]", nil, "[[ ... ]]"},
+		{"if [[ -n {{y}} && {{x}} == 1 ]]; then echo; fi", nil, "[[ ... ]]"},
+		{"[[ $(printf %s {{x}}) -eq 1 ]]", nil, "[[ ... ]]"},
+		{"eval {{x}}", nil, "eval"},
+		{"eval echo {{x}}", nil, "eval"},
+		{"true && eval {{x}}", nil, "eval"},
+		{"eval 2>&1 {{x}}", nil, "eval"}, // a redirection's & ends no command
+		{"eval $(printf %s {{x}})", nil, "eval"},
+		{"let n={{x}}", nil, "let"},
+		{"trap {{x}} EXIT", nil, "trap"},
+		{"sh -c {{x}}", nil, "-c"},
+		{"bash -c {{x}}", nil, "-c"},
+		{"zsh -c {{x}}", nil, "-c"},
+		{"dash -c {{x}}", nil, "-c"},
+		{"/bin/bash -lc {{x}}", nil, "-c"},
+		{"sudo -n sh -c {{x}}", nil, "-c"},
+		{"bash -o pipefail -c {{x}}", nil, "-c"},
+		{"su - root -c {{x}}", nil, "-c"},
+		{"bash -c $(printf %s {{x}})", nil, "-c"},
+		{"ref={{x}}; echo ${!ref}", nil, "assignment"},
+		{"v={{x}}", nil, "assignment"},
+		{"v+={{x}}", nil, "assignment"},
+		{"a[{{x}}]=1", nil, "assignment"},
+		{"export v={{x}}", nil, "assignment"},
+		{"local -r v={{x}}", nil, "assignment"},
+		{"declare -n r={{x}}", nil, "assignment"},
+		{"PGPASSWORD={{x}} psql", nil, "assignment"},
+		{"true; v={{x}}", nil, "assignment"},
+		{"if true; then v={{x}}; fi", nil, "assignment"},
+		{"v=$(printf %s {{x}})", nil, "assignment"},
+		{"v=`printf %s {{x}}`", nil, "assignment"},
+		// ... and where it does not.
+		{"printf '%s\n' {{x}} | cat", []string{"x"}, ""},
+		{"env PGPASSWORD={{x}} psql", []string{"x"}, ""},
+		{"make CFLAGS={{x}}", []string{"x"}, ""},
+		{`sh -c 'printf "%s" "$1"' sh {{x}}`, []string{"x"}, ""},
+		{"bash script.sh {{x}}", []string{"x"}, ""},
+		{"[ {{x}} -eq 1 ]", []string{"x"}, ""},
+		{"echo $((1 + 1)) ${HOME} {{x}}", []string{"x"}, ""},
+		{"echo $(printf %s {{x}})", []string{"x"}, ""},
+		{"cat <<EOF\n$(printf '%s' {{x}})\nEOF", []string{"x"}, ""},
+		{"case {{x}} in a) echo a;; esac", []string{"x"}, ""},
+		{"true # eval {{x}}", []string{"x"}, ""},
+		{"eval true; echo {{x}}", []string{"x"}, ""},
+		{"[[ -n $HOME ]] && echo {{x}}", []string{"x"}, ""},
 	}
 	for _, c := range cases {
 		got, err := Placeholders(c.cmd)
@@ -99,9 +151,9 @@ func TestRender(t *testing.T) {
 	if got, err := Render("uptime", nil); err != nil || got.String() != "uptime" {
 		t.Errorf("no parameters: %q, %v", got, err)
 	}
-	for _, c := range []string{"echo '{{x}}'", `echo "{{x}}"`} {
+	for _, c := range []string{"echo '{{x}}'", `echo "{{x}}"`, "eval {{x}}", "echo $(( {{x}} ))", "v={{x}}"} {
 		if _, err := Render(c, map[string]string{"x": "1"}); err == nil {
-			t.Errorf("%s: a quoted placeholder was rendered", c)
+			t.Errorf("%s: a placeholder Placeholders refuses was rendered", c)
 		}
 	}
 }
@@ -115,15 +167,24 @@ var hostile = []string{
 	`$(touch "$MARK")`, "`touch \"$MARK\"`", `x; touch "$MARK"`, "x\ntouch \"$MARK\"",
 	`'$(touch "$MARK")'`, `"$(touch "$MARK")"`, `'; touch "$MARK"; '`, `"; touch "$MARK"; "`,
 	"x\nEOF\ntouch \"$MARK\"\ncat <<EOF", `$(touch "$MARK")\`, `x' && touch "$MARK" && '`,
+	// What bash's arithmetic would run, through an array index.
+	`a[$(touch "$MARK")]`, `x[$(touch "$MARK")]+1`, `1+a[$(touch "$MARK")]`,
 }
 
 // The rendered script, run by a real shell, gets each value as exactly the
-// text given and runs nothing from it, wherever the placeholder stands: an
-// unquoted word, a here-document body, a comment, $(...) and backticks, and
-// with the caller's own text between Assign and Body.
+// text given and runs nothing from it, wherever Placeholders lets the
+// placeholder stand: an unquoted word, a here-document body, a comment,
+// $(...) and backticks, a test, a positional parameter of sh -c, and with
+// the caller's own text between Assign and Body. bash runs each one too,
+// since its arithmetic is the one that runs an array index.
 func TestRenderRunsNothingInARealShell(t *testing.T) {
-	sh, err := exec.LookPath("sh")
-	if err != nil {
+	var shells []string
+	for _, name := range []string{"sh", "bash"} {
+		if p, err := exec.LookPath(name); err == nil {
+			shells = append(shells, p)
+		}
+	}
+	if len(shells) == 0 {
 		t.Skip("no sh")
 	}
 	cases := []struct {
@@ -134,36 +195,52 @@ func TestRenderRunsNothingInARealShell(t *testing.T) {
 		{"word", `printf '%s|' {{v}} "$0"`, func(v string) string { return v + "|END|" }},
 		{"in a word", `printf '%s|' --opt={{v}}x`, func(v string) string { return "--opt=" + v + "x|" }},
 		{"here-doc", "cat <<EOF\n{{v}}\nEOF", func(v string) string { return `"` + v + `"` + "\n" }},
-		{"here-doc, assigned first", "w={{v}}; cat <<EOF\n[$w]\nEOF", func(v string) string { return "[" + v + "]\n" }},
+		// The README's way to print a value in a here-document without
+		// the quotes.
+		{"here-doc, README workaround", "cat <<EOF\n[$(printf '%s' {{v}})]\nEOF", func(v string) string { return "[" + strings.TrimRight(v, "\n") + "]\n" }},
 		{"comment", "printf ok # {{v}}", func(string) string { return "ok" }},
 		{"comment, own line", "# {{v}}\nprintf ok", func(string) string { return "ok" }},
-		{"$(...)", `x=$(printf '%s' {{v}}); printf '%s|' "$x"`, func(v string) string { return strings.TrimRight(v, "\n") + "|" }},
-		{"backticks", "x=`printf '%s' {{v}}`; printf '%s|' \"$x\"", func(v string) string { return strings.TrimRight(v, "\n") + "|" }},
+		{"backticks", "cat <<EOF\n[`printf '%s' {{v}}`]\nEOF", func(v string) string { return "[" + strings.TrimRight(v, "\n") + "]\n" }},
+		{"test", "[ {{v}} = x ] 2>/dev/null || printf no", func(string) string { return "no" }},
+		{"test -eq", "test {{v}} -eq 1 2>/dev/null; printf ok", func(string) string { return "ok" }},
+		{"printf %d", "printf %d {{v}} >/dev/null 2>&1; printf ok", func(string) string { return "ok" }},
+		{"env", `env V={{v}} sh -c 'printf "%s|" "$V"'`, func(v string) string { return v + "|" }},
+		{"sh -c positional", `sh -c 'printf "%s|" "$1"' sh {{v}}`, func(v string) string { return v + "|" }},
+		{"case", "case {{v}} in *) printf ok;; esac", func(string) string { return "ok" }},
+		{"for", `for w in {{v}}; do printf '%s|' "$w"; done`, func(v string) string { return v + "|" }},
+		{"pipe", `printf '%s|' {{v}} | cat`, func(v string) string { return v + "|" }},
 	}
-	for _, c := range cases {
-		for _, v := range hostile {
-			dir := t.TempDir()
-			mark := filepath.Join(dir, "pwned")
-			sc, err := Render(c.template, map[string]string{"v": v})
-			if err != nil {
-				t.Fatalf("%s: %v", c.name, err)
-			}
-			// What hop mcp puts between the two.
-			script := sc.Assign + "export PAGER=cat; " + sc.Body
-			cmd := exec.Command(sh, "-c", script, "END")
-			cmd.Dir = dir
-			cmd.Env = append(os.Environ(), "MARK="+mark)
-			out, err := cmd.Output()
-			if err != nil {
-				t.Errorf("%s, value %q: %v (script %q)", c.name, v, err, script)
-			}
-			if got, want := string(out), c.want(v); got != want {
-				t.Errorf("%s, value %q came out as %q, want %q (script %q)", c.name, v, got, want, script)
-			}
-			if _, err := os.Stat(mark); err == nil {
-				t.Errorf("%s, value %q ran a command (script %q)", c.name, v, script)
+	for _, sh := range shells {
+		for _, c := range cases {
+			for _, v := range hostile {
+				runProbe(t, sh, c.name, c.template, v, c.want(v))
 			}
 		}
+	}
+}
+
+func runProbe(t *testing.T, sh, name, template, v, want string) {
+	t.Helper()
+	dir := t.TempDir()
+	mark := filepath.Join(dir, "pwned")
+	sc, err := Render(template, map[string]string{"v": v})
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	// What hop mcp puts between the two.
+	script := sc.Assign + "export PAGER=cat; " + sc.Body
+	cmd := exec.Command(sh, "-c", script, "END")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "MARK="+mark)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Errorf("%s, %s, value %q: %v (script %q)", sh, name, v, err, script)
+	}
+	if got := string(out); got != want {
+		t.Errorf("%s, %s, value %q came out as %q, want %q (script %q)", sh, name, v, got, want, script)
+	}
+	if _, err := os.Stat(mark); err == nil {
+		t.Errorf("%s, %s, value %q ran a command (script %q)", sh, name, v, script)
 	}
 }
 
