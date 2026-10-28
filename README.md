@@ -116,3 +116,28 @@ kiln checks run test       # one check
 `test` also runs the packages that only exist under `-tags hopdev` (the dev store and the real `hop` binary starting its own daemon).
 
 `scripts/check.sh` defines each check. The ssh integration test needs an `ssh` binary and a passwd entry for the current uid; `scripts/with-passwd.sh` supplies the entry on Kiln. With `HOPKEY_REQUIRE_SSH=1` the test fails instead of skipping when `ssh` is missing.
+
+## End-to-end tests on Kiln
+
+`scripts/e2e/run.sh` runs the whole product on real machines. It builds `hop` and `hop-server` from the worktree with `kiln checks run`, leases two Ubuntu VMs (CLI-A, CLI-B), creates three sandboxes as SSH targets (T1-T3), runs the phases, writes a report and releases everything, also on failure. Nothing from the repository runs on the orchestrator.
+
+Prerequisites:
+
+- the `kiln` CLI, logged in;
+- for phases 3-5, a Tailscale auth key that is reusable, ephemeral and tagged `tag:hoptest`, in a file (default `~/hopkey-test/ts-authkey`, or `HOP_E2E_TS_AUTHKEY_FILE`). The tailnet policy must let `tag:hoptest` reach `tag:hoptest`, for example `{"action":"accept","src":["tag:hoptest"],"dst":["tag:hoptest:*"]}`. The script copies the file only by path and deletes it on each machine right after `tailscale up`.
+
+```
+scripts/e2e/run.sh                    # all phases
+scripts/e2e/run.sh --phases 1,2       # local only and MCP; no Tailscale key needed
+scripts/e2e/run.sh --keep             # leave the machines up and print their IDs
+```
+
+The phases:
+
+1. Local use with no account, on both VMs.
+2. MCP.
+3. Sync, through a throwaway `hop-server` on CLI-A that is reachable only on the tailnet, with a CA made for the run.
+4. SSH over Tailscale, including a jump host.
+5. The revocation matrix.
+
+Every check is one JSON line in `e2e-out/<run-id>/results.jsonl`. `REPORT.md` next to it has a table per phase and the failures in detail. Assertions encode the intended behaviour, so known product gaps show up as FAIL, tagged with their bug ID. A full run takes about 20 minutes: about 6 to build, lease and set up the machines, then about 14 for the phases. Phases 1-2 alone should take under 10 minutes.
