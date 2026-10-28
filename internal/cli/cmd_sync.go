@@ -16,6 +16,7 @@ import (
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/shellcmd"
 )
 
 // The daemon syncs on its own (design: "Automatic sync"). hop sync is an
@@ -941,7 +942,7 @@ func (r *resolver) unconfirmed(h *daemon.HeldChange, p *daemon.Proposal, req req
 		if p.Choice == daemon.ChoiceEdit {
 			cmd = fmt.Sprintf("hop sync resolve %d --edit", h.N)
 			for _, s := range req.sets {
-				cmd += " --set " + shellQuote(oneLine(s))
+				cmd += " --set " + shellcmd.Quote(oneLine(s))
 			}
 			if p.NewID != "" {
 				cmd += " --new-id " + oneLine(p.NewID)

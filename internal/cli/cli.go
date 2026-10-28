@@ -167,10 +167,17 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 
 // handlesInterrupt reports whether the command args runs returns on its
 // own once a signal cancels the context, and so is never cut short:
-// hop daemon, which closes cleanly. It is decided from the arguments
-// alone, before the command and Run's signal watcher start.
+// hop daemon, which closes cleanly, and hop mcp, whose cancelled context
+// stops the ssh it runs. It is decided from the arguments alone, before
+// the command and Run's signal watcher start.
 func handlesInterrupt(args []string) bool {
-	return len(args) == 1 && args[0] == "daemon"
+	switch {
+	case len(args) == 1 && args[0] == "daemon":
+		return true
+	case len(args) >= 1 && args[0] == "mcp":
+		return len(args) == 1 || args[1] != "install"
+	}
+	return false
 }
 
 // ErrInterrupted is the cause cmd/hop gives the context it cancels on
@@ -245,6 +252,8 @@ func init() {
 		"edit":    {runEdit, "hop edit <target> [--name N] [--address A]... [other flags as hop add]"},
 		"rm":      {runRm, "hop rm <target> [--yes]"},
 		"key":     {runKey, "hop key add <path> [--name N] | hop key ls | hop key rm <name> [--yes]"},
+		"snippet": {runSnippet, "hop snippet add <name> [--description D] -- <command...> | hop snippet ls | hop snippet rm <name> [--yes]"},
+		"mcp":     {runMCP, "hop mcp [--read-only] | hop mcp install [--client claude|codex|print] [--read-only]"},
 		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run] [--yes] [--json]"},
 		"ts":      {runTS, "hop ts import [name...] [--user U] [--key K] [--tag T] [--no-pin] [--dry-run] | hop ts link <host> <node-id-or-dns-name>"},
 		"setup":   {runSetup, "hop setup [--yes] | hop setup --service [--uninstall] [--yes] [--json]"},
@@ -266,6 +275,8 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop check|which|trust <target>
        hop ls [tag] | info <target> | add | edit | rm
        hop key add|ls|rm | import ssh-config | ts import|link
+       hop snippet add|ls|rm
+       hop mcp [--read-only] | mcp install   tools for local AI agents (MCP)
        hop setup [--service] | status | daemon
        hop init | lock | unlock [--password] | passwd
        hop sync [resolve]

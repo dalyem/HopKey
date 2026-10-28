@@ -19,15 +19,16 @@ import (
 
 // Ops.
 const (
-	OpStatus    = "status"
-	OpList      = "list"
-	OpResolve   = "resolve"
-	OpTailscale = "tailscale"
-	OpPutHost   = "put_host"
-	OpPutKey    = "put_key"
-	OpDelete    = "delete"
-	OpReload    = "reload"
-	OpShutdown  = "shutdown"
+	OpStatus     = "status"
+	OpList       = "list"
+	OpResolve    = "resolve"
+	OpTailscale  = "tailscale"
+	OpPutHost    = "put_host"
+	OpPutKey     = "put_key"
+	OpPutSnippet = "put_snippet"
+	OpDelete     = "delete"
+	OpReload     = "reload"
+	OpShutdown   = "shutdown"
 
 	// Sync ops (sync.go). They need the encrypted store; sync.now,
 	// sync.held, sync.resolve and devices.list need it unlocked too.
@@ -100,6 +101,10 @@ func IsCode(err error, code string) bool {
 type ResolveParams struct {
 	Target      string `json:"target"`
 	Interactive bool   `json:"interactive"`
+	// AgentOnly resolves among the hosts local agents may use (hop mcp):
+	// a host with agent_access deny is left out, as if it were not in the
+	// vault, so it is neither matched nor offered as a candidate.
+	AgentOnly bool `json:"agent_only,omitempty"`
 }
 
 // ResolveResult answers OpResolve.
@@ -131,6 +136,13 @@ type PutHostParams struct {
 type PutKeyParams struct {
 	Name       string `json:"name"`
 	PrivateKey string `json:"private_key"`
+}
+
+// PutSnippetParams is the request for OpPutSnippet. A zero ItemID creates
+// the snippet. The daemon sets Params from the command's {{name}}
+// placeholders; whatever the caller put there is ignored.
+type PutSnippetParams struct {
+	Snippet model.Snippet `json:"snippet"`
 }
 
 // DeleteParams is the request for OpDelete.

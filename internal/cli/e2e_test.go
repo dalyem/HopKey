@@ -158,8 +158,18 @@ func (e *e2e) configFile(t *testing.T) string {
 func (e *e2e) hop(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
 	var so, se bytes.Buffer
-	env := &cli.Env{
-		Stdin: strings.NewReader(e.stdin), Stdout: &so, Stderr: &se,
+	env := e.env(t, strings.NewReader(e.stdin), &so, &se)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	code = cli.Run(ctx, args, env)
+	e.stdin = ""
+	return code, so.String(), se.String()
+}
+
+// env is the environment hop runs in against this harness's daemon.
+func (e *e2e) env(t *testing.T, stdin io.Reader, stdout, stderr io.Writer) *cli.Env {
+	return &cli.Env{
+		Stdin: stdin, Stdout: stdout, Stderr: stderr,
 		Getenv: func(string) string { return "" },
 		Home:   e.home, Paths: e.paths,
 		StdoutTTY: e.tty, StdinTTY: e.tty, SSHBinary: e.sshBin, ReadPassword: e.readPassword,
@@ -176,11 +186,6 @@ func (e *e2e) hop(t *testing.T, args ...string) (code int, stdout, stderr string
 		},
 		DialTimeout: 5 * time.Second,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	code = cli.Run(ctx, args, env)
-	e.stdin = ""
-	return code, so.String(), se.String()
 }
 
 func TestExecRunsACommandThroughRealSSH(t *testing.T) {
@@ -839,6 +844,7 @@ type sshServer struct {
 	forwards []string
 	conns    int
 	accepted ssh.PublicKey
+	leak     string // what the command "leak" prints
 }
 
 func newSigner(t *testing.T) ssh.Signer {
@@ -962,7 +968,8 @@ func (s *sshServer) serve(c net.Conn, cfg *ssh.ServerConfig) {
 
 // session answers exec requests. Commands: "echo ok", "true", "exit N", "cat"
 // (echoes stdin), "stderr" (writes to stderr, exits 1), "big" (writes more than
-// 64 KB, ending in END), "sleep" (waits). Anything else is recorded and exits 0.
+// 64 KB, ending in END), "sleep" (waits), "leak" (prints s.leak). Anything else
+// is recorded and exits 0. hop mcp's mcpEnvPrefix is recorded, then ignored.
 func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 	for req := range reqs {
@@ -978,10 +985,15 @@ func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 		req.Reply(true, nil)
 		s.mu.Lock()
 		s.cmds = append(s.cmds, p.Command)
+		leak := s.leak
 		s.mu.Unlock()
+		// hop mcp puts its pager settings before every command.
+		p.Command = strings.TrimPrefix(p.Command, mcpEnvPrefix)
 
 		status := uint32(0)
 		switch {
+		case p.Command == "leak":
+			ch.Write([]byte(leak))
 		case p.Command == "echo ok":
 			ch.Write([]byte("ok\n"))
 		case p.Command == "cat":

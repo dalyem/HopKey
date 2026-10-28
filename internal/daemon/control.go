@@ -8,16 +8,19 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/resolve"
+	"github.com/dalyem/hopkey/internal/shellcmd"
 	"github.com/dalyem/hopkey/internal/sshagent"
 	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/sshkeys"
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
 const maxRequest = 4 << 20 // bytes in one request line
@@ -220,6 +223,12 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 			return nil, err
 		}
 		return d.opPutKey(ctx, p)
+	case OpPutSnippet:
+		var p PutSnippetParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return d.opPutSnippet(ctx, p)
 	case OpDelete:
 		var p DeleteParams
 		if err := decode(&p); err != nil {
@@ -321,7 +330,10 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		return nil, d.configStale(st.configErr)
 	}
 	ts := d.tsStatus(ctx)
-	in := resolve.Input{Target: p.Target, Hosts: snap.Hosts, Tailscale: ts, Interactive: p.Interactive}
+	in := resolve.Input{Target: p.Target, Hosts: resolvable(snap.Hosts, p.AgentOnly), Tailscale: ts, Interactive: p.Interactive}
+	if p.AgentOnly {
+		in.Tailscale = agentTailnet(ts, snap.Hosts)
+	}
 	res, err := resolve.Resolve(ctx, in)
 	if err != nil {
 		return nil, invalidf("%v", err)
@@ -337,7 +349,10 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		if st.configErr != "" {
 			return nil, d.configStale(st.configErr)
 		}
-		in.Hosts = snap.Hosts
+		in.Hosts = resolvable(snap.Hosts, p.AgentOnly)
+		if p.AgentOnly {
+			in.Tailscale = agentTailnet(ts, snap.Hosts)
+		}
 		if res, err = resolve.Resolve(ctx, in); err != nil {
 			return nil, invalidf("%v", err)
 		}
@@ -363,6 +378,106 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 	}
 	return out, nil
 }
+
+// resolvable is the hosts a resolution may match: all of them, or with
+// agentOnly only those whose agent_access allows local agents. Only
+// "allow", and the empty value it defaults to, lets an agent in.
+func resolvable(hosts []model.Host, agentOnly bool) []model.Host {
+	if !agentOnly {
+		return hosts
+	}
+	return slices.DeleteFunc(slices.Clone(hosts), func(h model.Host) bool {
+		return h.AgentAccess != "allow" && h.AgentAccess != ""
+	})
+}
+
+// agentTailnet is ts without the nodes of the hosts local agents may not
+// use, for agent_only resolution: otherwise a denied host's node would come
+// back as an unlinked node, by its Tailscale name or IP, in a note or among
+// the candidates. A node is left out when a denied host owns it
+// (HostOwnsNode), even if an allowed host is linked to it too. The route of
+// a matched host is still chosen with the whole of ts.
+func agentTailnet(ts *tailscale.Status, hosts []model.Host) *tailscale.Status {
+	if ts == nil || !ts.Available {
+		return ts
+	}
+	var deniedHosts []model.Host
+	for _, h := range hosts {
+		if h.AgentAccess != "allow" && h.AgentAccess != "" {
+			deniedHosts = append(deniedHosts, h)
+		}
+	}
+	all := ts.Nodes()
+	denied := func(n tailscale.Node) bool {
+		return slices.ContainsFunc(deniedHosts, func(h model.Host) bool { return HostOwnsNode(h, n, all) })
+	}
+	out := *ts
+	if denied(out.Self) {
+		out.Self = tailscale.Node{Self: true}
+	}
+	out.Peers = slices.DeleteFunc(slices.Clone(ts.Peers), denied)
+	return &out
+}
+
+// HostOwnsNode reports whether tailnet node n, one of all (the whole
+// tailnet), is host h by another name. A link that names one node only
+// decides: h's stable node ID or MagicDNS name, or an address of h that is
+// one of n's IPs or its MagicDNS name, ignoring case and a trailing dot.
+// Failing that, an address of h that is n's short name (the MagicDNS
+// name's first label) or its host name owns n only when no other node in
+// all has that name, and h is not linked as above to another node: two
+// machines can report the same host name ("build", given the MagicDNS
+// names build and build-1), and such a name does not say which one h is.
+func HostOwnsNode(h model.Host, n tailscale.Node, all []tailscale.Node) bool {
+	if hostLinksNode(h, n) {
+		return true
+	}
+	if slices.ContainsFunc(all, func(o tailscale.Node) bool { return o.ID != n.ID && hostLinksNode(h, o) }) {
+		return false
+	}
+	named := func(o tailscale.Node, k string) bool { return k == normDNS(o.ShortName()) || k == normDNS(o.HostName) }
+	for _, a := range h.Addresses {
+		k := normDNS(strings.Trim(strings.TrimSpace(a), "[]"))
+		if k == "" || !named(n, k) {
+			continue
+		}
+		if !slices.ContainsFunc(all, func(o tailscale.Node) bool { return o.ID != n.ID && named(o, k) }) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostLinksNode is HostOwnsNode's links that name one node only.
+func hostLinksNode(h model.Host, n tailscale.Node) bool {
+	if t := h.Tailscale; t != nil {
+		if t.StableNodeID != "" && t.StableNodeID == n.ID {
+			return true
+		}
+		if t.DNSName != "" && normDNS(t.DNSName) == normDNS(n.DNSName) {
+			return true
+		}
+	}
+	for _, a := range h.Addresses {
+		a = strings.Trim(strings.TrimSpace(a), "[]")
+		if ip, err := netip.ParseAddr(a); err == nil {
+			ip = ip.Unmap().WithZone("")
+			if slices.ContainsFunc(n.IPs, func(s string) bool {
+				nip, err := netip.ParseAddr(s)
+				return err == nil && nip.Unmap().WithZone("") == ip
+			}) {
+				return true
+			}
+			continue
+		}
+		if k := normDNS(a); k != "" && k == normDNS(n.DNSName) {
+			return true
+		}
+	}
+	return false
+}
+
+func normDNS(s string) string { return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), ".")) }
 
 // checkHostInput fills defaults and refuses a host the ssh config could not
 // represent or that would share a name with another host.
@@ -489,6 +604,55 @@ func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error)
 	d.localWrite()
 	info := keyInfo(saved)
 	return &info, d.reloadAfter(ctx, "saved")
+}
+
+// checkSnippetInput derives the snippet's parameters from its command and
+// refuses one hop could not run, or that would share a name with another
+// snippet.
+func checkSnippetInput(s model.Snippet, all []model.Snippet) (model.Snippet, error) {
+	s.Name = strings.TrimSpace(s.Name)
+	if !sshconfig.ValidAlias(s.Name) {
+		return s, invalidf("%q is not a valid snippet name: use letters, digits, '.', '_' and '-', starting with a letter or digit, up to 64 characters", s.Name)
+	}
+	if strings.TrimSpace(s.Command) == "" {
+		return s, invalidf("a snippet needs a command")
+	}
+	if len(s.Command) > 8192 {
+		return s, invalidf("the command is longer than 8192 bytes")
+	}
+	if len(s.Description) > 1024 {
+		return s, invalidf("the description is longer than 1024 bytes")
+	}
+	params, err := shellcmd.Placeholders(s.Command)
+	if err != nil {
+		return s, invalidf("%v", err)
+	}
+	s.Params = params
+	for _, o := range all {
+		if o.ItemID != s.ItemID && strings.EqualFold(o.Name, s.Name) {
+			return s, invalidf("a snippet named %q already exists", o.Name)
+		}
+	}
+	return s, nil
+}
+
+func (d *Daemon) opPutSnippet(ctx context.Context, p PutSnippetParams) (*model.Snippet, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	snap, err := d.store.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sn, err := checkSnippetInput(p.Snippet, snap.Snippets)
+	if err != nil {
+		return nil, err
+	}
+	saved, err := d.store.PutSnippet(ctx, sn)
+	if err != nil {
+		return nil, storeError(err)
+	}
+	d.localWrite()
+	return &saved, d.reloadAfter(ctx, "saved")
 }
 
 func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {
