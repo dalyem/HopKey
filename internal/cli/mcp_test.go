@@ -921,7 +921,7 @@ func TestMCPStartsADaemonWithoutTheSecrets(t *testing.T) {
 
 func TestMCPLockedAndAbsentVault(t *testing.T) {
 	f := newFakeDaemon(t)
-	f.fail(daemon.OpList, daemon.CodeLocked, "model: vault is locked; run hop unlock")
+	f.fail(daemon.OpList, daemon.CodeLocked, "vault is locked; run hop unlock")
 	m := startMCP(t, f.env(t, nil, nil, nil))
 	for _, c := range []struct {
 		tool string

@@ -23,10 +23,40 @@ import (
 // 0.165.0 (codex mcp add <NAME> -- <COMMAND>..., which writes
 // ~/.codex/config.toml).
 
+// MCPInstallReport is the --json shape of hop mcp install: the server entry a
+// client registers, and the client commands that register it. Registered is
+// true when hop ran a client's CLI and it added hop; with --client print
+// nothing is run and it is false.
+type mcpInstallReport struct {
+	Client     string            `json:"client"`
+	Registered bool              `json:"registered"`
+	Server     mcpServerEntry    `json:"server"`
+	Commands   map[string]string `json:"commands,omitempty"`
+}
+
+type mcpServerEntry struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+}
+
+func mcpServerJSON(server []string) mcpServerEntry {
+	return mcpServerEntry{Command: server[0], Args: append([]string{}, server[1:]...)}
+}
+
+// mcpClientCommands maps each client to the shell command that registers
+// server with it.
+func mcpClientCommands(server []string) map[string]string {
+	return map[string]string{
+		"claude": quoteArgv(append([]string{"claude", "mcp", "add", "--scope", "user", "hop", "--"}, server...)),
+		"codex":  quoteArgv(append([]string{"codex", "mcp", "add", "hop", "--"}, server...)),
+	}
+}
+
 func runMCPInstall(ctx context.Context, e *Env, args []string) error {
-	fs := newFlags(e, "mcp install", "hop mcp install [--client claude|codex|print] [--read-only]")
+	fs := newFlags(e, "mcp install", "hop mcp install [--client claude|codex|print] [--read-only] [--json]")
 	client := fs.String("client", "print", "claude (Claude Code, for this user), codex (Codex CLI), or print to show the config to paste")
 	readOnly := fs.Bool("read-only", false, "register hop mcp --read-only, which offers no tool that runs a command")
+	asJSON := fs.Bool("json", false, "print the result as JSON")
 	pos, rest, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -45,12 +75,15 @@ func runMCPInstall(ctx context.Context, e *Env, args []string) error {
 	}
 	switch *client {
 	case "claude":
-		return runClientCLI(ctx, e, "Claude Code", append([]string{"claude", "mcp", "add", "--scope", "user", "hop", "--"}, server...),
+		return runClientCLI(ctx, e, *asJSON, "Claude Code", "claude", append([]string{"claude", "mcp", "add", "--scope", "user", "hop", "--"}, server...),
 			"claude mcp remove --scope user hop", server)
 	case "codex":
-		return runClientCLI(ctx, e, "Codex", append([]string{"codex", "mcp", "add", "hop", "--"}, server...),
+		return runClientCLI(ctx, e, *asJSON, "Codex", "codex", append([]string{"codex", "mcp", "add", "hop", "--"}, server...),
 			"codex mcp remove hop", server)
 	case "print":
+		if *asJSON {
+			return printJSON(e, mcpInstallReport{Client: "print", Server: mcpServerJSON(server), Commands: mcpClientCommands(server)})
+		}
 		printMCPConfig(e, server)
 		return nil
 	}
@@ -90,7 +123,7 @@ func quoteArgv(argv []string) string {
 }
 
 // runClientCLI shows the command, runs it, and passes its output on.
-func runClientCLI(ctx context.Context, e *Env, name string, argv []string, remove string, server []string) error {
+func runClientCLI(ctx context.Context, e *Env, asJSON bool, name, client string, argv []string, remove string, server []string) error {
 	fmt.Fprintf(e.Stderr, "hop: running %s\n", oneLine(quoteArgv(argv)))
 	out, err := e.runCommand(ctx, argv)
 	if len(out) > 0 {
@@ -98,11 +131,16 @@ func runClientCLI(ctx context.Context, e *Env, name string, argv []string, remov
 		fmt.Fprintf(e.Stderr, "%s\n", displaySafe(strings.TrimRight(string(out), "\n")))
 	}
 	if errors.Is(err, exec.ErrNotFound) {
-		printMCPConfig(e, server)
+		if !asJSON {
+			printMCPConfig(e, server)
+		}
 		return failf("%s is not on PATH; add hop to %s by hand with the config above", argv[0], name)
 	}
 	if err != nil {
 		return failf("%s did not add hop (%v). If hop is already registered, remove it first with: %s", argv[0], err, remove)
+	}
+	if asJSON {
+		return printJSON(e, mcpInstallReport{Client: client, Registered: true, Server: mcpServerJSON(server)})
 	}
 	e.printf("hop mcp is registered with %s as %q. Start a new session to load its tools.\n", name, "hop")
 	return nil

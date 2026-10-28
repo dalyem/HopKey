@@ -50,6 +50,23 @@ func decodeTS(t *testing.T, stdout string) map[string]cli.TSEntry {
 	return m
 }
 
+// The text report is for people: the JSON statuses are identifiers
+// (would_created), the text says "would create".
+func TestTSImportDryRunTextIsPlainEnglish(t *testing.T) {
+	st, _ := tailnet(t)
+	e := newE2EWith(t, fixedTS{st})
+	code, stdout, stderr := e.hop(t, "ts", "import", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry run: %d %s", code, stderr)
+	}
+	if strings.Contains(stdout, "would_") || strings.Contains(stdout, "_") {
+		t.Errorf("text report has a status identifier in it:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "would create") {
+		t.Errorf("text report does not say \"would create\":\n%s", stdout)
+	}
+}
+
 func TestTSImportCreatesAndLinksHosts(t *testing.T) {
 	st, _ := tailnet(t)
 	e := newE2EWith(t, fixedTS{st})

@@ -40,21 +40,15 @@ func main() {
 	}
 
 	env := &cli.Env{
-		Stdin:     os.Stdin,
-		Stdout:    os.Stdout,
-		Stderr:    os.Stderr,
-		Getenv:    os.Getenv,
-		Home:      home,
-		Paths:     daemon.DefaultPaths(home, os.Getenv),
-		StdoutTTY: term.IsTerminal(int(os.Stdout.Fd())),
-		StdinTTY:  term.IsTerminal(stdinFd),
-		OpenStore: openStore,
-		ReadPassword: func(prompt string) ([]byte, error) {
-			os.Stderr.WriteString(prompt)
-			b, err := term.ReadPassword(stdinFd)
-			os.Stderr.WriteString("\n")
-			return b, err
-		},
+		Stdin:      os.Stdin,
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+		Getenv:     os.Getenv,
+		Home:       home,
+		Paths:      daemon.DefaultPaths(home, os.Getenv),
+		StdoutTTY:  term.IsTerminal(int(os.Stdout.Fd())),
+		StdinTTY:   term.IsTerminal(stdinFd),
+		OpenStore:  openStore,
 		Executable: exe,
 		Exit: func(code int) {
 			if termState != nil {
@@ -62,6 +56,17 @@ func main() {
 			}
 			os.Exit(code)
 		},
+	}
+	// Prompts need a terminal to read from. Without one ReadPassword stays
+	// nil, which the commands that prompt report as "needs a terminal"
+	// instead of failing in the middle with an ioctl error.
+	if env.StdinTTY {
+		env.ReadPassword = func(prompt string) ([]byte, error) {
+			os.Stderr.WriteString(prompt)
+			b, err := term.ReadPassword(stdinFd)
+			os.Stderr.WriteString("\n")
+			return b, err
+		}
 	}
 	os.Exit(cli.Run(ctx, os.Args[1:], env))
 }

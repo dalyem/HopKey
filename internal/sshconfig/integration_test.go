@@ -67,6 +67,51 @@ func TestOpenSSHUsesAgentKey(t *testing.T) {
 	}
 }
 
+// With hop's agent down, or up and holding no keys (the vault is locked), the
+// login fails as plain "Permission denied". It must not be preceded by
+// ssh's `Load key ".../keys/<id>.pub": error in libcrypto`, which is what ssh
+// prints when it tries a public key file as a private key.
+func TestOpenSSHWithoutTheKeyIsQuiet(t *testing.T) {
+	sshBin := requireSSH(t)
+	for _, tt := range []string{"agent down", "agent holds no keys"} {
+		t.Run(tt, func(t *testing.T) {
+			e := newEnv(t, false, "hop")
+			cfg := e.config()
+			if tt == "agent down" {
+				if err := os.Remove(e.opts.AgentSocket); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				// A socket directory of its own: one agent per directory.
+				emptyDir, err := os.MkdirTemp("", "hk")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { os.RemoveAll(emptyDir) })
+				empty, err := sshagent.Listen(filepath.Join(emptyDir, "agent.sock"), sshagent.NewKeyring().Agent())
+				if err != nil {
+					t.Fatal(err)
+				}
+				go empty.Serve()
+				t.Cleanup(func() { empty.Close() })
+				cfg = e.writeVariant(t, func(cfg, _ string) string {
+					return replaceLine(cfg, "IdentityAgent", empty.Path())
+				})
+			}
+			_, stderr, err := e.ssh(t, sshBin, cfg, "echo", "ok")
+			if err == nil {
+				t.Fatal("ssh succeeded without the key")
+			}
+			if strings.Contains(stderr, "Load key") || strings.Contains(stderr, "libcrypto") {
+				t.Errorf("ssh complains about the key file:\n%s", stderr)
+			}
+			if !strings.Contains(stderr, "Permission denied") {
+				t.Errorf("stderr lacks Permission denied:\n%s", stderr)
+			}
+		})
+	}
+}
+
 func TestOpenSSHRejectsWrongHostKeyPin(t *testing.T) {
 	sshBin := requireSSH(t)
 	e := newEnv(t, false, "hop")

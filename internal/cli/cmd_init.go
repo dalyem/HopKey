@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -27,6 +28,7 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "init", commands["init"].usage)
 	kitFile := fs.String("kit-file", "", "also write the Emergency Kit to this new file (mode 0600)")
 	devStore := fs.String("device-key-store", "", "where the device key lives: keychain (the default) or file")
+	asJSON := fs.Bool("json", false, "print the result as JSON (the Emergency Kit and the prompts go to the terminal on stderr)")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -35,7 +37,7 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 		return failf("usage: %s", commands["init"].usage)
 	}
 	if e.ReadPassword == nil {
-		return failf("hop init needs a terminal to ask for the master password")
+		return failf("hop init needs a terminal to ask for the master password, and stdin is not one; run it in an interactive terminal")
 	}
 	cfg := e.storeConfig()
 	if ok, err := store.Exists(cfg.DataDir); err != nil {
@@ -74,7 +76,13 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprint(e.Stderr, unsealedWarning(path))
 	}
 	kit := p.Kit()
-	if err := showKit(e, kit, *kitFile); err != nil {
+	// The kit is for the person at the terminal. With --json, stdout holds
+	// the JSON result alone.
+	var kitOut io.Writer = e.Stdout
+	if *asJSON {
+		kitOut = e.Stderr
+	}
+	if err := showKitTo(e, kitOut, kit, *kitFile); err != nil {
 		return failf("%v; nothing was created", err)
 	}
 	if err := typeBack(e, kit); err != nil {
@@ -92,8 +100,20 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 	if err := s.Close(); err != nil {
 		return failf("closing the vault: %v", err)
 	}
+	if *asJSON {
+		return printJSON(e, InitReport{DataDir: cfg.DataDir, DeviceKeyStore: p.DeviceStore(), KitFile: *kitFile})
+	}
 	e.printf("\nVault created in %s.\nDevice key: %s.\n", oneLine(cfg.DataDir), oneLine(p.DeviceStore()))
 	return nil
+}
+
+// InitReport is the --json shape of hop init. It holds no secret: the
+// Emergency Kit is shown on the terminal only.
+type InitReport struct {
+	DataDir        string `json:"data_dir"`
+	DeviceKeyStore string `json:"device_key_store"`
+	// KitFile is the file --kit-file wrote the kit to, if any.
+	KitFile string `json:"kit_file,omitempty"`
 }
 
 // unsealedWarning is what hop init says before it keeps the device key in
@@ -131,14 +151,19 @@ func readNewPassword(e *Env, prompt string) ([]byte, error) {
 // given, as a new 0600 file. The file is on disk, fsynced, before it is
 // reported saved and before the kit can be typed back.
 func showKit(e *Env, kit store.Kit, kitFile string) error {
-	e.printf("\n%s\n", kit.Text())
+	return showKitTo(e, e.Stdout, kit, kitFile)
+}
+
+// showKitTo is showKit with the kit shown on out.
+func showKitTo(e *Env, out io.Writer, kit store.Kit, kitFile string) error {
+	fmt.Fprintf(out, "\n%s\n", kit.Text())
 	if kitFile == "" {
 		return nil
 	}
 	if err := writeKitFile(kitFile, []byte(kit.Text())); err != nil {
 		return failf("writing the kit: %v", err)
 	}
-	e.printf("The kit was also written to %s.\n", oneLine(kitFile))
+	fmt.Fprintf(out, "The kit was also written to %s.\n", oneLine(kitFile))
 	return nil
 }
 

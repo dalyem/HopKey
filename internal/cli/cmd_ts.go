@@ -298,6 +298,18 @@ func runTSImport(ctx context.Context, e *Env, args []string) error {
 	return printTSReport(e, *asJSON, report)
 }
 
+// tsStatusText is a report status in words: the JSON statuses are
+// identifiers (would_created), the text is for people (would create).
+func tsStatusText(status string) string {
+	switch status {
+	case "would_created":
+		return "would create"
+	case "would_linked":
+		return "would link"
+	}
+	return strings.ReplaceAll(status, "_", " ")
+}
+
 func printTSReport(e *Env, asJSON bool, report []TSEntry) error {
 	if asJSON {
 		if report == nil {
@@ -310,7 +322,7 @@ func printTSReport(e *Env, asJSON bool, report []TSEntry) error {
 	}
 	for _, r := range report {
 		// Node and host names are raw in the JSON report; here they are text.
-		line := fmt.Sprintf("%-14s %s", r.Status, oneLine(r.Node))
+		line := fmt.Sprintf("%-14s %s", tsStatusText(r.Status), oneLine(r.Node))
 		if r.Host != "" && r.Host != r.Node {
 			line += " -> " + oneLine(r.Host)
 		}

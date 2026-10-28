@@ -76,7 +76,7 @@ func runSync(ctx context.Context, e *Env, args []string) error {
 	var st daemon.SyncStatusResult
 	nowErr := cleanErr(c.Call(ctx, daemon.OpSyncNow, nil, &st))
 	if daemon.IsCode(nowErr, daemon.CodeLocalOnly) {
-		return failf("%v: this vault is local-only, so there is nothing to sync", nowErr)
+		return failf("this vault is local-only, so there is nothing to sync")
 	}
 	if nowErr != nil {
 		// Report where sync stands all the same, then fail.
@@ -385,7 +385,7 @@ func (r *resolver) held() ([]daemon.HeldChange, error) {
 	var res daemon.SyncHeldResult
 	if err := r.c.Call(r.ctx, daemon.OpSyncHeld, nil, &res); err != nil {
 		if daemon.IsCode(err, daemon.CodeLocalOnly) {
-			return nil, failf("%v: this vault is local-only, so nothing is ever held", err)
+			return nil, failf("this vault is local-only, so nothing is ever held")
 		}
 		return nil, cleanErr(err)
 	}
