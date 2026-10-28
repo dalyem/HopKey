@@ -23,6 +23,8 @@ import (
 	"github.com/dalyem/hopkey/internal/cli"
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/resolve"
+	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
 // These tests run hop mcp as a client would: cli.Run with "mcp", speaking
@@ -577,12 +579,20 @@ func TestMCPSnippets(t *testing.T) {
 		t.Errorf("list_snippets = %+v", list)
 	}
 	out := mcpCall[cli.MCPExec](m, "run_snippet", map[string]any{"name": "restart", "hosts": []string{"web-1"}, "params": map[string]any{"unit": "my unit; rm -rf /"}})
-	want := "systemctl restart 'my unit; rm -rf /'"
-	if out.Command != want || out.Results[0].ExitCode != 0 {
+	if out.Snippet != "restart" || out.Command != "" || out.Results[0].ExitCode != 0 {
 		t.Errorf("run_snippet = %+v", out)
 	}
-	if got := e.server.commands(); !slices.Equal(got, []string{mcpEnvPrefix + want}) {
-		t.Errorf("the server saw %q", got)
+	// The value is assigned to a variable before the pager settings; the
+	// command uses the variable.
+	want := `HOP_P_unit='my unit; rm -rf /'; ` + mcpEnvPrefix + `systemctl restart "${HOP_P_unit}"`
+	if got := e.server.commands(); !slices.Equal(got, []string{want}) {
+		t.Errorf("the server saw %q, want %q", got, want)
+	}
+	// The answer names the snippet; it does not show the filled-in command.
+	for _, raw := range m.raw {
+		if strings.HasPrefix(raw, "run_snippet:") && strings.Contains(raw, "my unit") {
+			t.Errorf("run_snippet's answer holds the value: %s", raw)
+		}
 	}
 	if msg := m.mcpError("run_snippet", map[string]any{"name": "restart", "hosts": "web-1"}); !strings.Contains(msg, "missing parameter(s) unit") {
 		t.Errorf("missing param: %s", msg)
@@ -611,6 +621,7 @@ type auditLine struct {
 	Tool    string   `json:"tool"`
 	Client  string   `json:"client"`
 	Snippet string   `json:"snippet"`
+	Params  []string `json:"params"`
 	Hosts   []string `json:"hosts"`
 	Command string   `json:"command"`
 	Results []struct {
@@ -639,12 +650,18 @@ func readAudit(t *testing.T, path string) []auditLine {
 
 func TestMCPAuditLog(t *testing.T) {
 	e := newE2E(t)
-	if _, err := e.store.PutSnippet(context.Background(), model.Snippet{Name: "say", Command: "echo {{what}}"}); err != nil {
+	if _, err := e.store.PutSnippet(context.Background(), model.Snippet{Name: "say", Command: "PGPASSWORD={{password}} echo {{what}}"}); err != nil {
 		t.Fatal(err)
 	}
-	m := e.startMCP(t)
+	env := e.env(t, nil, nil, nil)
+	env.Environ = withSecretEnv(os.Environ())
+	m := startMCP(t, env)
 	mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": []string{"web-1", "web-2"}, "command": "big"})
-	mcpCall[cli.MCPExec](m, "run_snippet", map[string]any{"name": "say", "hosts": "web-1", "params": map[string]any{"what": "hi"}})
+	const paramSecret = "pg-param-password-0451"
+	mcpCall[cli.MCPExec](m, "run_snippet", map[string]any{"name": "say", "hosts": "web-1", "params": map[string]any{"what": "hi", "password": paramSecret}})
+	// exec's command is logged, scrubbed of the secrets hop knows and with
+	// its control characters escaped.
+	mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": "web-1", "command": "echo " + secretEnv["HOP_PASSWORD"] + " \x1b[31mred"})
 
 	path := filepath.Join(e.paths.StateDir, "mcp-audit.jsonl")
 	fi, err := os.Stat(path)
@@ -658,9 +675,15 @@ func TestMCPAuditLog(t *testing.T) {
 	if bytes.Contains(raw, []byte("zzzzzzzz")) || bytes.Contains(raw, []byte("aaaaaaaa")) {
 		t.Error("the audit log holds command output")
 	}
+	if bytes.Contains(raw, []byte(paramSecret)) || bytes.Contains(raw, []byte("HOP_P_")) {
+		t.Errorf("the audit log holds a snippet parameter's value or the filled-in command: %s", raw)
+	}
+	if bytes.Contains(raw, []byte(secretEnv["HOP_PASSWORD"])) || bytes.Contains(raw, []byte{0x1b}) || bytes.Contains(raw, []byte(`\u001b`)) {
+		t.Errorf("the audit log holds a secret or a raw control character: %s", raw)
+	}
 	lines := readAudit(t, path)
-	if len(lines) != 4 {
-		t.Fatalf("audit has %d lines, want 4: %s", len(lines), raw)
+	if len(lines) != 6 {
+		t.Fatalf("audit has %d lines, want 6: %s", len(lines), raw)
 	}
 	start, end := lines[0], lines[1]
 	if start.Event != "start" || end.Event != "end" || start.Run == "" || start.Run != end.Run || start.Tool != "exec" ||
@@ -671,8 +694,11 @@ func TestMCPAuditLog(t *testing.T) {
 		end.Results[1].ExitCode != 255 || !strings.Contains(end.Results[1].Error, "no pinned host key") {
 		t.Errorf("exec audit results: %+v", end.Results)
 	}
-	if s := lines[2]; s.Tool != "run_snippet" || s.Snippet != "say" || s.Command != "echo hi" {
+	if s := lines[2]; s.Tool != "run_snippet" || s.Snippet != "say" || s.Command != "" || !slices.Equal(s.Params, []string{"password", "what"}) {
 		t.Errorf("run_snippet audit: %+v", s)
+	}
+	if s := lines[4]; s.Command != `echo [redacted by hop] \x1b[31mred` {
+		t.Errorf("exec audit command = %q", s.Command)
 	}
 
 	// No log, no run.
@@ -684,7 +710,7 @@ func TestMCPAuditLog(t *testing.T) {
 	if msg := m.mcpError("exec", map[string]any{"hosts": "web-1", "command": "echo ok"}); !strings.Contains(msg, "audit log") {
 		t.Errorf("exec without an audit log: %s", msg)
 	}
-	if msg := m.mcpError("run_snippet", map[string]any{"name": "say", "hosts": "web-1", "params": map[string]any{"what": "x"}}); !strings.Contains(msg, "audit log") {
+	if msg := m.mcpError("run_snippet", map[string]any{"name": "say", "hosts": "web-1", "params": map[string]any{"what": "x", "password": "y"}}); !strings.Contains(msg, "audit log") {
 		t.Errorf("run_snippet without an audit log: %s", msg)
 	}
 	if after := len(e.server.commands()); after != before {
@@ -699,7 +725,7 @@ var secretEnv = map[string]string{
 	"HOP_NEW_PASSWORD":      "new-horse-battery-staple",
 	"HOP_SECRET_KEY":        "A3-ABCDEF-GHJKLM-NPQRST-VWXYZ2-345678-9ABCDE",
 	"HOP_RECOVERY_KEY":      "R1-QWERTY-UIOPAS-DFGHJK-LZXCVB-NM2345-678912",
-	"HOP_KIT_CONFIRM":       "KITCONFIRM-9ABCDE",
+	"HOP_KIT_CONFIRM":       "Zq7Xk", // short: redacted all the same
 	"HOP_DEVICE_PASSPHRASE": "device-passphrase-for-the-key-file",
 }
 
@@ -730,7 +756,7 @@ func TestMCPNeverReturnsSecrets(t *testing.T) {
 	// The remote prints the vault's private key (a copy deployed there) and
 	// the Secret Key; hop must not hand either to the agent.
 	e.server.mu.Lock()
-	e.server.leak = pem + "\n" + secretEnv["HOP_SECRET_KEY"] + "\n"
+	e.server.leak = pem + "\n" + secretEnv["HOP_SECRET_KEY"] + "\n" + secretEnv["HOP_KIT_CONFIRM"] + "\n"
 	e.server.mu.Unlock()
 
 	env := e.env(t, nil, nil, nil)
@@ -828,9 +854,50 @@ func TestMCPChildrenGetNoAuthSecrets(t *testing.T) {
 	env = e.env(t, nil, nil, nil)
 	m = startMCP(t, env)
 	m.toolNames()
-	for _, k := range []string{"HOP_PASSWORD", "HOP_NEW_PASSWORD", "HOP_SECRET_KEY", "HOP_RECOVERY_KEY", "HOP_KIT_CONFIRM"} {
+	for k := range secretEnv {
 		if v, ok := os.LookupEnv(k); ok {
 			t.Errorf("hop mcp left %s=%s in its environment", k, v)
+		}
+	}
+}
+
+// A daemon hop mcp starts gets none of them either: not the hop auth
+// secrets, and not the device key passphrase, so on a sealed key file it
+// comes up locked until the user runs hop unlock.
+func TestMCPStartsADaemonWithoutTheSecrets(t *testing.T) {
+	base, err := os.MkdirTemp("", "hkd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	dump := filepath.Join(base, "env")
+	fake := filepath.Join(base, "fake-hop")
+	// A stand-in for hop daemon: it records its environment and exits, so
+	// the daemon never comes up.
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nenv > \"$HOPKEY_TEST_ENV_DUMP\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stderr lockedBuffer
+	env := &cli.Env{
+		Getenv: func(string) string { return "" }, Home: filepath.Join(base, "home"), DataDir: filepath.Join(base, "data"),
+		Paths:      daemon.Paths{RunDir: filepath.Join(base, "run"), ConfigDir: filepath.Join(base, "cfg"), StateDir: filepath.Join(base, "state")},
+		Executable: fake, DaemonWait: 300 * time.Millisecond, Stderr: &stderr,
+		Environ: append(withSecretEnv(os.Environ()), "HOPKEY_TEST_ENV_DUMP="+dump),
+	}
+	m := startMCP(t, env)
+	m.mcpError("list_hosts", nil)
+	var b []byte
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if b, err = os.ReadFile(dump); err == nil && len(b) > 0 {
+			break
+		}
+	}
+	if !strings.Contains(string(b), "HOPKEY_TEST_ENV_DUMP=") {
+		t.Fatalf("the stand-in daemon did not run: %v %q", err, b)
+	}
+	for k := range secretEnv {
+		if strings.Contains(string(b), k+"=") {
+			t.Errorf("the daemon hop mcp started got %s", k)
 		}
 	}
 }
@@ -923,5 +990,215 @@ func TestMCPInstall(t *testing.T) {
 	}
 	if code, _, stderr, _ := run("--client", "vim"); code != 255 || !strings.Contains(stderr, "unknown client") {
 		t.Errorf("unknown client: %d %q", code, stderr)
+	}
+}
+
+// run_snippet sends each value in a single-quoted assignment and uses the
+// variable in the command: run by a real shell, the script the server
+// received prints the value as it was given and runs nothing from it, in a
+// word, a here-document body and a comment alike.
+func TestMCPRunSnippetValuesRunNothing(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	e := newE2E(t)
+	snippets := []struct {
+		name, cmd string
+		want      func(v string) string
+	}{
+		{"word", `printf '%s|' {{v}}`, func(v string) string { return v + "|" }},
+		{"heredoc", "cat <<EOF\n{{v}}\nEOF", func(v string) string { return `"` + v + `"` + "\n" }},
+		{"comment", "printf ok # {{v}}", func(string) string { return "ok" }},
+	}
+	for _, sn := range snippets {
+		if _, err := e.store.PutSnippet(context.Background(), model.Snippet{Name: sn.name, Command: sn.cmd}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := e.startMCP(t)
+	values := []string{`'$(touch "$MARK")'`, "x\ntouch \"$MARK\"", "`touch \"$MARK\"`", `a"b'c;d\e`, "x\nEOF\ntouch \"$MARK\"\ncat <<EOF", "$HOME *"}
+	for _, sn := range snippets {
+		for _, v := range values {
+			e.server.reset()
+			out := mcpCall[cli.MCPExec](m, "run_snippet", map[string]any{"name": sn.name, "hosts": "web-1", "params": map[string]any{"v": v}})
+			cmds := e.server.commands()
+			if len(cmds) != 1 || out.Results[0].Error != "" {
+				t.Fatalf("%s %q: %+v, server saw %q", sn.name, v, out, cmds)
+			}
+			dir := t.TempDir()
+			mark := filepath.Join(dir, "pwned")
+			cmd := exec.Command(sh, "-c", cmds[0])
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "MARK="+mark)
+			got, err := cmd.Output()
+			if err != nil || string(got) != sn.want(v) {
+				t.Errorf("%s, value %q: %v, printed %q, want %q (script %q)", sn.name, v, err, got, sn.want(v), cmds[0])
+			}
+			if _, err := os.Stat(mark); err == nil {
+				t.Errorf("%s, value %q ran a command (script %q)", sn.name, v, cmds[0])
+			}
+		}
+	}
+}
+
+type staticTS struct{ st *tailscale.Status }
+
+func (s staticTS) Status(context.Context) (*tailscale.Status, error) { return s.st, nil }
+
+func tsNode(id, name, ip string) tailscale.Node {
+	return tailscale.Node{ID: id, HostName: name, DNSName: name + ".tn.ts.net", Online: true, IPs: []string{ip}}
+}
+
+func tsLink(id, name string) *model.Tailscale {
+	return &model.Tailscale{StableNodeID: id, DNSName: name + ".tn.ts.net", SSH: "unknown"}
+}
+
+// A denied host's tailnet node is that host by another name: resolve_host
+// by its Tailscale IP or name does not come back with it, and a name it
+// shares with an allowed host's node is the allowed host's.
+func TestMCPResolveHidesDeniedHostsTailnetNodes(t *testing.T) {
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Self:  tailscale.Node{ID: "nSELF", HostName: "me", DNSName: "me.tn.ts.net", Online: true, IPs: []string{"100.64.0.1"}},
+		Peers: []tailscale.Node{tsNode("nVAULT", "vaultbox", "100.64.0.9"), tsNode("nTWINA", "twin", "100.64.0.11"), tsNode("nTWINB", "twin", "100.64.0.12")}}
+	e := newE2EWith(t, staticTS{ts})
+	e.addHost(t, "vault-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Tailscale = tsLink("nVAULT", "vaultbox") })
+	e.addHost(t, "twin-open", func(h *model.Host) { h.Tailscale = tsLink("nTWINA", "twin") })
+	e.addHost(t, "twin-secret", func(h *model.Host) {
+		h.AgentAccess = "deny"
+		h.Tailscale = &model.Tailscale{StableNodeID: "nTWINB", SSH: "unknown"}
+	})
+	m := e.startMCP(t)
+	for _, target := range []string{"100.64.0.9", "vaultbox", "vaultbox.tn.ts.net", "100.64.0.12", "twin"} {
+		r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": target})
+		b, _ := json.Marshal([]any{r.Candidates, r.Notes, r.Matched, r.Host, r.RouteError})
+		for _, h := range []string{"nVAULT", "vaultbox", "nTWINB", "100.64.0.12", "vault-secret", "twin-secret"} {
+			if !strings.Contains(target, h) && strings.Contains(string(b), h) {
+				t.Errorf("resolve_host %s names %s: %s", target, h, b)
+			}
+		}
+	}
+	if r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "twin"}); r.Status != "matched" || r.Host == nil || r.Host.Name != "twin-open" {
+		t.Errorf("resolve_host twin = %+v", r)
+	}
+}
+
+// hop mcp drops a denied host's node itself, from a daemon that still
+// offers it: an unlinked candidate or a note about it.
+func TestMCPDropsDeniedHostsNodesFromTheDaemonsAnswer(t *testing.T) {
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Peers: []tailscale.Node{tsNode("nVAULT", "vaultbox", "100.64.0.9"), tsNode("nTWINA", "twin", "100.64.0.11"), tsNode("nTWINB", "twin", "100.64.0.12")}}
+	open := model.Host{Header: model.Header{ItemID: model.ID{1}}, Name: "twin-open", AgentAccess: "allow", Tailscale: tsLink("nTWINA", "twin")}
+	hosts := []model.Host{
+		open,
+		{Header: model.Header{ItemID: model.ID{2}}, Name: "vault-secret", AgentAccess: "deny", Tailscale: tsLink("nVAULT", "vaultbox")},
+		// Linked by neither ID nor name: it lists the node's IP.
+		{Header: model.Header{ItemID: model.ID{3}}, Name: "twin-secret", AgentAccess: "deny", Addresses: []string{"100.64.0.12"}},
+	}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: hosts, Snippets: []model.Snippet{}, Tailscale: ts})
+	f.on(daemon.OpResolve, func(params json.RawMessage) (any, error) {
+		var p daemon.ResolveParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		res := &resolve.Result{Target: p.Target, Status: resolve.StatusNoMatch, Rule: resolve.RuleNone}
+		switch p.Target {
+		case "100.64.0.9":
+			res.Notes = []string{`tailscale node "vaultbox" (nVAULT) is not linked to a vault host; hop ts import or hop ts link links it`}
+		case "twin":
+			res.Status, res.Rule, res.Matched = resolve.StatusAmbiguous, resolve.RuleTailscale, "2 tailscale nodes or hosts match"
+			res.Candidates = []resolve.Candidate{
+				{HostID: open.ItemID.String(), Name: "twin-open", NodeID: "nTWINA", Detail: "linked to tailscale node twin (nTWINA, online)"},
+				{Name: "twin", Addresses: []string{"100.64.0.12"}, NodeID: "nTWINB", Detail: "tailscale node nTWINB (online), not linked to a vault host"},
+			}
+		}
+		return daemon.ResolveResult{Result: res}, nil
+	})
+	m := startMCP(t, f.env(t, nil, nil, nil))
+	if r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "100.64.0.9"}); len(r.Notes) != 0 || len(r.Candidates) != 0 {
+		t.Errorf("resolve_host 100.64.0.9 = %+v", r)
+	}
+	r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "twin"})
+	if len(r.Candidates) != 1 || r.Candidates[0].Name != "twin-open" {
+		t.Errorf("resolve_host twin candidates = %+v", r.Candidates)
+	}
+}
+
+// A denied host can still be another host's jump host. Its name, aliases
+// and address appear in no answer: not in ssh_problem when it has no usable
+// key, and not in check steps, errors or ssh's stderr when the connection
+// to it fails.
+func TestMCPHidesADeniedJumpHost(t *testing.T) {
+	e := newE2E(t)
+	e.addHost(t, "vault-secret", func(h *model.Host) {
+		h.AgentAccess, h.Aliases, h.Addresses, h.KeyID = "deny", []string{"vs-bastion"}, []string{"127.0.0.2"}, model.ID{}
+	})
+	e.addHost(t, "inner", func(h *model.Host) { h.JumpHostID = mustHost(t, e, "vault-secret").ItemID })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	e.addHost(t, "dead-bastion", func(h *model.Host) {
+		h.AgentAccess, h.Addresses, h.Port = "deny", []string{"127.0.0.2"}, uint32(deadPort)
+	})
+	e.addHost(t, "inner2", func(h *model.Host) { h.JumpHostID = mustHost(t, e, "dead-bastion").ItemID })
+	m := e.startMCP(t)
+
+	list := mcpCall[cli.MCPHosts](m, "list_hosts", map[string]any{"query": "inner"})
+	if len(list.Hosts) != 2 || !strings.Contains(list.Hosts[0].SSHProblem, "<hidden host>") {
+		t.Errorf("list_hosts inner = %+v", list.Hosts)
+	}
+	if r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "inner"}); r.Host == nil || !strings.Contains(r.Host.SSHProblem, "<hidden host>") {
+		t.Errorf("resolve_host inner = %+v", r)
+	}
+	if msg := m.mcpError("ssh_command", map[string]any{"host": "inner"}); !strings.Contains(msg, "<hidden host>") {
+		t.Errorf("ssh_command inner: %s", msg)
+	}
+	mcpCall[cli.CheckResult](m, "check_host", map[string]any{"host": "inner"})
+	c := mcpCall[cli.CheckResult](m, "check_host", map[string]any{"host": "inner2"})
+	if got := statuses(c); got["auth_ok"] != "fail" {
+		t.Errorf("check_host inner2 = %+v", c)
+	}
+	out := mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": []string{"inner", "inner2"}, "command": "echo ok", "timeout_s": 30})
+	res := execResults(t, out)
+	if r := res["inner"]; !strings.Contains(r.Error, "<hidden host>") {
+		t.Errorf("exec inner: %+v", r)
+	}
+	if r := res["inner2"]; r.ExitCode != 255 || !strings.Contains(r.Stderr, "<hidden host>") {
+		t.Errorf("exec inner2: %+v", r)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, raw := range m.raw {
+		for _, h := range []string{"vault-secret", "vs-bastion", "dead-bastion", "127.0.0.2"} {
+			if strings.Contains(raw, h) {
+				t.Errorf("an answer names %s: %.400s", h, raw)
+			}
+		}
+	}
+}
+
+// check_host's login is bounded like exec: an ssh that exits but leaves a
+// child holding stderr open (a ProxyJump ssh, say) does not hold the call.
+func TestMCPCheckHostIsBoundedWhenSSHLeavesAChild(t *testing.T) {
+	e := newE2E(t)
+	fake := filepath.Join(e.base, "lingering-ssh")
+	script := "#!/bin/sh\necho 'from ssh' >&2\nsleep 60 >/dev/null &\nexit 0\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := e.env(t, nil, nil, nil)
+	env.SSHBinary = fake
+	m := startMCP(t, env)
+	start := time.Now()
+	c := mcpCall[cli.CheckResult](m, "check_host", map[string]any{"host": "web-1"})
+	if d := time.Since(start); d > 15*time.Second {
+		t.Errorf("check_host took %s; a child holding stderr must not hold it", d)
+	}
+	if got := statuses(c); got["auth_ok"] != "pass" {
+		t.Errorf("check_host web-1 = %+v", c)
 	}
 }

@@ -43,7 +43,7 @@ For development, build with `-tags hopdev`: the vault is then a plaintext JSON f
 
 ## Using hop with AI agents (MCP)
 
-`hop mcp` is an MCP server on stdin and stdout for local agents such as Claude Code and Codex. It is a thin layer over the daemon, like every other command: it never opens the vault, and works the same on a local-only vault and a signed-in one. If the vault is locked or missing, a tool says so and names the fix (`hop unlock`, `hop init`); the server keeps running.
+`hop mcp` is an MCP server on stdin and stdout for local agents such as Claude Code and Codex. It is a thin layer over the daemon, like every other command: it never opens the vault, and works the same on a local-only vault and a signed-in one. If the vault is locked or missing, a tool says so and names the fix (`hop unlock`, `hop init`); the server keeps running. If no daemon is running, `hop mcp` starts one, without `HOP_DEVICE_PASSPHRASE`: on a device whose key file is sealed with a passphrase, that daemon comes up locked, and the tools say to run `hop unlock` from a terminal.
 
 Register it once with the client's own CLI:
 
@@ -66,20 +66,27 @@ Tools:
 | `check_host(host)` | The step-by-step diagnosis of `hop check`. |
 | `ssh_command(host)` | The `ssh -F ...` command line for an agent that has its own shell. |
 | `list_snippets()` | Saved commands and their `{{name}}` parameters. |
-| `run_snippet(name, hosts, params)` | Runs a snippet as `exec` does. Each value is quoted as one shell word; a missing or unknown parameter is refused. |
+| `run_snippet(name, hosts, params)` | Runs a snippet as `exec` does. Each value arrives as one word and is never read as shell code; a missing or unknown parameter is refused. The answer names the snippet; it does not show the command with the values filled in. |
 
-Commands run with no terminal, stdin closed, `PAGER=cat` and a timeout per host, so a password prompt fails instead of hanging. Use `sudo -n`. One host failing does not stop the others.
+Commands run with no terminal, stdin closed, `PAGER=cat` and a timeout per host, so a password prompt fails instead of hanging. Use `sudo -n`. One host failing does not stop the others. `exec` and `run_snippet` hand the command to the remote user's login shell, which must be POSIX `sh` compatible (sh, bash, dash, ksh, zsh). fish and csh quote differently, and are not supported.
 
-Snippets are saved with `hop snippet add restart --description "restart a unit" -- systemctl restart {{unit}}`. One word after `--` is a shell command line, as with ssh; several words are quoted one by one. Write a placeholder bare, outside quotes: hop quotes each value itself and refuses `'{{x}}'`. Snippets sync like hosts.
+Snippets are saved with `hop snippet add restart --description "restart a unit" -- systemctl restart {{unit}}`. One word after `--` is a shell command line, as with ssh; several words are quoted one by one. Snippets sync like hosts.
+
+A parameter's name is letters, digits and `_`, not starting with a digit. hop puts each value in a shell variable at the top of the script and the placeholder becomes a reference to it, so `systemctl restart {{unit}}` runs as `HOP_P_unit='...'; systemctl restart "${HOP_P_unit}"`. The value is never read as shell code: not in a word, a comment, a here-document or `$(...)`, whatever quotes, newlines or `$` it holds. Write a placeholder bare, outside quotes: hop refuses `'{{x}}'`, which would not expand, and `"{{x}}"`, which would nest the quotes. In a here-document body the variable's double quotes are printed with the value; to avoid them, assign it first (`v={{x}}`) and use `$v` in the body.
+
+A snippet's command is shown to agents by `list_snippets`, so keep secrets out of it: pass one as a parameter instead.
 
 Safety rules:
 
-- No tool or error returns a private key, a password, the Secret Key or any other secret. The daemon never sends them, and every answer is also scrubbed of private key blocks (from remote output too) and of the hop auth secrets the process started with.
-- A host with `agent_access: deny` is invisible to every tool: not listed, never resolved or offered as a candidate, skipped by `tag:`, and `exec`, `check_host` and `ssh_command` treat it as not found. Set it with `hop edit <host> --agent-access deny`.
+- hop never returns the vault's secret fields: private keys, credential passwords, the Secret Key, auth values. The daemon never sends them to `hop mcp`.
+- Command output (`stdout`, `stderr`) is what the remote printed. hop removes private key blocks from it, and the values of the hop auth secrets and `HOP_DEVICE_PASSPHRASE` the server started with, every non-empty value however short. This is best effort: a secret the remote prints in another form, or one hop does not know, passes through. Do not run commands that print secrets.
+- Snippet commands are shown to agents as they are; keep secrets out of them.
+- A host with `agent_access: deny` is invisible to every tool: not listed, never resolved or offered as a candidate, skipped by `tag:`, and `exec`, `check_host` and `ssh_command` treat it as not found. Its Tailscale node is left out of resolution too, so its Tailscale name or IP does not find it. Set it with `hop edit <host> --agent-access deny`.
+- A denied host can still be another host's jump host, and commands through it work. Its name stays hidden: the jump host shows as `(a host hidden from agents)`, and its names and addresses read `<hidden host>` in `ssh_problem`, check steps, errors and ssh's stderr. A name or address an allowed host also has is not hidden.
 - An agent never trusts a host key on first use. `exec` and `run_snippet` refuse a host with no pinned key, or one behind a jump host with none, and say to run `hop trust <host>`. ssh runs with `StrictHostKeyChecking yes` against the pinned keys only, so a changed key blocks the call.
-- Every `exec` and `run_snippet` is logged before and after it runs to `$XDG_STATE_HOME/hop/mcp-audit.jsonl` (mode 0600): time, tool, client name, hosts, command and exit codes, never output. If the log cannot be written, nothing runs.
+- Every `exec` and `run_snippet` is logged before and after it runs to `$XDG_STATE_HOME/hop/mcp-audit.jsonl` (mode 0600): time, tool, client name, hosts and exit codes, never output. For `exec` it logs the command the agent sent; for `run_snippet` the snippet's name and the names of the parameters, never their values. Every string is scrubbed as answers are, and control characters are written as escapes. If the log cannot be written, nothing runs.
 - `hop mcp --read-only` offers no tool that runs a command: no `exec`, no `run_snippet`, and `check_host` skips its login step.
-- The hop auth secrets (`HOP_PASSWORD` and the others) are removed from the server's environment and from ssh's.
+- The hop auth secrets (`HOP_PASSWORD` and the others) and `HOP_DEVICE_PASSPHRASE` are removed from the server's environment, from ssh's, and from a daemon the server starts.
 
 `agent_access: deny` is a guardrail for well-behaved agents, not a security boundary. An agent runs as you and can use your agent socket and unlocked daemon directly. For a real boundary, run the agent in a container or VM.
 

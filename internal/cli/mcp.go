@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"regexp"
 	"slices"
@@ -20,6 +21,7 @@ import (
 	"github.com/dalyem/hopkey/internal/resolve"
 	"github.com/dalyem/hopkey/internal/shellcmd"
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/tailscale"
 	"github.com/dalyem/hopkey/internal/version"
 )
 
@@ -35,8 +37,14 @@ import (
 //   - every exec and run_snippet is logged to mcpAuditFile before it runs
 //     and after, and nothing runs if the log cannot be written;
 //   - --read-only registers no tool that runs a command;
-//   - the hop auth secrets leave this process's environment, and every
-//     answer is scrubbed of them and of private key blocks.
+//   - the hop auth secrets and the device key passphrase leave this
+//     process's environment, so neither ssh nor a daemon it starts gets
+//     them;
+//   - no answer carries a vault secret field: the daemon sends none.
+//     Command output is the remote's, scrubbed best-effort of private key
+//     blocks and of the secret values this process was started with;
+//   - a denied host used as a jump host is named in no answer: its names
+//     and addresses are masked in diagnostics (hide).
 //
 // agent_access deny is a guardrail for well-behaved agents, not a security
 // boundary: an agent runs as the user, and can reach the agent socket.
@@ -57,7 +65,8 @@ const mcpInstructions = `hop reaches the user's SSH hosts from their HopKey vaul
 Find hosts with list_hosts or resolve_host; a target that is not an exact name, alias or address comes back as candidates, never as a guess.
 exec runs a non-interactive command: no terminal, stdin closed, a timeout per host. Use sudo -n, never plain sudo.
 exec refuses a host with no pinned host key; the user pins one from a terminal with hop trust <host>.
-Output keeps the last 64 KiB of stdout and of stderr per host.`
+Output keeps the last 64 KiB of stdout and of stderr per host.
+hop never returns the vault's secret fields (private keys, credential passwords, the Secret Key, auth values). Command output is what the remote printed; hop removes private key blocks and its own auth values from it on a best-effort basis, so it can still hold secrets the remote prints. Snippet commands are shown to agents as they are.`
 
 func runMCP(ctx context.Context, e *Env, args []string) error {
 	if len(args) > 0 && args[0] == "install" {
@@ -75,18 +84,22 @@ func runMCP(ctx context.Context, e *Env, args []string) error {
 		return failf("hop mcp takes no arguments")
 	}
 
-	// The hop auth secrets answer that command's prompts. hop mcp has none,
-	// so they leave its environment and its children's; their values are
-	// also scrubbed from every answer, as is the device key passphrase.
+	// The hop auth secrets answer that command's prompts, and the device
+	// key passphrase opens a sealed key file. hop mcp has no prompt and
+	// never opens the vault, so all of them leave its environment and its
+	// children's: ssh, and a daemon it starts, which then comes up locked
+	// on a sealed key file until the user runs hop unlock. Their values are
+	// also scrubbed from every answer.
+	scrubbed := append(slices.Clone(authSecretEnv), store.PassphraseEnv)
 	base := e.Environ
 	if base == nil {
 		base = os.Environ()
-		for _, name := range authSecretEnv {
+		for _, name := range scrubbed {
 			os.Unsetenv(name)
 		}
 	}
-	secrets := envValues(base, append(slices.Clone(authSecretEnv), store.PassphraseEnv)...)
-	e.Environ = withoutEnv(base, authSecretEnv...)
+	secrets := envValues(base, scrubbed...)
+	e.Environ = withoutEnv(base, scrubbed...)
 
 	// Stdout carries the protocol and nothing else; stdin is the client's.
 	in, out := e.Stdin, e.Stdout
@@ -139,6 +152,9 @@ type mcpServer struct {
 }
 
 func newMCPServer(e *Env, readOnly bool, secrets []string) *mcp.Server {
+	// Longest first, so a secret that contains another is replaced whole.
+	secrets = slices.Clone(secrets)
+	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
 	s := &mcpServer{e: e, readOnly: readOnly, secrets: secrets, audit: newAuditLog(e)}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "hop", Title: "HopKey", Version: version.Version},
 		&mcp.ServerOptions{Instructions: mcpInstructions})
@@ -163,7 +179,8 @@ func newMCPServer(e *Env, readOnly bool, secrets []string) *mcp.Server {
 		"Returns per host exit_code, stdout and stderr (each the last 64 KiB) and truncated, and an error when hop could not run the command. " +
 		"Hosts with no pinned host key are refused."}, s.exec)
 	addMCPTool(s, srv, &mcp.Tool{Name: "run_snippet", InputSchema: json.RawMessage(mcpRunSnippetSchema), Description: "Run a saved snippet on one " +
-		"or more hosts, as exec does. Each parameter value is quoted as one shell word; every parameter is required and unknown ones are refused."}, s.runSnippet)
+		"or more hosts, as exec does. Each parameter value is passed in a shell variable, never as shell code, and arrives as one word; every parameter is required " +
+		"and unknown ones are refused. Snippet commands are visible to agents, so they hold no secrets; pass one as a parameter instead."}, s.runSnippet)
 	return srv
 }
 
@@ -226,12 +243,15 @@ var (
 
 const redacted = "[redacted by hop]"
 
-// redact removes what must never reach an agent: the secret values this
-// process was started with, and private key blocks, including one cut
-// short at either end by the 64 KiB tail.
+// redact removes, best-effort, what must never reach an agent: the secret
+// values this process was started with (every non-empty one, however
+// short, so a short value is not handed over because it is short; such a
+// value also masks the same text where it is not a secret), and private
+// key blocks, including one cut short at either end by the 64 KiB tail. It
+// cannot catch a secret the remote prints in another form.
 func (s *mcpServer) redact(text string) string {
 	for _, v := range s.secrets {
-		if len(v) >= 6 {
+		if v != "" {
 			text = strings.ReplaceAll(text, v, redacted)
 		}
 	}
@@ -328,8 +348,156 @@ func (s *mcpServer) resolve(ctx context.Context, target string, l *daemon.ListRe
 	if rr.Host != nil && !visible(rr.Host.ItemID.String()) {
 		rr = daemon.ResolveResult{Result: &resolve.Result{Target: rr.Result.Target, User: rr.Result.User, Status: resolve.StatusNoMatch, Rule: resolve.RuleNone}}
 	}
-	rr.Result.Candidates = slices.DeleteFunc(rr.Result.Candidates, func(c resolve.Candidate) bool { return c.HostID != "" && !visible(c.HostID) })
+	// A tailnet node a denied host is linked to is that host by another
+	// name: the daemon leaves such nodes out, and so does this, for a
+	// daemon from before it did.
+	nodes := deniedNodes(l)
+	rr.Result.Candidates = slices.DeleteFunc(rr.Result.Candidates, func(c resolve.Candidate) bool {
+		return (c.HostID != "" && !visible(c.HostID)) || (c.NodeID != "" && nodes[c.NodeID])
+	})
+	rr.Result.Notes = slices.DeleteFunc(rr.Result.Notes, func(n string) bool {
+		for id := range nodes {
+			if strings.Contains(n, id) {
+				return true
+			}
+		}
+		return false
+	})
+	if rr.Result.Status == resolve.StatusAmbiguous && len(rr.Result.Candidates) == 0 {
+		rr.Result.Status, rr.Result.Rule, rr.Result.Matched = resolve.StatusNoMatch, resolve.RuleNone, ""
+	}
 	return &rr, nil
+}
+
+// deniedNodes is the stable IDs of the tailnet nodes that belong to hosts
+// agents may not use: linked by node ID or MagicDNS name, or holding one of
+// the host's addresses.
+func deniedNodes(l *daemon.ListResult) map[string]bool {
+	out := map[string]bool{}
+	for _, h := range l.Hosts {
+		if agentAllowed(h) {
+			continue
+		}
+		for _, n := range l.Tailscale.Nodes() {
+			if hostOwnsNode(h, n) {
+				out[n.ID] = true
+			}
+		}
+		if h.Tailscale != nil && h.Tailscale.StableNodeID != "" {
+			out[h.Tailscale.StableNodeID] = true
+		}
+	}
+	delete(out, "")
+	return out
+}
+
+func hostOwnsNode(h model.Host, n tailscale.Node) bool {
+	if t := h.Tailscale; t != nil {
+		if t.StableNodeID != "" && t.StableNodeID == n.ID {
+			return true
+		}
+		if t.DNSName != "" && strings.EqualFold(strings.TrimSuffix(t.DNSName, "."), strings.TrimSuffix(n.DNSName, ".")) {
+			return true
+		}
+	}
+	return slices.ContainsFunc(h.Addresses, func(a string) bool { return slices.Contains(n.IPs, strings.Trim(a, "[]")) })
+}
+
+// ---- hiding denied hosts in diagnostics ----
+
+// hiddenHost replaces a denied host's name or address in text an agent
+// sees.
+const hiddenHost = "<hidden host>"
+
+// masker hides the hosts agents may not use from diagnostics: ssh_problem,
+// check steps, errors and ssh's stderr. A denied host can still be another
+// host's jump host, and ssh and the daemon name it when it fails.
+type masker struct{ names []string }
+
+// newMasker collects what names the denied hosts: names, aliases,
+// addresses, and the Tailscale name, node ID and IPs of their nodes. A word
+// an allowed host is also known by is not hidden: it says nothing about
+// the denied host, and hiding it would garble the allowed host's answers.
+func newMasker(l *daemon.ListResult) masker {
+	known := func(h model.Host) []string {
+		out := append(resolve.Names(h), h.Addresses...)
+		for _, n := range l.Tailscale.Nodes() {
+			if hostOwnsNode(h, n) {
+				out = append(out, n.ID, n.HostName, n.DNSName, n.ShortName())
+				out = append(out, n.IPs...)
+			}
+		}
+		if t := h.Tailscale; t != nil {
+			out = append(out, t.StableNodeID, t.DNSName)
+		}
+		return out
+	}
+	allowed := map[string]bool{}
+	for _, h := range l.Hosts {
+		if agentAllowed(h) {
+			for _, n := range known(h) {
+				allowed[strings.ToLower(strings.Trim(n, "[]."))] = true
+			}
+		}
+	}
+	seen := map[string]bool{}
+	var m masker
+	for _, h := range l.Hosts {
+		if agentAllowed(h) {
+			continue
+		}
+		for _, n := range known(h) {
+			n = strings.Trim(n, "[].")
+			k := strings.ToLower(n)
+			if n == "" || allowed[k] || seen[k] {
+				continue
+			}
+			seen[k] = true
+			m.names = append(m.names, n)
+		}
+	}
+	slices.SortFunc(m.names, func(a, b string) int { return len(b) - len(a) })
+	return m
+}
+
+// hide replaces each hidden name in text, ignoring case, where it stands as
+// a whole word: not inside a longer name or address. keep is the agent's
+// own target, echoed back as it was given; hiding it would tell the agent
+// that it names a hidden host.
+func (m masker) hide(text, keep string) string {
+	if _, t, err := resolve.ParseTarget(keep); err == nil {
+		keep = t
+	}
+	for _, n := range m.names {
+		if strings.EqualFold(n, keep) {
+			continue
+		}
+		text = replaceWord(text, n, hiddenHost)
+	}
+	return text
+}
+
+func replaceWord(text, word, with string) string {
+	inWord := func(c byte) bool {
+		return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
+	}
+	var b strings.Builder
+	last := 0
+	for i := 0; i+len(word) <= len(text); {
+		end := i + len(word)
+		if strings.EqualFold(text[i:end], word) && (i == 0 || !inWord(text[i-1])) && (end == len(text) || !inWord(text[end])) {
+			b.WriteString(text[last:i])
+			b.WriteString(with)
+			last, i = end, end
+			continue
+		}
+		i++
+	}
+	if last == 0 {
+		return text
+	}
+	b.WriteString(text[last:])
+	return b.String()
 }
 
 func hostByID(l *daemon.ListResult, id model.ID) (model.Host, bool) {
@@ -386,12 +554,12 @@ func authType(h model.Host) string {
 	return "agent-only"
 }
 
-func agentHost(h model.Host, l *daemon.ListResult) AgentHost {
+func agentHost(h model.Host, l *daemon.ListResult, m masker) AgentHost {
 	v := hostView(h, l)
 	a := AgentHost{
 		Name: v.Name, Aliases: v.Aliases, Addresses: v.Addresses, User: v.User, Port: v.Port, Tags: v.Tags,
 		Description: v.Description, Auth: authType(h), Route: v.Route, HostKeyPinned: len(v.HostKeys) > 0,
-		HostKeys: v.HostKeys, SSHAlias: v.SSHAlias, SSHProblem: v.SSHProblem, Sync: v.Mark,
+		HostKeys: v.HostKeys, SSHAlias: v.SSHAlias, SSHProblem: m.hide(v.SSHProblem, ""), Sync: v.Mark,
 	}
 	if v.Key != nil {
 		a.Key = v.Key.Name
@@ -429,6 +597,7 @@ func (s *mcpServer) listHosts(ctx context.Context, _ *mcp.CallToolRequest, in mc
 	}
 	q := strings.ToLower(strings.TrimSpace(in.Query))
 	out := MCPHosts{Hosts: []AgentHost{}}
+	m := newMasker(l)
 	for _, h := range l.Hosts {
 		if !agentAllowed(h) {
 			continue
@@ -445,7 +614,7 @@ func (s *mcpServer) listHosts(ctx context.Context, _ *mcp.CallToolRequest, in mc
 				continue
 			}
 		}
-		out.Hosts = append(out.Hosts, agentHost(h, l))
+		out.Hosts = append(out.Hosts, agentHost(h, l, m))
 	}
 	slices.SortFunc(out.Hosts, func(a, b AgentHost) int { return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)) })
 	return out, nil
@@ -482,15 +651,19 @@ func (s *mcpServer) resolveHost(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return MCPResolution{}, err
 	}
 	w := whichResult(rr)
+	m := newMasker(l)
 	out := MCPResolution{
-		Target: w.Target, User: w.User, Status: w.Status, Rule: w.Rule, Matched: w.Matched, Route: w.Route,
-		RouteError: w.RouteError, Candidates: w.Candidates, Notes: w.Notes,
+		Target: w.Target, User: w.User, Status: w.Status, Rule: w.Rule, Matched: m.hide(w.Matched, in.Target), Route: w.Route,
+		RouteError: m.hide(w.RouteError, in.Target), Candidates: w.Candidates,
+	}
+	for _, n := range w.Notes {
+		out.Notes = append(out.Notes, m.hide(n, in.Target))
 	}
 	if out.Candidates == nil {
 		out.Candidates = []resolve.Candidate{}
 	}
 	if rr.Host != nil {
-		h := agentHost(*rr.Host, l)
+		h := agentHost(*rr.Host, l, m)
 		out.Host = &h
 	}
 	return out, nil
@@ -513,6 +686,10 @@ func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mc
 	}
 	out := CheckResult{Target: in.Host, Host: rr.Result.HostName}
 	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly)
+	m := newMasker(l)
+	for i := range out.Steps {
+		out.Steps[i].Detail = m.hide(out.Steps[i].Detail, in.Host)
+	}
 	return out, nil
 }
 
@@ -535,7 +712,7 @@ func (s *mcpServer) sshCommand(ctx context.Context, _ *mcp.CallToolRequest, in m
 	}
 	t, err := connectable(rr)
 	if err != nil {
-		return MCPSSHCommand{}, err
+		return MCPSSHCommand{}, failMsg(newMasker(l).hide(err.Error(), in.Host))
 	}
 	addr, _ := chooseAddress(ctx, s.e, t)
 	argv := append([]string{"ssh"}, s.e.sshArgs(t, addr)...)
@@ -587,9 +764,12 @@ type mcpRunSnippetIn struct {
 }
 
 // MCPExec answers exec and run_snippet: one result per host, in the order
-// the hosts were given (a tag's hosts by name).
+// the hosts were given (a tag's hosts by name). exec echoes the command;
+// run_snippet names the snippet, and never shows the command with the
+// parameters filled in.
 type MCPExec struct {
-	Command string       `json:"command"`
+	Command string       `json:"command,omitempty"`
+	Snippet string       `json:"snippet,omitempty"`
 	Results []ExecResult `json:"results"`
 	// Warning is set when the command ran but its end could not be logged.
 	Warning string `json:"warning,omitempty"`
@@ -649,7 +829,11 @@ func (s *mcpServer) exec(ctx context.Context, req *mcp.CallToolRequest, in mcpEx
 	if err != nil {
 		return MCPExec{}, err
 	}
-	return s.run(ctx, req, l, "exec", "", targets, in.Command, timeout)
+	// The audit log records the command as the agent sent it: that is
+	// what it is for. redact scrubs what it can.
+	out, err := s.run(ctx, req, l, auditEntry{Tool: "exec", Command: in.Command}, targets, mcpEnvPrefix+in.Command, timeout)
+	out.Command = in.Command
+	return out, err
 }
 
 func (s *mcpServer) runSnippet(ctx context.Context, req *mcp.CallToolRequest, in mcpRunSnippetIn) (MCPExec, error) {
@@ -669,18 +853,26 @@ func (s *mcpServer) runSnippet(ctx context.Context, req *mcp.CallToolRequest, in
 	if err != nil {
 		return MCPExec{}, err
 	}
-	command, err := shellcmd.Render(sn.Command, in.Params)
+	script, err := shellcmd.Render(sn.Command, in.Params)
 	if err != nil {
 		return MCPExec{}, failf("snippet %s: %v", sn.Name, err)
 	}
-	return s.run(ctx, req, l, "run_snippet", sn.Name, targets, command, timeout)
+	// A value can be a password (PGPASSWORD={{password}}), so neither the
+	// values nor the filled-in command go to the audit log or the answer:
+	// the snippet's name and the parameters' names do.
+	params := slices.Sorted(maps.Keys(in.Params))
+	entry := auditEntry{Tool: "run_snippet", Snippet: sn.Name, Params: params}
+	out, err := s.run(ctx, req, l, entry, targets, script.Assign+mcpEnvPrefix+script.Body, timeout)
+	out.Snippet = sn.Name
+	return out, err
 }
 
 // execStep is one host an exec runs on, or why it will not.
 type execStep struct {
-	host string // the host's name, or the target as given when it did not resolve
-	t    *target
-	err  error
+	host  string // the host's name, or the target as given when it did not resolve
+	given string // the target as given, or the host's name for a tag's host
+	t     *target
+	err   error
 }
 
 // plan expands tag: targets to the hosts agents may use, resolves each one
@@ -693,7 +885,7 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 	for _, tg := range targets {
 		tag, ok := strings.CutPrefix(tg, "tag:")
 		if !ok {
-			items = append(items, execStep{host: tg})
+			items = append(items, execStep{host: tg, given: tg})
 			continue
 		}
 		var tagged []string
@@ -703,11 +895,11 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 			}
 		}
 		if len(tagged) == 0 {
-			items = append(items, execStep{host: tg, err: failf("no host has the tag %q", tag)})
+			items = append(items, execStep{host: tg, given: tg, err: failf("no host has the tag %q", tag)})
 		}
 		slices.SortFunc(tagged, func(a, b string) int { return strings.Compare(strings.ToLower(a), strings.ToLower(b)) })
 		for _, n := range tagged {
-			items = append(items, execStep{host: n})
+			items = append(items, execStep{host: n, given: n})
 		}
 	}
 	if len(items) > mcpMaxHosts {
@@ -726,7 +918,7 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 		}
 		t, err := runnable(rr, l)
 		if err != nil {
-			steps = append(steps, execStep{host: it.host, err: err})
+			steps = append(steps, execStep{host: it.host, given: it.given, err: err})
 			continue
 		}
 		key := rr.Host.ItemID.String() + "\x00" + t.user
@@ -734,7 +926,7 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 			continue // named twice, or by name and by tag: run it once
 		}
 		seen[key] = true
-		steps = append(steps, execStep{host: rr.Result.HostName, t: t})
+		steps = append(steps, execStep{host: rr.Result.HostName, given: it.given, t: t})
 	}
 	return steps, nil
 }
@@ -768,28 +960,37 @@ func runnable(rr *daemon.ResolveResult, l *daemon.ListResult) (*target, error) {
 	return connectable(rr)
 }
 
-func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon.ListResult, tool, snippet string, targets []string, command string, timeout time.Duration) (MCPExec, error) {
+// run runs script on targets, logging entry (Tool, and Command or Snippet
+// and Params, filled in) before and after. Every string the log records
+// passes through auditText.
+func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon.ListResult, entry auditEntry, targets []string, script string, timeout time.Duration) (MCPExec, error) {
 	steps, err := s.plan(ctx, l, targets)
 	if err != nil {
 		return MCPExec{}, err
 	}
-	entry := auditEntry{Tool: tool, Snippet: snippet, Command: s.redact(command), Hosts: []string{}, TimeoutS: int(timeout / time.Second)}
+	entry.Command = s.auditText(entry.Command)
+	entry.Snippet = s.auditText(entry.Snippet)
+	for i, p := range entry.Params {
+		entry.Params[i] = s.auditText(p)
+	}
+	entry.Hosts, entry.TimeoutS = []string{}, int(timeout/time.Second)
 	if ci := req.ClientInfo(); ci != nil {
-		entry.Client, entry.ClientVersion = ci.Name, ci.Version
+		entry.Client, entry.ClientVersion = s.auditText(ci.Name), s.auditText(ci.Version)
 	}
 	for _, st := range steps {
-		entry.Hosts = append(entry.Hosts, st.host)
+		entry.Hosts = append(entry.Hosts, s.auditText(st.host))
 	}
 	if err := s.audit.start(&entry); err != nil {
 		return MCPExec{}, failf("nothing was run: the audit log could not be written (%v), and hop mcp runs nothing it cannot log", err)
 	}
 
-	out := MCPExec{Command: command, Results: make([]ExecResult, len(steps))}
+	out := MCPExec{Results: make([]ExecResult, len(steps))}
 	sem := make(chan struct{}, mcpParallel)
 	var wg sync.WaitGroup
+	m := newMasker(l)
 	for i, st := range steps {
 		if st.err != nil {
-			out.Results[i] = ExecResult{Host: st.host, ExitCode: ExitFailure, Error: st.err.Error()}
+			out.Results[i] = ExecResult{Host: st.host, ExitCode: ExitFailure, Error: m.hide(st.err.Error(), st.given)}
 			continue
 		}
 		wg.Add(1)
@@ -797,17 +998,26 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out.Results[i] = s.runOne(ctx, st.t, mcpEnvPrefix+command, timeout)
+			r := s.runOne(ctx, st.t, script, timeout)
+			// stderr has ssh's own messages, which name a jump host that
+			// failed; stdout is the command's alone.
+			r.Error, r.Stderr = m.hide(r.Error, st.given), m.hide(r.Stderr, st.given)
+			out.Results[i] = r
 		}()
 	}
 	wg.Wait()
 
-	if err := s.audit.end(&entry, out.Results, s.redact); err != nil {
+	if err := s.audit.end(&entry, out.Results, s.auditText); err != nil {
 		out.Warning = safef("the command ran, but the end of the run could not be written to the audit log: %v", err)
 		fmt.Fprintf(s.e.Stderr, "hop mcp: warning: %s\n", oneLine(out.Warning))
 	}
 	return out, nil
 }
+
+// auditText is a string as the audit log records it: redacted, and with
+// every control character written as an escape, so the log holds no
+// secret hop knows of and nothing a terminal would act on.
+func (s *mcpServer) auditText(text string) string { return exact(s.redact(text)) }
 
 func (s *mcpServer) runOne(ctx context.Context, t *target, command string, timeout time.Duration) ExecResult {
 	addr, _ := chooseAddress(ctx, s.e, t)

@@ -383,6 +383,9 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	var ee *exec.ExitError
 	switch {
 	case runErr == nil:
+	case errors.Is(runErr, exec.ErrWaitDelay):
+		// ssh exited 0, but something it started (a ProxyJump ssh, say)
+		// still held its output open, and WaitDelay cut that off.
 	case r.timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		res.ExitCode = ExitFailure
 		res.Error = fmt.Sprintf("timed out after %s", r.timeout)
@@ -652,6 +655,9 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 	return nil
 }
 
+// authCheckTimeout bounds hop check's login, ssh's own start included.
+const authCheckTimeout = 20 * time.Second
+
 // diagnose runs hop check's steps for rr, in order, and says whether they
 // all passed. Without login the last step, which logs in with ssh and runs
 // true there, is skipped.
@@ -749,18 +755,21 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		if err != nil {
 			return stepFail, err.Error() // composed by failf/failMsg: already display-safe
 		}
-		actx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		sshArgs := e.sshArgs(t, addr, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
-		cmd := exec.CommandContext(actx, e.sshBinary(), append(sshArgs, "true")...)
-		cmd.Env = e.sshEnviron()
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
+		// runRemote bounds it: stdin closed, output capped, and WaitDelay,
+		// so a ProxyJump child that keeps stderr open cannot hold it past
+		// the timeout.
+		res, err := e.runRemote(ctx, t, addr, remoteRun{command: "true", timeout: authCheckTimeout})
+		if err != nil {
+			return stepFail, err.Error() // composed by failf: already display-safe
+		}
+		if res.ExitCode != 0 || res.Error != "" {
 			// ssh's stderr is remote text; lastLines makes each line safe.
-			msg := strings.TrimSpace(stderr.String())
+			msg := strings.TrimSpace(res.Stderr)
 			if msg == "" {
-				msg = err.Error()
+				msg = res.Error
+			}
+			if msg == "" {
+				msg = fmt.Sprintf("exit status %d", res.ExitCode)
 			}
 			return stepFail, "ssh did not log in: " + lastLines(msg, 3)
 		}

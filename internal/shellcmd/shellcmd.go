@@ -2,6 +2,14 @@
 // it finds and fills the {{name}} parameters of a saved snippet. The daemon
 // uses it to check a snippet before saving it, and the CLI to run one, so
 // both read a command the same way.
+//
+// A parameter's value never becomes shell source. Render assigns each value,
+// single-quoted, to a variable at the top of the script (HOP_P_unit='...';)
+// and puts "${HOP_P_unit}" where {{unit}} was. The shell expands a variable
+// without reading its value as code, so a value cannot run anything wherever
+// the placeholder stands: in a word, a comment, a here-document or $(...).
+// The remote login shell must be POSIX sh compatible (sh, bash, dash, zsh,
+// ksh); fish and csh quote differently.
 package shellcmd
 
 import (
@@ -39,12 +47,20 @@ const (
 )
 
 // placeholderRe matches {{name}}, with optional spaces inside the braces.
+// It also takes a '-' in the name, so that Placeholders can refuse one
+// instead of leaving it in the command as text.
 var placeholderRe = regexp.MustCompile(`\{\{\s*([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}`)
+
+// ParamVar is the shell variable that holds parameter name's value. A name
+// is letters, digits and '_', not starting with a digit, so it is always a
+// valid variable name.
+func ParamVar(name string) string { return "HOP_P_" + name }
 
 // Placeholders returns the parameter names in command, each once, in the
 // order they first appear. A placeholder must stand outside quotes and not
-// after a backslash: Render puts a quoted word in its place, and inside
-// quotes that word would not be one word any more.
+// after a backslash: Render puts "${HOP_P_name}" in its place, which inside
+// single quotes would not expand, and inside double quotes would nest the
+// quotes.
 func Placeholders(command string) ([]string, error) {
 	quoted := quotedBytes(command)
 	var names []string
@@ -53,6 +69,9 @@ func Placeholders(command string) ([]string, error) {
 		name := command[m[2]:m[3]]
 		if quoted[m[0]] {
 			return nil, fmt.Errorf("{{%s}} is inside quotes or after a backslash; write it bare, since hop quotes each value itself", name)
+		}
+		if strings.Contains(name, "-") {
+			return nil, fmt.Errorf("parameter name %q has a '-'; use letters, digits and '_'", name)
 		}
 		if len(name) > MaxParamName {
 			return nil, fmt.Errorf("parameter name %q is longer than %d characters", name, MaxParamName)
@@ -70,7 +89,11 @@ func Placeholders(command string) ([]string, error) {
 
 // quotedBytes reports, for each byte of s, whether a POSIX shell reads it
 // inside single or double quotes or right after a backslash. It follows the
-// quoting rules only, which is all Placeholders needs.
+// quoting rules and skips comments (so an apostrophe in one does not open a
+// quote), which is all Placeholders needs. It does not know here-documents:
+// a quote character in one is taken as a quote. Getting it wrong can only
+// refuse a placeholder, or leave a value's quotes visible; Render never puts
+// a value into the command, so it cannot make one run.
 func quotedBytes(s string) []bool {
 	out := make([]bool, len(s))
 	const (
@@ -93,6 +116,14 @@ func quotedBytes(s string) []bool {
 				state = single
 			case '"':
 				state = double
+			case '#':
+				// A comment, when # starts a word. It runs to the end of
+				// the line, and nothing in it is quoted.
+				if i == 0 || strings.IndexByte(" \t\n;&|()<>", s[i-1]) >= 0 {
+					for i+1 < len(s) && s[i+1] != '\n' {
+						i++
+					}
+				}
 			}
 		case single:
 			out[i] = true
@@ -115,14 +146,32 @@ func quotedBytes(s string) []bool {
 	return out
 }
 
-// Render fills command's placeholders from values, each value quoted as one
-// word. Every placeholder needs a value and every value a placeholder:
-// anything else is refused, so a misspelt name never runs a half-filled
-// command.
-func Render(command string, values map[string]string) (string, error) {
+// Script is a rendered snippet. Assign sets one variable per parameter to
+// its value, single-quoted, and Body is the snippet's command with each
+// {{name}} replaced by "${HOP_P_name}". A caller may put shell text of its
+// own between the two; Assign must come first.
+type Script struct {
+	Assign string // HOP_P_a='...'; HOP_P_b='...'; (empty with no parameters)
+	Body   string
+}
+
+// String is the script to run: Assign, then Body.
+func (s Script) String() string { return s.Assign + s.Body }
+
+// Render fills command's placeholders from values. Every placeholder needs a
+// value and every value a placeholder: anything else is refused, so a
+// misspelt name never runs a half-filled command.
+//
+// A value reaches the shell only inside a single-quoted assignment at the
+// top level of the script, so here-documents, comments, newlines, $(...)
+// and backticks in the template or the value cannot make it run. In a
+// here-document body the double quotes around ${HOP_P_name} are printed
+// with the value; assign it to a variable first (v={{x}}) and use $v there
+// to avoid them.
+func Render(command string, values map[string]string) (Script, error) {
 	names, err := Placeholders(command)
 	if err != nil {
-		return "", err
+		return Script{}, err
 	}
 	want := map[string]bool{}
 	var missing []string
@@ -139,20 +188,24 @@ func Render(command string, values map[string]string) (string, error) {
 		}
 	}
 	if len(unknown) > 0 {
-		return "", fmt.Errorf("unknown parameter(s) %s; this snippet takes %s", strings.Join(slices.Sorted(slices.Values(unknown)), ", "), paramList(names))
+		return Script{}, fmt.Errorf("unknown parameter(s) %s; this snippet takes %s", strings.Join(slices.Sorted(slices.Values(unknown)), ", "), paramList(names))
 	}
 	if len(missing) > 0 {
-		return "", fmt.Errorf("missing parameter(s) %s; this snippet takes %s", strings.Join(missing, ", "), paramList(names))
+		return Script{}, fmt.Errorf("missing parameter(s) %s; this snippet takes %s", strings.Join(missing, ", "), paramList(names))
 	}
-	for n, v := range values {
-		if strings.ContainsRune(v, 0) {
-			return "", fmt.Errorf("the value of %s contains a NUL byte", n)
+	var assign strings.Builder
+	for _, n := range names {
+		if strings.ContainsRune(values[n], 0) {
+			return Script{}, fmt.Errorf("the value of %s contains a NUL byte", n)
 		}
+		// Always single-quoted, even a plain word, so not even a leading
+		// tilde is expanded.
+		fmt.Fprintf(&assign, "%s='%s'; ", ParamVar(n), strings.ReplaceAll(values[n], "'", `'\''`))
 	}
-	return placeholderRe.ReplaceAllStringFunc(command, func(m string) string {
-		name := placeholderRe.FindStringSubmatch(m)[1]
-		return Quote(values[name])
-	}), nil
+	body := placeholderRe.ReplaceAllStringFunc(command, func(m string) string {
+		return `"${` + ParamVar(placeholderRe.FindStringSubmatch(m)[1]) + `}"`
+	})
+	return Script{Assign: assign.String(), Body: body}, nil
 }
 
 func paramList(names []string) string {

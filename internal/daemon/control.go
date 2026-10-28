@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/sshkeys"
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/tailscale"
 )
 
 const maxRequest = 4 << 20 // bytes in one request line
@@ -329,6 +331,9 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 	}
 	ts := d.tsStatus(ctx)
 	in := resolve.Input{Target: p.Target, Hosts: resolvable(snap.Hosts, p.AgentOnly), Tailscale: ts, Interactive: p.Interactive}
+	if p.AgentOnly {
+		in.Tailscale = agentTailnet(ts, snap.Hosts)
+	}
 	res, err := resolve.Resolve(ctx, in)
 	if err != nil {
 		return nil, invalidf("%v", err)
@@ -345,6 +350,9 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 			return nil, d.configStale(st.configErr)
 		}
 		in.Hosts = resolvable(snap.Hosts, p.AgentOnly)
+		if p.AgentOnly {
+			in.Tailscale = agentTailnet(ts, snap.Hosts)
+		}
 		if res, err = resolve.Resolve(ctx, in); err != nil {
 			return nil, invalidf("%v", err)
 		}
@@ -382,6 +390,55 @@ func resolvable(hosts []model.Host, agentOnly bool) []model.Host {
 		return h.AgentAccess != "allow" && h.AgentAccess != ""
 	})
 }
+
+// agentTailnet is ts without the nodes of the hosts local agents may not
+// use, for agent_only resolution: otherwise a denied host's node would come
+// back as an unlinked node, by its Tailscale name or IP, in a note or among
+// the candidates. A node is a denied host's when the host is linked to it
+// (stable node ID or MagicDNS name) or lists one of its Tailscale IPs as an
+// address; such a node is left out even if an allowed host is linked to it
+// too. The route of a matched host is still chosen with the whole of ts.
+func agentTailnet(ts *tailscale.Status, hosts []model.Host) *tailscale.Status {
+	if ts == nil || !ts.Available {
+		return ts
+	}
+	ids, names, addrs := map[string]bool{}, map[string]bool{}, map[netip.Addr]bool{}
+	for _, h := range hosts {
+		if h.AgentAccess == "allow" || h.AgentAccess == "" {
+			continue
+		}
+		if t := h.Tailscale; t != nil {
+			if t.StableNodeID != "" {
+				ids[t.StableNodeID] = true
+			}
+			if t.DNSName != "" {
+				names[normDNS(t.DNSName)] = true
+			}
+		}
+		for _, a := range h.Addresses {
+			if ip, err := netip.ParseAddr(strings.Trim(a, "[]")); err == nil {
+				addrs[ip.Unmap().WithZone("")] = true
+			}
+		}
+	}
+	denied := func(n tailscale.Node) bool {
+		if ids[n.ID] || (n.DNSName != "" && names[normDNS(n.DNSName)]) {
+			return true
+		}
+		return slices.ContainsFunc(n.IPs, func(s string) bool {
+			ip, err := netip.ParseAddr(s)
+			return err == nil && addrs[ip.Unmap().WithZone("")]
+		})
+	}
+	out := *ts
+	if denied(out.Self) {
+		out.Self = tailscale.Node{Self: true}
+	}
+	out.Peers = slices.DeleteFunc(slices.Clone(ts.Peers), denied)
+	return &out
+}
+
+func normDNS(s string) string { return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), ".")) }
 
 // checkHostInput fills defaults and refuses a host the ssh config could not
 // represent or that would share a name with another host.

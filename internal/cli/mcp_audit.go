@@ -16,7 +16,10 @@ import (
 // object per line, appended to mcpAuditFile in the state directory, mode
 // 0600. A run writes a "start" line before anything runs and an "end" line
 // with each host's exit code after. It records what ran where and for which
-// client, never the output. The file is never rotated or truncated by hop.
+// client, never the output: for exec the command the agent sent, for
+// run_snippet the snippet's name and the names of the parameters it was
+// given, never their values. Every string is redacted and escaped
+// (auditText). The file is never rotated or truncated by hop.
 type auditLog struct {
 	mu   sync.Mutex
 	path string
@@ -35,8 +38,9 @@ type auditEntry struct {
 	Client        string        `json:"client,omitempty"`
 	ClientVersion string        `json:"client_version,omitempty"`
 	Snippet       string        `json:"snippet,omitempty"`
+	Params        []string      `json:"params,omitempty"` // run_snippet: names only
 	Hosts         []string      `json:"hosts"`
-	Command       string        `json:"command"`
+	Command       string        `json:"command,omitempty"` // exec only
 	TimeoutS      int           `json:"timeout_s"`
 	Results       []auditResult `json:"results,omitempty"` // end only
 }
@@ -55,13 +59,13 @@ func (a *auditLog) start(entry *auditEntry) error {
 	return a.append(*entry)
 }
 
-// end logs the results: exit codes and hop's own errors, which redact
-// scrubs as it does every answer. Output is not logged.
-func (a *auditLog) end(entry *auditEntry, results []ExecResult, redact func(string) string) error {
+// end logs the results: exit codes and hop's own errors, through clean
+// (auditText). Output is not logged.
+func (a *auditLog) end(entry *auditEntry, results []ExecResult, clean func(string) string) error {
 	end := *entry
 	end.Event = "end"
 	for _, r := range results {
-		end.Results = append(end.Results, auditResult{Host: r.Host, ExitCode: r.ExitCode, Error: redact(r.Error), DurationMS: r.DurationMS})
+		end.Results = append(end.Results, auditResult{Host: clean(r.Host), ExitCode: r.ExitCode, Error: clean(r.Error), DurationMS: r.DurationMS})
 	}
 	return a.append(end)
 }

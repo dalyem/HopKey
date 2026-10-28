@@ -13,7 +13,8 @@ import (
 )
 
 // Snippets are saved commands with {{name}} parameters. hop snippet keeps
-// them; hop mcp runs them (run_snippet), quoting each parameter's value.
+// them; hop mcp runs them (run_snippet), passing each parameter's value in
+// a shell variable (shellcmd.Render).
 
 func runSnippet(ctx context.Context, e *Env, args []string) error {
 	if len(args) == 0 {
@@ -54,8 +55,8 @@ func runSnippetAdd(ctx context.Context, e *Env, args []string) error {
 	desc := fs.String("description", "", "what the snippet does, for people and agents")
 	asJSON := fs.Bool("json", false, "print the saved snippet as JSON")
 	helpNote(e, fs, "\nOne word after -- is a shell command line, as with ssh: hop snippet add df -- 'df -h {{path}}'.\n"+
-		"Several words are quoted one by one. A {{name}} placeholder becomes one quoted word when the snippet runs,\n"+
-		"so write it bare, outside quotes.\n")
+		"Several words are quoted one by one. A {{name}} placeholder (letters, digits and _) is filled from a shell variable\n"+
+		"when the snippet runs, so its value is never read as shell code; write it bare, outside quotes.\n")
 	pos, rest, err := parseFlags(fs, args)
 	if err != nil {
 		return err
