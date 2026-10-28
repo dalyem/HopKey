@@ -952,11 +952,32 @@ func TestWipeIfDecidesAndFinishesUnderTheLock(t *testing.T) {
 		t.Fatalf("owed: %v, done ran %v", err, doneRan)
 	}
 
-	// A directory that was never made: done still runs, if owed.
+	// A directory that was never made: owed and done still run under the
+	// lock, or a cleanup that stalled there could clear the marker of a
+	// logout that came after it.
 	gone := opts
 	gone.Dir = filepath.Join(t.TempDir(), "never")
+	goneLocked := func() bool {
+		f, err := filelock.TryLock(filepath.Join(gone.Dir, lockName))
+		if err == nil {
+			f.Close()
+		}
+		return errors.Is(err, filelock.ErrLocked)
+	}
 	doneRan = false
-	if err := WipeIf(gone, func() (bool, error) { return true, nil }, func() error { doneRan = true; return nil }); err != nil || !doneRan {
+	err = WipeIf(gone, func() (bool, error) {
+		if !goneLocked() {
+			t.Error("owed ran without config.lock in a missing directory")
+		}
+		return true, nil
+	}, func() error {
+		if !goneLocked() {
+			t.Error("done ran without config.lock in a missing directory")
+		}
+		doneRan = true
+		return nil
+	})
+	if err != nil || !doneRan {
 		t.Errorf("a missing directory: %v, done ran %v", err, doneRan)
 	}
 }

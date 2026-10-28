@@ -216,31 +216,33 @@ func Wipe(opts Options) error { return WipeIf(opts, nil, nil) }
 // Write that comes after done can never be wiped by a decision taken
 // before it: a writer that must not follow a pending wipe clears, under
 // this lock, what owed reads (owed true and done after it), and only then
-// writes. A directory that does not exist has nothing to wipe: owed and
-// done still run, without the lock.
+// writes. With owed or done, a directory that does not exist is made, so
+// they run under the lock too: a writer can make the directory while they
+// run, and a later logout can set the marker done clears.
 func WipeIf(opts Options, owed func() (bool, error), done func() error) error {
 	if !filepath.IsAbs(opts.Dir) {
 		return fmt.Errorf("sshconfig: path %q is not absolute", opts.Dir)
 	}
-	wipe := func() error { return nil }
-	if _, err := os.Lstat(opts.Dir); !errors.Is(err, os.ErrNotExist) {
-		dir, err := safepath.EnsurePrivateDir(opts.Dir)
-		if err != nil {
-			return fmt.Errorf("sshconfig: %w", err)
+	if owed == nil && done == nil {
+		if _, err := os.Lstat(opts.Dir); errors.Is(err, os.ErrNotExist) {
+			return nil // nothing to wipe and nothing decided
 		}
-		lock, err := filelock.Lock(filepath.Join(dir, lockName))
-		if err != nil {
-			return fmt.Errorf("sshconfig: %w", err)
-		}
-		defer lock.Close()
-		wipe = func() error { return wipeLocked(opts, dir) }
 	}
+	dir, err := safepath.EnsurePrivateDir(opts.Dir)
+	if err != nil {
+		return fmt.Errorf("sshconfig: %w", err)
+	}
+	lock, err := filelock.Lock(filepath.Join(dir, lockName))
+	if err != nil {
+		return fmt.Errorf("sshconfig: %w", err)
+	}
+	defer lock.Close()
 	if owed != nil {
 		if ok, err := owed(); err != nil || !ok {
 			return err
 		}
 	}
-	if err := wipe(); err != nil {
+	if err := wipeLocked(opts, dir); err != nil {
 		return err
 	}
 	if done != nil {
