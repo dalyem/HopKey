@@ -73,6 +73,9 @@ func (r *revocableStore) Info() store.Info {
 
 func (r *revocableStore) Lock()                        {}
 func (r *revocableStore) Unlock(context.Context) error { return r.err() }
+func (r *revocableStore) UnlockWithPassphrase(context.Context, []byte) error {
+	return r.err()
+}
 func (r *revocableStore) UnlockWithPassword(context.Context, []byte, string) error {
 	return r.err()
 }

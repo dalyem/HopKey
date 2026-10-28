@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1240,5 +1241,234 @@ func TestPullEquivocation(t *testing.T) {
 	behind.entries, behind.hashes = behind.entries[:len(behind.entries)-1], behind.hashes[:len(behind.hashes)-1]
 	if err := c.Pull(ctx, behind); !errors.Is(err, ErrServerBehind) {
 		t.Errorf("pull from a server that lost an entry: %v", err)
+	}
+}
+
+// An edit that replaces another device's description is reported once,
+// when verified history settles its candidate, whichever call does that:
+// the push after one whose answer was lost, a pull, or a push after a
+// restart, including a re-post of a candidate that had not committed.
+func TestReplacementIsReportedWhenVerifiedHistorySettlesIt(t *testing.T) {
+	reopen := func(t *testing.T, p *pair) *Store {
+		t.Helper()
+		if err := p.a.s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return open(t, p.a.cfg)
+	}
+	for _, tc := range []struct {
+		name   string
+		commit bool // whether the post whose answer is lost commits
+		settle func(t *testing.T, p *pair) *Store
+	}{
+		{"the next push", true, func(t *testing.T, p *pair) *Store { pushAll(t, p.a.s, p.r); return p.a.s }},
+		{"a pull", true, func(t *testing.T, p *pair) *Store { pull(t, p.a.s, p.r); return p.a.s }},
+		{"a push after a restart", true, func(t *testing.T, p *pair) *Store { a := reopen(t, p); pushAll(t, a, p.r); return a }},
+		{"a re-post after a restart", false, func(t *testing.T, p *pair) *Store { a := reopen(t, p); pushAll(t, a, p.r); return a }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPair(t)
+			a, b := p.a.s, p.b.s
+			editHost(t, b, p.host.ItemID, func(h *model.Host) { h.Description = "from B" })
+			pushAll(t, b, p.r)
+			editHost(t, a, p.host.ItemID, func(h *model.Host) { h.Description = "from A" })
+			p.r.onPost = func(*vaultlog.Wire) (bool, error) { return tc.commit, errLostResponse }
+			if _, err := a.PushHead(context.Background(), p.r); !errors.Is(err, errLostResponse) {
+				t.Fatalf("push with a lost answer: %v", err)
+			}
+			p.r.onPost = nil
+			if got := takeReplacements(t, a); len(got) != 0 {
+				t.Errorf("reported before verified history settled it: %+v", got)
+			}
+
+			s := tc.settle(t, p)
+			if len(records(t, s)) != 0 {
+				t.Fatal("the edit is still queued")
+			}
+			got := takeReplacements(t, s)
+			if len(got) != 1 || got[0].ItemID != p.host.ItemID || got[0].Type != model.TypeHost || got[0].Name != "web" ||
+				!slices.Equal(got[0].Fields, []string{"description"}) {
+				t.Errorf("replacements: %+v", got)
+			}
+			if again := takeReplacements(t, s); len(again) != 0 {
+				t.Errorf("reported twice: %+v", again)
+			}
+			if h, _ := verifiedHost(t, s, p.host.ItemID); h.Description != "from A" {
+				t.Errorf("host %+v", h)
+			}
+		})
+	}
+}
+
+// takeReplacements reads s's notes of replaced edits and acknowledges
+// them, as the daemon does.
+func takeReplacements(t *testing.T, s *Store) []Replacement {
+	t.Helper()
+	rs, err := s.Replacements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AckReplacements(rs); err != nil {
+		t.Fatal(err)
+	}
+	return rs.Notes
+}
+
+// The notes of replaced edits stay, sealed, until they are acknowledged:
+// a store that settles one and closes leaves it for the next. An
+// acknowledgement removes only what was read, and past maxReplaced the
+// oldest go, counted, until that count is acknowledged too.
+func TestReplacementNotesStayUntilAcknowledged(t *testing.T) {
+	p := newPair(t)
+	a := p.a.s
+	add := func(s *Store, names ...string) {
+		t.Helper()
+		var rs []Replacement
+		for _, n := range names {
+			rs = append(rs, Replacement{ItemID: p.host.ItemID, Type: model.TypeHost, Name: n, Fields: []string{"description"}})
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		tx := &txn{}
+		if err := s.addNotes(tx, s.rec, s.state.VaultID, rs); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.commitTxn(tx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func(rs Replacements) []string {
+		var out []string
+		for _, r := range rs.Notes {
+			out = append(out, r.Name)
+		}
+		return out
+	}
+	read := func(s *Store) Replacements {
+		t.Helper()
+		rs, err := s.Replacements()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rs
+	}
+
+	add(a, "secret-host-name", "two")
+	if b, err := os.ReadFile(a.l.replacedFile()); err != nil || bytes.Contains(b, []byte("secret-host-name")) || bytes.Contains(b, []byte("description")) {
+		t.Fatalf("the notes file is not sealed: %v\n%s", err, b)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a = open(t, p.a.cfg)
+	rs := read(a)
+	if got := names(rs); !slices.Equal(got, []string{"secret-host-name", "two"}) || rs.Evicted != 0 {
+		t.Fatalf("after a reopen: %q, %d evicted", got, rs.Evicted)
+	}
+	add(a, "three")
+	if err := a.AckReplacements(rs); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(read(a)); !slices.Equal(got, []string{"three"}) {
+		t.Fatalf("after an acknowledgement: %q", got)
+	}
+
+	var many []string
+	for i := range maxReplaced + 2 {
+		many = append(many, fmt.Sprint("h", i))
+	}
+	add(a, many...)
+	rs = read(a)
+	if len(rs.Notes) != maxReplaced || rs.Evicted != 3 || rs.Notes[0].Name != "h2" || rs.Notes[maxReplaced-1].Name != many[len(many)-1] {
+		t.Fatalf("past the cap: %d notes from %q, %d evicted", len(rs.Notes), rs.Notes[0].Name, rs.Evicted)
+	}
+	if err := a.AckReplacements(rs); err != nil {
+		t.Fatal(err)
+	}
+	if rs := read(a); len(rs.Notes) != 0 || rs.Evicted != 0 {
+		t.Fatalf("after acknowledging everything: %+v", rs)
+	}
+	// Numbers are never reused, so an old read can't remove a new note.
+	add(a, "fresh")
+	if err := a.AckReplacements(Replacements{Notes: []Replacement{{N: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(read(a)); !slices.Equal(got, []string{"fresh"}) {
+		t.Fatalf("a stale acknowledgement removed a new note: %q", got)
+	}
+}
+
+// A crash in the commit that settles a replacing edit, once the journal
+// has deleted its outbox record, keeps the note: the replay finishes the
+// commit, and the next store to open the vault reports it.
+func TestReplacementSurvivesACrashAfterItsRecordIsDeleted(t *testing.T) {
+	// The commit's operations: the entry, state.json, the record's
+	// deletion, then the note.
+	for _, stage := range []string{"wal:op:2:sync", "wal:op:3", "wal:applied", "wal:removed"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx := context.Background()
+			p := newPair(t)
+			a, b := p.a.s, p.b.s
+			editHost(t, b, p.host.ItemID, func(h *model.Host) { h.Description = "from B" })
+			pushAll(t, b, p.r)
+			editHost(t, a, p.host.ItemID, func(h *model.Host) { h.Description = "from A" })
+			p.r.onPost = func(*vaultlog.Wire) (bool, error) { return true, errLostResponse }
+			if _, err := a.PushHead(ctx, p.r); !errors.Is(err, errLostResponse) {
+				t.Fatalf("push with a lost answer: %v", err)
+			}
+			p.r.onPost = nil
+
+			a.testHook = crashAt(stage)
+			if err := a.Pull(ctx, p.r); !errors.Is(err, errCrash) {
+				t.Fatalf("pull with a crash at %s: %v", stage, err)
+			}
+			a.Close()
+			s := open(t, p.a.cfg)
+			if len(records(t, s)) != 0 {
+				t.Fatal("the edit is still queued")
+			}
+			got := takeReplacements(t, s)
+			if len(got) != 1 || got[0].ItemID != p.host.ItemID || got[0].Name != "web" || !slices.Equal(got[0].Fields, []string{"description"}) {
+				t.Errorf("replacements after the crash: %+v", got)
+			}
+		})
+	}
+}
+
+// A record written before the sealed state recorded replacements (record
+// version 1) still opens and is pushed.
+func TestVersion1RecordStillOpens(t *testing.T) {
+	p := newPair(t)
+	a := p.a.s
+	editHost(t, a, p.host.ItemID, func(h *model.Host) { h.Description = "queued before the upgrade" })
+	r := records(t, a)[0]
+	a.mu.Lock()
+	vaultID := a.state.VaultID
+	key, err := a.rec.localKey()
+	a.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, err := canonjson.Marshal(sealedStateV1{V: 1, Intent: intentToJSON(r.Intent, r.Import), Held: r.Held, Candidates: []candidate{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := crypto.SealAEAD(key, pt, outboxAAD(vaultID, r.N))
+	key.Zero()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := canonjson.Marshal(recordFile{V: 1, VaultID: vaultID, N: r.N, Sealed: env, Wires: []canonjson.Raw{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(p.a.cfg.DataDir, "vault", outboxRel(r.N)), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if res := pushAll(t, a, p.r); res.Outcome != PushEmpty {
+		t.Fatalf("push: %+v", res)
+	}
+	if h, _ := verifiedHost(t, a, p.host.ItemID); h.Description != "queued before the upgrade" {
+		t.Errorf("host %+v", h)
 	}
 }

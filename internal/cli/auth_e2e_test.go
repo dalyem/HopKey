@@ -500,7 +500,9 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 		waitFor(t, 20*time.Second, m.name+"'s queue drains", func() bool { st := m.syncState(t); return st.Pending == 0 && st.Held == 0 })
 	}
 
-	// Logout needs --yes without a terminal, then leaves nothing.
+	// Logout needs --yes without a terminal, then leaves nothing: not
+	// even what the vault decrypted into the ssh config directory.
+	checkWiped := plantHopSSH(t, m2.paths.ConfigDir, m2.home)
 	s = &session{}
 	if code := m2.hop(t, s, "logout"); code != 255 || !strings.Contains(s.stderr.String(), "--yes") {
 		t.Errorf("logout without --yes: exit %d, %q", code, s.stderr.String())
@@ -515,6 +517,7 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 	if a := m2.authStatus(t); a.Vault || a.SignedIn {
 		t.Errorf("m2 after logout: %+v", a)
 	}
+	checkWiped()
 	var dl daemon.DevicesResult
 	waitFor(t, 20*time.Second, "m1 stops listing m2", func() bool {
 		decodeJSON(t, m1.must(t, nil, "auth", "devices", "--json"), &dl)

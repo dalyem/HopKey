@@ -113,6 +113,10 @@ type Result struct {
 	// plaintext.
 	Action    Action
 	Plaintext *Item
+	// Replaced lists, sorted, the free members both sides changed to
+	// different values: want's value replaced the one S had (§5.4), with
+	// nothing held. A put write only.
+	Replaced []string
 
 	// Hold: the reason. For CauseGuardedConflict, Local lists the guarded
 	// members the user changed and Remote the guarded members S changed,
@@ -201,11 +205,15 @@ func rebuildDelete(in Intent, current *Item, live bool) Result {
 
 func rebuildPut(in Intent, s *Item) Result {
 	var local, remote []string // guarded members in L and in R
+	var replaced []string      // free members in L and R that differ
 	inL := map[string]bool{}
 	for _, m := range names(in.Want, in.Seen, s) {
 		l := !memberEqual(in.Want, in.Seen, m)
 		r := !memberEqual(s, in.Seen, m)
 		inL[m] = l
+		if IsFree(in.Type, m) && l && r && !memberEqual(in.Want, s, m) {
+			replaced = append(replaced, m)
+		}
 		if IsGuarded(in.Type, m) {
 			if l {
 				local = append(local, m)
@@ -234,7 +242,7 @@ func rebuildPut(in Intent, s *Item) Result {
 	if err != nil {
 		return ruleFailure(err)
 	}
-	return Result{Kind: KindWrite, Action: ActionPut, Plaintext: merged}
+	return Result{Kind: KindWrite, Action: ActionPut, Plaintext: merged, Replaced: replaced}
 }
 
 // sameOnGuarded reports whether a and b agree on every guarded member.

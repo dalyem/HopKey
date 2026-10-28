@@ -126,6 +126,12 @@ func New(serverURL string, opts Options) (*Client, error) {
 		MaxResponseHeaderBytes: maxHeaderBytes,
 		TLSHandshakeTimeout:    10 * time.Second,
 		IdleConnTimeout:        90 * time.Second,
+		// Every request to a server shares one HTTP/2 connection. One the
+		// network dropped stays open, silent, until TCP gives up, and
+		// every request on it waits for its deadline: a connection that
+		// has received nothing for a while is pinged, and closed when the
+		// ping goes unanswered.
+		HTTP2: &http.HTTP2Config{SendPingTimeout: 20 * time.Second, PingTimeout: 10 * time.Second},
 	}
 	if plain {
 		// Plaintext goes to the loopback server and nowhere else: never

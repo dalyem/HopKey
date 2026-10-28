@@ -66,6 +66,14 @@ func (d *Daemon) dispatchSync(ctx context.Context, req Request) (result any, han
 		if devs == nil {
 			devs = []store.DeviceListing{}
 		}
+		// The log knows when a device last wrote; the server, when it last
+		// asked for anything. The later of the two is when it was seen.
+		seen := d.sync.devicesSeen(ctx)
+		for i := range devs {
+			if t, ok := seen[devs[i].ID]; ok && (devs[i].LastSeen == nil || t.After(*devs[i].LastSeen)) {
+				devs[i].LastSeen = &t
+			}
+		}
 		return &DevicesResult{Devices: devs}, true, nil
 	}
 	return nil, false, nil

@@ -37,6 +37,12 @@ const (
 // it runs listens where the CLI looks.
 var serviceEnv = []string{"XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_DATA_HOME"}
 
+// sealedServiceWarning is what hop setup --service says on a device whose
+// key is a sealed file: the service has no passphrase.
+const sealedServiceWarning = "this device's key is a sealed file, and the service does not get HOP_DEVICE_PASSPHRASE (hop writes it to no file): " +
+	"the service's daemon starts locked after every boot, and sync is paused until you run hop unlock. " +
+	"For a daemon that unlocks by itself, keep the device key in the keychain or in an unsealed file instead"
+
 type serviceSpec struct {
 	kind    string // "systemd" or "launchd"
 	dir     string
@@ -296,6 +302,14 @@ func runService(ctx context.Context, e *Env, yes, uninstall, asJSON bool) error 
 	}
 	res.Notes = append(res.Notes, safef("the service runs %s by that path: run hop setup --service again after moving or upgrading hop", e.Executable))
 	res.Notes = append(res.Notes, "if a hop daemon started some other way owns the vault, the service's daemon exits: run hop daemon stop, then hop setup --service again")
+	if sealed, err := store.SealedDeviceFile(e.storeConfig().DataDir); err == nil && sealed {
+		// hop never writes the passphrase to a file, the unit included.
+		w := sealedServiceWarning
+		res.Notes = append(res.Notes, w)
+		if !asJSON {
+			fmt.Fprintf(e.Stderr, "hop: warning: %s\n", w)
+		}
+	}
 
 	// The file in place says nothing about what the service manager runs
 	// (an earlier run may have failed after writing it, or the daemon may

@@ -83,6 +83,15 @@ CREATE TABLE IF NOT EXISTS devices (
 	PRIMARY KEY (account_id, device_id)
 ) STRICT;
 
+-- When each device last made an authenticated request. A table of its
+-- own, so a database from before it needs no migration.
+CREATE TABLE IF NOT EXISTS device_seen (
+	account_id BLOB NOT NULL,
+	device_id  BLOB NOT NULL,
+	seen_at    INTEGER NOT NULL,
+	PRIMARY KEY (account_id, device_id)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS receipts (
 	account_id BLOB NOT NULL REFERENCES accounts (account_id),
 	device_id  BLOB NOT NULL,
@@ -476,6 +485,34 @@ func (t *sqliteTx) PutDevice(d *Device) error {
 	return t.exec(`INSERT INTO devices (account_id, device_id, sig_pk, active, added_seq) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (account_id, device_id) DO UPDATE SET active = excluded.active`,
 		d.AccountID[:], d.DeviceID[:], d.SigPK, d.Active, d.AddedSeq)
+}
+
+func (t *sqliteTx) SetDeviceSeen(accountID, deviceID model.ID, at time.Time) error {
+	return t.exec(`INSERT INTO device_seen (account_id, device_id, seen_at) VALUES (?, ?, ?)
+		ON CONFLICT (account_id, device_id) DO UPDATE SET seen_at = max(seen_at, excluded.seen_at)`,
+		accountID[:], deviceID[:], at.Unix())
+}
+
+func (t *sqliteTx) DevicesSeen(accountID model.ID) (map[model.ID]time.Time, error) {
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT device_id, seen_at FROM device_seen WHERE account_id = ?`, accountID[:])
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[model.ID]time.Time{}
+	for rows.Next() {
+		var b []byte
+		var at int64
+		if err := rows.Scan(&b, &at); err != nil {
+			return nil, err
+		}
+		var id model.ID
+		if err := scanID(b, &id); err != nil {
+			return nil, err
+		}
+		out[id] = time.Unix(at, 0).UTC()
+	}
+	return out, rows.Err()
 }
 
 func (t *sqliteTx) Receipt(accountID, deviceID model.ID) (*Receipt, error) {

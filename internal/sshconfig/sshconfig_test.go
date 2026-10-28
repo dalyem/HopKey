@@ -856,3 +856,270 @@ func TestKeylessHostOffersNothing(t *testing.T) {
 		t.Error("a host with neither key nor Keyless was accepted")
 	}
 }
+
+// Wipe leaves a config with no hosts and removes every key file and pins
+// file at once, the previous generation's and those within the grace
+// period too, and nothing else in the directory.
+func TestWipeRemovesEverythingGeneratedAtOnce(t *testing.T) {
+	opts := testOpts(t)
+	dir := opts.Dir
+	pub := newPub(t)
+	mustWrite(t, opts, Host{Alias: "a", HostName: "10.0.0.1", PublicKey: pub, HostKeys: []ssh.PublicKey{pub}})
+	mustWrite(t, opts, Host{Alias: "b", HostName: "10.0.0.2", PublicKey: newPub(t), HostKeys: []ssh.PublicKey{newPub(t)}})
+	if len(names(t, dir, "known_hosts-*")) < 2 || len(names(t, filepath.Join(dir, "keys"), "*.pub")) < 2 {
+		t.Fatal("setup: two generations of files are not on disk")
+	}
+	mine := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(mine, []byte("the user's own"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Wipe(opts); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := os.ReadFile(filepath.Join(dir, "config"))
+	if err != nil {
+		t.Fatalf("the config is gone: %v", err)
+	}
+	if string(cfg) != configHeader {
+		t.Errorf("the config after Wipe:\n%s", cfg)
+	}
+	if left := append(names(t, dir, "known_hosts*"), names(t, filepath.Join(dir, "keys"), "*")...); len(left) != 0 {
+		t.Errorf("left behind: %q", left)
+	}
+	if b, err := os.ReadFile(mine); err != nil || string(b) != "the user's own" {
+		t.Errorf("a file hop did not write changed: %v %q", err, b)
+	}
+	// Again, and on a directory that was never made: nothing to do.
+	if err := Wipe(opts); err != nil {
+		t.Errorf("a second Wipe: %v", err)
+	}
+	gone := opts
+	gone.Dir = filepath.Join(t.TempDir(), "never")
+	if err := Wipe(gone); err != nil {
+		t.Errorf("Wipe of a missing directory: %v", err)
+	}
+	if _, err := os.Stat(gone.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Wipe made the missing directory: %v", err)
+	}
+}
+
+// WipeIf asks whether the wipe is owed, wipes and runs done in one hold of
+// config.lock: a Write can't come between them. Not owed, it touches
+// nothing and done does not run.
+func TestWipeIfDecidesAndFinishesUnderTheLock(t *testing.T) {
+	opts := testOpts(t)
+	pub := newPub(t)
+	mustWrite(t, opts, Host{Alias: "a", HostName: "10.0.0.1", PublicKey: pub, HostKeys: []ssh.PublicKey{pub}})
+	cfgPath := filepath.Join(opts.Dir, "config")
+	before, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := func() bool {
+		f, err := filelock.TryLock(filepath.Join(opts.Dir, lockName))
+		if err == nil {
+			f.Close()
+		}
+		return errors.Is(err, filelock.ErrLocked)
+	}
+
+	doneRan := false
+	err = WipeIf(opts, func() (bool, error) {
+		if !locked() {
+			t.Error("owed ran without config.lock")
+		}
+		return false, nil
+	}, func() error { doneRan = true; return nil })
+	if err != nil || doneRan {
+		t.Fatalf("not owed: %v, done ran %v", err, doneRan)
+	}
+	if after, _ := os.ReadFile(cfgPath); !bytes.Equal(after, before) {
+		t.Fatalf("not owed, yet the config changed:\n%s", after)
+	}
+
+	err = WipeIf(opts, func() (bool, error) { return true, nil }, func() error {
+		if !locked() {
+			t.Error("done ran without config.lock")
+		}
+		if b, _ := os.ReadFile(cfgPath); string(b) != configHeader {
+			t.Errorf("done ran before the wipe:\n%s", b)
+		}
+		doneRan = true
+		return nil
+	})
+	if err != nil || !doneRan {
+		t.Fatalf("owed: %v, done ran %v", err, doneRan)
+	}
+
+	// A directory that was never made: owed and done still run under the
+	// lock, or a cleanup that stalled there could clear the marker of a
+	// logout that came after it.
+	gone := opts
+	gone.Dir = filepath.Join(t.TempDir(), "never")
+	goneLocked := func() bool {
+		f, err := filelock.TryLock(filepath.Join(gone.Dir, lockName))
+		if err == nil {
+			f.Close()
+		}
+		return errors.Is(err, filelock.ErrLocked)
+	}
+	doneRan = false
+	err = WipeIf(gone, func() (bool, error) {
+		if !goneLocked() {
+			t.Error("owed ran without config.lock in a missing directory")
+		}
+		return true, nil
+	}, func() error {
+		if !goneLocked() {
+			t.Error("done ran without config.lock in a missing directory")
+		}
+		doneRan = true
+		return nil
+	})
+	if err != nil || !doneRan {
+		t.Errorf("a missing directory: %v, done ran %v", err, doneRan)
+	}
+}
+
+// planted is a file hop did not write but whose name looks like one of
+// its own: a key the user keeps in keys/, a pins backup, an old-style
+// known_hosts, a temp file of the user's.
+var planted = []string{
+	filepath.Join("keys", "company.pub"),
+	"known_hosts-backup",
+	"known_hosts",
+	".notes.tmp",
+	filepath.Join("keys", ".notes.tmp"),
+}
+
+func plant(t *testing.T, dir string, when time.Time) {
+	t.Helper()
+	for _, name := range planted {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("the user's own "+name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func checkPlanted(t *testing.T, dir string) {
+	t.Helper()
+	for _, name := range planted {
+		if b, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(b) != "the user's own "+name {
+			t.Errorf("%s, which hop did not write, changed: %v %q", name, err, b)
+		}
+	}
+}
+
+// Wipe removes what Write generated and nothing else, however much a
+// name looks like hop's.
+func TestWipeKeepsFilesHopDidNotGenerate(t *testing.T) {
+	opts := testOpts(t)
+	mustWrite(t, opts, Host{Alias: "a", HostName: "10.0.0.1", PublicKey: newPub(t), HostKeys: []ssh.PublicKey{newPub(t)}})
+	plant(t, opts.Dir, time.Now())
+	if err := Wipe(opts); err != nil {
+		t.Fatal(err)
+	}
+	checkPlanted(t, opts.Dir)
+	if left := names(t, opts.Dir, "known_hosts-????????????????"); len(left) != 0 {
+		t.Errorf("generated pins left behind: %q", left)
+	}
+	if left := names(t, filepath.Join(opts.Dir, "keys"), "????????????????.pub"); len(left) != 0 {
+		t.Errorf("generated keys left behind: %q", left)
+	}
+}
+
+// Write's pruning goes by the same names: a file of the user's is never
+// old enough to remove.
+func TestPruneKeepsFilesHopDidNotGenerate(t *testing.T) {
+	opts, clk := testOptsClock(t)
+	host := Host{Alias: "a", HostName: "10.0.0.1", PublicKey: newPub(t)}
+	mustWrite(t, opts, host)
+	plant(t, opts.Dir, clk.now().Add(-10*graceForTests))
+	mustWrite(t, opts, host)
+	checkPlanted(t, opts.Dir)
+}
+
+// The temp files writeFileAtomic leaves after a crash are recognized by
+// the exact names it gives them, in both directories.
+func TestIsTempMatchesWriteFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	for _, base := range []string{"config", "known_hosts-0123456789abcdef", "0123456789abcdef.pub"} {
+		f, err := os.CreateTemp(dir, tempPattern(base))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		if name := filepath.Base(f.Name()); !isTemp(name) {
+			t.Errorf("a temp file of %s, %s, is not recognized", base, name)
+		}
+	}
+	for _, name := range []string{".notes.tmp", ".config.tmp", ".config.tmpx1", ".known_hosts-backup.tmp1", ".company.pub.tmp1", "config.tmp1"} {
+		if isTemp(name) {
+			t.Errorf("%s is taken for a temp file of hop's", name)
+		}
+	}
+}
+
+// Wipe looks at keys/ only once it holds config.lock: a Write that holds
+// the lock while Wipe waits for it may create keys/ and its files, and
+// Wipe must still remove them.
+func TestWipeSeesKeysAWriterCreatedWhileItWaited(t *testing.T) {
+	opts := testOpts(t)
+	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := filelock.Lock(filepath.Join(opts.Dir, lockName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- Wipe(opts) }()
+	time.Sleep(200 * time.Millisecond) // Wipe is waiting for the lock by now
+	select {
+	case err := <-done:
+		t.Fatalf("Wipe finished while config.lock was held: %v", err)
+	default:
+	}
+
+	// What a Write does under the lock: keys/ and a generation in it.
+	f, err := render(opts, []Host{{Alias: "a", HostName: "10.0.0.1", PublicKey: newPub(t), HostKeys: []ssh.PublicKey{newPub(t)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keysDir := filepath.Join(opts.Dir, "keys")
+	if err := os.Mkdir(keysDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range f.pubKeys {
+		if err := writeImmutable(filepath.Join(keysDir, name), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeImmutable(filepath.Join(opts.Dir, f.knownHostsName), f.knownHosts); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(filepath.Join(opts.Dir, "config"), f.config, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Wipe did not finish after the lock was released")
+	}
+	if left := append(names(t, opts.Dir, "known_hosts-*"), names(t, keysDir, "*")...); len(left) != 0 {
+		t.Errorf("left behind by a Wipe that waited for the writer: %q", left)
+	}
+	if cfg, _ := os.ReadFile(filepath.Join(opts.Dir, "config")); string(cfg) != configHeader {
+		t.Errorf("the config after Wipe:\n%s", cfg)
+	}
+}

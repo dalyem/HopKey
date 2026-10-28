@@ -73,6 +73,7 @@ type Server struct {
 	hub      *hub // by vault
 	mbox     *hub // by enroll ID
 	accounts *accountLocks
+	seen     *seenTracker
 	mux      *http.ServeMux
 
 	stop     chan struct{}
@@ -112,6 +113,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		rates:   DefaultRates(),
 		hub:     newHub(),
 		mbox:    newHub(),
+		seen:    newSeenTracker(),
 		stop:    make(chan struct{}),
 	}
 	if s.log == nil {
@@ -138,8 +140,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.signups = newQueue(s.lim.SignupJobs, s.lim.SignupQueue)
 	s.polls = newPollLimiter(s.lim)
 	s.routes()
-	s.wg.Add(1)
+	s.wg.Add(2)
 	go s.janitor()
+	go s.seenWriter()
 	return s, nil
 }
 
@@ -319,6 +322,7 @@ func (s *Server) routes() {
 		{pattern: "GET /v1/vaults/{vault}/entries/{seq}", ipRate: s.rates.IP, h: s.getEntry},
 		{pattern: "GET /v1/vaults/{vault}/objects/{sha256}", ipRate: s.rates.IP, h: s.getObject},
 		{pattern: "POST /v1/vaults/{vault}/log", ipRate: s.rates.IP, body: lim.MaxBody, h: s.postLog},
+		{pattern: "GET /v1/vaults/{vault}/devices/seen", ipRate: s.rates.IP, h: s.getDevicesSeen},
 		{pattern: "POST /v1/enroll", ipRate: s.rates.EnrollIP, body: lim.MaxBody, h: s.enrollCreate},
 		{pattern: "POST /v1/enroll/claim", ipRate: s.rates.IP, body: lim.MaxBody, h: s.enrollClaim},
 		// The mailbox's byte limit applies to the canonical body, after

@@ -71,6 +71,11 @@ type Tx interface {
 	PutDevice(d *Device) error
 	Receipt(accountID, deviceID model.ID) (*Receipt, error)
 	InsertReceipt(r *Receipt) error
+	// SetDeviceSeen records that a device made an authenticated request at
+	// at, unless a later time is recorded. DevicesSeen returns those times
+	// for an account's devices.
+	SetDeviceSeen(accountID, deviceID model.ID, at time.Time) error
+	DevicesSeen(accountID model.ID) (map[model.ID]time.Time, error)
 
 	Session(tokenHash crypto.Hash) (*Session, error)
 	InsertSession(s *Session) error

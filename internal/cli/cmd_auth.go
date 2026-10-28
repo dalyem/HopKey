@@ -14,6 +14,7 @@ import (
 	"github.com/dalyem/hopkey/internal/authflow"
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/sshconfig"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/syncclient"
 )
@@ -990,6 +991,18 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if s == nil {
+		if h.loggedOut {
+			// An earlier logout was recorded and cut short; opening the
+			// vault finished it, and open emptied the ssh config.
+			if o.asJSON {
+				return printJSON(e, logoutReport{LogoutResult: store.LogoutResult{State: store.StateRetired, Done: true}})
+			}
+			e.printf("An interrupted logout is finished: this device's keys and vault are deleted.\n")
+			return nil
+		}
+		// A logout that deleted the vault but could not empty the ssh
+		// config said to run it again: this is that retry.
+		wipeSSHConfig(e, o.asJSON)
 		return failf("there is no vault on this device, so there is nothing to log out of")
 	}
 	defer s.Close()
@@ -1014,6 +1027,9 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return authFailure(err)
 	}
 	s.Close()
+	if res.Done {
+		finishLogoutCleanup(e, o.asJSON)
+	}
 	if o.asJSON {
 		return printJSON(e, logoutReport{LogoutResult: res, DeviceID: id})
 	}
@@ -1028,6 +1044,63 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	}
 	e.printf("Logged out: this device left the account, and its keys and vault are deleted.\n")
 	return nil
+}
+
+// wipeSSHConfig removes what the vault decrypted into the ssh config
+// directory (§5.5), as the daemon does for a logout it finishes: the
+// config is left with no hosts, and the key files and pins go
+// (sshconfig.Wipe). Files hop did not write are left alone. It is for a
+// device that has no vault: once config.lock is held, a vault that is
+// there after all is a new sign-in's, whose config this is, and nothing
+// is wiped. After a wipe that worked, and before the lock goes, the
+// store's mark of a logout that still owes it is cleared. A failure is a
+// warning: the mark stays, and the next hop command that finds no vault,
+// or starts the daemon, tries again (finishLogoutCleanup), as does hop
+// logout run again.
+func wipeSSHConfig(e *Env, asJSON bool) {
+	dataDir := e.storeConfig().DataDir
+	err := sshconfig.WipeIf(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()},
+		func() (bool, error) {
+			exists, err := store.Exists(dataDir)
+			return !exists, err
+		},
+		func() error { return store.ClearLogoutCleanup(dataDir) })
+	if err != nil {
+		warn(e, asJSON, fmt.Sprintf("the ssh config in %s could not be emptied (%v) and may still name the vault's hosts; hop tries again on its next start, or run hop logout again", e.Paths.ConfigDir, err))
+	}
+}
+
+// testHookLogoutCleanup, if set, runs once finishLogoutCleanup has read
+// the mark of a logout that owes the ssh config.
+var testHookLogoutCleanup func()
+
+// finishLogoutCleanup empties the ssh config, as wipeSSHConfig does, if a
+// finished logout still owes it (store.LogoutCleanupPending): one a crash
+// cut short after it was recorded, which store.Open has just finished, or
+// one whose wipe failed. The mark is read, the config emptied and the mark
+// cleared in one hold of config.lock (sshconfig.WipeIf), the lock every
+// config write takes: a new sign-in clears the mark this way before its
+// daemon writes, so a mark read before that sign-in can't wipe its
+// config.
+func finishLogoutCleanup(e *Env, asJSON bool) {
+	dataDir := e.storeConfig().DataDir
+	var readErr error
+	err := sshconfig.WipeIf(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()},
+		func() (bool, error) {
+			pending, err := store.LogoutCleanupPending(dataDir)
+			if testHookLogoutCleanup != nil {
+				testHookLogoutCleanup()
+			}
+			readErr = err
+			return pending, err
+		},
+		func() error { return store.ClearLogoutCleanup(dataDir) })
+	switch {
+	case readErr != nil:
+		warn(e, asJSON, fmt.Sprintf("could not tell whether a logout still has to empty the ssh config in %s: %v", e.Paths.ConfigDir, readErr))
+	case err != nil:
+		warn(e, asJSON, fmt.Sprintf("the ssh config in %s could not be emptied (%v) and may still name the vault's hosts; hop tries again on its next start, or run hop logout again", e.Paths.ConfigDir, err))
+	}
 }
 
 // ---- merge ----

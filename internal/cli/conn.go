@@ -47,32 +47,66 @@ func socketAbsent(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscallECONNREFUSED)
 }
 
-// startDaemon launches the daemon and waits for its control socket.
+// startDaemon launches the daemon and waits for its control socket. A
+// daemon that fails to start ends the wait at once, and the error shows
+// what it logged on this start, which says why. One that exits because
+// another daemon has the sockets (exit 0) or the vault (exitVaultBusy)
+// leaves the wait to go on: that daemon, started by another command at
+// the same moment, may still be unlocking the vault.
 func startDaemon(ctx context.Context, e *Env) error {
 	wait := e.DaemonWait
 	if wait == 0 {
 		wait = 10 * time.Second
 	}
-	launch := e.StartDaemon
-	if launch == nil {
-		launch = func() error { return launchDaemon(e) }
+	var proc *daemonProc
+	if e.StartDaemon != nil {
+		if err := e.StartDaemon(); err != nil {
+			return fmt.Errorf("starting the hop daemon: %w", cleanErr(err))
+		}
+	} else {
+		p, err := spawnDaemon(e)
+		if err != nil {
+			return fmt.Errorf("starting the hop daemon: %w", cleanErr(err))
+		}
+		proc = p
 	}
-	if err := launch(); err != nil {
-		return fmt.Errorf("starting the hop daemon: %w", cleanErr(err))
+	var exited <-chan struct{}
+	logFrom := int64(-1)
+	if proc != nil {
+		exited, logFrom = proc.exited, proc.logFrom
 	}
-	deadline := time.Now().Add(wait)
-	for {
+	dial := func() bool {
 		c, err := daemon.Dial(ctx, e.Paths.ControlSocket())
 		if err == nil {
 			c.Close()
+		}
+		return err == nil
+	}
+	// Composed: the log tail's line breaks are layout (logTail sanitizes
+	// each line), so the report keeps them.
+	failure := func(what string) error {
+		return &exitError{code: ExitFailure, composed: true, msg: fmt.Sprintf("%s; see %s%s", what, oneLine(e.Paths.LogFile()), logTail(e.Paths.LogFile(), logFrom))}
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		if dial() {
 			return nil
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			// Composed: the log tail's line breaks are layout (logTail
-			// sanitizes each line), so the report keeps them.
-			return &exitError{code: ExitFailure, composed: true, msg: fmt.Sprintf("the hop daemon did not come up within %s; see %s%s", wait, oneLine(e.Paths.LogFile()), logTail(e.Paths.LogFile()))}
+			return failure(fmt.Sprintf("the hop daemon did not come up within %s", wait))
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-exited:
+			if dial() {
+				return nil
+			}
+			if code := proc.exitCode(); code != 0 && code != exitVaultBusy {
+				return failure("the hop daemon exited as it started")
+			}
+			exited = nil // another daemon is starting: wait for it
+		case <-ctx.Done():
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 
@@ -80,22 +114,44 @@ func startDaemon(ctx context.Context, e *Env) error {
 // aside, keeping one previous generation.
 const maxLogSize = 1 << 20
 
+// daemonProc is a daemon this process launched.
+type daemonProc struct {
+	// exited is closed once the daemon has exited and been reaped, so it
+	// is never left defunct under a long-lived hop mcp.
+	exited <-chan struct{}
+	// code is the exit status, set before exited is closed.
+	code int
+	// logFrom is the log's size before the daemon started: what it
+	// writes comes after.
+	logFrom int64
+}
+
 // launchDaemon runs `hop daemon` detached, with its output going to the log.
 func launchDaemon(e *Env) error {
+	_, err := spawnDaemon(e)
+	return err
+}
+
+// spawnDaemon is launchDaemon, and says when the daemon exits.
+func spawnDaemon(e *Env) (*daemonProc, error) {
 	if e.Executable == "" {
-		return errors.New("do not know where the hop binary is")
+		return nil, errors.New("do not know where the hop binary is")
 	}
 	if _, err := safepath.EnsurePrivateDir(e.Paths.StateDir); err != nil {
-		return err
+		return nil, err
 	}
 	logf, err := openLog(e.Paths.LogFile(), os.Getuid())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer logf.Close()
+	logFrom := int64(-1)
+	if fi, err := logf.Stat(); err == nil {
+		logFrom = fi.Size()
+	}
 	devnull, err := os.Open(os.DevNull)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer devnull.Close()
 
@@ -104,15 +160,34 @@ func launchDaemon(e *Env) error {
 	cmd.Env = e.environ()
 	detach(cmd)
 	if err := cmd.Start(); err != nil {
-		return err
+		return nil, err
 	}
-	return cmd.Process.Release()
+	exited := make(chan struct{})
+	p := &daemonProc{exited: exited, logFrom: logFrom}
+	go func() {
+		cmd.Wait()
+		p.code = cmd.ProcessState.ExitCode()
+		close(exited)
+	}()
+	return p, nil
 }
 
-// logTail returns the last few lines of the daemon log for an error message.
-func logTail(path string) string {
+// exitCode is the daemon's exit status, once exited is closed: -1 for one
+// a signal ended.
+func (p *daemonProc) exitCode() int { return p.code }
+
+// logTail returns the last few lines of the daemon log for an error message:
+// of those written from offset from on, when from is not negative and the
+// log is still that long.
+func logTail(path string, from int64) string {
 	b, err := os.ReadFile(path)
-	if err != nil || len(b) == 0 {
+	if err != nil {
+		return ""
+	}
+	if from >= 0 && from <= int64(len(b)) {
+		b = b[from:]
+	}
+	if len(strings.TrimSpace(string(b))) == 0 {
 		return ""
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")

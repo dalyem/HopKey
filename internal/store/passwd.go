@@ -407,8 +407,9 @@ func (s *Store) outside(fl *fileHold, gen uint64, f func() error) error {
 // device record can open, and adds their number to the count LostIntents
 // reports, in one commit (§11). The caller holds the file lock.
 //
-// The other files sealed under that local_key go in the same commit, and
-// the loss is recorded with them (LostJournals) until AckLostJournals: a
+// The other files sealed under that local_key go in the same commit, the
+// notes of replaced edits (notes.go) among them, and for the journals the
+// loss is recorded with them (LostJournals) until AckLostJournals: a
 // server-backed checkpoint's journal (checkpoint.go), whose candidate may
 // still have committed with a kit no one can read, and an approval's
 // journal (approve.go), whose device_add may have committed for a device
@@ -454,6 +455,13 @@ func (s *Store) dropLostRecords() error {
 		if err := putOutboxMeta(t, m); err != nil {
 			return err
 		}
+	}
+	// The notes of replaced edits are sealed under the same local_key, and
+	// go undelivered.
+	if _, err := os.Lstat(s.l.replacedFile()); err == nil {
+		t.remove(replacedRel)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	return s.commitTxn(t)
 }

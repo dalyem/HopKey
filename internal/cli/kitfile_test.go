@@ -84,7 +84,7 @@ func TestDaemonWithTheVaultBusy(t *testing.T) {
 	}
 	err := runDaemon(context.Background(), e, nil)
 	var ee *exitError
-	if !errors.As(err, &ee) || ee.code != ExitFailure || ee.msg != "the vault is busy (another hop process owns it)" {
+	if !errors.As(err, &ee) || ee.code != exitVaultBusy || ee.msg != "the vault is busy (another hop process owns it)" {
 		t.Fatalf("runDaemon: %v, want a failure saying the vault is busy", err)
 	}
 	if strings.Contains(stderr.String(), "already running") {

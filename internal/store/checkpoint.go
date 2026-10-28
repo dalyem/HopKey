@@ -1355,7 +1355,8 @@ type DeviceListing struct {
 	// How is AddedBySignup, AddedByBootstrap or AddedByApproval.
 	How string `json:"how"`
 	// LastSeen is the time of the newest entry the device authored, if it
-	// authored any.
+	// authored any. The daemon makes it the time of the device's last
+	// request to the server when the server says that is later.
 	LastSeen *time.Time `json:"last_seen,omitempty"`
 	// This is this device; Stale is a device this machine's password
 	// unlocks left behind, which the next password change revokes.

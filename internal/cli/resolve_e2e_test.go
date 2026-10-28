@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +42,8 @@ const (
 type memRing struct {
 	mu sync.Mutex
 	m  map[string]string
+	// failDelete makes Delete fail, as a keychain that refuses can.
+	failDelete atomic.Bool
 }
 
 func (r *memRing) Get(s, u string) (string, error) {
@@ -61,6 +64,9 @@ func (r *memRing) Set(s, u, v string) error {
 }
 
 func (r *memRing) Delete(s, u string) error {
+	if r.failDelete.Load() {
+		return errors.New("memRing: the keychain refused to delete")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.m, s+"/"+u)

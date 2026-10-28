@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/merge"
@@ -354,12 +356,13 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 	t := &txn{}
 	t.create(entryRel(w.Entry.Seq), eb)
 	t.put(stateRel, sb)
-	if err := s.settle(t, w.Entry.Seq, func(seq uint64) (crypto.Hash, error) {
+	hashAt := func(seq uint64) (crypto.Hash, error) {
 		if seq == w.Entry.Seq {
 			return h, nil
 		}
 		return s.entryHash(seq)
-	}, rec, st.VaultID); err != nil {
+	}
+	if err := s.settle(t, w.Entry.Seq, hashAt, rec, st.VaultID); err != nil {
 		return err
 	}
 	// A journaled checkpoint's candidate at this seq is settled in the same
@@ -402,9 +405,11 @@ func (s *Store) entryHash(seq uint64) (crypto.Hash, error) {
 // settle adds to t the outbox changes that verified history up to head
 // decides: every live candidate at a seq ≤ head is committed if the
 // verified entry there has its H, and dead otherwise. A record with a
-// committed candidate is deleted. Nothing else ever settles a candidate.
-// rec's local_key opens the outbox of vault vaultID. The caller holds the
-// file lock.
+// committed candidate is deleted, and the note of what that candidate
+// replaced of other devices' values, if anything, is added in the same
+// commit (addNotes), for the daemon to deliver. Nothing else ever settles
+// a candidate. rec's local_key opens the outbox of vault vaultID. The
+// caller holds the file lock.
 func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, error), rec *deviceRecord, vaultID model.ID) error {
 	if ns, err := s.l.outboxNumbers(); err != nil || len(ns) == 0 {
 		return err
@@ -413,6 +418,7 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 	if err != nil {
 		return err
 	}
+	var replaced []Replacement
 	receipts := map[model.ID][]mergeReceipt{}
 	for _, r := range recs {
 		c := r.live()
@@ -425,6 +431,9 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 		}
 		if h.Equal(c.H) {
 			t.remove(outboxRel(r.N))
+			if rp := r.replacement(c.H); rp != nil {
+				replaced = append(replaced, *rp)
+			}
 			if !r.Import.IsZero() {
 				// A login merge's import: its receipt is written in this
 				// same commit (§4.4).
@@ -434,6 +443,7 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 		}
 		c.Status = statusDead
 		delete(r.Wires, c.H)
+		delete(r.Replaced, c.H)
 		if err := s.putRecordAs(t, r, rec, vaultID); err != nil {
 			return err
 		}
@@ -443,7 +453,7 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 			return err
 		}
 	}
-	return nil
+	return s.addNotes(t, rec, vaultID, replaced)
 }
 
 // settleAtUnlock settles candidates that verified history already decides.
@@ -481,6 +491,41 @@ type PushResult struct {
 	N       uint64    // the head record's number; 0 for PushEmpty
 	Hold    *HoldInfo // for PushHeld
 	Head    Head      // the verified head afterwards
+}
+
+// Replacement is a change that replaced, in free members (a host's or a
+// snippet's description, §5.4), a different value another device had
+// committed since this device's edit was made. The last change to reach
+// the server wins there and nothing is held, so the other value is lost.
+// It names the item and the members, never the values. It is journaled
+// with the candidate it describes and, once verified history shows that
+// candidate committed, kept as a note until the daemon has delivered it
+// (Replacements, AckReplacements).
+type Replacement struct {
+	// N numbers a note (Replacements); it is 0 elsewhere.
+	N      uint64
+	ItemID model.ID
+	Type   model.Type
+	Name   string // the item's name, if it has one
+	Fields []string
+}
+
+// replacementOf describes what res, a write of rec's intent, replaces, or
+// is nil.
+func replacementOf(rec *record, res merge.Result) *Replacement {
+	if res.Kind != merge.KindWrite || len(res.Replaced) == 0 {
+		return nil
+	}
+	r := &Replacement{ItemID: rec.Intent.ItemID, Type: rec.Intent.Type, Fields: slices.Clone(res.Replaced)}
+	if res.Plaintext != nil {
+		if raw, ok := res.Plaintext.Member("name"); ok {
+			var name string
+			if json.Unmarshal(raw, &name) == nil {
+				r.Name = name
+			}
+		}
+	}
+	return r
 }
 
 // HoldInfo says why a record is held: the §5.4 cause, the guarded members
@@ -622,7 +667,8 @@ func (s *Store) prepareHead(gen, pushed uint64) (PushResult, *vaultlog.Wire, err
 		out.Outcome, out.Hold = PushHeld, holdInfo(ev.res)
 		return out, nil, s.commitTxn(t)
 	}
-	// Journal the candidate before posting it (§11.1).
+	// Journal the candidate before posting it (§11.1), with what it
+	// replaces: the pull that settles it may come in another call.
 	w := ev.wire
 	h, err := w.Entry.Hash()
 	if err != nil {
@@ -631,6 +677,12 @@ func (s *Store) prepareHead(gen, pushed uint64) (PushResult, *vaultlog.Wire, err
 	prev, _ := w.Entry.Prev.Get()
 	rec.Cands = append(rec.Cands, candidate{Seq: w.Entry.Seq, Prev: prev, H: h, Status: statusLive})
 	rec.Wires[h] = w
+	if rp := replacementOf(rec, ev.res); rp != nil {
+		if rec.Replaced == nil {
+			rec.Replaced = map[crypto.Hash]*Replacement{}
+		}
+		rec.Replaced[h] = rp
+	}
 	if err := s.putRecord(t, rec); err != nil {
 		return out, nil, err
 	}
