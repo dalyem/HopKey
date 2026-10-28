@@ -299,8 +299,13 @@ func redactSpans(ss []span, secrets []string) []span {
 			break
 		}
 	}
+	// t has had the marks of typed text taken out (unmark), so a secret
+	// holding a mark rune is looked for as it stands there too.
 	for _, v := range secrets {
-		if v != "" {
+		for _, v := range slices.Compact([]string{v, unmark.Replace(v)}) {
+			if v == "" {
+				continue
+			}
 			for _, m := range indexAll(t, v) {
 				hits = append(hits, hit{m[0], m[1], false})
 			}
@@ -354,8 +359,9 @@ func joinSpans(ss []span) string {
 	return b.String()
 }
 
-// indexAll is where v stands in t, left to right and not overlapping, as
-// strings.ReplaceAll finds it.
+// indexAll is every place v stands in t, left to right, overlapping ones
+// included: in "abababa" the secret "ababa" stands at 0 and at 2, and
+// redactSpans joins the two, where taking only the first would leave "ba".
 func indexAll(t, v string) [][]int {
 	var out [][]int
 	for i := 0; ; {
@@ -364,7 +370,7 @@ func indexAll(t, v string) [][]int {
 			return out
 		}
 		out = append(out, []int{i + j, i + j + len(v)})
-		i += j + len(v)
+		i += j + 1
 	}
 }
 

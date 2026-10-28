@@ -114,6 +114,27 @@ func TestHideRedactsWholeSecretsAcrossTypedTextAndKeyBlocks(t *testing.T) {
 	}
 }
 
+// A secret is redacted whole where it overlaps itself, and where it holds
+// a mark rune, which redact and hide take out of the text before looking.
+func TestRedactOverlappingAndMarkedSecrets(t *testing.T) {
+	for _, c := range []struct {
+		secret, text, want string
+	}{
+		{"ababa", "out: abababa", "out: " + redacted},
+		{"ababa", "ababababa", redacted},
+		{"left" + markOpen + "right", "pw leftright end", "pw " + redacted + " end"},
+		{"left" + markClose + "right", "pw left" + markClose + "right end", "pw " + redacted + " end"},
+	} {
+		s := &mcpServer{secrets: []string{c.secret}}
+		if got := s.redact(c.text); got != c.want {
+			t.Errorf("secret %q: redact(%q) = %q, want %q", c.secret, c.text, got, c.want)
+		}
+		if got := s.masker(&daemon.ListResult{}).hide(c.text); got != c.want {
+			t.Errorf("secret %q: hide(%q) = %q, want %q", c.secret, c.text, got, c.want)
+		}
+	}
+}
+
 // Text the agent typed is marked where hop echoes it, and nowhere else:
 // in a message about a target, a user or a tag, in what the resolver says
 // matched, and where ssh names the user on its own login to the target,
