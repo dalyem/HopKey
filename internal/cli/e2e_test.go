@@ -188,6 +188,19 @@ func (e *e2e) env(t *testing.T, stdin io.Reader, stdout, stderr io.Writer) *cli.
 	}
 }
 
+// ssh's own refusal ("Host key verification failed") does not say what to
+// do, so hop adds the hop trust hint, as hop check and the MCP server do.
+func TestExecOnAnUnpinnedHostSaysToRunHopTrust(t *testing.T) {
+	e := newE2E(t)
+	code, _, stderr := e.hop(t, "exec", "web-2", "--", "echo", "ok")
+	if code != 255 {
+		t.Errorf("exit %d, want 255", code)
+	}
+	if !strings.Contains(stderr, "hop trust web-2") {
+		t.Errorf("no hop trust hint in stderr:\n%s", stderr)
+	}
+}
+
 func TestExecRunsACommandThroughRealSSH(t *testing.T) {
 	e := newE2E(t)
 
@@ -603,6 +616,15 @@ func TestConnectExecsSSHWithTheGeneratedConfig(t *testing.T) {
 	want = []string{"ssh", "-F", cfg, "-o", "HostName=127.0.0.1", "-o", "User=root", "--", "web-1"}
 	if !slices.Equal(gotArgv, want) {
 		t.Errorf("argv = %q\nwant   %q", gotArgv, want)
+	}
+
+	// A host with no pinned host key gets the hint that hop check and the
+	// MCP server give; a pinned one does not.
+	if _, stderr := run("web-2"); !strings.Contains(stderr, "hop trust web-2") {
+		t.Errorf("hop web-2 (unpinned): no hop trust hint in %q", stderr)
+	}
+	if _, stderr := run("web-1"); strings.Contains(stderr, "hop trust") {
+		t.Errorf("hop web-1 (pinned): stderr %q", stderr)
 	}
 
 	// A target that starts with - is never handed to ssh.

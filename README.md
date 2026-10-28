@@ -14,27 +14,31 @@ hop ls [tag] | info <target> | add | edit | rm
 hop key add <path> | ls | rm
 hop snippet add <name> [--description D] -- <cmd...> | ls | rm <name>
 hop import ssh-config [path] [--with-keys] [--dry-run] [--yes]
-hop ts import | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
+hop ts import [--dry-run] | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
 hop setup                         put `Include ~/.ssh/hop/config` above every other directive in ~/.ssh/config
-hop init [--device-key-store keychain|file] [--kit-file F]
+hop init [--device-key-store keychain|file] [--kit-file F] [--json]
 hop lock | unlock [--password] | passwd [--kit-file F]
-hop status | daemon [stop]
+hop status | daemon [stop [--json]]
 hop sync [resolve]                sync now, settle a change the daemon held
 hop auth signup|login|approve|status|devices|logout|rotate|passwd|merge|resume
-hop mcp [--read-only] | mcp install [--client claude|codex|print]
+hop mcp [--read-only] | mcp install [--client claude|codex|print] [--read-only] [--json]
 ```
 
 `hop import ssh-config` reads your config with `ssh -G`, the way `ssh <host>` does, so it runs any `Match exec` commands in it and may do DNS lookups. It lists what its own scan found (best effort, not a guarantee) and asks before it runs ssh; without a terminal, or with `--json`, it refuses unless you pass `--yes`. Importing your config carries the same trust as using it.
 
-Every command takes `--json`. hop's own failures exit 255, and `hop <target>` and `hop exec` pass the remote exit code through. `hop daemon` exits 75 when another hop process owns the vault: a command that started it then waits for that other daemon. Resolution is interactive (DNS, fuzzy match, picker, plain-ssh fallback) only when stdout is a terminal and `--json` is not given; otherwise it stops after the Tailscale step and returns candidates. `hop exec` is never fuzzy.
+Every command takes `--json`, except `hop mcp` itself, which speaks MCP on stdin and stdout (`hop mcp install` takes it). hop's own failures exit 255, and `hop <target>` and `hop exec` pass the remote exit code through. `hop daemon` exits 75 when another hop process owns the vault: a command that started it then waits for that other daemon. Resolution is interactive (DNS, fuzzy match, picker, plain-ssh fallback) only when stdout is a terminal and `--json` is not given; otherwise it stops after the Tailscale step and returns candidates. `hop exec` is never fuzzy.
 
-The first command that needs the daemon starts it (`hop daemon`, detached, logging to `$XDG_STATE_HOME/hop/daemon.log`). The daemon serves the read-only ssh-agent socket and a control socket in `$XDG_RUNTIME_DIR/hop/` (or `~/.ssh/hop/run/`), and regenerates `~/.ssh/hop/config` after every change, so plain `ssh <alias>` works too.
+`hop ts import --dry-run` prints `would create` and `would link`; its `--json` report has the statuses `would_created` and `would_linked`.
+
+A host with no pinned host key is refused by ssh, since hop never trusts a key on first use. `hop <target>` and `hop exec` say so before they run ssh, and name the fix: `hop trust <host>`.
+
+The first command that needs the daemon starts it (`hop daemon`, detached, logging to `$XDG_STATE_HOME/hop/daemon.log`). The daemon serves the read-only ssh-agent socket and a control socket in `$XDG_RUNTIME_DIR/hop/` (or `~/.ssh/hop/run/`), and regenerates `~/.ssh/hop/config` after every change, so plain `ssh <alias>` works too. While the daemon is down or the vault is locked, the agent has no key to offer and plain `ssh <alias>` fails with `Permission denied (publickey)`; any hop command starts the daemon again, and `hop unlock` unlocks the vault.
 
 ## The vault
 
 The vault lives in `$XDG_DATA_HOME/hop` (or `~/.local/share/hop`) as a signed log. The contents of vault items (hosts, keys, credentials, snippets) are encrypted on disk. The log's public metadata and the verified state are not encrypted and are not secret: account, device and item IDs, item types and versions, device names, public keys, sequence numbers, times and digests. `hop init` creates and opens the vault itself; after that the daemon is the one process that opens it, and every other command goes through the daemon.
 
-- `hop init` creates the account and the vault. It asks for a master password and prints the Emergency Kit: the Secret Key and the Recovery Key. You type back the last group of each before anything is written. `--kit-file` also saves the kit to a new 0600 file.
+- `hop init` creates the account and the vault. It asks for a master password and prints the Emergency Kit: the Secret Key and the Recovery Key. You type back the last group of each before anything is written. `--kit-file` also saves the kit to a new 0600 file. It needs a terminal (stdin) for the password and the type-back, so it refuses to run without one. With `--json`, stdout holds one JSON result (the data directory, the device key store, the kit file if any, and no secret) and the kit and the prompts stay on the terminal, on stderr.
 - `hop lock` drops every secret from memory and empties the agent. `hop unlock` opens the vault again with the device key. `hop unlock --password` uses the master password and Secret Key instead and sets up a new device key, for when the old one is gone. The old device stays in the log as stale until the next `hop passwd`.
 - `hop passwd` changes the master password. That re-keys the whole vault and makes a new Secret Key and Recovery Key, so keep the new kit. It also revokes the stale devices that password unlocks left behind.
 - The device key record (this device's private keys and the Secret Key) is kept in the OS keychain by default. On a machine without one, `hop init --device-key-store file` keeps it in `device.key` next to the vault, sealed with a passphrase when `HOP_DEVICE_PASSPHRASE` is set. Every unlock after that needs the passphrase. A daemon started with `HOP_DEVICE_PASSPHRASE` in its environment uses it. One started without it (by `hop mcp`, or by the login service) comes up locked, and `hop unlock` opens it: it sends the daemon the passphrase from its own `HOP_DEVICE_PASSPHRASE`, or asks for it on a terminal. The daemon uses it for that unlock only and does not keep it, so after `hop lock` the next `hop unlock` needs it again. Without the passphrase the file is unsealed: it holds the device private keys and the Secret Key in plain form, protected only by its 0600 file permissions, and `hop init` warns about that. hop never falls back from one store to the other. `hop status` shows the store in use, `keychain`, `file (sealed)` or `file (unsealed: private keys on disk)`, and warns about anything pending.

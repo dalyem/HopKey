@@ -445,8 +445,8 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 	if loginCode != 0 || approveCode != 0 {
 		t.Fatalf("approval: login exit %d, approve exit %d", loginCode, approveCode)
 	}
-	if !strings.Contains(approver.stdout.String(), "Approved m2") {
-		t.Errorf("approve output: %q", approver.stdout.String())
+	if !strings.Contains(approver.stdout.String(), "Approved m2. It receives") {
+		t.Errorf("approve output: %q (want the name alone, with no empty device ID in parentheses)", approver.stdout.String())
 	}
 
 	// Machine 2 gets the host with no sync command.

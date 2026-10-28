@@ -622,7 +622,11 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 	if o.asJSON {
 		return printJSON(e, approveReport{Approved: &approvedDevice{EnrollID: res.EnrollID.String(), DeviceName: res.DeviceName}})
 	}
-	e.printf("Approved %s. It receives the vault now.\n", fmtDevice(res.DeviceName, ""))
+	name := oneLine(res.DeviceName)
+	if name == "" {
+		name = "the new device"
+	}
+	e.printf("Approved %s. It receives the vault now.\n", name)
 	return nil
 }
 
@@ -630,8 +634,11 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 
 // AuthStatus is the --json shape of hop auth status.
 type AuthStatus struct {
-	// SignedIn means the vault syncs with a server.
+	// SignedIn means the vault syncs with a server. A revoked device is not
+	// signed in: nothing syncs on it again.
 	SignedIn bool `json:"signed_in"`
+	// Revoked means the account revoked this device (SignedIn is false).
+	Revoked bool `json:"revoked,omitempty"`
 	// Vault is false when this device has no vault at all.
 	Vault          bool                     `json:"vault"`
 	Server         string                   `json:"server,omitempty"`
@@ -690,7 +697,8 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		a.Warnings = append(a.Warnings, v.Warnings...)
 	}
 	if s := st.Sync; s != nil && s.State != daemon.SyncOff {
-		a.SignedIn = true
+		a.Revoked = s.State == daemon.SyncRevoked
+		a.SignedIn = !a.Revoked
 		a.Server, a.Email, a.VaultID = s.Server, s.Email, s.VaultID
 		if s.AccountID != "" {
 			a.AccountID = s.AccountID
@@ -711,9 +719,12 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	if o.asJSON {
 		return printJSON(e, a)
 	}
-	if a.SignedIn {
+	switch {
+	case a.SignedIn:
 		e.printf("signed in:    yes\n")
-	} else {
+	case a.Revoked:
+		e.printf("signed in:    no; this device was revoked from the account, so nothing syncs here any more (hop auth logout --local-only wipes this device's copy, then hop auth login signs in again)\n")
+	default:
 		e.printf("signed in:    no; this vault is local-only (hop auth signup publishes it, hop auth login --merge merges it into an account)\n")
 	}
 	if a.DeviceID != "" {
@@ -728,7 +739,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		e.printf("vault:        unlocked\n")
 	}
 	shown := map[string]bool{}
-	if a.Sync != nil && a.SignedIn {
+	if a.Sync != nil && (a.SignedIn || a.Revoked) {
 		printSyncBlock(e, e.Stdout, a.Sync, syncBlockOpts{shown: shown})
 		for _, w := range a.Sync.Warnings {
 			shown[w] = true
@@ -1266,7 +1277,7 @@ func runAuthDevices(ctx context.Context, e *Env, args []string) error {
 	var res daemon.DevicesResult
 	if err := call(ctx, e, daemon.OpDevicesList, nil, &res); err != nil {
 		if daemon.IsCode(err, daemon.CodeLocalOnly) {
-			return failf("%v: this vault is local-only, so it has no devices to list", err)
+			return failf("this vault is local-only, so it has no devices to list")
 		}
 		if daemon.IsCode(err, daemon.CodeLocked) {
 			return failf("%v; run hop unlock first", err)

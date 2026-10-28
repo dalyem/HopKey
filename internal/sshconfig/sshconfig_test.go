@@ -136,7 +136,7 @@ func TestRender(t *testing.T) {
 			b += "  User " + user + "\n"
 		}
 		return b + `  IdentityAgent "/home/a b/hop/agent.sock"
-  IdentityFile "/home/a b/hop/keys/` + pubID + `"
+  IdentityFile "/home/a b/hop/keys/` + strings.TrimSuffix(pubID, ".pub") + `"
   IdentitiesOnly yes
   ForwardAgent no
   HostKeyAlias ` + alias + `
@@ -157,6 +157,22 @@ func TestRender(t *testing.T) {
 	// One key file for the one distinct public key.
 	if len(f.pubKeys) != 1 || string(f.pubKeys[pubID]) != string(ssh.MarshalAuthorizedKey(pub)) {
 		t.Errorf("unexpected public key files: %v", f.pubKeys)
+	}
+}
+
+// The config names the key without ".pub", so ssh does not try the public
+// key file as a private key when the agent lacks the key. A config written
+// before that change names the .pub file, and its generation is still kept.
+func TestReferencedFilesAcceptsBothKeyNames(t *testing.T) {
+	const id = "0123456789abcdef"
+	for _, cfg := range []string{
+		"  IdentityFile /home/a/hop/keys/" + id + "\n",
+		"  IdentityFile \"/home/a b/hop/keys/" + id + ".pub\"\n",
+	} {
+		got := referencedFiles([]byte(cfg))
+		if len(got) != 1 || !got[id+".pub"] {
+			t.Errorf("referencedFiles(%q) = %v, want %s.pub", cfg, got, id)
+		}
 	}
 }
 

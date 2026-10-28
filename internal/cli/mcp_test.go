@@ -921,7 +921,7 @@ func TestMCPStartsADaemonWithoutTheSecrets(t *testing.T) {
 
 func TestMCPLockedAndAbsentVault(t *testing.T) {
 	f := newFakeDaemon(t)
-	f.fail(daemon.OpList, daemon.CodeLocked, "model: vault is locked; run hop unlock")
+	f.fail(daemon.OpList, daemon.CodeLocked, "vault is locked; run hop unlock")
 	m := startMCP(t, f.env(t, nil, nil, nil))
 	for _, c := range []struct {
 		tool string
@@ -1004,6 +1004,12 @@ func TestMCPInstall(t *testing.T) {
 	if want := []string{"codex", "mcp", "add", "hop", "--", exe, "mcp", "--read-only"}; code != 255 || len(ran) != 1 || !slices.Equal(ran[0], want) ||
 		!strings.Contains(stderr, "not on PATH") || !strings.Contains(stdout, `args = ["mcp", "--read-only"]`) {
 		t.Errorf("codex not found: %d %v %q %q", code, ran, stdout, stderr)
+	}
+	// With --json no config is printed, so the error must not point "above".
+	code, stdout, stderr, _ = run("--client", "codex", "--read-only", "--json")
+	if out := stdout + stderr; code != 255 || !strings.Contains(out, "hop mcp install --client print --json") ||
+		strings.Contains(out, "config above") || strings.Contains(stdout, "[mcp_servers.hop]") {
+		t.Errorf("codex not found, --json: %d %q %q", code, stdout, stderr)
 	}
 	if code, _, stderr, _ := run("--client", "vim"); code != 255 || !strings.Contains(stderr, "unknown client") {
 		t.Errorf("unknown client: %d %q", code, stderr)

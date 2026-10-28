@@ -138,10 +138,14 @@ func TestSyncExitsNonZeroWhenSyncIsNotWorking(t *testing.T) {
 
 func TestSyncOnALocalOnlyVault(t *testing.T) {
 	f := newFakeDaemon(t)
-	f.fail(daemon.OpSyncNow, daemon.CodeLocalOnly, "this vault store does not sync")
+	// The real daemon's message already says the vault is local-only.
+	f.fail(daemon.OpSyncNow, daemon.CodeLocalOnly, "store: this vault is local-only")
 	code, _, errOut := f.hop(t, "sync")
 	if code != 255 || !strings.Contains(errOut, "local-only") {
 		t.Errorf("exit %d, stderr %q", code, errOut)
+	}
+	if n := strings.Count(errOut, "local-only"); n != 1 || strings.Contains(errOut, "store:") {
+		t.Errorf("the message repeats itself or leaks the package prefix: %q", errOut)
 	}
 }
 
@@ -1049,6 +1053,33 @@ func TestAuthStatus(t *testing.T) {
 	code, out, _ = f.hop(t, "auth", "status")
 	if code != 0 || !strings.Contains(out, "signed in:    no") || !strings.Contains(out, "local-only") || !strings.Contains(out, "locked") {
 		t.Errorf("local-only: exit %d:\n%s", code, out)
+	}
+}
+
+// A revoked device is not signed in: nothing syncs on it again, and
+// auth status says so and what to do.
+func TestAuthStatusOnARevokedDevice(t *testing.T) {
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpStatus, daemon.StatusResult{
+		Vault: &store.Info{DeviceStore: "keychain", DeviceID: model.ID{7}.String()},
+		Sync:  &daemon.SyncStatusResult{State: daemon.SyncRevoked, Server: "https://hop.example", Email: "me@example.com"},
+	})
+	code, out, errOut := f.hop(t, "auth", "status")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if strings.Contains(out, "signed in:    yes") || !strings.Contains(out, "signed in:    no; this device was revoked") ||
+		!strings.Contains(out, "hop auth logout --local-only") || !strings.Contains(out, "hop auth login") {
+		t.Errorf("auth status on a revoked device:\n%s", out)
+	}
+	if !strings.Contains(out, "this device was revoked") || !strings.Contains(out, "stopped") {
+		t.Errorf("the sync block is missing:\n%s", out)
+	}
+	code, out, _ = f.hop(t, "auth", "status", "--json")
+	var a map[string]any
+	decodeJSON(t, out, &a)
+	if code != 0 || a["signed_in"] != false || a["revoked"] != true || a["server"] != "https://hop.example" {
+		t.Errorf("--json: exit %d: %v", code, a)
 	}
 }
 

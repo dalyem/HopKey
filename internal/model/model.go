@@ -214,10 +214,10 @@ const (
 )
 
 // ErrNotFound means no live item has the requested ID.
-var ErrNotFound = errors.New("model: item not found")
+var ErrNotFound = errors.New("item not found")
 
 // ErrLocked means the vault is locked and must be unlocked first.
-var ErrLocked = errors.New("model: vault is locked")
+var ErrLocked = errors.New("vault is locked")
 
 // Store reads and writes vault items. Implementations handle encryption,
 // the vault log and sync; callers see plaintext only.

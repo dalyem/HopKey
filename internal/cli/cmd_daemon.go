@@ -20,8 +20,8 @@ import (
 // signalled. The CLI starts it this way, detached, when the control socket is
 // missing. `hop daemon stop` asks a running one to exit.
 func runDaemon(ctx context.Context, e *Env, args []string) error {
-	if len(args) == 1 && args[0] == "stop" {
-		return stopDaemon(ctx, e)
+	if len(args) >= 1 && args[0] == "stop" {
+		return stopDaemon(ctx, e, args[1:])
 	}
 	if len(args) != 0 {
 		return failf("usage: %s", commands["daemon"].usage)
@@ -159,10 +159,28 @@ func dialExisting(ctx context.Context, e *Env) (*daemon.Client, error) {
 	return c, nil
 }
 
-func stopDaemon(ctx context.Context, e *Env) error {
+// StopReport is the --json shape of hop daemon stop.
+type StopReport struct {
+	// WasRunning is false when there was no daemon to stop.
+	WasRunning bool `json:"was_running"`
+}
+
+func stopDaemon(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "daemon stop", "hop daemon stop [--json]")
+	asJSON := fs.Bool("json", false, "print the result as JSON")
+	pos, _, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := noArgs(fs, pos); err != nil {
+		return err
+	}
 	running, err := shutdownDaemon(ctx, e)
 	if err != nil {
 		return err
+	}
+	if *asJSON {
+		return printJSON(e, StopReport{WasRunning: running})
 	}
 	if !running {
 		e.printf("hop daemon is not running\n")

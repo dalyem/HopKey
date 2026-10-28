@@ -59,6 +59,20 @@ func connectableAs(rr *daemon.ResolveResult, quote func(string) string) (*target
 	return &target{rr: rr, alias: rr.SSHAlias, user: res.User}, nil
 }
 
+// unpinnedNote is what hop says before it runs ssh for a host that has no
+// pinned host key: the generated config makes ssh refuse such a host (it
+// never trusts a key on first use), and ssh's own "Host key verification
+// failed" does not say what to do. It is "" for a host with a pin.
+func unpinnedNote(rr *daemon.ResolveResult) string {
+	if rr.Host == nil {
+		return ""
+	}
+	if pins, _ := parsePins(rr.Host.HostKeys); len(pins) > 0 {
+		return ""
+	}
+	return safef("no host key is pinned for %s, so ssh will refuse it; pin the server's key with: hop trust %s", rr.Result.HostName, rr.Result.HostName)
+}
+
 func orUnknown(s string) string {
 	if s == "" {
 		return "unknown reason"
@@ -122,6 +136,9 @@ func runConnect(ctx context.Context, e *Env, args []string) error {
 	addr, note := chooseAddress(ctx, e, t)
 	if note != "" {
 		fmt.Fprintf(e.Stderr, "hop: %s\n", note)
+	}
+	if hint := unpinnedNote(rr); hint != "" {
+		fmt.Fprintf(e.Stderr, "hop: %s\n", hint)
 	}
 	argv := append([]string{e.sshBinary()}, e.sshArgs(t, addr)...)
 	// ssh takes over this process's terminal (or runs as a child on the same
@@ -314,6 +331,10 @@ func runExec(ctx context.Context, e *Env, args []string) error {
 	addr, note := chooseAddress(ctx, e, t)
 	if note != "" {
 		fmt.Fprintf(e.Stderr, "hop: %s\n", note)
+	}
+
+	if hint := unpinnedNote(rr); hint != "" {
+		fmt.Fprintf(e.Stderr, "hop: %s\n", hint)
 	}
 
 	r := remoteRun{command: remoteCommand(words, *sudo), timeout: *timeout, stdin: e.Stdin}

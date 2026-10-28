@@ -376,12 +376,17 @@ func render(opts Options, hosts []Host) (*files, error) {
 		if port == 0 {
 			port = 22
 		}
-		var pubPath string
+		var identityPath string
 		if !h.Keyless {
 			pub := ssh.MarshalAuthorizedKey(h.PublicKey)
-			pubName := contentID(pub) + ".pub"
-			pubKeys[pubName] = pub
-			if pubPath, err = quotePath(filepath.Join(opts.Dir, "keys", pubName)); err != nil {
+			id := contentID(pub)
+			pubKeys[id+".pub"] = pub
+			// IdentityFile names the key without ".pub": ssh finds keys/<id>.pub
+			// by itself when keys/<id> is missing, and uses it to choose the
+			// agent's key. Named with the ".pub", ssh would also try the file
+			// as a private key when the agent has no such key (hop is down
+			// or locked) and print "Load key ...: error in libcrypto".
+			if identityPath, err = quotePath(filepath.Join(opts.Dir, "keys", id)); err != nil {
 				return nil, err
 			}
 		}
@@ -402,7 +407,7 @@ func render(opts Options, hosts []Host) (*files, error) {
 			config.WriteString("  IdentityFile none\n")
 		} else {
 			fmt.Fprintf(&config, "  IdentityAgent %s\n", agentSock)
-			fmt.Fprintf(&config, "  IdentityFile %s\n", pubPath)
+			fmt.Fprintf(&config, "  IdentityFile %s\n", identityPath)
 		}
 		config.WriteString("  IdentitiesOnly yes\n")
 		config.WriteString("  ForwardAgent no\n")
@@ -481,7 +486,11 @@ func isBareChar(r rune) bool {
 // referencedRe finds the generated files a config names. It matches the
 // file names, not whole paths, so quoting and escaping in the config do not
 // matter.
-var referencedRe = regexp.MustCompile(`keys/([0-9a-f]{16}\.pub)|(known_hosts-[0-9a-f]{16})`)
+//
+// A key is named keys/<id> (the file is keys/<id>.pub); a config written
+// before that change names keys/<id>.pub. Both count, and both are the
+// file <id>.pub.
+var referencedRe = regexp.MustCompile(`keys/([0-9a-f]{16})(?:\.pub)?|(known_hosts-[0-9a-f]{16})`)
 
 // referencedFiles returns the generated file names that any of the configs
 // refer to.
@@ -489,7 +498,11 @@ func referencedFiles(configs ...[]byte) map[string]bool {
 	keep := make(map[string]bool)
 	for _, c := range configs {
 		for _, m := range referencedRe.FindAllSubmatch(c, -1) {
-			keep[string(m[1])+string(m[2])] = true // one group is empty
+			if len(m[1]) > 0 {
+				keep[string(m[1])+".pub"] = true
+			} else {
+				keep[string(m[2])] = true
+			}
 		}
 	}
 	return keep
