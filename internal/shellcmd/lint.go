@@ -16,6 +16,7 @@ import (
 //     evaluates an array index or an offset as arithmetic, and an array
 //     index in a value (a[$(cmd)]) runs cmd;
 //   - inside [[ ... ]], whose -eq, -lt and the like are arithmetic too;
+//     each of these runs to its end over line breaks;
 //   - as an argument of eval, let or trap;
 //   - as the command string of sh, bash, zsh, dash, ksh or su -c;
 //   - in an assignment (v={{x}}, a[{{x}}]=1, export v={{x}}), since a
@@ -183,6 +184,10 @@ func evalContext(s string, quoted []bool) error {
 		case c == ' ' || c == '\t':
 			endWord(f)
 		case c == '\n' || c == ';':
+			endWord(f) // which may be the ]] that ends a [[
+			if c == '\n' && f.dbracket {
+				continue // [[ ... ]] goes on past a line break, to its ]]
+			}
 			endCommand(f)
 			f.dbracket = false
 		case c == '&' && i > 0 && (s[i-1] == '>' || s[i-1] == '<'), c == '&' && i+1 < len(s) && s[i+1] == '>':

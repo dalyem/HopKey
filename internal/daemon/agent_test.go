@@ -165,6 +165,87 @@ func TestResolveAgentOnlyLeavesOutNodesDeniedHostsNameByDNS(t *testing.T) {
 	}
 }
 
+// Two machines can report the same host name; Tailscale names the second
+// build-1. A denied host linked to the first by stable ID and addressed as
+// build owns that node only: build is a name both answer to, and does not
+// say which one it is. The second, an allowed host's, is found by its IP
+// and its names, and the first stays hidden.
+func TestResolveAgentOnlyRepeatedHostNamesOwnOnlyTheLinkedNode(t *testing.T) {
+	ts := &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Peers: []tailscale.Node{
+			{ID: "nBUILD1", HostName: "build", DNSName: "build.tn.ts.net", Online: true, IPs: []string{"100.64.0.21"}},
+			{ID: "nBUILD2", HostName: "build", DNSName: "build-1.tn.ts.net", Online: true, IPs: []string{"100.64.0.22"}},
+		}}
+	f := newFixture(t, fakeTS{ts})
+	link := func(id, dns string) *model.Tailscale {
+		return &model.Tailscale{StableNodeID: id, DNSName: dns, SSH: "unknown"}
+	}
+	f.put(f.host("build-secret", func(h *model.Host) {
+		h.AgentAccess, h.Addresses, h.Tailscale = "deny", []string{"build"}, link("nBUILD1", "build.tn.ts.net")
+	}))
+	f.put(f.host("ci-runner", func(h *model.Host) {
+		h.Addresses = []string{"203.0.113.22"}
+		h.Tailscale = link("nBUILD2", "build-1.tn.ts.net")
+	}))
+	c := f.client()
+	resolveAs := func(target string) ResolveResult {
+		t.Helper()
+		var rr ResolveResult
+		if err := c.Call(context.Background(), OpResolve, ResolveParams{Target: target, AgentOnly: true}, &rr); err != nil {
+			t.Fatal(err)
+		}
+		return rr
+	}
+	for _, target := range []string{"100.64.0.22", "build-1", "build-1.tn.ts.net"} {
+		if rr := resolveAs(target); rr.Host == nil || rr.Host.Name != "ci-runner" || rr.Route == nil {
+			t.Errorf("agent_only %q = %+v, want ci-runner", target, rr.Result)
+		}
+	}
+	for _, target := range []string{"100.64.0.21", "build.tn.ts.net", "build"} {
+		rr := resolveAs(target)
+		if rr.Host != nil && rr.Host.Name != "ci-runner" {
+			t.Errorf("agent_only %q matched %s", target, rr.Host.Name)
+		}
+		b, _ := json.Marshal([]any{rr.Result.Candidates, rr.Result.Notes, rr.Result.Tailscale, rr.Result.Matched})
+		for _, h := range []string{"nBUILD1", "100.64.0.21", "build-secret"} {
+			if h != target && strings.Contains(string(b), h) {
+				t.Errorf("agent_only %q names %s: %s", target, h, b)
+			}
+		}
+	}
+}
+
+// A stable ID, a MagicDNS name or a Tailscale IP names one node; a short
+// name or a host name owns a node only when no other node has it, and the
+// host is not linked to another node.
+func TestHostOwnsNode(t *testing.T) {
+	b1 := tailscale.Node{ID: "nB1", HostName: "build", DNSName: "build.tn.ts.net.", IPs: []string{"100.64.0.21", "fd7a::21"}}
+	b2 := tailscale.Node{ID: "nB2", HostName: "build", DNSName: "build-1.tn.ts.net.", IPs: []string{"100.64.0.22"}}
+	solo := tailscale.Node{ID: "nS", HostName: "solo-host", DNSName: "solo.tn.ts.net.", IPs: []string{"100.64.0.23"}}
+	all := []tailscale.Node{b1, b2, solo}
+	for _, c := range []struct {
+		name string
+		h    model.Host
+		n    tailscale.Node
+		want bool
+	}{
+		{"stable ID", model.Host{Tailscale: &model.Tailscale{StableNodeID: "nB2"}}, b2, true},
+		{"linked MagicDNS name", model.Host{Tailscale: &model.Tailscale{DNSName: "BUILD-1.tn.ts.net"}}, b2, true},
+		{"address: MagicDNS name", model.Host{Addresses: []string{"build.TN.ts.net."}}, b1, true},
+		{"address: Tailscale IP", model.Host{Addresses: []string{"[fd7a::21]"}}, b1, true},
+		{"address: a short name no other node has", model.Host{Addresses: []string{"build-1"}}, b2, true},
+		{"address: a host name no other node has", model.Host{Addresses: []string{"solo-host"}}, solo, true},
+		{"address: a host name two nodes have", model.Host{Addresses: []string{"build"}}, b2, false},
+		{"address: a host name two nodes have, linked to the other", model.Host{Addresses: []string{"build"}, Tailscale: &model.Tailscale{StableNodeID: "nB1"}}, b2, false},
+		{"address: a short name, linked to another node", model.Host{Addresses: []string{"build-1"}, Tailscale: &model.Tailscale{StableNodeID: "nB1"}}, b2, false},
+		{"linked, and the short name of another", model.Host{Addresses: []string{"build-1"}, Tailscale: &model.Tailscale{StableNodeID: "nB1"}}, b1, true},
+	} {
+		if got := HostOwnsNode(c.h, c.n, all); got != c.want {
+			t.Errorf("%s: HostOwnsNode(%s) = %v, want %v", c.name, c.n.ID, got, c.want)
+		}
+	}
+}
+
 func candidateNames(r *resolve.Result) []string {
 	var out []string
 	for _, c := range r.Candidates {

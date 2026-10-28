@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -305,15 +306,19 @@ func pick(e *Env, res *resolve.Result) (string, error) {
 // the user sees, with candidates listed. The line breaks are its layout, so
 // every value in it is made single-line safe here; callers pass the result to
 // failMsg, not failf.
-func describeUnresolved(res *resolve.Result) string {
+func describeUnresolved(res *resolve.Result) string { return describeUnresolvedAs(res, strconv.Quote) }
+
+// describeUnresolvedAs is describeUnresolved with the target, as the user
+// typed it, quoted by quote (hop mcp marks it: typedQ).
+func describeUnresolvedAs(res *resolve.Result, quote func(string) string) string {
 	var sb strings.Builder
 	switch res.Status {
 	case resolve.StatusAmbiguous:
-		fmt.Fprintf(&sb, "%q is ambiguous (%s)", res.Target, oneLine(res.Matched))
+		fmt.Fprintf(&sb, "%s is ambiguous (%s)", quote(res.Target), oneLine(res.Matched))
 	case resolve.StatusPlainSSH:
-		fmt.Fprintf(&sb, "%q is not in the vault", res.Target)
+		fmt.Fprintf(&sb, "%s is not in the vault", quote(res.Target))
 	default:
-		fmt.Fprintf(&sb, "no host matches %q", res.Target)
+		fmt.Fprintf(&sb, "no host matches %s", quote(res.Target))
 	}
 	for _, c := range res.Candidates {
 		id := oneLine(c.Name)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -34,10 +35,14 @@ type target struct {
 	user  string // explicit user@, or ""
 }
 
-func connectable(rr *daemon.ResolveResult) (*target, error) {
+func connectable(rr *daemon.ResolveResult) (*target, error) { return connectableAs(rr, strconv.Quote) }
+
+// connectableAs is connectable with what the user typed (the target, the
+// user) quoted by quote, as describeUnresolvedAs.
+func connectableAs(rr *daemon.ResolveResult, quote func(string) string) (*target, error) {
 	res := rr.Result
 	if res.Status != resolve.StatusMatched || rr.Host == nil {
-		return nil, failMsg(describeUnresolved(res))
+		return nil, failMsg(describeUnresolvedAs(res, quote))
 	}
 	if rr.SSHAlias == "" {
 		return nil, failf("%s cannot be used with ssh: %s", res.HostName, orUnknown(rr.SSHProblem))
@@ -49,7 +54,7 @@ func connectable(rr *daemon.ResolveResult) (*target, error) {
 		return nil, failf("%s", rr.Route.Blocked)
 	}
 	if res.User != "" && !sshconfig.ValidUser(res.User) {
-		return nil, failf("user %q is not usable in an ssh config", res.User)
+		return nil, failf("user %s is not usable in an ssh config", quote(res.User))
 	}
 	return &target{rr: rr, alias: rr.SSHAlias, user: res.User}, nil
 }
@@ -649,7 +654,7 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 		syncNotice(ctx, e)
 	}
 	out := CheckResult{Target: pos[0], Host: rr.Result.HostName}
-	out.Steps, out.OK = e.diagnose(ctx, rr, true)
+	out.Steps, out.OK = e.diagnose(ctx, rr, true, plainEcho)
 	if *asJSON {
 		if err := printJSON(e, out); err != nil {
 			return err
@@ -666,18 +671,29 @@ func runCheck(ctx context.Context, e *Env, args []string) error {
 	return nil
 }
 
+// echo is how a message shows what the user typed. The CLI quotes it as %q
+// does (plainEcho); hop mcp marks it too, so that its masker leaves it be
+// (mcpEcho).
+type echo struct {
+	quote func(string) string
+	// login, if set, is applied to ssh's stderr from a login to t at addr.
+	login func(t *target, addr, stderr string) string
+}
+
+var plainEcho = echo{quote: strconv.Quote}
+
 // authCheckTimeout bounds hop check's login, ssh's own start included.
 const authCheckTimeout = 20 * time.Second
 
 // diagnose runs hop check's steps for rr, in order, and says whether they
 // all passed. Without login the last step, which logs in with ssh and runs
-// true there, is skipped.
-func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool) ([]Step, bool) {
+// true there, is skipped. What the user typed is shown as ec says.
+func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool, ec echo) ([]Step, bool) {
 	var c checker
 	res := rr.Result
 	c.run("resolved", nil, func() (string, string) {
 		if res.Status != resolve.StatusMatched {
-			return stepFail, describeUnresolved(res)
+			return stepFail, describeUnresolvedAs(res, ec.quote)
 		}
 		return stepPass, safef("host %q by rule %s (%s)", res.HostName, res.Rule, res.Matched)
 	})
@@ -762,7 +778,7 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		return c.steps, c.ok()
 	}
 	c.run("auth_ok", []string{"host_key_pinned", "host_key_matches"}, func() (string, string) {
-		t, err := connectable(rr)
+		t, err := connectableAs(rr, ec.quote)
 		if err != nil {
 			return stepFail, err.Error() // composed by failf/failMsg: already display-safe
 		}
@@ -775,7 +791,11 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		}
 		if res.ExitCode != 0 || res.Error != "" {
 			// ssh's stderr is remote text; lastLines makes each line safe.
-			msg := strings.TrimSpace(res.Stderr)
+			stderr := res.Stderr
+			if ec.login != nil {
+				stderr = ec.login(t, addr, stderr)
+			}
+			msg := strings.TrimSpace(stderr)
 			if msg == "" {
 				msg = res.Error
 			}

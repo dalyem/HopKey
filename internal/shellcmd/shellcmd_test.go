@@ -57,6 +57,18 @@ func TestPlaceholders(t *testing.T) {
 		{"[[ {{x}} -eq 1 ]]", nil, "[[ ... ]]"},
 		{"if [[ -n {{y}} && {{x}} == 1 ]]; then echo; fi", nil, "[[ ... ]]"},
 		{"[[ $(printf %s {{x}}) -eq 1 ]]", nil, "[[ ... ]]"},
+		// Over line breaks, to the end of each.
+		{"[[ -n x &&\n{{x}} -eq 1 ]]", nil, "[[ ... ]]"},
+		{"[[\n{{x}} -eq 1\n]]", nil, "[[ ... ]]"},
+		{"if [[ -n $HOME ||\n  {{x}} == 1 ]]; then echo; fi", nil, "[[ ... ]]"},
+		{"((\n{{x}} > 1\n)) && echo big", nil, "arithmetic"},
+		{"echo $((\n1 +\n{{x}}\n))", nil, "arithmetic"},
+		{"echo ${a[\n{{x}}]}", nil, "${...}"},
+		{"echo ${v:\n{{x}}}", nil, "${...}"},
+		{"v=$(\nprintf %s {{x}}\n)", nil, "assignment"},
+		{"eval $(\ntrue\nprintf %s {{x}}\n)", nil, "eval"},
+		{"[[ $(\nprintf %s {{x}}\n) -eq 1 ]]", nil, "[[ ... ]]"},
+		{"[[ -n x ]]\nv={{x}}", nil, "assignment"}, // the line break after ]] ends the command
 		{"eval {{x}}", nil, "eval"},
 		{"eval echo {{x}}", nil, "eval"},
 		{"true && eval {{x}}", nil, "eval"},
@@ -99,6 +111,8 @@ func TestPlaceholders(t *testing.T) {
 		{"true # eval {{x}}", []string{"x"}, ""},
 		{"eval true; echo {{x}}", []string{"x"}, ""},
 		{"[[ -n $HOME ]] && echo {{x}}", []string{"x"}, ""},
+		{"[[ -n $HOME &&\n-n $PATH ]]\necho {{x}}", []string{"x"}, ""},
+		{"echo $(\ntrue\n)\necho {{x}}", []string{"x"}, ""},
 	}
 	for _, c := range cases {
 		got, err := Placeholders(c.cmd)
@@ -259,6 +273,40 @@ func TestJoin(t *testing.T) {
 		}
 		if _, err := Placeholders(got); err != nil {
 			t.Errorf("Join(%q) = %q, which Placeholders refuses: %v", c.words, got, err)
+		}
+	}
+}
+
+// A [[ ... ]] over two lines evaluates its operands as one on a line does:
+// bash runs a command from a value in it. Placeholders refuses both, and
+// this is why: the script Render would make without that check runs the
+// value's command.
+func TestDoubleBracketOverLinesWouldRunAValue(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	const v = `a[$(touch "$MARK")]`
+	for _, template := range []string{
+		"[[ {{v}} -eq 1 ]] 2>/dev/null; printf ok",
+		"[[ -n x &&\n{{v}} -eq 1 ]] 2>/dev/null; printf ok",
+		"[[\n{{v}} -eq 1 ]] 2>/dev/null; printf ok",
+	} {
+		if _, err := Placeholders(template); err == nil || !strings.Contains(err.Error(), "[[ ... ]]") {
+			t.Errorf("Placeholders(%q) = %v, want a refusal", template, err)
+		}
+		// Render's script, without the check.
+		script := ParamVar("v") + "='" + strings.ReplaceAll(v, "'", `'\''`) + "'; " + strings.ReplaceAll(template, "{{v}}", `"${HOP_P_v}"`)
+		dir := t.TempDir()
+		mark := filepath.Join(dir, "pwned")
+		cmd := exec.Command(bash, "-c", script)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "MARK="+mark)
+		if out, err := cmd.CombinedOutput(); err != nil || string(out) != "ok" {
+			t.Errorf("bash %q: %q, %v", script, out, err)
+		}
+		if _, err := os.Stat(mark); err != nil {
+			t.Errorf("bash %q ran nothing from the value, so the test shows nothing: %v", script, err)
 		}
 	}
 }

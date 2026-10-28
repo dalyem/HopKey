@@ -1184,8 +1184,11 @@ func TestMCPFallbackHidesDNSNamedNodesAndHiddenSuggestions(t *testing.T) {
 }
 
 // An answer about a denied name is the answer about a name that does not
-// exist, however the agent writes it: the target it gave is echoed as it
-// gave it, never masked, while hop's own mentions of the host still are.
+// exist, however the agent writes it, as the host, the user (x:@web-1 is
+// not a usable user, x@web-1 is refused by the server) or a tag, with a
+// port or without: what the agent typed is echoed as it typed it, never
+// masked, while hop's own mentions of the host still are. The same
+// commands run for either.
 func TestMCPDeniedNameAnswersLikeAnAbsentOne(t *testing.T) {
 	e := newE2E(t)
 	e.addHost(t, "vault-secret", func(h *model.Host) { h.AgentAccess = "deny"; h.Addresses = []string{"192.0.2.9"} })
@@ -1199,8 +1202,15 @@ func TestMCPDeniedNameAnswersLikeAnAbsentOne(t *testing.T) {
 		}
 		return string(b)
 	}
+	ran := func(f func() string) (string, int) {
+		t.Helper()
+		before := len(e.server.commands())
+		out := f()
+		return out, len(e.server.commands()) - before
+	}
+	total := 0
 	for _, name := range []string{"vault-secret", "VAULT-Secret"} {
-		for _, pattern := range []string{"%s", "%s.", "deploy@%s", "%s:22", "[%s]", "root@%s.:22"} {
+		for _, pattern := range []string{"%s", "%s.", "deploy@%s", "%s:22", "%s:2222", "[%s]", "root@%s.:22", "%s:@web-1", "%s@web-1", "%s@web-1:22"} {
 			d, a := fmt.Sprintf(pattern, name), fmt.Sprintf(pattern, absent)
 			for _, c := range []struct {
 				tool string
@@ -1214,19 +1224,27 @@ func TestMCPDeniedNameAnswersLikeAnAbsentOne(t *testing.T) {
 				{"exec", func(x string) map[string]any {
 					return map[string]any{"hosts": []string{"web-1", x}, "command": "echo ok"}
 				}},
+				{"exec", func(x string) map[string]any {
+					return map[string]any{"hosts": []string{"tag:" + x, "web-1"}, "command": "echo ok"}
+				}},
 			} {
-				got, want := answer(c.tool, c.args(d)), strings.ReplaceAll(answer(c.tool, c.args(a)), absent, name)
+				got, n := ran(func() string { return answer(c.tool, c.args(d)) })
+				want, wantN := ran(func() string { return answer(c.tool, c.args(a)) })
+				want = strings.ReplaceAll(want, absent, name)
 				got, want = durationRe.ReplaceAllString(got, "${1}:0"), durationRe.ReplaceAllString(want, "${1}:0")
 				if got != want {
 					t.Errorf("%s %q answered\n%s\nbut for a name that does not exist\n%s", c.tool, d, got, want)
 				}
+				if n != wantN {
+					t.Errorf("%s %q ran %d commands, and %d for a name that does not exist", c.tool, d, n, wantN)
+				}
+				total += n
 			}
 		}
 	}
-	// Two names, six ways of writing each, the denied and the absent one:
-	// web-1 ran once for each list.
-	if got := e.server.commands(); len(got) != 2*6*2 {
-		t.Errorf("the server ran %d commands, want one per exec on web-1", len(got))
+	// web-1 ran for each list, so the answers compared are about a run.
+	if total < 2*10*2 {
+		t.Errorf("the server ran %d commands, want one at least for each list with web-1", total)
 	}
 }
 
@@ -1430,5 +1448,100 @@ func TestMCPCheckHostIsBoundedWhenSSHLeavesAChild(t *testing.T) {
 	}
 	if got := statuses(c); got["auth_ok"] != "pass" {
 		t.Errorf("check_host web-1 = %+v", c)
+	}
+}
+
+// buildTwins are two machines that both report the host name build;
+// Tailscale names the second build-1.
+func buildTwins() *tailscale.Status {
+	return &tailscale.Status{Available: true, MagicDNSSuffix: "tn.ts.net",
+		Peers: []tailscale.Node{
+			{ID: "nBUILD1", HostName: "build", DNSName: "build.tn.ts.net", Online: true, IPs: []string{"100.64.0.21"}},
+			{ID: "nBUILD2", HostName: "build", DNSName: "build-1.tn.ts.net", Online: true, IPs: []string{"100.64.0.22"}},
+		}}
+}
+
+// A denied host linked to one of two machines that share a host name, and
+// addressed by that name, owns its own node only: the other, an allowed
+// host's, is still found by its IP and its names, and the denied one is
+// still hidden.
+func TestMCPRepeatedTailscaleHostNamesHideOnlyTheLinkedNode(t *testing.T) {
+	e := newE2EWith(t, staticTS{buildTwins()})
+	e.addHost(t, "build-secret", func(h *model.Host) {
+		h.AgentAccess, h.Addresses, h.Tailscale = "deny", []string{"build"}, tsLink("nBUILD1", "build")
+	})
+	e.addHost(t, "ci-runner", func(h *model.Host) { h.Tailscale = tsLink("nBUILD2", "build-1") })
+	m := e.startMCP(t)
+	for _, target := range []string{"100.64.0.22", "build-1", "build-1.tn.ts.net"} {
+		if r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": target}); r.Status != "matched" || r.Host == nil || r.Host.Name != "ci-runner" {
+			t.Errorf("resolve_host %s = %+v, want ci-runner", target, r)
+		}
+	}
+	for _, target := range []string{"100.64.0.21", "build.tn.ts.net", "build-secret", "build"} {
+		r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": target})
+		if r.Host != nil && r.Host.Name != "ci-runner" {
+			t.Errorf("resolve_host %s matched %s", target, r.Host.Name)
+		}
+		b, _ := json.Marshal(r)
+		for _, h := range []string{"nBUILD1", "100.64.0.21", "build-secret", "build.tn.ts.net"} {
+			if !strings.Contains(target, h) && strings.Contains(string(b), h) {
+				t.Errorf("resolve_host %s names %s: %s", target, h, b)
+			}
+		}
+	}
+}
+
+// From a daemon that does not filter, hop mcp drops the denied host's node
+// and keeps the allowed one that shares its host name.
+func TestMCPFallbackKeepsAnAllowedNodeWithARepeatedHostName(t *testing.T) {
+	open := model.Host{Header: model.Header{ItemID: model.ID{1}}, Name: "ci-runner", AgentAccess: "allow", Tailscale: tsLink("nBUILD2", "build-1")}
+	denied := model.Host{Header: model.Header{ItemID: model.ID{2}}, Name: "build-secret", AgentAccess: "deny", Addresses: []string{"build"}, Tailscale: tsLink("nBUILD1", "build")}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: []model.Host{open, denied}, Snippets: []model.Snippet{}, Tailscale: buildTwins()})
+	f.on(daemon.OpResolve, func(params json.RawMessage) (any, error) {
+		var p daemon.ResolveParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		res := &resolve.Result{Target: p.Target, Status: resolve.StatusAmbiguous, Rule: resolve.RuleTailscale, Matched: "2 tailscale nodes or hosts match",
+			Candidates: []resolve.Candidate{
+				{HostID: open.ItemID.String(), Name: "ci-runner", NodeID: "nBUILD2", Detail: "linked to tailscale node build (nBUILD2, online)"},
+				{Name: "build", Addresses: []string{"100.64.0.21"}, NodeID: "nBUILD1", Detail: "tailscale node nBUILD1 (online), not linked to a vault host"},
+			}}
+		return daemon.ResolveResult{Result: res}, nil
+	})
+	m := startMCP(t, f.env(t, nil, nil, nil))
+	r := mcpCall[cli.MCPResolution](m, "resolve_host", map[string]any{"target": "build"})
+	if len(r.Candidates) != 1 || r.Candidates[0].Name != "ci-runner" || r.Matched != "1 tailscale nodes or hosts match" {
+		t.Errorf("resolve_host build = %+v", r)
+	}
+	hosts := mcpCall[cli.MCPHosts](m, "list_hosts", nil)
+	if b, _ := json.Marshal(hosts); len(hosts.Hosts) != 1 || !strings.Contains(string(b), "build-1.tn.ts.net") || strings.Contains(string(b), "<hidden host>") {
+		t.Errorf("list_hosts = %s", b)
+	}
+}
+
+// hop mcp's stderr, which the MCP client keeps in its log, gets what the
+// answers get: no secret hop knows of. Here the end of a run cannot be
+// written to the audit log, whose path (as the error names it) is a secret.
+func TestMCPAuditWarningOnStderrIsRedacted(t *testing.T) {
+	e := newE2E(t)
+	audit := filepath.Join(e.paths.StateDir, "mcp-audit.jsonl")
+	// An ssh that turns the audit log into a directory as the command runs.
+	fake := filepath.Join(e.base, "audit-ssh")
+	if err := os.WriteFile(fake, []byte(fmt.Sprintf("#!/bin/sh\nrm -f %q && mkdir %q\nexit 0\n", audit, audit)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := e.env(t, nil, nil, nil)
+	env.SSHBinary = fake
+	env.Environ = append(os.Environ(), "HOP_PASSWORD="+e.paths.StateDir)
+	m := startMCP(t, env)
+	out := mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": "web-1", "command": "true"})
+	if !strings.Contains(out.Warning, "audit log") || strings.Contains(out.Warning, e.paths.StateDir) {
+		t.Errorf("warning = %q", out.Warning)
+	}
+	stderr := m.stderr.String()
+	if !strings.Contains(stderr, "hop mcp: warning:") || !strings.Contains(stderr, "[redacted by hop]") || strings.Contains(stderr, e.paths.StateDir) {
+		t.Errorf("stderr = %q", stderr)
 	}
 }

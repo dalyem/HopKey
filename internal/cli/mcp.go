@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -106,13 +107,13 @@ func runMCP(ctx context.Context, e *Env, args []string) error {
 	e.Stdout, e.Stdin = io.Discard, strings.NewReader("")
 	e.StdoutTTY, e.StdinTTY = false, false
 
-	srv := newMCPServer(e, *readOnly, secrets)
+	srv, s := newMCPServer(e, *readOnly, secrets)
 	t := &mcp.IOTransport{Reader: readCloser(in), Writer: writeCloser(out)}
 	err = srv.Run(ctx, t)
 	if err == nil || ctx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, mcp.ErrConnectionClosed) {
 		return nil
 	}
-	return failf("hop mcp: %v", err)
+	return failf("hop mcp: %s", s.auditText(err.Error()))
 }
 
 func envValues(environ []string, names ...string) []string {
@@ -151,10 +152,7 @@ type mcpServer struct {
 	audit    *auditLog
 }
 
-func newMCPServer(e *Env, readOnly bool, secrets []string) *mcp.Server {
-	// Longest first, so a secret that contains another is replaced whole.
-	secrets = slices.Clone(secrets)
-	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
+func newMCPServer(e *Env, readOnly bool, secrets []string) (*mcp.Server, *mcpServer) {
 	s := &mcpServer{e: e, readOnly: readOnly, secrets: secrets, audit: newAuditLog(e)}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "hop", Title: "HopKey", Version: version.Version},
 		&mcp.ServerOptions{Instructions: mcpInstructions})
@@ -172,7 +170,7 @@ func newMCPServer(e *Env, readOnly bool, secrets []string) *mcp.Server {
 		"generated config and agent, for an agent that runs commands in its own shell."}, s.sshCommand)
 	addMCPTool(s, srv, &mcp.Tool{Name: "list_snippets", Annotations: reads, Description: "List saved command snippets with their {{name}} parameters."}, s.listSnippets)
 	if readOnly {
-		return srv
+		return srv, s
 	}
 	addMCPTool(s, srv, &mcp.Tool{Name: "exec", InputSchema: json.RawMessage(mcpExecSchema), Description: "Run a shell command on one or more hosts " +
 		"over ssh, at most 8 at a time. No terminal, stdin closed, PAGER=cat, and a timeout per host: a prompt fails instead of waiting, so use sudo -n. " +
@@ -184,7 +182,7 @@ func newMCPServer(e *Env, readOnly bool, secrets []string) *mcp.Server {
 		"A snippet that itself evaluates a value (eval, sh -c, arithmetic, indirect expansion) can still run it, and the snippet's author is responsible for that; " +
 		"hop refuses the common cases when the snippet is saved and run. Every parameter is required and unknown ones are refused. " +
 		"Snippet commands are visible to agents, so they hold no secrets; pass one as a parameter instead."}, s.runSnippet)
-	return srv
+	return srv, s
 }
 
 const mcpHostsSchema = `{
@@ -223,7 +221,7 @@ func addMCPTool[In, Out any](s *mcpServer, srv *mcp.Server, t *mcp.Tool, h func(
 	mcp.AddTool(srv, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (_ *mcp.CallToolResult, out Out, err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				fmt.Fprintf(s.e.Stderr, "hop mcp: %s panicked: %v\n", t.Name, r)
+				s.logf("%s panicked: %v", t.Name, r)
 				var zero Out
 				out, err = zero, fmt.Errorf("hop failed inside %s; see the MCP client's log for hop's stderr", t.Name)
 			}
@@ -241,7 +239,7 @@ func addMCPTool[In, Out any](s *mcpServer, srv *mcp.Server, t *mcp.Tool, h func(
 
 var (
 	pemBlockRe = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)`)
-	pemEndRe   = regexp.MustCompile(`(?s)\A.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
+	pemEndRe   = regexp.MustCompile(`-----END [A-Z0-9 ]*PRIVATE KEY-----`)
 )
 
 const redacted = "[redacted by hop]"
@@ -250,29 +248,124 @@ const redacted = "[redacted by hop]"
 // blocks, including one cut short at either end by the 64 KiB tail, and the
 // secret values this process was started with (every non-empty one, however
 // short, so a short value is not handed over because it is short; such a
-// value also masks the same text where it is not a secret). Key blocks go
-// first: a secret such as "-" replaced inside a block's -----BEGIN line
-// would leave its body unrecognised. It cannot catch a secret the remote
-// prints in another form.
+// value also masks the same text where it is not a secret), all of them
+// found before any is replaced (redactSpans). It cannot catch a secret the
+// remote prints in another form. The marks of text the agent typed (typed)
+// are removed with it.
 func (s *mcpServer) redact(text string) string {
-	return replaceSecrets(redactKeys(text), s.secrets)
+	return joinSpans(redactSpans([]span{{text: unmark.Replace(text)}}, s.secrets))
 }
 
 // keyRedacted stands where a private key block was.
 const keyRedacted = "[private key " + redacted + "]"
 
-func redactKeys(text string) string {
-	text = pemBlockRe.ReplaceAllString(text, keyRedacted)
-	return pemEndRe.ReplaceAllString(text, keyRedacted)
+// span is a piece of a message: hop's own text, text the agent typed
+// (typed), or a marker redaction put in.
+type span struct {
+	text string
+	kind spanKind
 }
 
-func replaceSecrets(text string, secrets []string) string {
-	for _, v := range secrets {
-		if v != "" {
-			text = strings.ReplaceAll(text, v, redacted)
+type spanKind int
+
+const (
+	hopText spanKind = iota
+	typedText
+	markerText
+)
+
+// redactSpans redacts the text of ss as one string. Every key block and
+// every secret is looked for in that same text before any is replaced, so
+// that neither breaks up the other (a secret "-" replaced in a block's
+// -----BEGIN line would leave its body unrecognised), and one that runs
+// across two spans, or over a block's edge, goes whole. Each stretch they
+// cover becomes a marker span.
+func redactSpans(ss []span, secrets []string) []span {
+	t := joinSpans(ss)
+	type hit struct {
+		lo, hi int
+		key    bool
+	}
+	var hits []hit
+	blocks := pemBlockRe.FindAllStringIndex(t, -1)
+	for _, b := range blocks {
+		hits = append(hits, hit{b[0], b[1], true})
+	}
+	// A block the tail cut short at its start runs from the start of the
+	// text to the first END line that ends no whole block.
+	for _, e := range pemEndRe.FindAllStringIndex(t, -1) {
+		if !slices.ContainsFunc(blocks, func(b []int) bool { return b[0] <= e[0] && e[1] <= b[1] }) {
+			hits = append(hits, hit{0, e[1], true})
+			break
 		}
 	}
-	return text
+	for _, v := range secrets {
+		if v != "" {
+			for _, m := range indexAll(t, v) {
+				hits = append(hits, hit{m[0], m[1], false})
+			}
+		}
+	}
+	slices.SortFunc(hits, func(a, b hit) int { return a.lo - b.lo })
+	var out []span
+	last := 0
+	for i := 0; i < len(hits); {
+		lo, hi, key := hits[i].lo, hits[i].hi, hits[i].key
+		for i++; i < len(hits) && hits[i].lo < hi; i++ {
+			hi, key = max(hi, hits[i].hi), key || hits[i].key
+		}
+		with := redacted
+		if key {
+			with = keyRedacted
+		}
+		out = append(cutSpans(out, ss, last, lo), span{text: with, kind: markerText})
+		last = hi
+	}
+	return cutSpans(out, ss, last, len(t))
+}
+
+// cutSpans appends to out the bytes from to to of run's text, each piece
+// with the kind of the span it came from, joining a piece to the last span
+// of out when they are of one kind.
+func cutSpans(out, run []span, from, to int) []span {
+	at := 0
+	for _, sp := range run {
+		base := at
+		at += len(sp.text)
+		lo, hi := max(from, base), min(to, at)
+		if lo >= hi {
+			continue
+		}
+		piece := sp.text[lo-base : hi-base]
+		if k := len(out) - 1; k >= 0 && out[k].kind == sp.kind && sp.kind != markerText {
+			out[k].text += piece
+		} else {
+			out = append(out, span{text: piece, kind: sp.kind})
+		}
+	}
+	return out
+}
+
+func joinSpans(ss []span) string {
+	var b strings.Builder
+	for _, sp := range ss {
+		b.WriteString(sp.text)
+	}
+	return b.String()
+}
+
+// indexAll is where v stands in t, left to right and not overlapping, as
+// strings.ReplaceAll finds it.
+func indexAll(t, v string) [][]int {
+	var out [][]int
+	for i := 0; ; {
+		j := strings.Index(t[i:], v)
+		if j < 0 {
+			return out
+		}
+		out = append(out, []int{i + j, i + j + len(v)})
+		i += j + len(v)
+	}
 }
 
 // redactValue applies redact to every string in v.
@@ -339,7 +432,11 @@ func (s *mcpServer) daemonError(err error) error {
 
 func (s *mcpServer) list(ctx context.Context) (*daemon.ListResult, error) {
 	l, err := listAll(ctx, s.e)
-	return l, s.daemonError(err)
+	if err != nil {
+		return nil, s.daemonError(err)
+	}
+	unmarkValue(l)
+	return l, nil
 }
 
 // resolve resolves target as hop which --json does, among the hosts agents
@@ -353,6 +450,7 @@ func (s *mcpServer) resolve(ctx context.Context, target string, l *daemon.ListRe
 	if rr.Result == nil {
 		return nil, failf("the daemon did not resolve %q", target)
 	}
+	unmarkValue(&rr)
 	visible := func(id string) bool {
 		for _, h := range l.Hosts {
 			if h.ItemID.String() == id {
@@ -396,6 +494,7 @@ func (s *mcpServer) resolve(ctx context.Context, target string, l *daemon.ListRe
 			res.Matched = fmt.Sprintf("%d tailscale nodes or hosts match", len(res.Candidates))
 		}
 	}
+	res.Matched = markMatched(res)
 	return &rr, nil
 }
 
@@ -411,8 +510,9 @@ func deniedNodes(l *daemon.ListResult) map[string]bool {
 		if agentAllowed(h) {
 			continue
 		}
-		for _, n := range l.Tailscale.Nodes() {
-			if daemon.HostOwnsNode(h, n) {
+		all := l.Tailscale.Nodes()
+		for _, n := range all {
+			if daemon.HostOwnsNode(h, n, all) {
 				out[n.ID] = true
 			}
 		}
@@ -445,8 +545,9 @@ type masker struct {
 func (s *mcpServer) masker(l *daemon.ListResult) masker {
 	known := func(h model.Host) []string {
 		out := append(resolve.Names(h), h.Addresses...)
-		for _, n := range l.Tailscale.Nodes() {
-			if daemon.HostOwnsNode(h, n) {
+		all := l.Tailscale.Nodes()
+		for _, n := range all {
+			if daemon.HostOwnsNode(h, n, all) {
 				out = append(out, n.ID, n.HostName, n.DNSName, n.ShortName())
 				out = append(out, n.IPs...)
 			}
@@ -484,71 +585,123 @@ func (s *mcpServer) masker(l *daemon.ListResult) masker {
 	return m
 }
 
-// hide scrubs text as redact does, then replaces each hidden name in it,
-// ignoring case, where it stands as a whole host token (replaceWord).
-// Private key blocks go first, so that neither a secret nor a hidden name
-// (a host called PRIVATE) breaks one up before it is found. hop's own
-// markers ([redacted by hop]) are never masked, so such a host leaves them
-// readable.
+// hide scrubs text as redact does, then replaces each hidden name in hop's
+// own text, ignoring case, where it stands as a whole host token
+// (replaceWord). Key blocks and secrets are found over the whole text
+// first, so that neither a hidden name (a host called PRIVATE) nor text the
+// agent typed breaks one up before it is found; what redaction put in is
+// never masked.
 //
-// The agent's own targets (given) are left out of the masking: hop quotes
-// one with %q wherever it echoes it ("no host matches %q"), and each such
-// quoted text stays as the agent wrote it. Masking it would answer
-// differently about a denied name than about one that does not exist
+// Text the agent typed, marked where hop echoes it in the message (typed),
+// is not masked either: masking a denied name in "no host matches %q"
+// would answer differently about it than about a name that does not exist
 // ("<hidden host>." for "vault-secret."), which tells the agent the name
-// is there.
-func (m masker) hide(text string, given ...string) string {
-	text = redactKeys(text)
-	keep := []string{keyRedacted}
-	for _, g := range given {
-		keep = append(keep, echoed(g)...)
-	}
+// is there. Everything else in text is hop's, and is masked, ssh's stderr
+// included, but for the user the agent gave where ssh names it on its own
+// login to the target (markSSHUser).
+func (m masker) hide(text string) string {
 	var b strings.Builder
-	for {
-		at, n := -1, 0
-		for _, k := range keep {
-			if i := strings.Index(text, k); i >= 0 && (at < 0 || i < at || i == at && len(k) > n) {
-				at, n = i, len(k)
+	for _, sp := range redactSpans(typedSpans(text), m.secrets) {
+		if sp.kind == hopText {
+			for _, n := range m.names {
+				sp.text = replaceWord(sp.text, n, hiddenHost)
 			}
 		}
-		if at < 0 {
-			b.WriteString(m.hideNames(text))
-			return b.String()
+		b.WriteString(sp.text)
+	}
+	return b.String()
+}
+
+// The marks around text the agent typed. Only hop puts them in a message
+// (typed); they are removed from what the daemon answers (unmarkValue),
+// from command output, and from what typed marks.
+const (
+	markOpen  = "\ue000"
+	markClose = "\ue001"
+)
+
+var unmark = strings.NewReplacer(markOpen, "", markClose, "")
+
+// typed marks s as text the agent typed, for hide. It goes where a message
+// echoes the agent's own input: a target, the host or user parsed from it,
+// a tag's name.
+func typed(s string) string { return markOpen + unmark.Replace(s) + markClose }
+
+// typedQ is typed for s quoted as %q quotes it.
+func typedQ(s string) string { return typed(strconv.Quote(s)) }
+
+var mcpEcho = echo{quote: typedQ, login: markSSHUser}
+
+// markSSHUser removes any marks from stderr, ssh's on a login to t at
+// addr, and marks the user the agent gave where ssh names it on that login
+// (user@addr: Permission denied ...). The address is the target's, so the
+// line is not about a jump host, whose user is the vault's.
+func markSSHUser(t *target, addr, stderr string) string {
+	stderr = unmark.Replace(stderr)
+	if t.user == "" {
+		return stderr
+	}
+	lines := strings.SplitAfter(stderr, "\n")
+	for i, l := range lines {
+		rest, ok := strings.CutPrefix(l, t.user+"@")
+		if ok && len(rest) > len(addr) && strings.EqualFold(rest[:len(addr)], addr) && strings.HasPrefix(rest[len(addr):], ": ") {
+			lines[i] = typed(t.user) + "@" + rest
 		}
-		b.WriteString(m.hideNames(text[:at]))
-		b.WriteString(text[at : at+n])
-		text = text[at+n:]
+	}
+	return strings.Join(lines, "")
+}
+
+// typedSpans splits text into hop's text and the agent's (typed), without
+// the marks. A mark that is not one of a pair is dropped, and the text
+// after it is hop's.
+func typedSpans(text string) []span {
+	var out []span
+	for {
+		i := strings.Index(text, markOpen)
+		j := -1
+		if i >= 0 {
+			j = strings.Index(text[i:], markClose)
+		}
+		if j < 0 {
+			return append(out, span{text: unmark.Replace(text)})
+		}
+		out = append(out, span{text: unmark.Replace(text[:i])},
+			span{text: unmark.Replace(text[i+len(markOpen) : i+j]), kind: typedText})
+		text = text[i+j+len(markClose):]
 	}
 }
 
-func (m masker) hideNames(text string) string {
-	parts := strings.Split(replaceSecrets(text, m.secrets), redacted)
-	for i := range parts {
-		for _, n := range m.names {
-			parts[i] = replaceWord(parts[i], n, hiddenHost)
-		}
+// unmarkValue removes the marks of typed from every string in *v, an
+// answer from the daemon: none of its text was typed by the agent here.
+func unmarkValue[T any](v *T) {
+	b, err := json.Marshal(v)
+	if err != nil || !bytes.Contains(b, []byte(markOpen)) && !bytes.Contains(b, []byte(markClose)) {
+		return
 	}
-	return strings.Join(parts, redacted)
+	var out T
+	if err := json.Unmarshal([]byte(unmark.Replace(string(b))), &out); err == nil {
+		*v = out
+	}
 }
 
-// echoed is how hop quotes a target the agent gave when it echoes it: as
-// given, without user@ and brackets as the resolver reads it, and a tag's
-// name.
-func echoed(given string) []string {
-	forms := []string{given}
-	if _, t, err := resolve.ParseTarget(given); err == nil {
-		forms = append(forms, t)
-	}
-	if tag, ok := strings.CutPrefix(given, "tag:"); ok {
-		forms = append(forms, tag)
-	}
-	var out []string
-	for _, f := range forms {
-		if f != "" {
-			out = append(out, strconv.Quote(f))
+// markMatched marks the target where the resolver quotes it in what
+// matched (resolve.Resolve: alias or name "x", stored address "x", "x"
+// resolves to ...). Anything else it says is hop's own text.
+func markMatched(res *resolve.Result) string {
+	q := strconv.Quote(res.Target)
+	switch res.Rule {
+	case resolve.RuleAlias, resolve.RuleAddress, resolve.RulePrefix:
+		for _, p := range []string{"alias or name ", "stored address ", "prefix or fuzzy match for "} {
+			if res.Matched == p+q {
+				return p + typed(q)
+			}
+		}
+	case resolve.RuleDNS:
+		if rest, ok := strings.CutPrefix(res.Matched, q+" resolves to "); ok {
+			return typed(q) + " resolves to " + rest
 		}
 	}
-	return out
+	return res.Matched
 }
 
 // replaceWord replaces word in text, ignoring case, where it is a whole
@@ -739,11 +892,11 @@ func (s *mcpServer) resolveHost(ctx context.Context, _ *mcp.CallToolRequest, in 
 	w := whichResult(rr)
 	m := s.masker(l)
 	out := MCPResolution{
-		Target: w.Target, User: w.User, Status: w.Status, Rule: w.Rule, Matched: m.hide(w.Matched, in.Target), Route: w.Route,
-		RouteError: m.hide(w.RouteError, in.Target), Candidates: w.Candidates,
+		Target: w.Target, User: w.User, Status: w.Status, Rule: w.Rule, Matched: m.hide(w.Matched), Route: w.Route,
+		RouteError: m.hide(w.RouteError), Candidates: w.Candidates,
 	}
 	for _, n := range w.Notes {
-		out.Notes = append(out.Notes, m.hide(n, in.Target))
+		out.Notes = append(out.Notes, m.hide(n))
 	}
 	if out.Candidates == nil {
 		out.Candidates = []resolve.Candidate{}
@@ -771,10 +924,10 @@ func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mc
 		return CheckResult{}, err
 	}
 	out := CheckResult{Target: in.Host, Host: rr.Result.HostName}
-	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly)
+	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly, mcpEcho)
 	m := s.masker(l)
 	for i := range out.Steps {
-		out.Steps[i].Detail = m.hide(out.Steps[i].Detail, in.Host)
+		out.Steps[i].Detail = m.hide(out.Steps[i].Detail)
 	}
 	return out, nil
 }
@@ -796,9 +949,9 @@ func (s *mcpServer) sshCommand(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if err != nil {
 		return MCPSSHCommand{}, err
 	}
-	t, err := connectable(rr)
+	t, err := connectableAs(rr, typedQ)
 	if err != nil {
-		return MCPSSHCommand{}, failMsg(s.masker(l).hide(err.Error(), in.Host))
+		return MCPSSHCommand{}, failMsg(s.masker(l).hide(err.Error()))
 	}
 	addr, _ := chooseAddress(ctx, s.e, t)
 	argv := append([]string{"ssh"}, s.e.sshArgs(t, addr)...)
@@ -955,10 +1108,9 @@ func (s *mcpServer) runSnippet(ctx context.Context, req *mcp.CallToolRequest, in
 
 // execStep is one host an exec runs on, or why it will not.
 type execStep struct {
-	host  string // the host's name, or the target as given when it did not resolve
-	given string // the target as given, or the host's name for a tag's host
-	t     *target
-	err   error
+	host string // the host's name, or the target as given when it did not resolve
+	t    *target
+	err  error
 }
 
 // plan expands tag: targets to the hosts agents may use, resolves each one
@@ -971,7 +1123,7 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 	for _, tg := range targets {
 		tag, ok := strings.CutPrefix(tg, "tag:")
 		if !ok {
-			items = append(items, execStep{host: tg, given: tg})
+			items = append(items, execStep{host: tg})
 			continue
 		}
 		var tagged []string
@@ -981,11 +1133,11 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 			}
 		}
 		if len(tagged) == 0 {
-			items = append(items, execStep{host: tg, given: tg, err: failf("no host has the tag %q", tag)})
+			items = append(items, execStep{host: tg, err: failf("no host has the tag %s", typedQ(tag))})
 		}
 		slices.SortFunc(tagged, func(a, b string) int { return strings.Compare(strings.ToLower(a), strings.ToLower(b)) })
 		for _, n := range tagged {
-			items = append(items, execStep{host: n, given: n})
+			items = append(items, execStep{host: n})
 		}
 	}
 	if len(items) > mcpMaxHosts {
@@ -1004,7 +1156,7 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 		}
 		t, err := runnable(rr, l)
 		if err != nil {
-			steps = append(steps, execStep{host: it.host, given: it.given, err: err})
+			steps = append(steps, execStep{host: it.host, err: err})
 			continue
 		}
 		key := rr.Host.ItemID.String() + "\x00" + t.user
@@ -1012,7 +1164,7 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 			continue // named twice, or by name and by tag: run it once
 		}
 		seen[key] = true
-		steps = append(steps, execStep{host: rr.Result.HostName, given: it.given, t: t})
+		steps = append(steps, execStep{host: rr.Result.HostName, t: t})
 	}
 	return steps, nil
 }
@@ -1023,7 +1175,7 @@ func (s *mcpServer) plan(ctx context.Context, l *daemon.ListResult, targets []st
 // ssh itself (StrictHostKeyChecking yes, in the generated config).
 func runnable(rr *daemon.ResolveResult, l *daemon.ListResult) (*target, error) {
 	if rr.Result.Status != resolve.StatusMatched || rr.Host == nil {
-		return nil, failMsg(describeUnresolved(rr.Result))
+		return nil, failMsg(describeUnresolvedAs(rr.Result, typedQ))
 	}
 	h := *rr.Host
 	if pins, _ := parsePins(h.HostKeys); len(pins) == 0 {
@@ -1043,7 +1195,7 @@ func runnable(rr *daemon.ResolveResult, l *daemon.ListResult) (*target, error) {
 		}
 		hop = j
 	}
-	return connectable(rr)
+	return connectableAs(rr, typedQ)
 }
 
 // run runs script on targets, logging entry (Tool, and Command or Snippet
@@ -1076,7 +1228,7 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 	m := s.masker(l)
 	for i, st := range steps {
 		if st.err != nil {
-			out.Results[i] = ExecResult{Host: st.host, ExitCode: ExitFailure, Error: m.hide(st.err.Error(), st.given)}
+			out.Results[i] = ExecResult{Host: st.host, ExitCode: ExitFailure, Error: m.hide(st.err.Error())}
 			continue
 		}
 		wg.Add(1)
@@ -1087,7 +1239,7 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 			r := s.runOne(ctx, st.t, script, timeout)
 			// stderr has ssh's own messages, which name a jump host that
 			// failed; stdout is the command's alone.
-			r.Error, r.Stderr = m.hide(r.Error, st.given), m.hide(r.Stderr, st.given)
+			r.Error, r.Stderr = m.hide(unmark.Replace(r.Error)), m.hide(r.Stderr)
 			out.Results[i] = r
 		}()
 	}
@@ -1095,9 +1247,15 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 
 	if err := s.audit.end(&entry, out.Results, s.auditText); err != nil {
 		out.Warning = safef("the command ran, but the end of the run could not be written to the audit log: %v", err)
-		fmt.Fprintf(s.e.Stderr, "hop mcp: warning: %s\n", oneLine(out.Warning))
+		s.logf("warning: %s", out.Warning)
 	}
 	return out, nil
+}
+
+// logf writes a line to hop mcp's stderr, which the MCP client keeps in its
+// log, passed through auditText: every write to it goes this way.
+func (s *mcpServer) logf(format string, args ...any) {
+	fmt.Fprintf(s.e.Stderr, "hop mcp: %s\n", s.auditText(fmt.Sprintf(format, args...)))
 }
 
 // auditText is a string as the audit log records it: redacted, and with
@@ -1108,6 +1266,7 @@ func (s *mcpServer) auditText(text string) string { return exact(s.redact(text))
 func (s *mcpServer) runOne(ctx context.Context, t *target, command string, timeout time.Duration) ExecResult {
 	addr, _ := chooseAddress(ctx, s.e, t)
 	res, err := s.e.runRemote(ctx, t, addr, remoteRun{command: command, timeout: timeout})
+	res.Stderr = markSSHUser(t, addr, res.Stderr)
 	if err != nil {
 		res.ExitCode, res.Error = ExitFailure, err.Error()
 		return res
