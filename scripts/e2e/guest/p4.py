@@ -76,7 +76,8 @@ def step_a_jump():
     r1 = hop('check', 't2inner')
     r2 = hop('info', 't2inner')
     c('A.jump-hints', 'hop check and hop info give the hop edit --host-key hint for a jump target, not hop trust',
-      'hop trust t2inner' not in r1.all + r2.all, '', r1.ev('check') + '\n' + r2.ev('info'), 'r2-P3-2')
+      r2.rc == 0 and 't2inner' in r2.out and 'hop trust t2inner' not in r1.all + r2.all,
+      '' if r2.rc == 0 else 'not judged: hop info t2inner failed', r1.ev('check') + '\n' + r2.ev('info'), 'r2-P3-2')
     key = open('/var/e2e/state/t2-internal.pub').read().split()
     r = hop('edit', 't2inner', '--host-key', '%s %s' % (key[0], key[1]))
     r1 = hop('check', 't2inner', timeout=60)
@@ -95,8 +96,9 @@ def step_a_ts():
     nodes = [T1S, T2F.split('.')[0], T3S, BS]
     r = hop('ts', 'import', *nodes, '--dry-run')
     c('A.ts-dryrun', 'hop ts import --dry-run lists what it would do', r.rc == 0 and T3S in r.out, '', r.ev('ts import --dry-run'))
-    c('A.ts-dryrun-words', 'the dry run prints readable actions, not would_created', 'would_created' not in r.out and 'would_linked' not in r.out,
-      '', r.ev('ts import --dry-run'), 'r1-P3-5')
+    c('A.ts-dryrun-words', 'the dry run prints readable actions, not would_created',
+      r.rc == 0 and T3S in r.out and 'would_created' not in r.out and 'would_linked' not in r.out,
+      '' if r.rc == 0 else 'not judged: the dry run failed', r.ev('ts import --dry-run'), 'r1-P3-5')
     r = hop('ts', 'import', T3S, '--user', 'deploy', '--key', 'testkey', '--tag', 'tsimp')
     c('A.ts-import', 'hop ts import of T3\'s node links it to the host added by IP', r.rc == 0 and re.search(r'linked\s+%s\s*->\s*t3' % re.escape(T3S), r.out),
       '', r.ev('ts import ' + T3S))
@@ -175,20 +177,34 @@ def step_conc(epoch):
     epoch = float(epoch)
     while time.time() < epoch:
         time.sleep(0.05)
-    out = []
+    out, errs, spans = [], [], []
     lock = threading.Lock()
 
     def one(h, i):
-        r = hop('exec', h, '--timeout', '40s', '--', 'sh', '-c', 'echo ok-%s-%d' % (h, i), timeout=60)
-        with lock:
-            out.append((h, i, r.rc, 'ok-%s-%d' % (h, i) in r.out, r.all.strip()[-200:]))
+        try:
+            s0 = time.time()
+            r = hop('exec', h, '--timeout', '40s', '--', 'sh', '-c', 'echo ok-%s-%d' % (h, i), timeout=60)
+            with lock:
+                out.append((h, i, r.rc, 'ok-%s-%d' % (h, i) in r.out, r.all.strip()[-200:]))
+                spans.append((s0, time.time()))
+        except Exception as e:  # a lost thread must not shrink the denominator
+            with lock:
+                errs.append('%s/%d %r' % (h, i, e))
     ths = [threading.Thread(target=one, args=(h, i)) for i in range(5) for h in TARGETS]
+    want = len(ths)
     t0 = time.time()
     [t.start() for t in ths]
     [t.join() for t in ths]
     ok = sum(1 for x in out if x[2] == 0 and x[3])
-    c('%s.concurrency' % M, 'A and B at once: 5 rounds x 3 targets of hop exec in parallel, all succeed', ok == len(out),
-      '%d/%d ok in %.1fs' % (ok, len(out), time.time() - t0), '; '.join('%s/%d rc=%d %s' % (h, i, rc, e) for h, i, rc, good, e in out if not good)[:800])
+    # The driver compares A's and B's windows to prove the two machines ran at once.
+    L.state_put('conc', {'start': min(a for a, _ in spans) if spans else None, 'end': max(b for _, b in spans) if spans else None,
+                         'n': len(out), 'errors': len(errs)})
+    if errs or len(out) != want:
+        L.harness('%s.concurrency' % M, 'A and B at once: 5 rounds x 3 targets of hop exec in parallel, all succeed',
+                  '%d results of %d; thread errors: %s' % (len(out), want, errs[:5]))
+        return
+    c('%s.concurrency' % M, 'A and B at once: 5 rounds x 3 targets of hop exec in parallel, all succeed', ok == want,
+      '%d/%d ok in %.1fs' % (ok, want, time.time() - t0), '; '.join('%s/%d rc=%d %s' % (h, i, rc, e) for h, i, rc, good, e in out if not good)[:800])
 
 
 def step_syncuse_a(epoch):

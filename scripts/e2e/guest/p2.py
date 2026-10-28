@@ -158,23 +158,33 @@ def main():
     _, st, _ = call('exec', {'hosts': 'm1', 'command': 'cat leak.pem; echo ---; cat pp.txt; echo ---; cat sk.txt; echo ---; cat mpw.txt'})
     planted = json.dumps(st)
     pem = open('/home/tester/testkey').read().splitlines()[1]
-    c('scrub.pem', 'a private key block the remote prints is redacted', 'PRIVATE KEY' not in planted and pem not in planted, '')
-    c('scrub.devpass', 'the device passphrase the remote prints is redacted', L.sec_read('devpass') not in planted, '')
-    leaked = [n for n, v in (('Secret Key', L.kit()[0]), ('master password', L.sec_read('masterpw'))) if v and v in planted]
-    c('scrub.unknown-secrets', 'the Secret Key and master password the remote prints are redacted (daemon knows the Secret Key)',
-      not leaked, 'passed through: %s (hop mcp was started without them in its env; README calls this best effort)' % leaked, '', 'r1-P1-rule')
+    # The scrub checks judge output, so the command must have run and printed all four parts.
+    pr = results(st).get('m1', {})
+    if pr.get('exit_code') == 0 and pr.get('stdout', '').count('---') == 3:
+        c('scrub.pem', 'a private key block the remote prints is redacted', 'PRIVATE KEY' not in planted and pem not in planted, '')
+        c('scrub.devpass', 'the device passphrase the remote prints is redacted', L.sec_read('devpass') not in planted, '')
+        leaked = [n for n, v in (('Secret Key', L.kit()[0]), ('master password', L.sec_read('masterpw'))) if v and v in planted]
+        c('scrub.unknown-secrets', 'the Secret Key and master password the remote prints are redacted (daemon knows the Secret Key)',
+          not leaked, 'passed through: %s (hop mcp was started without them in its env; README calls this best effort)' % leaked, '', 'r1-P1-rule')
+    else:
+        L.harness('scrub', 'the planted-secret command runs on m1 and prints its four parts', 'result: %s' % json.dumps(pr)[:200])
+    healthy = m.healthy
     m.close()
 
     # Denied names: never in an answer where the request did not type them.
     leaks = [raw[:160] for typed, raw in texts if not no_denied(raw, typed)]
-    c('deny.invisible', 'the denied host name, alias and description appear in no answer except as typed', not leaks, 'leaks: %s' % leaks[:3])
+    if healthy and texts:
+        c('deny.invisible', 'the denied host name, alias and description appear in no answer except as typed', not leaks, 'leaks: %s' % leaks[:3])
+    else:
+        L.harness('deny.invisible', 'the denied host name, alias and description appear in no answer except as typed',
+                  'prerequisite: hop mcp answered every request (hung %s, exited %s, %d of %d answered)' % (m.hung, m.exited, m.answered, m.nid))
 
     # Read-only.
     ro = MCP(['--read-only'], tag='p2-mcp-ro')
     tools, _ = ro.tools()
     c('ro.tools', '--read-only offers no exec or run_snippet', 'exec' not in tools and 'run_snippet' not in tools and 'list_hosts' in tools, 'tools %s' % tools)
     err, st, text = ro.call('exec', {'hosts': 'm1', 'command': 'echo SHOULD-NOT-RUN'})
-    c('ro.exec', '--read-only refuses an exec call', err and 'SHOULD-NOT-RUN' not in text, text[:200])
+    c('ro.exec', '--read-only refuses an exec call', ro.healthy and err and 'SHOULD-NOT-RUN' not in text, text[:200])
     err, st, text = ro.call('check_host', {'host': 'm1'})
     auth = [s for s in (st or {}).get('steps', []) if s.get('name') == 'auth_ok']
     c('ro.check', '--read-only check_host skips the login step', bool(auth) and auth[0].get('status') == 'skipped', json.dumps(auth)[:200])
@@ -201,7 +211,8 @@ def main():
     c('audit.snippet', 'run_snippet audit lines carry parameter names', any('name' in json.dumps(x.get('params', '')) for x in snip_lines), json.dumps(snip_lines[:1])[:300])
     vals = ['world', 'pwned1', 'pwned2', 'pwned3', 'pwned4', 'A1', 'B1', 'hello world', 'mcp-42']
     hits = [v for v in vals if v in audit]
-    c('audit.no-values', 'the audit log holds no parameter values and no output', not hits, 'found: %s' % hits)
+    c('audit.no-values', 'the audit log holds no parameter values and no output', bool(snip_lines) and not hits,
+      'found: %s' % hits if snip_lines else 'not judged: no run_snippet lines in the audit log')
 
     # Secret scan of every response, stderr log, the audit log and daemon.log
     # (the planted call's answer is judged above).
@@ -230,7 +241,12 @@ def main():
     except Exception:
         pass
     found = ['%s in %s' % (sn, cn) for cn, ct in corpus.items() for sn, sv in secrets.items() if sv and sv in ct]
-    c('scan', 'secret scan: no secret in any MCP response, stderr, audit log or daemon.log', not found, 'hits: %s' % found)
+    empty = [cn for cn in ('responses', 'audit') if not corpus[cn]]
+    if empty:
+        L.harness('scan', 'secret scan: no secret in any MCP response, stderr, audit log or daemon.log', 'prerequisite: empty corpus: %s' % empty)
+    else:
+        c('scan', 'secret scan: no secret in any MCP response, stderr, audit log or daemon.log', not found,
+          'hits: %s; scanned %s' % (found, {cn: len(ct) for cn, ct in corpus.items()}))
 
     # mcp install.
     r = hop('mcp', 'install', '--client', 'print')

@@ -1,5 +1,7 @@
 """A minimal MCP stdio client (newline-delimited JSON-RPC) for hop mcp."""
 import json
+import os
+import select
 import subprocess
 import time
 
@@ -15,31 +17,60 @@ class MCP:
                                   text=True, bufsize=1, cwd='/tmp')
         self.nid = 0
         self.transcript = []  # every raw response line, for the secret scan
+        self.buf = b''
+        self.hung = False      # a request went unanswered past its timeout
+        self.exited = False    # hop mcp closed its stdout
+        self.answered = 0      # responses that carried a result or an error from hop mcp
         self.init = self.rpc('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                                             'clientInfo': {'name': 'hk-e2e', 'version': '1'}})
         self.send({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
 
     def send(self, msg):
-        self.p.stdin.write(json.dumps(msg) + '\n')
-        self.p.stdin.flush()
+        try:
+            self.p.stdin.write(json.dumps(msg) + '\n')
+            self.p.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            self.exited = True
+
+    def _line(self, deadline):
+        """The next stdout line, '' at EOF, None at the deadline (reads the fd, so select sees all data)."""
+        fd = self.p.stdout.fileno()
+        while b'\n' not in self.buf:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            r, _, _ = select.select([fd], [], [], left)
+            if not r:
+                continue
+            d = os.read(fd, 65536)
+            if not d:
+                return ''
+            self.buf += d
+        line, self.buf = self.buf.split(b'\n', 1)
+        return line.decode(errors='replace') + '\n'
 
     def rpc(self, method, params, timeout=120):
         self.nid += 1
         self.send({'jsonrpc': '2.0', 'id': self.nid, 'method': method, 'params': params})
-        t0 = time.time()
+        deadline = time.time() + timeout
         while True:
-            line = self.p.stdout.readline()
+            if self.exited:
+                return {'error': {'message': 'EOF from hop mcp'}, 'transport': 'eof'}
+            line = self._line(deadline)
+            if line is None:
+                self.hung = True
+                return {'error': {'message': 'timeout'}, 'transport': 'timeout'}
             if not line:
-                return {'error': {'message': 'EOF from hop mcp'}}
+                self.exited = True
+                return {'error': {'message': 'EOF from hop mcp'}, 'transport': 'eof'}
             self.transcript.append(line)
             try:
                 m = json.loads(line)
             except ValueError:
                 continue
             if m.get('id') == self.nid:
+                self.answered += 1
                 return m
-            if time.time() - t0 > timeout:
-                return {'error': {'message': 'timeout'}}
 
     def tools(self):
         r = self.rpc('tools/list', {})
@@ -56,12 +87,18 @@ class MCP:
         L.log('MCP', name, json.dumps(args), '->', 'isError=%s' % res.get('isError'), text[:600])
         return bool(res.get('isError')), res.get('structuredContent'), text
 
+    @property
+    def healthy(self):
+        """Every request so far got an answer from hop mcp (no hang, no exit)."""
+        return not self.hung and not self.exited and self.answered == self.nid
+
     def close(self):
         try:
             self.p.stdin.close()
             self.p.wait(timeout=20)
         except Exception:
             self.p.kill()
+            self.p.wait()
         return self.p.returncode
 
     def stderr(self):

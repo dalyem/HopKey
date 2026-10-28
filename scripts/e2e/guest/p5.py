@@ -51,11 +51,26 @@ def step_ensure_t1():
 def step_b_wait_t1():
     got, secs = L.wait_for(lambda: (L.hosts() or {}).get('t1', {}).get('host_keys'), 60, 1)
     if not got:
-        L.log('t1 never arrived on B')
+        L.harness('B.wait-t1', 'B has t1 with a pinned host key before the revocation scenarios', 't1 not on B after 60s')
+
+
+def devices():
+    """A's device list by device_id, or None when hop auth devices --json gave no valid answer."""
+    r = hop('auth', 'devices', '--json')
+    j = r.json()
+    if r.rc != 0 or not isinstance(j, dict) or not isinstance(j.get('devices'), list) or \
+            not all(isinstance(d, dict) and d.get('device_id') for d in j['devices']):
+        return None, r
+    return {d['device_id']: d.get('name') for d in j['devices']}, r
 
 
 def step_revoke(dev, n):
     """On A: revoke a device; the kit goes only to 0600 files, then hop auth resume confirms it."""
+    before, rb = devices()
+    if before is None or dev not in before:
+        L.harness('A.revoke-%s' % n, 'B\'s device %s is in A\'s device list before revoke %s' % (dev or '(empty ID)', n),
+                  'no valid device list' if before is None else 'listed: %s' % before, rb.ev('auth devices --json'))
+        return
     kitf = '/root/e2e/sec/revoke-kit-%s.txt' % n
     raw = '/root/e2e/sec/revoke-%s.raw' % n
     root('rm -f %s; install -d -m 700 -o tester /home/tester/.hk-kits' % kitf)
@@ -83,9 +98,12 @@ def step_revoke(dev, n):
         r2 = hop('auth', 'resume', '--yes', '--password-stdin', env={'HOP_KIT_CONFIRM': conf}, stdin=L.sec_read('masterpw') + '\n', timeout=120)
         c('A.resume-%s' % n, 'hop auth resume confirms the new kit', r2.rc == 0, '', r2.ev('auth resume'))
     root('shred -u %s 2>/dev/null; rm -f %s' % (tkit, tkit))
-    j = hop('auth', 'devices', '--json').json() or {}
-    names = [d.get('name') for d in j.get('devices', [])]
-    c('A.devices-%s' % n, 'the revoked device is gone from A\'s device list', dev not in names, 'names %s' % names)
+    after, ra = devices()
+    if after is None:
+        L.harness('A.devices-%s' % n, 'the revoked device is gone from A\'s device list', 'no valid device list', ra.ev('auth devices --json'))
+    else:
+        c('A.devices-%s' % n, 'the revoked device is gone from A\'s device list', dev not in after,
+          '%s (%s) was listed before; now: %s' % (dev, before[dev], after))
 
 
 def m_hop_exec():
@@ -110,10 +128,15 @@ def m_agent():
 
 def m_mcp():
     m = MCP(tag='p5-mcp')
+    if m.hung:
+        m.close()
+        raise HarnessError('hop mcp did not answer initialize')
     _, st, _ = m.call('list_hosts', {})
     nh = len((st or {}).get('hosts', []))
     _, st2, text = m.call('exec', {'hosts': 't1', 'command': 'echo mcp-exec-ok'})
     m.close()
+    if m.hung:
+        raise HarnessError('hop mcp stopped answering')
     ok = 'mcp-exec-ok' in json.dumps(st2)
     return ok or nh > 0, 'list_hosts %d hosts; exec: %s' % (nh, (json.dumps(results(st2).get('t1', {}).get('error')) if st2 else text)[:200])
 
@@ -127,9 +150,38 @@ METHODS = [('hop-exec', 'hop exec t1', m_hop_exec), ('hop-target', 'hop t1 (comm
            ('plain-ssh', 'plain ssh t1', m_plain_ssh), ('agent', 'ssh-add -L on hop\'s agent', m_agent), ('mcp', 'MCP list_hosts/exec', m_mcp)]
 
 
+class HarnessError(Exception):
+    pass
+
+
+def t1_reachable():
+    """The control for every "no longer works" check: T1's sshd answers B over the tailnet."""
+    r = root('ssh-keyscan -T 5 -t ed25519 %s 2>/dev/null' % L.env_get('HK_T1_IP'), timeout=20)
+    return 'ssh-ed25519' in r.out
+
+
+def cut_prereq(cid, tag):
+    """True when a cut can be judged; otherwise records a harness failure under cid."""
+    if t1_reachable():
+        return True
+    L.harness(cid, '%s: T1 answers on port 22 from B, so a refusal means hop refused' % tag, 'ssh-keyscan of T1 got no key')
+    return False
+
+
+def working(methods):
+    """The ids of the methods that still work; a harness error in one raises."""
+    return [mid for mid, _, fn in methods if fn()[0]]
+
+
 def step_access(tag, expect, bug=None):
+    if expect == 'cut' and not cut_prereq('B.%s.control' % tag, tag):
+        return
     for mid, label, fn in METHODS:
-        works, ev = fn()
+        try:
+            works, ev = fn()
+        except HarnessError as e:
+            L.harness('B.%s.%s' % (tag, mid), '%s: %s (harness error)' % (tag, label), str(e))
+            continue
         if expect == 'work':
             c('B.%s.%s' % (tag, mid), '%s: %s works' % (tag, label), works, '', ev)
         else:
@@ -168,21 +220,45 @@ def first_cut(tl, after):
     return None
 
 
-def step_cutoff(tag, t0, limit):
-    t0, limit = float(t0), float(limit)
-    tl, secs = L.wait_for(lambda: (lambda w: w if first_cut(w, t0) or (w and w[-1].get('end')) else None)(L.state_get('watch5-%s' % tag, [])), limit + 10, 0.5)
-    tl = L.state_get('watch5-%s' % tag, [])
+def step_cutoff(tag, t0, limit, offset='0'):
+    """t0 is on the clock of the machine that started the change; offset is
+    B's clock minus that clock (measured by the driver), so B's times map back."""
+    t0, limit = float(t0) + float(offset), float(limit)
+    name = 'watch5-%s' % tag
+
+    def ready():
+        st, w = L.state_read(name)
+        if st == 'malformed':
+            return 'malformed'
+        return w if st == 'ok' and (first_cut(w, t0) or (w and w[-1].get('end'))) else None
+    got, secs = L.wait_for(ready, limit + 10, 0.5)
+    st, tl = L.state_read(name)
+    cid, label = 'B.%s.cutoff' % tag, '%s: hop\'s agent is empty within %ds of the revoke' % (tag, limit)
+    if st != 'ok':
+        return L.harness(cid, label, 'watch state %s' % st, str(tl)[:200])
+    before = [e for e in tl if not e.get('end') and e['t'] < t0]
+    if not before or before[-1]['agent_keys'] <= 0:
+        # The agent must hold keys before the change, or "empty" proves nothing.
+        return L.harness(cid, label, 'prerequisite: the agent held no keys before the change (%s)' % (before[-1:] or 'no sample'),
+                         json.dumps(tl[:6])[:600])
     cut = first_cut(tl, t0)
-    c('B.%s.cutoff' % tag, '%s: hop\'s agent is empty within %ds of the revoke' % (tag, limit), cut is not None and cut - t0 <= limit,
+    if cut is not None and cut - t0 < -0.25:
+        return L.harness(cid, label, 'implausible: cut %.2fs before the change' % (cut - t0), json.dumps(tl[-6:])[:600])
+    c(cid, label, cut is not None and cut - t0 <= limit,
       'cut at +%.1fs' % (cut - t0) if cut else 'not cut within the watch', json.dumps(tl[-6:])[:600])
 
 
 def step_unlock_after(tag):
     r = hop('unlock', timeout=40)
-    works = [mid for mid, _, fn in METHODS[:3] if fn()[0]]
+    if not cut_prereq('B.%s.unlock' % tag, tag):
+        return
+    works = working(METHODS[:3])
     c('B.%s.unlock' % tag, '%s: hop unlock on the revoked device does not bring access back' % tag, not works,
       'hop unlock rc=%d; working again: %s' % (r.rc, works), r.ev('hop unlock'), BUGS['unlock'])
     hop('lock')
+
+
+SESSIONS = ('open-hopexec', 'open-plain')
 
 
 def step_sessions_start():
@@ -193,42 +269,79 @@ def step_sessions_start():
         f = open('/var/e2e/state/%s.out' % name, 'w')
         subprocess.Popen(L.user_argv('tester', argv, 120), env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                          start_new_session=True)
-    time.sleep(3)
+
+    def connected():
+        got = [n for n in SESSIONS if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
+        return got if len(got) == len(SESSIONS) else None
+    got, secs = L.wait_for(connected, 20, 0.5)
+    got = got or [n for n in SESSIONS if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
+    L.state_put('sessions-start', {'connected': got, 't': time.time()})
+    if len(got) != len(SESSIONS):
+        L.harness('B.sessions-start', 'both sessions are connected and running before the revoke', 'connected: %s' % got)
 
 
 def step_sessions_end(tag):
     L.wait_for(lambda: not root('pgrep -u tester -f "seq 1 45"').out.strip(), 70, 2)
-    o = {n: open('/var/e2e/state/%s.out' % n).read() for n in ('open-hopexec', 'open-plain')}
+    o = {n: open('/var/e2e/state/%s.out' % n).read() for n in SESSIONS}
+    cid, label = 'B.%s.open-sessions' % tag, '%s: sessions open at the revoke are ended (hop exec and plain ssh)' % tag
+    _, pre = L.state_read('sessions-start')
+    connected = (pre or {}).get('connected') or []
+    if sorted(connected) != sorted(SESSIONS):
+        return L.harness(cid, label, 'prerequisite: not every session was running before the revoke (connected: %s)' % connected,
+                         '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items()))
     survived = [n for n, s in o.items() if 'tick 45' in s]
-    c('B.%s.open-sessions' % tag, '%s: sessions open at the revoke are ended (hop exec and plain ssh)' % tag, not survived,
+    c(cid, label, not survived,
       'ran to the end: %s' % survived, '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items()), 'r2-gap4')
 
 
 def step_block(on):
-    for rule in ('OUTPUT -d %s -p tcp --dport 8443 -j DROP' % SIP, 'INPUT -s %s -p tcp --sport 8443 -j DROP' % SIP):
-        root('while iptables -D %s 2>/dev/null; do :; done; %s' % (rule, 'iptables -I ' + rule if on == '1' else 'true'))
+    on = on == '1'
+    bad = L.fw_block(['OUTPUT -d %s -p tcp --dport 8443 -j DROP' % SIP, 'INPUT -s %s -p tcp --sport 8443 -j DROP' % SIP]) if on else []
+    if not on:
+        L.fw_clear()
+    t = time.time()
+    reach = L.server_reachable(URL, 1 if on else 5)
+    ok = not bad and reach != on
+    # The driver reads the time from here, so a cutoff after unblocking is timed on B's own clock.
+    L.state_put('block-%d' % int(on), {'t': t, 'ok': ok})
+    if not ok:
+        L.harness('B.block-%s' % ('on' if on else 'off'), 'the firewall %s B\'s path to the server' % ('blocks' if on else 'reopens'),
+                  'rules that failed: %s; server reachable: %s' % (bad, reach))
 
 
 def step_daemon_restart(tag):
     hop('daemon', 'stop')
     time.sleep(1)
     hop('ls')
-    works = [mid for mid, _, fn in METHODS[:3] if fn()[0]]
+    if not cut_prereq('B.%s.restart' % tag, tag):
+        return
+    works = working(METHODS[:3])
     c('B.%s.restart' % tag, '%s: after a daemon restart, still offline, the revoked device has no access' % tag, not works,
       'working: %s' % works, '', BUGS['offline'])
 
 
 def step_stopped(tag):
     pids = L.daemon_pids()
-    works = [mid for mid, _, fn in METHODS[2:4] if fn()[0]]
+    if not cut_prereq('B.%s.stopped' % tag, tag):
+        return
+    works = working(METHODS[2:4])
     c('B.%s.stopped' % tag, '%s: with the daemon stopped, plain ssh and the agent give nothing' % tag, not pids and not works,
       'daemon pids %s, working: %s' % (pids, works))
 
 
 def step_start_window(tag):
     """Start the daemon on a revoked device; nothing may be served before the server check."""
+    cid = 'B.%s.window' % tag
+    label = '%s: a daemon starting on the revoked device serves no keys before it checks with the server' % tag
+    if L.daemon_pids():
+        return L.harness(cid, label, 'prerequisite: a daemon was already running before the start')
+    if not cut_prereq(cid, tag):
+        return
+    dlog = '/home/tester/.local/state/hop/daemon.log'
+    size0 = os.path.getsize(dlog) if os.path.exists(dlog) else 0
     tl = []
     ssh_ok = []
+    seen_pid = False
     stop = time.time() + 12
     p = subprocess.Popen(L.user_argv('tester', ['hop', 'ls'], 30), env=L.user_env('tester'), stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
@@ -236,14 +349,19 @@ def step_start_window(tag):
     while time.time() < stop:
         n = L.agent_keys()
         tl.append((round(time.time() - t0, 2), n))
+        seen_pid = seen_pid or bool(L.daemon_pids())
         if n > 0:
             r = ssh('t1', 'echo window-ssh-ok', timeout=10)
             if 'window-ssh-ok' in r.out:
                 ssh_ok.append(round(time.time() - t0, 2))
         time.sleep(0.05)
     p.wait(timeout=30)
+    grew = os.path.exists(dlog) and os.path.getsize(dlog) > size0
+    if not seen_pid and not grew:
+        # Nothing served because nothing started proves nothing.
+        return L.harness(cid, label, 'prerequisite: no daemon started (no process seen, daemon.log unchanged)', json.dumps(tl[:40]))
     served = [t for t, n in tl if n > 0]
-    c('B.%s.window' % tag, '%s: a daemon starting on the revoked device serves no keys before it checks with the server' % tag,
+    c(cid, label,
       not served and not ssh_ok, 'keys served from +%.2fs to +%.2fs; plain ssh got in at %s' % (served[0], served[-1], ssh_ok) if served else '',
       json.dumps(tl[:40]), BUGS['window'])
 
@@ -271,9 +389,14 @@ def step_inventory(tag):
     c('B.%s.inv-pins' % tag, '%s: no decrypted vault data stays behind (pinned host keys)' % tag, not kh, '%d known_hosts files' % len(kh), '', 'r2-inv')
     privs = root('grep -rl "PRIVATE KEY" /home/tester/.ssh/hop /home/tester/.local /run/user/$(id -u tester) 2>/dev/null').out.split()
     c('B.%s.inv-private' % tag, '%s: no private key file under hop\'s directories' % tag, not privs, 'files: %s' % privs)
-    j = hop('auth', 'status', '--json').json() or {}
-    c('B.%s.inv-status' % tag, '%s: hop auth status does not say "signed in" on a revoked device' % tag, j.get('signed_in') is not True,
-      'signed_in=%s' % j.get('signed_in'), '', 'r1-P3-13')
+    r = hop('auth', 'status', '--json')
+    j = r.json()
+    if not isinstance(j, dict) or not isinstance(j.get('signed_in'), bool):
+        L.harness('B.%s.inv-status' % tag, '%s: hop auth status does not say "signed in" on a revoked device' % tag,
+                  'no valid answer with a signed_in field', r.ev('auth status --json'))
+    else:
+        c('B.%s.inv-status' % tag, '%s: hop auth status does not say "signed in" on a revoked device' % tag, j['signed_in'] is False,
+          'signed_in=%s' % j['signed_in'], '', 'r1-P3-13')
     r = hop('status')
     L.log('status after', tag, r.all)
 

@@ -2,7 +2,7 @@
 """Cross-machine timing helpers. The driver pairs them up.
 
   syncops.py mark <id> <hop args...>   run a hop change; state/mark-<id> = {rc, done}
-  syncops.py watch <id> <spec> <secs>  poll until spec holds; state/watch-<id> = {seen|timeout}
+  syncops.py watch <id> <spec> <secs>  poll until spec holds; state/watch-<id> = {started, initially, seen|timeout}
 
 spec: kind:name[:field=value | :absent], kind one of hosts|keys|snippets|config
       (hosts:synca1:user=deploy2, hosts:synca1:absent, config:rb2)
@@ -66,14 +66,16 @@ def main():
     elif op == 'watch':
         spec = parse(sys.argv[3])
         secs = float(sys.argv[4])
-        L.state_put('watch-' + wid, {'started': time.time()})
         t0 = time.time()
+        # Holding before any change was made means the watch can prove nothing.
+        initially = holds(spec)
+        L.state_put('watch-' + wid, {'started': t0, 'initially': initially})
         while True:
             if holds(spec):
-                L.state_put('watch-' + wid, {'seen': time.time(), 'started': t0})
+                L.state_put('watch-' + wid, {'seen': time.time(), 'started': t0, 'initially': initially})
                 return
             if time.time() - t0 > secs:
-                L.state_put('watch-' + wid, {'timeout': time.time(), 'started': t0})
+                L.state_put('watch-' + wid, {'timeout': time.time(), 'started': t0, 'initially': initially})
                 return
             time.sleep(0.2 if spec['kind'] == 'config' else 0.15)
 

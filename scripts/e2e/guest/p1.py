@@ -46,7 +46,7 @@ def step_init():
       rc2 == 0 and has(r2.out, 'unsealed') and ('unsealed' in out2.lower() or 'warn' in out2.lower()),
       'status: %s' % [l for l in r2.out.splitlines() if 'device key' in l], out2[-400:])
     c('init.sk-on-disk', 'the Secret Key is in the unsealed device.key and absent from the sealed one',
-      in_unsealed and not in_sealed, 'unsealed has it: %s, sealed has it: %s' % (in_unsealed, in_sealed))
+      bool(sk) and in_unsealed and not in_sealed, 'kit captured: %s, unsealed has it: %s, sealed has it: %s' % (bool(sk), in_unsealed, in_sealed))
     hop('daemon', 'stop', user='tester2', nopass=True)
 
 
@@ -128,8 +128,10 @@ chown tester: /home/tester/.ssh/config; chmod 600 /home/tester/.ssh/config''')
     hs = L.hosts() or {}
     c('import.yes', 'hop import ssh-config --yes imports imp1 and imp2', r.rc == 0 and 'imp1' in hs and 'imp2' in hs, '', r.ev('import --yes'))
     cfg = open('/home/tester/.ssh/hop/config').read() if os.path.exists('/home/tester/.ssh/hop/config') else ''
+    # Absent from the config only counts if imp1 was imported and other hosts are written there.
     c('import.blocked', 'imported hosts without a vault key are kept out of the generated config',
-      not re.search(r'^Host imp1$', cfg, re.M), '')
+      'imp1' in hs and re.search(r'^Host local1$', cfg, re.M) is not None and not re.search(r'^Host imp1$', cfg, re.M),
+      'imp1 imported: %s, config lists local1: %s' % ('imp1' in hs, bool(re.search(r'^Host local1$', cfg, re.M))))
     hop('rm', 'imp1', '--yes'); hop('rm', 'imp2', '--yes')
     r = hop('import', 'ssh-config', '--with-keys', '--yes')
     hs = L.hosts() or {}
@@ -191,7 +193,8 @@ def step_lock():
     n = L.agent_keys()
     c('lock.effect', 'locked: hop exec and plain ssh fail, the agent holds no keys',
       r1.rc == 255 and 'SHOULD-NOT-RUN' not in r1.out and r2.rc != 0 and n == 0, 'agent keys: %d' % n, r1.ev('exec') + '\n' + r2.ev('ssh'))
-    c('lock.msg', 'the locked error has no internal package prefix', 'model:' not in r1.all, '', r1.ev('exec'), 'r1-P3-7')
+    c('lock.msg', 'the locked error has no internal package prefix', 'lock' in r1.all.lower() and 'model:' not in r1.all,
+      '' if 'lock' in r1.all.lower() else 'not judged: the refusal does not mention the lock', r1.ev('exec'), 'r1-P3-7')
     r = hop('unlock')
     r1 = hop('exec', 'local1', '--', 'echo', 'unlocked-ok')
     c('unlock', 'hop unlock opens the vault again', r.rc == 0 and 'unlocked-ok' in r1.out, '', r.ev('hop unlock') + '\n' + r1.ev('exec'))

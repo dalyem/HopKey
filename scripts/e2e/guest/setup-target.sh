@@ -1,14 +1,18 @@
 #!/bin/sh
 # SSH target in a Kiln sandbox (gVisor, no systemd): sshd plus userspace
-# tailscaled. Usage: setup-target.sh <t1|t2|t3>
+# tailscaled. Usage: setup-target.sh <t1|t2|t3> <generation>
+# setup.done is "<ok|fail-...> <generation>", so the driver never takes a
+# marker from an earlier run (--reuse) for this one.
 set -u
-role=$1
+role=$1 gen=$2
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p /var/e2e
+rm -f /var/e2e/setup.done /var/e2e/tsup.done
 exec >/var/e2e/setup.log 2>&1
-apt-get update -q || { echo fail-apt > /var/e2e/setup.done; exit 1; }
-apt-get install -y -q openssh-server curl ca-certificates iproute2 procps >/dev/null || { echo fail-apt2 > /var/e2e/setup.done; exit 1; }
-curl -fsSL https://tailscale.com/install.sh | sh || { echo fail-ts > /var/e2e/setup.done; exit 1; }
+mark() { echo "$1 $gen" > /var/e2e/setup.done.tmp && mv /var/e2e/setup.done.tmp /var/e2e/setup.done; }
+apt-get update -q || { mark fail-apt; exit 1; }
+apt-get install -y -q openssh-server curl ca-certificates iproute2 procps >/dev/null || { mark fail-apt2; exit 1; }
+command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh || { mark fail-ts; exit 1; }
 mkdir -p /run/sshd /run/tailscale /var/lib/tailscale
 for u in deploy deploy2; do id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"; done
 # sshd refuses an account with a locked password even for keys under PAM-less setups.
@@ -26,4 +30,4 @@ pgrep -x tailscaled >/dev/null || setsid nohup tailscaled --tun=userspace-networ
 	--socket=/run/tailscale/tailscaled.sock >/var/e2e/tailscaled.log 2>&1 </dev/null &
 sleep 2
 ss -ltnp
-echo ok > /var/e2e/setup.done
+mark ok

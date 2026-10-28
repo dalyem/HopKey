@@ -27,8 +27,18 @@ def block(on):
     reply on an already open long-poll is dropped, so nothing arrives late."""
     rules = ['OUTPUT -d %s -p tcp --dport 8443 -j REJECT --reject-with tcp-reset' % SIP,
              'INPUT -s %s -p tcp --sport 8443 -j DROP' % SIP]
-    for rule in rules:
-        root('while iptables -D %s 2>/dev/null; do :; done; %s' % (rule, 'iptables -I ' + rule if on else 'true'))
+    bad = L.fw_block(rules) if on else []
+    if not on:
+        L.fw_clear()
+    t = time.time()
+    # The block is a prerequisite of every offline check: prove it took effect.
+    reach = L.server_reachable(URL, 1 if on else 5)
+    ok = not bad and reach != on
+    if not ok:
+        L.harness('%s.block-%s' % (M, 'on' if on else 'off'), 'the firewall %s B\'s path to the server' % ('blocks' if on else 'reopens'),
+                  'rules that failed: %s; server reachable: %s' % (bad, reach))
+    L.state_put('block-%d' % int(on), {'t': t, 'ok': ok})
+    return ok
 
 
 def sync_state():
@@ -37,11 +47,12 @@ def sync_state():
 
 
 def held():
+    """The held changes, or None when hop sync resolve --json gave no valid answer."""
     r = hop('sync', 'resolve', '--json')
     try:
         return json.loads(r.out).get('held') or []
     except Exception:
-        return []
+        return None
 
 
 def step_server_check():
@@ -114,7 +125,10 @@ def step_b_received():
       got == want and 'testkey' in keys and len(snips) > 0 and pins > 0,
       'hosts %d/%d in %.1fs, keys %s, %d snippets, %d pins' % (len(hs), len(want), secs, keys, len(snips), pins))
     deny = [h for h in hs.values() if h.get('agent_access') == 'deny']
-    c('B.agent-access', 'agent_access deny syncs', bool(deny) or 'mdeny' not in want, 'denied hosts on B: %s' % [h['name'] for h in deny])
+    if 'mdeny' in want:
+        c('B.agent-access', 'agent_access deny syncs', bool(deny), 'denied hosts on B: %s' % [h['name'] for h in deny])
+    else:
+        skip('B.agent-access', 'agent_access deny syncs', 'A has no denied host (phase 2 did not run)')
 
 
 def step_offline_start():
@@ -134,7 +148,7 @@ def step_offline_start():
 
 def step_offline_end():
     block(False)
-    L.state_put('unblocked', {'t': time.time()})
+    L.state_put('unblocked', L.state_get('block-0'))
 
 
 def step_block(on):
@@ -148,9 +162,14 @@ def step_conflict_check():
     time: resolve each as it appears until nothing is pending or held."""
     ids = {h['id']: n for n, h in (L.hosts() or {}).items()}
     ever, resolved = [], {}
+    bad_answers = 0
     t0 = time.time()
     while time.time() - t0 < 300:
         hl = held()
+        if hl is None:
+            bad_answers += 1
+            time.sleep(2)
+            continue
         if hl:
             x = hl[0]
             name = ids.get(x.get('item_id'), x.get('item_id'))
@@ -172,11 +191,15 @@ def step_conflict_check():
         time.sleep(2)
     hs = L.hosts() or {}
     st = sync_state()
-    c('B.conflict-drained', 'after resolving every held change, nothing is pending or held', st.get('pending') == 0 and st.get('held') == 0,
+    if bad_answers:
+        L.harness('B.conflict-resolve-json', 'hop sync resolve --json answers with JSON while resolving', '%d answers were not JSON' % bad_answers)
+    drained = st.get('pending') == 0 and st.get('held') == 0
+    c('B.conflict-drained', 'after resolving every held change, nothing is pending or held', drained,
       'held in order: %s; pending %s, held %s after %.0fs' % (ever, st.get('pending'), st.get('held'), time.time() - t0))
     c('B.conflict-held', 'a concurrent edit of the same protected field (user) is held', 'cf1' in ever, 'held: %s' % ever)
-    c('B.conflict-fields', 'edits of different protected fields (port on A, user on B) merge without a hold', 'cf2' not in ever,
-      'held: %s' % ever, '', 'r1-P3-2')
+    # "Not held" only means something once the queue has drained.
+    c('B.conflict-fields', 'edits of different protected fields (port on A, user on B) merge without a hold', drained and 'cf2' not in ever,
+      'held: %s' % ever if drained else 'not judged: the queue did not drain', '', 'r1-P3-2')
     c('B.conflict-unprotected', 'a concurrent edit of an unprotected field (description) is not lost silently',
       'cf3' in ever, 'held: %s; final description %r' % (ever, hs.get('cf3', {}).get('description')), '', 'r1-P3-1')
     if 'cf1' in resolved:
@@ -214,8 +237,12 @@ def step_usebkey():
 
 def step_daemon_stop():
     hop('daemon', 'stop')
-    time.sleep(1)
-    L.state_put('daemon-stopped', {'pids': L.daemon_pids()})
+    pids, _ = L.wait_for(lambda: not L.daemon_pids(), 10, 0.5)
+    left = L.daemon_pids()
+    L.state_put('daemon-stopped', {'pids': left})
+    if left:
+        # The restart checks that follow would prove nothing with the daemon still up.
+        L.harness('%s.daemon-stop' % M, 'hop daemon stop leaves no daemon running', 'daemon pids %s' % left)
 
 
 def step_after_restart(name):
@@ -307,8 +334,11 @@ def step_a_after_logout(gone):
     c('A.after-b-logout', 'A keeps working after B logs out', 'A-still-works' in r.out, '', r.ev('exec'))
     r = hop('auth', 'devices', '--json')
     j = r.json()
-    names = [d.get('name') for d in (j if isinstance(j, list) else (j or {}).get('devices', []))]
-    c('A.devices-after-logout', 'the logged-out device is gone from the device list', gone not in names, 'names %s' % names)
+    if r.rc != 0 or not isinstance(j, dict) or not isinstance(j.get('devices'), list):
+        L.harness('A.devices-after-logout', 'the logged-out device is gone from the device list', 'no valid device list', r.ev('auth devices --json'))
+        return
+    names = [d.get('name') for d in j['devices']]
+    c('A.devices-after-logout', 'the logged-out device is gone from the device list', bool(names) and gone not in names, 'names %s' % names)
 
 
 def step_pwlogin(name):

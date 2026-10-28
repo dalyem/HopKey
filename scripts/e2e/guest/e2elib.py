@@ -68,13 +68,17 @@ def kit():
     return sk, rk
 
 
-def _secret_values():
+def _secret_values(strict=False):
+    """Every secret value under SEC. strict: raise instead of masking with
+    fewer values than there are (an unreadable SEC or secret file)."""
     global _sec_cache
     try:
         stamp = tuple((n, os.stat(sec_path(n)).st_mtime) for n in sorted(os.listdir(SEC)))
     except OSError:
+        if strict:
+            raise
         stamp = ()
-    if _sec_cache[0] == stamp:
+    if _sec_cache[0] == stamp and _sec_cache[0] is not None:
         return _sec_cache[1]
     vals = set()
     for n, _ in stamp:
@@ -85,19 +89,21 @@ def _secret_values():
                 if len(v) >= 6:
                     vals.add(v)
         except OSError:
-            pass
+            if strict:
+                raise
     vals = sorted(vals, key=len, reverse=True)
     _sec_cache = (stamp, vals)
     return vals
 
 
-def mask(s):
+def mask(s, strict=False):
     if s is None:
         return ''
     if not isinstance(s, str):
         s = str(s)
-    for v in _secret_values():
+    for v in _secret_values(strict):
         s = s.replace(v, '<SECRET>')
+    s = re.sub(r'\btskey-[A-Za-z0-9-]{8,}', '<TS-AUTHKEY>', s)
     s = re.sub(r'\bH1-[A-Z0-9]{4,}(-[A-Z0-9]{2,}){3,}', '<SECRET-KEY>', s)
     s = re.sub(r'\bR1-[A-Z0-9$]{4,}(-[A-Z0-9$]{2,}){3,}', '<RECOVERY-KEY>', s)
     s = re.sub(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '<PRIVATE-KEY-BLOCK>', s, flags=re.S)
@@ -137,6 +143,11 @@ def check(cid, name, ok, detail='', evidence='', bug=None, status=None):
 
 def skip(cid, name, why, bug=None):
     return check(cid, name, False, why, '', bug, status='skip')
+
+
+def harness(cid, name, detail, evidence=''):
+    """A failure of the harness or of a check's prerequisite, never a product verdict."""
+    return check(cid, name, False, detail, evidence, 'harness')
 
 
 def guard(cid, name):
@@ -195,7 +206,8 @@ def user_env(user, nopass=False, extra=None):
 def user_argv(user, argv, timeout):
     # Each command gets its own systemd scope, so a hop daemon it starts
     # outlives the step (and the guest agent) instead of dying with it.
-    return ['systemd-run', '--scope', '--quiet', '--collect', '--',
+    # hke2e.slice holds everything the suite starts, so reset-vm.sh can stop it all.
+    return ['systemd-run', '--scope', '--quiet', '--collect', '--slice=hke2e.slice', '--',
             'timeout', '-k', '3', str(int(timeout)), 'runuser', '-u', user, '--'] + list(argv)
 
 
@@ -287,11 +299,31 @@ def status_json(user='tester'):
 
 
 def state_put(name, value):
-    with open(os.path.join(STATE, name), 'w') as f:
+    """Write a state file atomically: a reader sees the old or the new content, never part of it."""
+    p = os.path.join(STATE, name)
+    tmp = '%s/.%s.%d.tmp' % (STATE, name, os.getpid())
+    with open(tmp, 'w') as f:
         f.write(value if isinstance(value, str) else json.dumps(value))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def state_read(name):
+    """(status, value) of a JSON state file: status is missing, ok or malformed."""
+    try:
+        with open(os.path.join(STATE, name)) as f:
+            s = f.read()
+    except OSError:
+        return 'missing', None
+    try:
+        return 'ok', json.loads(s)
+    except ValueError:
+        return 'malformed', s[:200]
 
 
 def state_get(name, default=None):
+    """A state value: JSON if it parses, else the stripped text (plain values like device-id)."""
     try:
         with open(os.path.join(STATE, name)) as f:
             s = f.read()
@@ -301,6 +333,36 @@ def state_get(name, default=None):
         return json.loads(s)
     except Exception:
         return s.strip()
+
+
+FW_TAG = 'hk-e2e'
+
+
+def fw_clear():
+    """Remove the firewall rules the suite added (and only those), both chains."""
+    return root("for c in INPUT OUTPUT; do iptables -S $c | grep -e '--comment %s' | sed 's/^-A /-D /' | "
+                "while read -r r; do iptables $r; done; done; iptables -S | grep -c -e '--comment %s'" % (FW_TAG, FW_TAG))
+
+
+def fw_block(rules):
+    """Replace the suite's rules with these (iptables -I specs ending in -j TARGET), tagged."""
+    fw_clear()
+    bad = []
+    for rule in rules:
+        r = root('iptables -I ' + rule.replace(' -j ', ' -m comment --comment %s -j ' % FW_TAG, 1))
+        if r.rc != 0:
+            bad.append(rule)
+    return bad
+
+
+def server_reachable(url, tries=1):
+    """Whether this machine reaches the run's hop-server (a TCP connect plus TLS, 3 s each)."""
+    for i in range(tries):
+        if root('curl -fsS -m 3 %s/v1/healthz' % url, timeout=10).rc == 0:
+            return True
+        if i + 1 < tries:
+            time.sleep(1)
+    return False
 
 
 def env_get(name, default=''):

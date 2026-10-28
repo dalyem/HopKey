@@ -3,6 +3,12 @@
 
 usage: report.py <out-dir> <run-id> <phases> <start-epoch> <end-epoch> <machines.env>
 Runs on the orchestrator; it only reads JSON lines.
+
+It also checks coverage with <out-dir>/steps.jsonl (the driver's step and
+phase records): every selected phase must have started and ended, every step
+must have finished with exit 0, and each machine the phase uses must have
+reported checks. The verdict goes to <out-dir>/verdict, which run.sh exits with:
+0 all pass, 1 assertion failures, 2 harness failures, 3 missing coverage.
 """
 import glob
 import json
@@ -44,7 +50,46 @@ def esc(s):
 
 
 sel = [int(p) for p in phases.split(',') if p.strip().isdigit()]
+
+# Coverage: which selected phases or steps did not finish.
+MACHINES = {1: {'A', 'B'}, 2: {'A'}, 3: {'A', 'B'}, 4: {'A', 'B'}, 5: {'A', 'B'}}
+steps = []
+try:
+    for line in open(os.path.join(out, 'steps.jsonl')):
+        try:
+            steps.append(json.loads(line))
+        except ValueError:
+            pass
+except OSError:
+    pass
+gaps = []
+started = {}
+for e in steps:
+    if e.get('event') == 'start':
+        started[e.get('job')] = e
+    elif e.get('event') == 'end':
+        st = started.pop(e.get('job'), None)
+        if e.get('rc') != '0':
+            gaps.append('phase %s: step %s on %s ended with %s' % (e.get('phase'), e.get('step'), e.get('who'), e.get('rc') or 'no exit code'))
+for e in started.values():
+    gaps.append('phase %s: step %s on %s never finished (nobody waited for it)' % (e.get('phase'), e.get('step'), e.get('who')))
+for p in sel:
+    ev = {e.get('event') for e in steps if e.get('phase') == p and e.get('who') == 'driver'}
+    if 'phase-start' not in ev:
+        gaps.append('phase %d: never started' % p)
+    elif 'phase-end' not in ev:
+        gaps.append('phase %d: stopped before its end' % p)
+    got = {r.get('machine') for r in rows if r.get('phase') == p}
+    for m in sorted(MACHINES.get(p, set()) - got):
+        gaps.append('phase %d: no checks from %s' % (p, m))
+harness_rows = [r for r in rows if r.get('status') == 'fail' and r.get('bug') == 'harness']
+fail_rows = [r for r in rows if r.get('status') == 'fail']
+verdict = 3 if gaps else 2 if harness_rows else 1 if fail_rows else 0
+VERDICT = {0: 'pass', 1: 'assertion failures', 2: 'harness failures', 3: 'missing coverage'}
+
 md = ['# HopKey end-to-end report: run %s' % run, '']
+md.append('**Verdict: %s** (exit %d)' % (VERDICT[verdict], verdict))
+md.append('')
 md.append('- Time: %s to %s UTC (%dm%02ds)' % (time.strftime('%Y-%m-%d %H:%M', time.gmtime(t0)), time.strftime('%H:%M', time.gmtime(t1)),
                                              (t1 - t0) // 60, (t1 - t0) % 60))
 md.append('- Phases selected: %s' % phases)
@@ -77,6 +122,13 @@ for p in sorted(set(sel) | {r.get('phase') for r in rows if isinstance(r.get('ph
     kb = sum(1 for r in pr if r['status'] == 'fail' and r.get('bug') and r['bug'] != 'harness')
     md.append('| %s. %s | %d | %d | %d | %d | %d |' % (p, PH.get(p, 'setup'), n['pass'], n['fail'], n['skip'], kb, n['fail'] - kb))
 md.append('| **Total** | **%d** | **%d** | **%d** | | |' % (tot['pass'], tot['fail'], tot['skip']))
+md.append('')
+md.append('## Coverage')
+md.append('')
+if gaps:
+    md.extend('- %s' % g for g in gaps)
+else:
+    md.append('Every selected phase ran to its end, every step finished with exit 0, and every machine reported checks.')
 md.append('')
 
 fails = [r for r in rows if r['status'] == 'fail']
@@ -117,4 +169,7 @@ for p in sorted({r.get('phase') for r in rows}, key=str):
 
 with open(os.path.join(out, 'REPORT.md'), 'w') as f:
     f.write('\n'.join(md) + '\n')
-print('report: %d checks, %d pass, %d fail, %d skip' % (len(rows), tot['pass'], tot['fail'], tot['skip']))
+with open(os.path.join(out, 'verdict'), 'w') as f:
+    f.write('%d\n' % verdict)
+print('report: %d checks, %d pass, %d fail (%d harness), %d skip, %d coverage gaps: verdict %d (%s)' % (
+    len(rows), tot['pass'], tot['fail'], len(harness_rows), tot['skip'], len(gaps), verdict, VERDICT[verdict]))

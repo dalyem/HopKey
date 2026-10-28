@@ -124,7 +124,7 @@ kiln checks run test       # one check
 Prerequisites:
 
 - the `kiln` CLI, logged in;
-- for phases 3-5, a Tailscale auth key that is reusable, ephemeral and tagged `tag:hoptest`, in a file (default `~/hopkey-test/ts-authkey`, or `HOP_E2E_TS_AUTHKEY_FILE`). The tailnet policy must let `tag:hoptest` reach `tag:hoptest`, for example `{"action":"accept","src":["tag:hoptest"],"dst":["tag:hoptest:*"]}`. The script copies the file only by path and deletes it on each machine right after `tailscale up`.
+- for phases 3-5, a Tailscale auth key that is reusable, ephemeral and tagged `tag:hoptest`, in a file (default `~/hopkey-test/ts-authkey`, or `HOP_E2E_TS_AUTHKEY_FILE`). The tailnet policy must let `tag:hoptest` reach `tag:hoptest`, for example `{"action":"accept","src":["tag:hoptest"],"dst":["tag:hoptest:*"]}`. The script copies the file only by path. Each machine deletes it when `tailscale up` ends, whatever the outcome. The driver deletes it again at cleanup on every machine that got a copy, also with `--keep`, and checks that it is gone.
 
 ```
 scripts/e2e/run.sh                    # all phases
@@ -140,4 +140,18 @@ The phases:
 4. SSH over Tailscale, including a jump host.
 5. The revocation matrix.
 
-Every check is one JSON line in `e2e-out/<run-id>/results.jsonl`. `REPORT.md` next to it has a table per phase and the failures in detail. Assertions encode the intended behaviour, so known product gaps show up as FAIL, tagged with their bug ID. A full run takes about 20 minutes: about 6 to build, lease and set up the machines, then about 14 for the phases. Phases 1-2 alone should take under 10 minutes.
+Every check is one JSON line in `e2e-out/<run-id>/results.jsonl`. `REPORT.md` next to it has a table per phase and the failures in detail. Assertions encode the intended behaviour, so known product gaps show up as FAIL, tagged with their bug ID. A check whose prerequisite did not hold (a session that never connected, a daemon that never started, an answer that was not valid JSON, a firewall block that did not take effect) fails as `harness`; it never passes. A full run takes about 20 minutes: about 6 to build, lease and set up the machines, then about 14 for the phases. Phases 1-2 alone should take under 10 minutes.
+
+The exit code is the verdict:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | every check passed |
+| 1 | assertion failures (known product bugs show up here) |
+| 2 | harness failures: setup, a `harness` check, log collection or masking, or a machine that could not be released |
+| 3 | missing coverage: a selected phase that did not run to its end, a step that did not finish with exit 0, or a machine that reported no checks |
+| 128+n | interrupted by signal n |
+
+Cleanup runs on every exit, including Ctrl-C. Each lease's operation ID and each sandbox ID go to `alloc.state` the moment they exist. Cleanup waits for allocations still under way, then releases everything this run asked for and checks with `kiln vm list` and `kiln sandbox list` that it is gone. A second Ctrl-C only skips the rest of the log collection; the releases still run. Logs leave a machine only after its suite jobs are stopped and each file is masked into a separate export directory. A file that cannot be masked is withheld and counted as a harness failure. Cross-machine timings are corrected by the A-B clock offset, measured over the tailnet at the start and the end; an offset over 0.5 s is a harness failure.
+
+`--reuse e2e-out/<run>` (with machines kept by `--keep`) is for debugging. It stops every job of the earlier run (they all run in `hke2e.slice`), removes only the firewall rules the suite added (tagged `hk-e2e`), and clears the completion markers, which carry the run ID.
