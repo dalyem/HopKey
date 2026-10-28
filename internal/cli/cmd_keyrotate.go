@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
@@ -37,19 +39,27 @@ import (
 // hosts), adds the new public key to ~/.ssh/authorized_keys with the old
 // line's options, logs in again offering only the new key, and only then
 // removes the old key's lines and points the host at the new key. A host
-// where any step fails is put back as it was and keeps the old key.
+// where any step fails is put back as it was and keeps the old key. A host
+// hop cannot put back, or cannot tell the state of, needs attention: both
+// keys stay in the vault, and the report names the command that finishes
+// it.
 //
-// The new private key is made in this process. It goes to the daemon as
-// hop key add sends a key, and to ssh only through an agent this process
-// serves on a socket in hop's private run directory for the length of the
-// run. No private key is written to a file.
+// The checks that log in with one key (the new key works, the old one is
+// refused) run ssh on a config of their own, which offers that key alone
+// from an agent that holds it alone. The new private key is made in this
+// process. It goes to the daemon as hop key add sends a key, and to ssh
+// only through an agent this process serves on a socket in hop's private
+// run directory for the length of the run. No private key is written to a
+// file.
 
 // Host results in the report.
 const (
-	rotRotated = "rotated"
-	rotFailed  = "failed"
-	rotSkipped = "skipped"
-	rotPlanned = "planned" // --dry-run, and the plan before a run
+	rotRotated   = "rotated"
+	rotAlready   = "already-rotated" // the server took the new key through another record
+	rotFailed    = "failed"          // put back as it was: the host keeps the old key
+	rotAttention = "needs-attention" // see RotateHost.Fix
+	rotSkipped   = "skipped"
+	rotPlanned   = "planned" // --dry-run, and the plan before a run
 )
 
 // RotateHost is one host in hop key rotate's report.
@@ -62,6 +72,13 @@ type RotateHost struct {
 	// Warning is set on a rotated host when something after the rotation
 	// is not as it should be: the old key still logs in, say.
 	Warning string `json:"warning,omitempty"`
+	// RemoteState is where the host's authorized_keys stands after the
+	// run, for a host hop started on: unchanged, new_key_added,
+	// old_key_removed or unknown.
+	RemoteState string `json:"remote_state,omitempty"`
+	// Fix, on a host that needs attention, is the command that finishes
+	// it: a run that reuses the new key and finds out what the host takes.
+	Fix string `json:"fix,omitempty"`
 }
 
 // RotateKey is one key in hop key rotate's report.
@@ -87,7 +104,7 @@ type RotateKey struct {
 // RotateResult is the --json shape of hop key rotate.
 type RotateResult struct {
 	DryRun bool `json:"dry_run"`
-	// OK is false when a host failed or has a warning.
+	// OK is false when a host failed, needs attention or has a warning.
 	OK   bool        `json:"ok"`
 	Keys []RotateKey `json:"keys"`
 }
@@ -96,17 +113,21 @@ type rotateOpts struct {
 	all, dryRun, yes, keepOld, asJSON bool
 	hosts                             []string
 	keyType                           string // as model.Key.KeyType; "" keeps each key's type
+	newKey                            string // a vault key to use as the new key, instead of making one
 }
 
 // rotHost is a host in a plan.
 type rotHost struct {
 	host model.Host
 	t    *target // nil when skipped
-	out  *RotateHost
-	// onlyNew is set when the host was left accepting only the new key
-	// while the vault still points it at the old one: the new key must then
-	// stay in the vault.
-	onlyNew bool
+	// jump is the ssh alias of the host's jump host, "" for none.
+	jump string
+	// ident is the record's connection as planned (connIdentity).
+	ident string
+	out   *RotateHost
+	// state is where the host's authorized_keys stands (remUnchanged and
+	// so on) once hop has started on it, and "" before.
+	state string
 }
 
 // rotPlan is the plan for one key.
@@ -116,8 +137,12 @@ type rotPlan struct {
 	oldPub  ssh.PublicKey
 	newType string
 	newName string
-	hosts   []*rotHost
-	out     *RotateKey
+	// reuse is the vault key --new-key names, with its public key: the new
+	// key, instead of one made by this run.
+	reuse  *daemon.KeyInfo
+	newPub ssh.PublicKey
+	hosts  []*rotHost
+	out    *RotateKey
 }
 
 func (p *rotPlan) runnable() []*rotHost {
@@ -134,7 +159,7 @@ func (p *rotPlan) runnable() []*rotHost {
 const rotateStepTimeout = 30 * time.Second
 
 func runKeyRotate(ctx context.Context, e *Env, args []string) error {
-	fs := newFlags(e, "key rotate", "hop key rotate <key> | --all [--hosts h1,h2] [--type ed25519|ecdsa|rsa] [--dry-run] [--yes] [--keep-old] [--json]")
+	fs := newFlags(e, "key rotate", "hop key rotate <key> | --all [--hosts h1,h2] [--type ed25519|ecdsa|rsa] [--new-key K] [--dry-run] [--yes] [--keep-old] [--json]")
 	var o rotateOpts
 	fs.BoolVar(&o.all, "all", false, "rotate every key in the vault")
 	hosts := fs.String("hosts", "", "only these hosts, by name, comma-separated")
@@ -143,6 +168,7 @@ func runKeyRotate(ctx context.Context, e *Env, args []string) error {
 	fs.BoolVar(&o.yes, "yes", false, "do not ask")
 	fs.BoolVar(&o.keepOld, "keep-old", false, "keep the old key in the vault even when no host uses it any more")
 	fs.BoolVar(&o.asJSON, "json", false, "print the result as JSON")
+	fs.StringVar(&o.newKey, "new-key", "", "use this vault key as the new key instead of making one (finishes a host that needs attention)")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -154,6 +180,10 @@ func runKeyRotate(ctx context.Context, e *Env, args []string) error {
 	case !o.all && len(pos) != 1:
 		fs.Usage()
 		return failf("expected one key name, or --all")
+	case o.newKey != "" && o.all:
+		return failf("--new-key goes with one key, not --all")
+	case o.newKey != "" && *typ != "":
+		return failf("--new-key uses that key's type; leave out --type")
 	}
 	switch *typ {
 	case "":
@@ -219,6 +249,9 @@ func runKeyRotate(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 
+	// From here a signal lets the rotation finish the host it is on, also
+	// when it runs inside another command (watchInterrupt).
+	defer e.beginRotation()()
 	res.Keys = nil
 	for _, p := range plans {
 		if p.out.Skipped == "" && len(p.runnable()) > 0 {
@@ -231,7 +264,7 @@ func runKeyRotate(ctx context.Context, e *Env, args []string) error {
 			}
 		}
 		for _, h := range p.hosts {
-			if h.out.Status == rotFailed || h.out.Warning != "" {
+			if h.out.Status == rotFailed || h.out.Status == rotAttention || h.out.Warning != "" {
 				res.OK = false
 			}
 		}
@@ -311,6 +344,26 @@ func (e *Env) planRotation(ctx context.Context, l *daemon.ListResult, pos []stri
 		}
 	}
 
+	var reuse *daemon.KeyInfo
+	var reusePub ssh.PublicKey
+	if o.newKey != "" {
+		id, err := findKey(l, o.newKey)
+		if err != nil {
+			return nil, err
+		}
+		i := slices.IndexFunc(l.Keys, func(k daemon.KeyInfo) bool { return k.ID == id.String() })
+		reuse = &l.Keys[i]
+		switch {
+		case reuse.ID == keys[0].ID:
+			return nil, failf("--new-key names the key being rotated")
+		case reuse.DedicatedGrant != "":
+			return nil, failf("key %s is a token grant's dedicated key", reuse.Name)
+		}
+		if reusePub, err = sshkeys.ParsePublic(reuse.PublicKey); err != nil {
+			return nil, failf("key %s: its public key does not parse: %v", reuse.Name, err)
+		}
+	}
+
 	// --hosts names vault hosts that use one of the keys.
 	only := map[model.ID]bool{}
 	for _, name := range o.hosts {
@@ -374,21 +427,25 @@ func (e *Env) planRotation(ctx context.Context, l *daemon.ListResult, pos []stri
 			continue
 		}
 
-		p.newType = o.keyType
-		if p.newType == "" {
-			p.newType = k.KeyType
+		if reuse != nil {
+			p.reuse, p.newPub, p.newType, p.newName = reuse, reusePub, reuse.KeyType, reuse.Name
+		} else {
+			p.newType = o.keyType
+			if p.newType == "" {
+				p.newType = k.KeyType
+			}
+			p.newName = rotatedName(k.Name, e.now(), names)
+			names[strings.ToLower(p.newName)] = true
 		}
-		p.newName = rotatedName(k.Name, e.now(), names)
-		names[strings.ToLower(p.newName)] = true
 		p.out.NewKey, p.out.NewKeyType = p.newName, p.newType
 
 		for _, h := range p.hosts {
-			t, why := e.rotateReach(ctx, h.host, l)
+			t, jump, why := e.rotateReach(ctx, h.host, l)
 			if why != "" {
 				h.out.Status, h.out.Reason = rotSkipped, why
 				continue
 			}
-			h.t, h.out.Status = t, rotPlanned
+			h.t, h.jump, h.ident, h.out.Status = t, jump, connIdentity(h.host, l.Hosts), rotPlanned
 		}
 		p.out.Hosts = hostResults(p.hosts)
 	}
@@ -410,8 +467,19 @@ func rotatedName(old string, now time.Time, taken map[string]bool) string {
 }
 
 // rotateReach says why hop cannot log in to h to rotate its key, or
-// returns what ssh needs to.
-func (e *Env) rotateReach(ctx context.Context, h model.Host, l *daemon.ListResult) (*target, string) {
+// returns what ssh needs to: the target, and the ssh alias of its jump
+// host ("" for none).
+func (e *Env) rotateReach(ctx context.Context, h model.Host, l *daemon.ListResult) (t *target, jump, why string) {
+	t, why = e.reach(ctx, h, l)
+	if why == "" && !h.JumpHostID.IsZero() {
+		if jump = l.SSH[h.JumpHostID.String()].Alias; jump == "" {
+			why = "its jump host is not in the ssh config"
+		}
+	}
+	return t, jump, why
+}
+
+func (e *Env) reach(ctx context.Context, h model.Host, l *daemon.ListResult) (*target, string) {
 	if s := l.SSH[h.ItemID.String()]; s.Alias == "" {
 		return nil, safef("it is not in the ssh config: %s", orUnknown(s.Problem))
 	}
@@ -457,7 +525,11 @@ func printRotatePlan(w io.Writer, plans []*rotPlan, o *rotateOpts) {
 			fmt.Fprintf(w, "key %s: skipped, %s\n", oneLine(p.key.Name), oneLine(p.out.Skipped))
 			continue
 		}
-		fmt.Fprintf(w, "key %s (%s %s) -> new %s key %s\n", oneLine(p.key.Name), oneLine(p.key.KeyType), oneLine(p.key.Fingerprint), oneLine(p.newType), oneLine(p.newName))
+		if p.reuse != nil {
+			fmt.Fprintf(w, "key %s (%s %s) -> existing key %s\n", oneLine(p.key.Name), oneLine(p.key.KeyType), oneLine(p.key.Fingerprint), oneLine(p.newName))
+		} else {
+			fmt.Fprintf(w, "key %s (%s %s) -> new %s key %s\n", oneLine(p.key.Name), oneLine(p.key.KeyType), oneLine(p.key.Fingerprint), oneLine(p.newType), oneLine(p.newName))
+		}
 		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 		for _, h := range p.hosts {
 			detail := "rotate"
@@ -478,7 +550,8 @@ func printRotatePlan(w io.Writer, plans []*rotPlan, o *rotateOpts) {
 	}
 	fmt.Fprintf(w, "On each host hop logs in with the old key, adds the new key to %s with the old line's options,\n"+
 		"logs in offering only the new key, and only then removes the old key's lines and points the host at the new key.\n"+
-		"A host where a step fails is put back as it was and keeps the old key.\n", akFile)
+		"A host where a step fails is put back as it was and keeps the old key. If hop cannot put a host back, or cannot tell\n"+
+		"which key it takes, both keys stay in the vault and hop names the command that finishes it.\n", akFile)
 	if o.dryRun {
 		fmt.Fprintf(w, "Dry run: nothing was changed.\n")
 	}
@@ -490,11 +563,17 @@ func printRotateResult(e *Env, res *RotateResult) {
 	for _, k := range res.Keys {
 		for _, h := range k.Hosts {
 			detail := h.Reason
-			if h.Status == rotRotated {
+			switch h.Status {
+			case rotRotated, rotAlready:
 				detail = "now uses " + k.NewKey
+				if h.Status == rotAlready {
+					detail += "; " + h.Reason
+				}
 				if h.Warning != "" {
 					detail += "; warning: " + h.Warning
 				}
+			case rotAttention:
+				detail += "; to finish, run: " + h.Fix
 			}
 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", oneLine(k.Key), oneLine(h.Host), h.Status, dash(oneLine(detail)))
 		}
@@ -553,31 +632,40 @@ func (e *Env) rotateKey(ctx context.Context, p *rotPlan, o *rotateOpts) {
 			h.out.Status, h.out.Reason = rotFailed, why
 		}
 	}
-	priv, err := generateKey(p.newType)
-	if err != nil {
-		fail(safef("could not make the new key: %v", err))
-		return
-	}
-	pem, err := priv.MarshalPrivate(p.newName)
-	if err != nil {
-		fail(safef("could not encode the new key: %v", err))
-		return
-	}
-	// The new key is in the vault before any host has it, so a host that
-	// ends up with only the new key never depends on this process.
-	info, err := putKey(ctx, e, o.asJSON, p.newName, pem)
-	if err != nil {
-		fail(safef("could not add the new key to the vault: %v", err))
-		return
-	}
-	newID, _ := model.ParseID(info.ID)
-	p.out.NewKeyID, p.out.NewFingerprint = info.ID, info.Fingerprint
-
-	ag, err := e.startRotateAgent(priv, p.newName)
-	if err != nil {
-		fail(safef("could not start the agent for the new key: %v", err))
+	k := &rotKeys{oldPub: p.oldPub, oldName: p.key.Name, newName: p.newName}
+	var priv *sshkeys.Private
+	if p.reuse != nil {
+		k.newPub = p.newPub
+		k.newID, _ = model.ParseID(p.reuse.ID)
+		p.out.NewKeyID, p.out.NewFingerprint = p.reuse.ID, p.reuse.Fingerprint
 	} else {
-		k := &rotKeys{oldPub: p.oldPub, newPub: priv.Public, newName: p.newName, newID: newID, agent: ag}
+		var err error
+		if priv, err = generateKey(p.newType); err != nil {
+			fail(safef("could not make the new key: %v", err))
+			return
+		}
+		pem, err := priv.MarshalPrivate(p.newName)
+		if err != nil {
+			fail(safef("could not encode the new key: %v", err))
+			return
+		}
+		// The new key is in the vault before any host has it, so a host
+		// that ends up with only the new key never depends on this process.
+		info, err := putKey(ctx, e, o.asJSON, p.newName, pem)
+		if err != nil {
+			fail(safef("could not add the new key to the vault: %v", err))
+			return
+		}
+		k.newPub = priv.Public
+		k.newID, _ = model.ParseID(info.ID)
+		p.out.NewKeyID, p.out.NewFingerprint = info.ID, info.Fingerprint
+	}
+
+	run, err := e.startRotateRun(k, priv)
+	if err != nil {
+		fail(safef("could not start the agents for the ssh checks: %v", err))
+	} else {
+		k.run = run
 		stamp := "hop-rotated " + e.now().UTC().Format("2006-01-02")
 		for _, h := range hosts {
 			if ctx.Err() != nil {
@@ -588,15 +676,18 @@ func (e *Env) rotateKey(ctx context.Context, p *rotPlan, o *rotateOpts) {
 			// the run between hosts, not in the middle of one.
 			e.rotateHost(context.WithoutCancel(ctx), h, k, stamp, o.asJSON)
 		}
-		ag.close()
+		run.close()
 	}
 
-	// The vault: the new key stays if any host took it, and the old one
-	// goes once nothing uses it.
-	took := slices.ContainsFunc(hosts, func(h *rotHost) bool { return h.out.Status == rotRotated || h.onlyNew })
+	// The vault: the new key goes again only when every host hop started on
+	// is known to be as it was, so no server can depend on it, and the old
+	// one goes once nothing uses it.
+	needed := slices.ContainsFunc(hosts, func(h *rotHost) bool {
+		return (h.state != "" && h.state != remUnchanged) || h.out.Status == rotAttention
+	})
 	vctx := context.WithoutCancel(ctx)
-	if !took {
-		if err := callChange(vctx, e, o.asJSON, daemon.OpDelete, daemon.DeleteParams{ID: info.ID}, nil); err != nil {
+	if p.reuse == nil && !needed {
+		if err := callChange(vctx, e, o.asJSON, daemon.OpDelete, daemon.DeleteParams{ID: p.out.NewKeyID}, nil); err != nil {
 			warn(e, o.asJSON, safef("no host took the new key %s, but it could not be removed from the vault: %v", p.newName, err))
 		} else {
 			p.out.NewKeyRemoved = true
@@ -605,11 +696,14 @@ func (e *Env) rotateKey(ctx context.Context, p *rotPlan, o *rotateOpts) {
 	p.out.OldKey, p.out.OldKeyReason = e.retireOldKey(vctx, p, o)
 }
 
-// retireOldKey deletes the old key from the vault unless --keep-old or a
-// host still uses it.
+// retireOldKey deletes the old key from the vault unless --keep-old, a
+// host needs attention, or a host still uses it.
 func (e *Env) retireOldKey(ctx context.Context, p *rotPlan, o *rotateOpts) (state, reason string) {
 	if o.keepOld {
 		return "kept", "--keep-old"
+	}
+	if slices.ContainsFunc(p.hosts, func(h *rotHost) bool { return h.out.Status == rotAttention }) {
+		return "kept", "a host needs attention"
 	}
 	l, err := listAll(ctx, e)
 	if err != nil {
@@ -633,57 +727,122 @@ func (e *Env) retireOldKey(ctx context.Context, p *rotPlan, o *rotateOpts) (stat
 
 // rotKeys is what every host of one key's rotation shares.
 type rotKeys struct {
-	oldPub, newPub ssh.PublicKey
-	newName        string
-	newID          model.ID
-	agent          *rotateAgent
+	oldPub, newPub   ssh.PublicKey
+	oldName, newName string
+	newID            model.ID
+	run              *rotateRun
 }
 
-// rotateHost rotates one host and records the result in h.out.
+// rotWays are the three ways rotateHost reaches a host: old, as hop always
+// logs in (the generated config, the old key), and two checks, new and
+// oldCheck, that offer one key alone.
+type rotWays struct {
+	old, new, oldCheck rotSSH
+}
+
+func (e *Env) rotWays(h *rotHost, k *rotKeys, addr string) (*rotWays, error) {
+	newCfg, err := e.checkConfig(h, addr, k.run.new)
+	if err != nil {
+		return nil, err
+	}
+	oldCfg, err := e.checkConfig(h, addr, k.run.old)
+	if err != nil {
+		return nil, err
+	}
+	return &rotWays{
+		old:      rotSSH{e: e, t: h.t, addr: addr},
+		new:      rotSSH{e: e, t: h.t, addr: addr, cfg: newCfg, dir: k.run.dir},
+		oldCheck: rotSSH{e: e, t: h.t, addr: addr, cfg: oldCfg, dir: k.run.dir},
+	}, nil
+}
+
+// fail records a host that is as it was.
+func (h *rotHost) fail(why string) { h.out.Status, h.out.Reason = rotFailed, why }
+
+// remText says what each remote state means for the user.
+var remText = map[string]string{
+	remUnchanged:  "the server takes the old key, as before",
+	remAdded:      "the server takes both keys",
+	remOldRemoved: "the server takes only the new key, while the vault still points the host at the old one",
+	remUnknown:    "hop cannot tell which of the two keys the server takes now",
+}
+
+// attention reports a host hop could not finish or put back, or whose
+// record it would not touch. Both keys stay in the vault, and Fix is the
+// command that finishes the job: it reuses the new key, finds out which
+// key the server takes, and carries on from there.
+func (h *rotHost) attention(k *rotKeys, why string) {
+	h.out.Status = rotAttention
+	h.out.Reason = why + "; " + remText[h.state] + safef("; both keys stay in the vault: %s (old) and %s (new)", k.oldName, k.newName)
+	h.out.Fix = "hop key rotate " + shellcmd.Quote(k.oldName) + " --hosts " + shellcmd.Quote(h.host.Name) + " --new-key " + shellcmd.Quote(k.newName)
+}
+
+// rotateHost rotates one host and records the result in h.out, and where
+// the host's authorized_keys stands in h.state.
 func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp string, asJSON bool) {
-	t := h.t
-	addr, _ := chooseAddress(ctx, e, t)
-	oldWay := rotSSH{e: e, t: t, addr: addr}
-	newWay := rotSSH{e: e, t: t, addr: addr, opts: k.agent.sshOpts()}
-	failed := func(why string) { h.out.Status, h.out.Reason = rotFailed, why }
+	defer func() { h.out.RemoteState = h.state }()
+	addr, _ := chooseAddress(ctx, e, h.t)
+	w, err := e.rotWays(h, k, addr)
+	if err != nil {
+		h.fail(safef("could not set up the ssh checks: %v; nothing was changed", err))
+		return
+	}
+	h.state = remUnchanged
 
 	// 1. Read authorized_keys with the old key.
-	orig, why := oldWay.readAK(ctx)
+	orig, why, noLogin := w.old.readAK(ctx)
 	if why != "" {
-		failed(why + "; nothing was changed")
+		// Another record for the same account may have been rotated
+		// first: then the account takes the new key, and not the old one.
+		if noLogin && sshOK(w.new.run(ctx, "true", nil, nil)) {
+			h.state = remOldRemoved
+			e.repoint(ctx, h, k, w, nil, asJSON)
+			return
+		}
+		h.fail(why + "; nothing was changed")
 		return
 	}
 	ed, err := planAKEdit(orig, k.oldPub, k.newPub, stamp)
 	if err != nil {
-		failed(err.Error())
+		h.fail(err.Error())
 		return
 	}
 
 	// 2. Add the new key's lines.
 	if len(ed.added) > 0 {
-		if why := oldWay.writeAK(ctx, orig, ed.appended); why != "" {
-			failed(why + oldWay.rollback(ctx, ed))
+		switch out, why, _ := w.old.writeAK(ctx, orig, ed.appended); out {
+		case akNotDone:
+			h.fail(why + "; nothing was changed")
+			return
+		case akUnknown:
+			h.state = remUnknown
+			e.putBack(ctx, h, k, w, ed, why)
 			return
 		}
 	}
+	h.state = remAdded
 
 	// 3. Log in offering only the new key.
-	res, err := newWay.run(ctx, "true", nil, nil, "PreferredAuthentications=publickey")
-	if err != nil || res.ExitCode != 0 || res.Error != "" {
-		failed("the new key did not log in (" + sshFailure(res, err) + ")" + oldWay.rollback(ctx, ed))
+	if res, err := w.new.run(ctx, "true", nil, nil); !sshOK(res, err) {
+		e.putBack(ctx, h, k, w, ed, "the new key did not log in ("+sshFailure(res, err)+")")
 		return
 	}
 
 	// 4. Remove the old key's lines. From here the new key is the way in.
-	if why := newWay.writeAK(ctx, ed.appended, ed.final); why != "" {
-		failed(why + newWay.rollback(ctx, ed))
+	switch out, why, _ := w.new.writeAK(ctx, ed.appended, ed.final); out {
+	case akNotDone:
+		e.putBack(ctx, h, k, w, ed, why)
+		return
+	case akUnknown:
+		h.state = remUnknown
+		e.putBack(ctx, h, k, w, ed, why)
 		return
 	}
+	h.state = remOldRemoved
 
 	// 5. The old key should now be refused.
-	res, err = oldWay.run(ctx, "true", nil, nil, "PreferredAuthentications=publickey")
-	switch {
-	case err == nil && res.ExitCode == 0 && res.Error == "":
+	switch res, err := w.oldCheck.run(ctx, "true", nil, nil); {
+	case sshOK(res, err):
 		h.out.Warning = "the old key still logs in: the server accepts it from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
 	case err == nil && strings.Contains(res.Stderr, "Permission denied"):
 	default:
@@ -691,24 +850,59 @@ func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp stri
 	}
 
 	// 6. Point the host at the new key.
-	if err := e.repointHost(ctx, h.host, k.newID, asJSON); err != nil {
-		why := safef("the new key works, but the vault could not be updated (%v)", err)
-		if back := newWay.rollback(ctx, ed); strings.HasPrefix(back, "; put back") {
-			failed(why + back)
-		} else {
-			h.onlyNew = true
-			failed(why + back + safef("; the host now accepts only %s: run hop edit %s --key %s", k.newName, h.host.Name, k.newName))
+	e.repoint(ctx, h, k, w, ed, asJSON)
+}
+
+// putBack undoes ed on the host after why, and reports the host as failed
+// if it is as it was, or as needing attention if not.
+func (e *Env) putBack(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, ed *akEdit, why string) {
+	h.state = w.rollback(ctx, ed, h.state)
+	if h.state == remUnchanged {
+		h.fail(why + "; put back as it was, and it keeps the old key")
+		return
+	}
+	h.attention(k, why+"; hop could not put "+akFile+" back")
+}
+
+// repoint points the host's record at the new key once the server takes
+// it. ed is the edit hop made, or nil when the server took the new key
+// before (through another record).
+func (e *Env) repoint(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, ed *akEdit, asJSON bool) {
+	err := e.repointHost(ctx, h, k.newID, asJSON)
+	if err == nil {
+		h.out.Status, h.out.Reason = rotRotated, ""
+		if ed == nil {
+			h.out.Status, h.out.Reason = rotAlready, "the server already takes the new key and refuses the old one: another host record for the same account was rotated first"
 		}
 		return
 	}
-	h.out.Status, h.out.Reason = rotRotated, ""
+	moved := errors.Is(err, errHostMoved)
+	why := safef("the new key works, but the vault could not point the host at it (%v)", err)
+	if moved {
+		why = "the host's record changed while its key was rotated (on another device, or by another command), so hop left the record alone"
+	}
+	if ed != nil {
+		h.state = w.rollback(ctx, ed, h.state)
+	}
+	if h.state == remUnchanged && !moved {
+		h.fail(why + "; put back as it was, and it keeps the old key")
+		return
+	}
+	h.attention(k, why)
 }
 
-// repointHost sets h's key to id, retrying once on a fresh copy if the
-// host changed meanwhile (a sync, say).
-func (e *Env) repointHost(ctx context.Context, h model.Host, id model.ID, asJSON bool) error {
-	h.KeyID = id
-	_, err := putHost(ctx, e, asJSON, h)
+// errHostMoved: the host's record no longer reaches the server hop
+// checked, or no longer names the old key.
+var errHostMoved = errors.New("the host's record changed")
+
+// repointHost sets the host's key to id. If the write fails because the
+// record changed meanwhile (a sync, say), it is retried once on the fresh
+// record, but only when that still reaches the server hop checked and
+// still names the old key; otherwise errHostMoved.
+func (e *Env) repointHost(ctx context.Context, h *rotHost, id model.ID, asJSON bool) error {
+	rec := h.host
+	rec.KeyID = id
+	_, err := putHost(ctx, e, asJSON, rec)
 	if err == nil {
 		return nil
 	}
@@ -716,24 +910,90 @@ func (e *Env) repointHost(ctx context.Context, h model.Host, id model.ID, asJSON
 	if lerr != nil {
 		return err
 	}
-	i := slices.IndexFunc(l.Hosts, func(x model.Host) bool { return x.ItemID == h.ItemID })
+	i := slices.IndexFunc(l.Hosts, func(x model.Host) bool { return x.ItemID == h.host.ItemID })
 	if i < 0 {
-		return err
+		return errHostMoved
 	}
 	fresh := l.Hosts[i]
+	if fresh.ItemVersion == h.host.ItemVersion {
+		return err // not a conflict
+	}
+	if fresh.KeyID != h.host.KeyID || connIdentity(fresh, l.Hosts) != h.ident {
+		return errHostMoved
+	}
 	fresh.KeyID = id
 	_, err = putHost(ctx, e, asJSON, fresh)
 	return err
 }
+
+// connIdentity is what decides which server a record reaches and how: its
+// addresses, port, user, route and pinned host keys, and the same for each
+// jump host on the way.
+func connIdentity(h model.Host, hosts []model.Host) string {
+	var b strings.Builder
+	seen := map[model.ID]bool{}
+	for cur := h; ; {
+		fmt.Fprintf(&b, "%s %q %d %q %q %q;", cur.ItemID, cur.Addresses, cur.Port, cur.User, cur.Route, cur.HostKeys)
+		if cur.JumpHostID.IsZero() || seen[cur.JumpHostID] {
+			return b.String()
+		}
+		seen[cur.JumpHostID] = true
+		i := slices.IndexFunc(hosts, func(j model.Host) bool { return j.ItemID == cur.JumpHostID })
+		if i < 0 {
+			return b.String() + "missing " + cur.JumpHostID.String()
+		}
+		cur = hosts[i]
+	}
+}
+
+// rollback undoes ed on the host as far as it can and returns where the
+// host stands then. state is where it stood as far as hop knew. It reads
+// the file over whichever key logs in, and tries again if the file changed
+// under it.
+func (w *rotWays) rollback(ctx context.Context, ed *akEdit, state string) string {
+	for range 3 {
+		cur, way := w.readAny(ctx)
+		if way == nil {
+			return state
+		}
+		state = akState(cur, ed.oldPub, ed.newPub)
+		next, changed := rollbackAK(cur, ed)
+		if !changed {
+			return state
+		}
+		switch out, _, code := way.writeAK(ctx, cur, next); {
+		case out == akDone:
+			return akState(next, ed.oldPub, ed.newPub)
+		case out == akUnknown:
+			state = remUnknown
+		case code != akExitChanged && code != akExitLocked:
+			return state
+		}
+	}
+	return state
+}
+
+// readAny reads authorized_keys with the old key, or else with the new one.
+func (w *rotWays) readAny(ctx context.Context) ([]byte, *rotSSH) {
+	if b, why, _ := w.old.readAK(ctx); why == "" {
+		return b, &w.old
+	}
+	if b, why, _ := w.new.readAK(ctx); why == "" {
+		return b, &w.new
+	}
+	return nil, nil
+}
+
+func sshOK(res ExecResult, err error) bool { return err == nil && res.ExitCode == 0 && res.Error == "" }
 
 // sshFailure describes a failed ssh run in a few safe words.
 func sshFailure(res ExecResult, err error) string {
 	if err != nil {
 		return err.Error() // composed by failf: already display-safe
 	}
-	// When only the new key is offered, ssh also says the old key's
-	// identity file has no private half ("no such identity"), which is the
-	// point and not the failure.
+	// When only the new key is offered, ssh may also say that a key file
+	// has no private half ("no such identity"), which is the point and not
+	// the failure.
 	var lines []string
 	for _, l := range strings.Split(strings.ReplaceAll(res.Stderr, "\r", ""), "\n") {
 		if !strings.HasPrefix(l, "no such identity: ") {
@@ -750,32 +1010,38 @@ func sshFailure(res ExecResult, err error) string {
 	return lastLines(msg, 2)
 }
 
-// rotSSH runs commands on a host for hop key rotate. Without opts it is
-// hop's normal way in, the generated config; with the new key's agent
-// options it offers that key alone.
+// rotSSH runs commands on a host for hop key rotate, on a fresh connection
+// every time: no ControlMaster. Without cfg it is hop's normal way in, the
+// generated config. With cfg it is a check: ssh reads that config and no
+// other (checkConfig).
 type rotSSH struct {
 	e    *Env
 	t    *target
 	addr string
-	opts []string
+	cfg  string // the config of a check
+	dir  string // where a check runs ssh
 }
 
-// run is runRemote with extra -o options, and a fresh connection every
-// time: no ControlMaster.
-func (r rotSSH) run(ctx context.Context, command string, stdin []byte, stdout io.Writer, extra ...string) (ExecResult, error) {
-	opts := []string{"-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=no", "-o", "ControlPath=none"}
-	opts = append(opts, r.opts...)
-	for _, x := range extra {
-		opts = append(opts, "-o", x)
-	}
+// rotCheckAlias is the one Host block of a check's config.
+const rotCheckAlias = "hop-rotate-check"
+
+func (r rotSSH) run(ctx context.Context, command string, stdin []byte, stdout io.Writer) (ExecResult, error) {
+	opts := []string{"-T", "-o", "ConnectTimeout=10"}
 	if stdin == nil {
 		opts = append(opts, "-n")
 	}
-	args := append(r.e.sshArgs(r.t, r.addr, opts...), command)
+	var args []string
+	if r.cfg == "" {
+		opts = append(opts, "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none")
+		args = append(r.e.sshArgs(r.t, r.addr, opts...), command)
+	} else {
+		args = append(append([]string{"-F", r.cfg}, opts...), "--", rotCheckAlias, command)
+	}
 	runCtx, cancel := context.WithTimeout(ctx, rotateStepTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, r.e.sshBinary(), args...)
 	cmd.Env = r.e.sshEnviron()
+	cmd.Dir = r.dir
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -805,56 +1071,44 @@ func (r rotSSH) run(ctx context.Context, command string, stdin []byte, stdout io
 // sh wraps a script so it runs under sh whatever the login shell is.
 func sh(script string) string { return "sh -c " + shellcmd.Quote(script) }
 
-// readAK returns authorized_keys, or why it could not.
-func (r rotSSH) readAK(ctx context.Context) ([]byte, string) {
+// readAK returns authorized_keys, or why it could not, and whether that
+// was because ssh did not get in.
+func (r rotSSH) readAK(ctx context.Context) (content []byte, why string, noLogin bool) {
 	out := &capBuffer{max: akMaxSize}
 	res, err := r.run(ctx, sh(akReadScript), nil, out)
 	switch {
 	case err != nil || res.ExitCode == ExitFailure || res.Error != "":
-		return nil, "could not log in to read " + akFile + " (" + sshFailure(res, err) + ")"
+		return nil, "could not log in to read " + akFile + " (" + sshFailure(res, err) + ")", true
 	case res.ExitCode == akExitMissing:
-		return nil, akFile + " does not exist; the server may read authorized keys from somewhere else (AuthorizedKeysFile)"
+		return nil, akFile + " does not exist; the server may read authorized keys from somewhere else (AuthorizedKeysFile)", false
 	case res.ExitCode != 0:
-		return nil, "could not read " + akFile + " (" + sshFailure(res, err) + ")"
+		return nil, "could not read " + akFile + " (" + sshFailure(res, err) + ")", false
 	case out.over:
-		return nil, akFile + " is larger than 1 MiB"
+		return nil, akFile + " is larger than 1 MiB", false
 	}
-	return out.buf.Bytes(), ""
+	return out.buf.Bytes(), "", false
 }
 
-// writeAK replaces authorized_keys content from with to, or says why not.
-func (r rotSSH) writeAK(ctx context.Context, from, to []byte) string {
+// akOutcome is how an authorized_keys write ended.
+type akOutcome int
+
+const (
+	akDone    akOutcome = iota // the new file is in place
+	akNotDone                  // the script stopped before the rename: nothing changed
+	akUnknown                  // the connection failed or timed out: the rename may have happened
+)
+
+// writeAK replaces authorized_keys content from with to. It says how that
+// ended, why when it did not end well, and the script's exit status.
+func (r rotSSH) writeAK(ctx context.Context, from, to []byte) (akOutcome, string, int) {
 	res, err := r.run(ctx, sh(akWriteScript(cksum(from), cksum(to))), to, nil)
 	switch {
-	case err != nil || res.ExitCode == ExitFailure || res.Error != "":
-		return "could not log in to write " + akFile + " (" + sshFailure(res, err) + ")"
-	case res.ExitCode != 0:
-		return "could not write " + akFile + " (" + sshFailure(res, err) + ")"
+	case err == nil && res.Error == "" && res.ExitCode == 0:
+		return akDone, "", 0
+	case err == nil && res.Error == "" && akRefused(res.ExitCode):
+		return akNotDone, "could not write " + akFile + " (" + sshFailure(res, err) + ")", res.ExitCode
 	}
-	return ""
-}
-
-// rollback undoes ed on the host and says how that went, as a clause to
-// append to the failure: "; put back as it was" or why not.
-func (r rotSSH) rollback(ctx context.Context, ed *akEdit) string {
-	for range 2 { // once more if the file changed under the first try
-		cur, why := r.readAK(ctx)
-		if why != "" {
-			return "; could not put " + akFile + " back: " + why
-		}
-		next, changed := rollbackAK(cur, ed)
-		if !changed {
-			return "; put back as it was, and it keeps the old key"
-		}
-		why = r.writeAK(ctx, cur, next)
-		if why == "" {
-			return "; put back as it was, and it keeps the old key"
-		}
-		if !strings.Contains(why, "changed while hop was editing it") {
-			return "; could not put " + akFile + " back: " + why
-		}
-	}
-	return "; could not put " + akFile + " back: it kept changing"
+	return akUnknown, "lost the connection while writing " + akFile + " (" + sshFailure(res, err) + ")", res.ExitCode
 }
 
 // capBuffer keeps up to max bytes and notes anything beyond.
@@ -872,18 +1126,26 @@ func (c *capBuffer) Write(p []byte) (int, error) {
 	return c.buf.Write(p)
 }
 
-// rotateAgent serves the new key, alone, to the ssh runs that check it.
-type rotateAgent struct {
-	dir  string
-	kr   *sshagent.Keyring
-	srv  *sshagent.Server
-	done chan struct{}
+// rotateRun is what the ssh checks of one key's rotation share: a private
+// directory under hop's run directory with two agents, each serving one key
+// next to its public key file. new serves the key being put in; old serves
+// the key being replaced, from the daemon's agent. Nothing secret is
+// written: the private keys stay in memory.
+type rotateRun struct {
+	dir      string
+	kr       *sshagent.Keyring // the new key, when this run made it
+	new, old *keyAgent
 }
 
-// startRotateAgent serves priv on a socket in a new private directory under
-// hop's run directory, next to the public key file ssh's IdentityFile
-// names. Nothing secret is written: the private key stays in memory.
-func (e *Env) startRotateAgent(priv *sshkeys.Private, name string) (*rotateAgent, error) {
+// keyAgent is an agent socket and the IdentityFile that selects its key:
+// the public key file's path without ".pub", where no private key is.
+type keyAgent struct {
+	sock, identity string
+	srv            *sshagent.Server
+	done           chan struct{}
+}
+
+func (e *Env) startRotateRun(k *rotKeys, priv *sshkeys.Private) (*rotateRun, error) {
 	if err := os.MkdirAll(e.Paths.RunDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -891,53 +1153,203 @@ func (e *Env) startRotateAgent(priv *sshkeys.Private, name string) (*rotateAgent
 	if err != nil {
 		return nil, err
 	}
-	a := &rotateAgent{dir: dir, kr: sshagent.NewKeyring(), done: make(chan struct{})}
-	if err := os.WriteFile(filepath.Join(dir, "new.pub"), ssh.MarshalAuthorizedKey(priv.Public), 0o600); err != nil {
-		os.RemoveAll(dir)
+	r := &rotateRun{dir: dir}
+	newAgent := agent.ExtendedAgent(daemonKey{sock: e.Paths.AgentSocket(), pub: k.newPub})
+	if priv != nil {
+		r.kr = sshagent.NewKeyring()
+		if err := r.kr.Add(priv.Raw, k.newName); err != nil {
+			r.close()
+			return nil, err
+		}
+		newAgent = r.kr.Agent()
+	}
+	if r.new, err = serveKeyAgent(filepath.Join(dir, "new"), k.newPub, newAgent); err != nil {
+		r.close()
 		return nil, err
 	}
-	if err := a.kr.Add(priv.Raw, name); err != nil {
-		os.RemoveAll(dir)
+	if r.old, err = serveKeyAgent(filepath.Join(dir, "old"), k.oldPub, daemonKey{sock: e.Paths.AgentSocket(), pub: k.oldPub}); err != nil {
+		r.close()
 		return nil, err
 	}
-	if a.srv, err = sshagent.Listen(filepath.Join(dir, "agent.sock"), a.kr.Agent()); err != nil {
-		a.kr.RemoveAll()
-		os.RemoveAll(dir)
+	return r, nil
+}
+
+// serveKeyAgent serves ag on a socket in a new directory dir, next to the
+// public key file of pub.
+func serveKeyAgent(dir string, pub ssh.PublicKey, ag agent.ExtendedAgent) (*keyAgent, error) {
+	if err := os.Mkdir(dir, 0o700); err != nil {
 		return nil, err
 	}
+	a := &keyAgent{sock: filepath.Join(dir, "agent.sock"), identity: filepath.Join(dir, "key"), done: make(chan struct{})}
+	if err := os.WriteFile(a.identity+".pub", ssh.MarshalAuthorizedKey(pub), 0o600); err != nil {
+		return nil, err
+	}
+	srv, err := sshagent.Listen(a.sock, ag)
+	if err != nil {
+		return nil, err
+	}
+	a.srv = srv
 	go func() {
 		defer close(a.done)
-		a.srv.Serve()
+		srv.Serve()
 	}()
 	return a, nil
 }
 
-// sshOpts makes ssh offer the new key and nothing else: the agent holds
-// only that key, and IdentitiesOnly limits ssh to the identity files, whose
-// other entry (the old key's, from the generated config) has no private
-// half on disk to sign with.
-func (a *rotateAgent) sshOpts() []string {
-	return []string{
-		"-o", "IdentityAgent=" + sshOptPath(filepath.Join(a.dir, "agent.sock")),
-		"-o", "IdentityFile=" + sshOptPath(filepath.Join(a.dir, "new")),
-		"-o", "IdentitiesOnly=yes",
-	}
-}
-
-func (a *rotateAgent) close() {
+func (a *keyAgent) close() {
 	a.srv.Close()
 	<-a.done
-	a.kr.RemoveAll()
-	os.RemoveAll(a.dir)
 }
 
-// sshOptPath quotes a path for an ssh -o option, as sshconfig does for the
-// config: % doubled, then double quotes.
-func sshOptPath(p string) string {
-	p = strings.ReplaceAll(p, "%", "%%")
-	p = strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(p)
-	return `"` + p + `"`
+func (r *rotateRun) close() {
+	for _, a := range []*keyAgent{r.new, r.old} {
+		if a != nil {
+			a.close()
+		}
+	}
+	if r.kr != nil {
+		r.kr.RemoveAll()
+	}
+	os.RemoveAll(r.dir)
 }
+
+// checkConfig writes the ssh config of a check that offers a's key to h,
+// and returns its path. ssh -F reads this file and no other: nothing of
+// the generated config applies (OpenSSH adds up IdentityFile lines, so the
+// old key's would stay in effect beside the one under test), and nothing
+// of the user's. The check reaches the server as hop's config does: the
+// same address, port and user, the host's pinned keys and nothing else,
+// and its jump host through hop's config, so only the last hop is checked.
+func (e *Env) checkConfig(h *rotHost, addr string, a *keyAgent) (string, error) {
+	rec := h.t.rr.Host
+	alias := strings.ToLower(h.t.alias)
+	user := h.t.user
+	if user == "" {
+		user = rec.User
+	}
+	port := int(rec.Port)
+	if port == 0 {
+		port = 22
+	}
+	for _, v := range []string{addr, alias, user} {
+		if strings.ContainsFunc(v, func(r rune) bool { return r <= ' ' || r == 0x7f || strings.ContainsRune(`"\%#'`, r) }) {
+			return "", fmt.Errorf("%q cannot go in an ssh config", v)
+		}
+	}
+	base := filepath.Join(filepath.Dir(a.sock), h.host.ItemID.String())
+	var kh bytes.Buffer
+	pins, _ := parsePins(rec.HostKeys)
+	for _, p := range pins {
+		fmt.Fprintf(&kh, "%s %s", alias, ssh.MarshalAuthorizedKey(p))
+	}
+	if err := os.WriteFile(base+".known_hosts", kh.Bytes(), 0o600); err != nil {
+		return "", err
+	}
+	paths := map[string]string{}
+	for name, p := range map[string]string{"kh": base + ".known_hosts", "agent": a.sock, "id": a.identity} {
+		q, err := sshCfgPath(p)
+		if err != nil {
+			return "", err
+		}
+		paths[name] = q
+	}
+
+	var c strings.Builder
+	fmt.Fprintf(&c, "Host %s\n", rotCheckAlias)
+	fmt.Fprintf(&c, "  HostName %s\n  Port %d\n", addr, port)
+	if user != "" {
+		fmt.Fprintf(&c, "  User %s\n", user)
+	}
+	fmt.Fprintf(&c, "  HostKeyAlias %s\n  GlobalKnownHostsFile none\n  UserKnownHostsFile %s\n", alias, paths["kh"])
+	c.WriteString("  StrictHostKeyChecking yes\n  UpdateHostKeys no\n")
+	fmt.Fprintf(&c, "  IdentityAgent %s\n  IdentityFile none\n  IdentityFile %s\n", paths["agent"], paths["id"])
+	c.WriteString("  IdentitiesOnly yes\n  PubkeyAuthentication yes\n  PreferredAuthentications publickey\n" +
+		"  PasswordAuthentication no\n  KbdInteractiveAuthentication no\n  GSSAPIAuthentication no\n  HostbasedAuthentication no\n" +
+		"  ForwardAgent no\n  ControlMaster no\n  ControlPath none\n  BatchMode yes\n")
+	if h.jump != "" {
+		// ssh runs it with sh -c "exec ...", after expanding % tokens.
+		var cmd []string
+		for _, arg := range []string{e.sshBinary(), "-F", e.sshConfigFile(), "-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-W", "%h:%p", "--", h.jump} {
+			if arg != "%h:%p" {
+				arg = strings.ReplaceAll(shellcmd.Quote(arg), "%", "%%")
+			}
+			cmd = append(cmd, arg)
+		}
+		fmt.Fprintf(&c, "  ProxyCommand %s\n", strings.Join(cmd, " "))
+	}
+	file := base + ".config"
+	if err := os.WriteFile(file, []byte(c.String()), 0o600); err != nil {
+		return "", err
+	}
+	return file, nil
+}
+
+// sshCfgPath quotes a path for an ssh config, with % doubled. A path that
+// has a double quote, a backslash or a control character is refused.
+func sshCfgPath(p string) (string, error) {
+	if strings.ContainsFunc(p, func(r rune) bool { return r < ' ' || r == 0x7f || r == '"' || r == '\\' }) {
+		return "", fmt.Errorf("the path %q cannot go in an ssh config", p)
+	}
+	return `"` + strings.ReplaceAll(p, "%", "%%") + `"`, nil
+}
+
+// daemonKey is one key of the daemon's agent served as an agent of its
+// own: it lists that key alone and signs with it alone, so ssh offered it
+// sees no other key in the vault.
+type daemonKey struct {
+	sock string
+	pub  ssh.PublicKey
+}
+
+var errOneKeyAgent = errors.New("hop: this agent only signs with the key under test")
+
+func (d daemonKey) call(f func(agent.ExtendedAgent) error) error {
+	c, err := net.Dial("unix", d.sock)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	return f(agent.NewClient(c))
+}
+
+func (d daemonKey) List() ([]*agent.Key, error) {
+	var out []*agent.Key
+	err := d.call(func(a agent.ExtendedAgent) error {
+		keys, err := a.List()
+		for _, k := range keys {
+			if bytes.Equal(k.Blob, d.pub.Marshal()) {
+				out = append(out, k)
+			}
+		}
+		return err
+	})
+	return out, err
+}
+
+func (d daemonKey) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
+	return d.SignWithFlags(key, data, 0)
+}
+
+func (d daemonKey) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
+	if !bytes.Equal(key.Marshal(), d.pub.Marshal()) {
+		return nil, errOneKeyAgent
+	}
+	var sig *ssh.Signature
+	err := d.call(func(a agent.ExtendedAgent) error {
+		var err error
+		sig, err = a.SignWithFlags(key, data, flags)
+		return err
+	})
+	return sig, err
+}
+
+func (daemonKey) Signers() ([]ssh.Signer, error)           { return nil, errOneKeyAgent }
+func (daemonKey) Add(agent.AddedKey) error                 { return errOneKeyAgent }
+func (daemonKey) Remove(ssh.PublicKey) error               { return errOneKeyAgent }
+func (daemonKey) RemoveAll() error                         { return errOneKeyAgent }
+func (daemonKey) Lock([]byte) error                        { return errOneKeyAgent }
+func (daemonKey) Unlock([]byte) error                      { return errOneKeyAgent }
+func (daemonKey) Extension(string, []byte) ([]byte, error) { return nil, agent.ErrExtensionUnsupported }
 
 // ---- after hop auth devices revoke ----
 
@@ -971,7 +1383,7 @@ func offerKeyRotation(ctx context.Context, e *Env, asJSON bool) error {
 	if !e.StdinTTY {
 		return nil
 	}
-	ok, err := confirm(e, false, "Rotate them now?")
+	ok, err := confirmCtx(ctx, e, "Rotate them now?")
 	if err != nil || !ok {
 		return nil
 	}

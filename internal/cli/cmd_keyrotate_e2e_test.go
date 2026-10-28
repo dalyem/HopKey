@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,10 +44,18 @@ type akServer struct {
 	hostKey ssh.PublicKey
 	cfg     *ssh.ServerConfig
 
+	// down makes the server unreachable: every new connection is closed
+	// before the handshake.
+	down atomic.Bool
+
 	mu sync.Mutex
 	// refuse, if set, turns away a key whose authorized_keys line has it
 	// in the comment: a server that does not read what hop wrote.
 	refuse string
+	// onExec, if set, sees each command before it runs. It returns true to
+	// have the connection dropped once the command has run, before its exit
+	// status is sent: the client cannot tell whether it ran.
+	onExec func(command string) (drop bool)
 }
 
 func startAKServer(t *testing.T, home string) *akServer {
@@ -80,6 +89,16 @@ func (s *akServer) setRefuse(comment string) {
 	defer s.mu.Unlock()
 	s.refuse = comment
 }
+
+func (s *akServer) setOnExec(f func(command string) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onExec = f
+}
+
+// isAKWrite reports whether a command hop runs is one of its
+// authorized_keys edits: the script that writes a temp file and renames it.
+func isAKWrite(command string) bool { return strings.Contains(command, "authorized_keys.hop-") }
 
 func (s *akServer) authorize(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
 	data, err := os.ReadFile(filepath.Join(s.home, ".ssh", "authorized_keys"))
@@ -131,6 +150,9 @@ func fromAllows(patterns, ip string) bool {
 
 func (s *akServer) serve(c net.Conn) {
 	defer c.Close()
+	if s.down.Load() {
+		return
+	}
 	conn, chans, reqs, err := ssh.NewServerConn(c, s.cfg)
 	if err != nil {
 		return
@@ -144,7 +166,7 @@ func (s *akServer) serve(c net.Conn) {
 			if err != nil {
 				return
 			}
-			go s.session(ch, creqs)
+			go s.session(conn, ch, creqs)
 		case "direct-tcpip":
 			go forwardTCP(nc)
 		default:
@@ -153,7 +175,7 @@ func (s *akServer) serve(c net.Conn) {
 	}
 }
 
-func (s *akServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
+func (s *akServer) session(conn ssh.Conn, ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 	for req := range reqs {
 		if req.Type != "exec" {
@@ -166,6 +188,10 @@ func (s *akServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			continue
 		}
 		req.Reply(true, nil)
+		s.mu.Lock()
+		hook := s.onExec
+		s.mu.Unlock()
+		drop := hook != nil && hook(p.Command)
 		cmd := exec.Command("sh", "-c", p.Command)
 		cmd.Dir = s.home
 		cmd.Env = []string{"HOME=" + s.home, "PATH=" + os.Getenv("PATH")}
@@ -178,6 +204,10 @@ func (s *akServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			if errors.As(err, &ee) && ee.ExitCode() >= 0 {
 				status = uint32(ee.ExitCode())
 			}
+		}
+		if drop {
+			conn.Close()
+			return
 		}
 		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
 		return
@@ -687,5 +717,283 @@ func TestKeyRotateOfferAfterRevoke(t *testing.T) {
 	}
 	if w.keyNamed(t, "deploy-key") != nil {
 		t.Error("the old key is still in the vault")
+	}
+}
+
+// rotHostJSON is a host of hop key rotate --json, decoded on its own so
+// the tests read every field the command prints.
+type rotHostJSON struct {
+	Host        string `json:"host"`
+	Status      string `json:"status"`
+	Reason      string `json:"reason"`
+	Warning     string `json:"warning"`
+	RemoteState string `json:"remote_state"`
+	Fix         string `json:"fix"`
+}
+
+func decodeRotateHosts(t *testing.T, stdout string) map[string]rotHostJSON {
+	t.Helper()
+	var res struct {
+		Keys []struct {
+			Hosts []rotHostJSON `json:"hosts"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, stdout)
+	}
+	out := map[string]rotHostJSON{}
+	for _, k := range res.Keys {
+		for _, h := range k.Hosts {
+			out[h.Host] = h
+		}
+	}
+	return out
+}
+
+// identityFile is the IdentityFile of host's block in the generated ssh
+// config: the path ssh tries as a private key file before the agent.
+func (w *rotWorld) identityFile(t *testing.T, host string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(w.paths.ConfigDir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := false
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(l, "Host ") {
+			in = strings.TrimSpace(strings.TrimPrefix(l, "Host ")) == host
+			continue
+		}
+		if v, ok := strings.CutPrefix(strings.TrimSpace(l), "IdentityFile "); ok && in {
+			return strings.Trim(v, `"`)
+		}
+	}
+	t.Fatalf("no IdentityFile for %s in:\n%s", host, b)
+	return ""
+}
+
+func (w *rotWorld) hostNamed(t *testing.T, name string) model.Host {
+	t.Helper()
+	for _, h := range w.snapshot(t).Hosts {
+		if h.Name == name {
+			return h
+		}
+	}
+	t.Fatalf("no host %s", name)
+	return model.Host{}
+}
+
+// The rename that removes the old key goes through, but the connection
+// drops before its exit status arrives, and the host is unreachable after.
+// hop cannot know what the server accepts, so both keys stay in the vault,
+// the host is reported as needing attention, and the command it names
+// finishes the job once the host is back.
+func TestKeyRotateUnknownRemoteStateKeepsBothKeys(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	s := w.srv[0]
+	var writes atomic.Int32
+	s.setOnExec(func(cmd string) bool {
+		if isAKWrite(cmd) && writes.Add(1) == 2 { // the write that removes the old key
+			s.down.Store(true)
+			return true
+		}
+		return false
+	})
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--hosts", "web-1", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	if writes.Load() < 2 {
+		t.Fatalf("the old key's lines were never removed (%d writes); the test did not drop the connection", writes.Load())
+	}
+	res := decodeRotate(t, stdout)
+	rk := res.Keys[0]
+
+	// The server took the edit: only the new key is in authorized_keys.
+	got, _ := w.authorizedKeys(t, 0)
+	if strings.Contains(got, authorizedKeysLine(w.oldKey.PublicKey())) || !strings.Contains(got, "hop-rotated") {
+		t.Fatalf("the test meant the removal to go through:\n%s", got)
+	}
+	// So the new key must still be in the vault, and the old one too.
+	if rk.NewKeyRemoved || w.keyNamed(t, rk.NewKey) == nil {
+		t.Fatalf("the new key %q was deleted from the vault, and the server accepts only it", rk.NewKey)
+	}
+	if w.keyNamed(t, "deploy-key") == nil || rk.OldKey != "kept" {
+		t.Errorf("the old key was deleted: %+v", rk)
+	}
+	if code == 0 || res.OK {
+		t.Errorf("exit %d, ok %v: an unknown host is not a success", code, res.OK)
+	}
+	h := decodeRotateHosts(t, stdout)["web-1"]
+	if h.Status != "needs-attention" || h.RemoteState != "unknown" ||
+		!strings.Contains(h.Reason, "deploy-key") || !strings.Contains(h.Reason, rk.NewKey) || !strings.HasPrefix(h.Fix, "hop key rotate ") {
+		t.Fatalf("web-1: %+v", h)
+	}
+
+	// The host is back: the command hop named finds the old key's lines
+	// gone, logs in with the new key, and points web-1 at it.
+	s.down.Store(false)
+	s.setOnExec(nil)
+	args := append(strings.Fields(h.Fix)[1:], "--yes", "--json")
+	code, stdout, stderr = w.hop(t, args...)
+	t.Logf("hop %s (exit %d)\n%s\nstderr: %s", strings.Join(args, " "), code, stdout, stderr)
+	if h := decodeRotateHosts(t, stdout)["web-1"]; code != 0 || h.Status != "already-rotated" {
+		t.Fatalf("the fix: exit %d, web-1 %+v", code, h)
+	}
+	if w.hostKeyID(t, "web-1") != w.keyNamed(t, rk.NewKey).ItemID {
+		t.Error("web-1 is not on the new key after the fix")
+	}
+	if w.keyNamed(t, rk.NewKey) == nil || w.keyNamed(t, "deploy-key") == nil {
+		t.Error("the fix deleted a key that web-2 or web-1 uses")
+	}
+}
+
+// OpenSSH adds up IdentityFile lines, so a check that ran through the
+// generated config would also offer the old key from a private key file at
+// that config's IdentityFile. The server refuses the new key here: the
+// rotation must fail and put the host back, not log in with the old key
+// and call it verified.
+func TestKeyRotateVerifyOffersOnlyTheNewKey(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	old := w.keyNamed(t, "deploy-key")
+	if err := os.WriteFile(w.identityFile(t, "web-1"), []byte(old.PrivateKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w.srv[0].setRefuse("hop-rotated")
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--hosts", "web-1", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	res := decodeRotate(t, stdout)
+	if h := decodeRotateHosts(t, stdout)["web-1"]; code != 255 || h.Status != "failed" || !strings.Contains(h.Reason, "did not log in") {
+		t.Errorf("exit %d, web-1 %+v", code, h)
+	}
+	if got, _ := w.authorizedKeys(t, 0); got != w.orig[0] {
+		t.Errorf("authorized_keys after the failed check:\n%s\nwant:\n%s", got, w.orig[0])
+	}
+	if err := login(w.srv[0], w.oldKey); err != nil {
+		t.Errorf("web-1 refuses the old key: %v", err)
+	}
+	if w.hostKeyID(t, "web-1") != w.keyID || !res.Keys[0].NewKeyRemoved {
+		t.Errorf("vault after the failure: web-1 on %v, %+v", w.hostKeyID(t, "web-1"), res.Keys[0])
+	}
+}
+
+// Another device moves web-1 to another address while its key is being
+// rotated. The vault write then conflicts, and hop must not point the moved
+// record, at a server it never checked, at the new key.
+func TestKeyRotateConflictDoesNotRepointAMovedHost(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	var writes atomic.Int32
+	w.srv[0].setOnExec(func(cmd string) bool {
+		if isAKWrite(cmd) && writes.Add(1) == 2 {
+			// A Run of its own: w.hop's stdin field belongs to the rotation.
+			var out, errOut bytes.Buffer
+			env := w.env(t, strings.NewReader(""), &out, &errOut)
+			if code := cli.Run(context.Background(), []string{"edit", "web-1", "--address", "127.0.0.9"}, env); code != 0 {
+				t.Errorf("hop edit during the rotation: exit %d: %s", code, errOut.String())
+			}
+		}
+		return false
+	})
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--hosts", "web-1", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	res := decodeRotate(t, stdout)
+	h := w.hostNamed(t, "web-1")
+	if len(h.Addresses) != 1 || h.Addresses[0] != "127.0.0.9" {
+		t.Fatalf("the edit did not land: %v", h.Addresses)
+	}
+	if h.KeyID != w.keyID {
+		t.Errorf("the moved record was pointed at the new key")
+	}
+	if st := decodeRotateHosts(t, stdout)["web-1"]; code == 0 || st.Status != "needs-attention" || !strings.Contains(st.Reason, "changed") {
+		t.Errorf("exit %d, web-1 %+v", code, st)
+	}
+	if w.keyNamed(t, "deploy-key") == nil || w.keyNamed(t, res.Keys[0].NewKey) == nil {
+		t.Errorf("both keys should stay: %+v", res.Keys[0])
+	}
+	// The server hop checked is put back on the old key, which the record
+	// still names.
+	if err := login(w.srv[0], w.oldKey); err != nil {
+		t.Errorf("web-1's server refuses the old key: %v", err)
+	}
+}
+
+// Another hop run holds the authorized_keys lock and edits the file while
+// it does. hop waits for the lock, finds the file changed from what it
+// read, and changes nothing.
+func TestKeyRotateWaitsForTheAuthorizedKeysLock(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	s := w.srv[0]
+	f := filepath.Join(s.home, ".ssh", "authorized_keys")
+	lock := filepath.Join(s.home, ".ssh", ".hop-authorized_keys.lock")
+	const theirs = "# added by another hop\n"
+	var once sync.Once
+	other := make(chan string, 1) // what went wrong while the other writer held the lock
+	s.setOnExec(func(cmd string) bool {
+		if !isAKWrite(cmd) {
+			return false
+		}
+		once.Do(func() {
+			if err := os.Mkdir(lock, 0o700); err != nil {
+				other <- err.Error()
+				return
+			}
+			go func() {
+				time.Sleep(1500 * time.Millisecond)
+				b, _ := os.ReadFile(f)
+				msg := ""
+				if string(b) != w.orig[0] {
+					msg = "authorized_keys changed while another writer held the lock:\n" + string(b)
+				}
+				os.WriteFile(f, append(b, theirs...), 0o640)
+				os.Remove(lock)
+				other <- msg
+			}()
+		})
+		return false
+	})
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--hosts", "web-1", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	select {
+	case msg := <-other:
+		if msg != "" {
+			t.Error(msg)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the other writer never ran")
+	}
+	if h := decodeRotateHosts(t, stdout)["web-1"]; code != 255 || h.Status != "failed" || !strings.Contains(h.Reason, "changed") {
+		t.Errorf("exit %d, web-1 %+v", code, h)
+	}
+	if got, _ := w.authorizedKeys(t, 0); got != w.orig[0]+theirs {
+		t.Errorf("authorized_keys:\n%s\nwant the original plus the other writer's line", got)
+	}
+	if _, err := os.Stat(lock); err == nil {
+		t.Error("the lock was left behind")
+	}
+	if w.hostKeyID(t, "web-1") != w.keyID {
+		t.Error("web-1 moved to the new key")
+	}
+}
+
+// Two records for the same account: the first rotation removes the old
+// key there, so the second record's old-key login fails. hop tries the new
+// key, and points that record at it too.
+func TestKeyRotateSecondAliasOfTheSameAccount(t *testing.T) {
+	w := newRotWorld(t, rotWorldOpts{})
+	if code, _, errOut := w.hop(t, "add", "web-1-alias", "--address", "127.0.0.1", "--port", strconv.Itoa(w.srv[0].port),
+		"--user", "deploy", "--key", "deploy-key", "--host-key", authorizedKeysLine(w.srv[0].hostKey)); code != 0 {
+		t.Fatalf("hop add: %d %s", code, errOut)
+	}
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	st := decodeRotateHosts(t, stdout)
+	if code != 0 || st["web-1"].Status != "rotated" || st["web-2"].Status != "rotated" || st["web-1-alias"].Status != "already-rotated" {
+		t.Fatalf("exit %d, %+v", code, st)
+	}
+	res := decodeRotate(t, stdout)
+	newKey := w.keyNamed(t, res.Keys[0].NewKey)
+	if newKey == nil || w.hostKeyID(t, "web-1-alias") != newKey.ItemID {
+		t.Errorf("web-1-alias is not on the new key")
+	}
+	if w.keyNamed(t, "deploy-key") != nil || res.Keys[0].OldKey != "deleted" {
+		t.Errorf("the old key should go once every record moved: %+v", res.Keys[0])
 	}
 }

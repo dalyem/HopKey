@@ -278,3 +278,113 @@ func TestAKScriptsWithSh(t *testing.T) {
 		t.Errorf("write through a symlink: %d", code)
 	}
 }
+
+// sshd reads the options field quote-aware: a key blob or a space inside a
+// quoted value belongs to the options, and \" does not end the quotes. hop
+// must read it the same way, or the new line loses restrictions.
+func TestParseAKLineQuotedOptions(t *testing.T) {
+	k := rotTestKey(t)
+	blob := strings.Fields(akText(k))[1]
+	cases := []struct{ line, opts string }{
+		{`environment="OLD=` + blob + `",restrict ` + akText(k) + " c", `environment="OLD=` + blob + `",restrict`},
+		{`environment="X=` + akText(k) + `" ` + akText(k), `environment="X=` + akText(k) + `"`},
+		{`command="echo \"a b\" ` + blob + `",no-pty ` + akText(k) + " c", `command="echo \"a b\" ` + blob + `",no-pty`},
+		{`restrict ` + akText(k), "restrict"},
+		{`command="/bin/a,b c",restrict,from="10.0.0.1" ` + akText(k) + " x y", `command="/bin/a,b c",restrict,from="10.0.0.1"`},
+		{"\t" + akText(k) + " " + blob, ""},
+	}
+	for _, c := range cases {
+		got, ok := parseAKLine(c.line)
+		if !ok {
+			t.Errorf("%q: not parsed", c.line)
+			continue
+		}
+		if got.options != c.opts || !bytes.Equal(got.pub.Marshal(), k.Marshal()) {
+			t.Errorf("%q: options %q, want %q", c.line, got.options, c.opts)
+		}
+	}
+	// An unterminated quote is not a key line to sshd.
+	if _, ok := parseAKLine(`command="x ` + akText(k)); ok {
+		t.Error("unterminated quote parsed")
+	}
+	// cert-authority inside a quoted value is not the option.
+	if got, ok := parseAKLine(`command="cert-authority" ` + akText(k)); !ok || got.certCA {
+		t.Errorf("quoted cert-authority: %+v %v", got, ok)
+	}
+	if got, ok := parseAKLine(`Cert-Authority,from="*" ` + akText(k)); !ok || !got.certCA {
+		t.Errorf("cert-authority in another case: %+v %v", got, ok)
+	}
+
+	// The new line keeps every restriction of the old one.
+	newK := rotTestKey(t)
+	orig := `environment="OLD=` + blob + `",restrict ` + akText(k) + " c\n"
+	ed, err := planAKEdit([]byte(orig), k, newK, "n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{`environment="OLD=` + blob + `",restrict ` + akText(newK) + " n"}; strings.Join(ed.added, "\n") != want[0] {
+		t.Errorf("added %q, want %q", ed.added, want)
+	}
+}
+
+// The write script waits for another hop's lock, gives up with nothing
+// changed when it stays, and takes over one left by a run that died.
+func TestAKWriteScriptLock(t *testing.T) {
+	defer func(w int) { akLockWait = w }(akLockWait)
+	akLockWait = 1
+	home := t.TempDir()
+	dir := filepath.Join(home, ".ssh")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(dir, "authorized_keys")
+	orig, next := []byte("a\n"), []byte("a\nb\n")
+	if err := os.WriteFile(f, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(dir, akLockDir)
+	if err := os.Mkdir(lock, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := runAKScript(t, home, akWriteScript(cksum(orig), cksum(next)), next)
+	if code != akExitLocked || !strings.Contains(stderr, "another hop run") {
+		t.Errorf("held lock: %d %q", code, stderr)
+	}
+	if got, _ := os.ReadFile(f); !bytes.Equal(got, orig) {
+		t.Errorf("written under another's lock: %q", got)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Errorf("the other run's lock was removed: %v", err)
+	}
+
+	// Three minutes old: stale.
+	old := time.Now().Add(-3 * time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, stderr := runAKScript(t, home, akWriteScript(cksum(orig), cksum(next)), next); code != 0 {
+		t.Fatalf("stale lock: %d %q", code, stderr)
+	}
+	if got, _ := os.ReadFile(f); !bytes.Equal(got, next) {
+		t.Errorf("after taking a stale lock: %q", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("~/.ssh holds %d entries, want only authorized_keys", len(entries))
+	}
+}
+
+func TestAKState(t *testing.T) {
+	oldK, newK, other := rotTestKey(t), rotTestKey(t), rotTestKey(t)
+	o, n, x := akText(oldK)+"\n", "restrict "+akText(newK)+"\n", akText(other)+"\n"
+	for content, want := range map[string]string{
+		x + o: remUnchanged,
+		o + n: remAdded,
+		x + n: remOldRemoved,
+		x:     remUnknown,
+		"cert-authority " + akText(oldK) + "\n" + n: remOldRemoved,
+	} {
+		if got := akState([]byte(content), oldK, newK); got != want {
+			t.Errorf("%q: %s, want %s", content, got, want)
+		}
+	}
+}

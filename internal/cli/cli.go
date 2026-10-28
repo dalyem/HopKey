@@ -113,6 +113,11 @@ type Env struct {
 	// hold is the hop auth command's hold of the vault while it lasts.
 	holdMu sync.Mutex
 	hold   *vaultHold
+
+	// rotation is closed when the hop key rotate that is changing hosts
+	// ends, and nil when none is (beginRotation).
+	rotMu    sync.Mutex
+	rotation chan struct{}
 }
 
 // ExitInterrupted is the exit status after SIGINT or SIGTERM, as a shell
@@ -127,7 +132,8 @@ const ExitInterrupted = 130
 // vault once this process is gone, and the process exits. A command that
 // holds nothing exits at once, as it did when the signal killed it,
 // unless it handles the context itself (ctxAware, decided before the
-// command starts: see handlesInterrupt).
+// command starts: see handlesInterrupt). A hop key rotate that another
+// command runs is waited for (beginRotation).
 func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware bool) {
 	if e.Exit == nil {
 		return
@@ -143,11 +149,26 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 	if ctxAware {
 		return
 	}
-	if h := e.currentHold(); h != nil {
-		grace := e.InterruptGrace
-		if grace <= 0 {
-			grace = 3 * time.Second
+	grace := e.InterruptGrace
+	if grace <= 0 {
+		grace = 3 * time.Second
+	}
+	if ch := e.activeRotation(); ch != nil {
+		// hop key rotate, run by another command (hop auth devices
+		// revoke): it finishes or puts back the host it is on and returns.
+		// Then the command gets the grace to return too.
+		select {
+		case <-done:
+			return
+		case <-ch:
 		}
+		select {
+		case <-done:
+			return
+		case <-time.After(grace):
+		}
+	}
+	if h := e.currentHold(); h != nil {
 		select {
 		case <-done:
 			return
@@ -163,6 +184,27 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 	default:
 	}
 	e.Exit(ExitInterrupted)
+}
+
+// beginRotation marks hop key rotate as changing hosts until end is
+// called. A signal then waits for it, whatever command runs it.
+func (e *Env) beginRotation() (end func()) {
+	ch := make(chan struct{})
+	e.rotMu.Lock()
+	e.rotation = ch
+	e.rotMu.Unlock()
+	return func() {
+		e.rotMu.Lock()
+		e.rotation = nil
+		e.rotMu.Unlock()
+		close(ch)
+	}
+}
+
+func (e *Env) activeRotation() <-chan struct{} {
+	e.rotMu.Lock()
+	defer e.rotMu.Unlock()
+	return e.rotation
 }
 
 // handlesInterrupt reports whether the command args runs returns on its
@@ -255,7 +297,7 @@ func init() {
 		"add":     {runAdd, "hop add <name> [--address A]... [--user U] [--port N] [--key NAME] [--jump HOST] [--tag T]... [--alias A]... [--host-key LINE]..."},
 		"edit":    {runEdit, "hop edit <target> [--name N] [--address A]... [other flags as hop add]"},
 		"rm":      {runRm, "hop rm <target> [--yes]"},
-		"key":     {runKey, "hop key add <path> [--name N] | hop key ls | hop key rm <name> [--yes] | hop key rotate <name>|--all [--hosts H,...] [--type T] [--dry-run] [--yes] [--keep-old]"},
+		"key":     {runKey, "hop key add <path> [--name N] | hop key ls | hop key rm <name> [--yes] | hop key rotate <name>|--all [--hosts H,...] [--type T] [--new-key K] [--dry-run] [--yes] [--keep-old]"},
 		"snippet": {runSnippet, "hop snippet add <name> [--description D] -- <command...> | hop snippet ls | hop snippet rm <name> [--yes]"},
 		"mcp":     {runMCP, "hop mcp [--read-only] | hop mcp install [--client claude|codex|print] [--read-only] [--json]"},
 		"import":  {runImport, "hop import ssh-config [path] [--with-keys] [--dry-run] [--yes] [--json]"},
