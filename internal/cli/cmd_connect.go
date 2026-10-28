@@ -468,6 +468,7 @@ type WhichResult struct {
 	Host       *hostRef            `json:"host,omitempty"`
 	Route      *resolve.Route      `json:"route,omitempty"`
 	RouteError string              `json:"route_error,omitempty"`
+	RouteHint  string              `json:"route_hint,omitempty"`
 	SSHAlias   string              `json:"ssh_alias,omitempty"`
 	SSHProblem string              `json:"ssh_problem,omitempty"`
 	Candidates []resolve.Candidate `json:"candidates,omitempty"`
@@ -479,7 +480,7 @@ func whichResult(rr *daemon.ResolveResult) WhichResult {
 	res := rr.Result
 	w := WhichResult{
 		Target: res.Target, User: res.User, Status: res.Status, Rule: res.Rule, Matched: res.Matched,
-		Route: rr.Route, RouteError: rr.RouteError, SSHAlias: rr.SSHAlias, SSHProblem: rr.SSHProblem,
+		Route: rr.Route, RouteError: rr.RouteError, RouteHint: rr.RouteHint, SSHAlias: rr.SSHAlias, SSHProblem: rr.SSHProblem,
 		Candidates: res.Candidates, Notes: res.Notes, Tailscale: res.Tailscale,
 	}
 	if res.HostID != "" {
@@ -552,6 +553,9 @@ func printWhich(e *Env, rr *daemon.ResolveResult, w *WhichResult) {
 	}
 	if rr.RouteError != "" {
 		e.printf("route:    %s\n", oneLine(rr.RouteError))
+	}
+	if rr.RouteHint != "" {
+		e.printf("hint:     %s\n", oneLine(rr.RouteHint))
 	}
 	if rr.Host != nil {
 		user := res.User
@@ -751,7 +755,11 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		if route.Blocked != "" {
 			return stepFail, oneLine(route.Blocked)
 		}
-		return stepPass, safef("%s:%d via %s", addr, port, route.Label())
+		detail := safef("%s:%d via %s", addr, port, route.Label())
+		if rr.RouteHint != "" {
+			detail += safef("; %s", rr.RouteHint)
+		}
+		return stepPass, detail
 	})
 
 	probe := func(name string, deps []string, fn func() (string, string)) {

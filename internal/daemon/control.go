@@ -371,6 +371,9 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		default:
 			out.Route = &route
 		}
+		if !p.AgentOnly {
+			_, out.RouteHint, _ = resolve.SuggestLink(h, ts)
+		}
 		info := st.ssh[h.ItemID.String()]
 		out.SSHAlias, out.SSHProblem = info.Alias, info.Problem
 		out.Mark = snap.Marks[h.ItemID]

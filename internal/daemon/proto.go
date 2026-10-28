@@ -114,6 +114,10 @@ type ResolveResult struct {
 	Host       *model.Host    `json:"host,omitempty"`
 	Route      *resolve.Route `json:"route,omitempty"`
 	RouteError string         `json:"route_error,omitempty"`
+	// RouteHint says how to route a host over Tailscale when its address
+	// names a tailnet node the host is not linked to (resolve.SuggestLink).
+	// It is never set for agent_only resolution.
+	RouteHint string `json:"route_hint,omitempty"`
 	// SSHAlias is the name of the host's Host block in the generated ssh
 	// config. Empty means the host has none; SSHProblem then says why.
 	SSHAlias   string `json:"ssh_alias,omitempty"`

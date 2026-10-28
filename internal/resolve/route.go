@@ -1,13 +1,11 @@
 package resolve
 
 import (
-	"context"
+	"cmp"
 	"fmt"
-	"net"
 	"net/netip"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/tailscale"
@@ -84,7 +82,7 @@ func IsTailnetAddr(addr, magicDNSSuffix string) bool {
 // ChooseRoute picks the address for h. ts may be nil or unavailable.
 //
 //   - direct: the first stored address that is not on the tailnet. A
-//     single-label name counts as the tailnet only as place says.
+//     single-label name is a direct address unless a link says otherwise.
 //   - tailnet: the host's tailnet address and never a direct one. If Tailscale
 //     is not available here the route is Blocked, so the connection fails with
 //     a message that says why, rather than going around the restriction.
@@ -96,13 +94,6 @@ func IsTailnetAddr(addr, magicDNSSuffix string) bool {
 // its tailnet address, with no direct fallback, and is Blocked like route
 // tailnet; asking for "direct" is an error.
 func ChooseRoute(h model.Host, ts *tailscale.Status) (Route, error) {
-	return ChooseRouteWith(h, ts, SystemLookup)
-}
-
-// ChooseRouteWith is ChooseRoute with the resolver that decides whether a
-// single-label address names a tailnet node (see place). A nil lookup
-// resolves nothing, so no such address counts as the tailnet.
-func ChooseRouteWith(h model.Host, ts *tailscale.Status, lookup Lookup) (Route, error) {
 	setting := h.Route
 	if setting == "" {
 		setting = RouteAuto
@@ -112,7 +103,7 @@ func ChooseRouteWith(h model.Host, ts *tailscale.Status, lookup Lookup) (Route, 
 		port = 22
 	}
 
-	p := place(h, ts, lookup)
+	p := place(h, ts)
 	direct := p.direct
 	tailnet, node, haveNode := tailnetAddress(h, p)
 
@@ -201,87 +192,60 @@ type placement struct {
 	haveNode        bool
 }
 
-// Lookup resolves a host name to addresses.
-type Lookup func(ctx context.Context, host string) ([]string, error)
-
-// lookupTimeout bounds the lookup of one short name.
-const lookupTimeout = 2 * time.Second
-
-// SystemLookup resolves a name with the system resolver, which is what a
-// direct connection uses (/etc/hosts, the DNS search domains, MagicDNS).
-func SystemLookup(ctx context.Context, host string) ([]string, error) {
-	return net.DefaultResolver.LookupHost(ctx, host)
-}
-
-// place sorts h's addresses into the tailnet's and the direct ones, in the
-// same order HostOwnsNode decides which node a host is. The authoritative
-// ones come first: the stable node ID, the stored MagicDNS name, and an
-// address that is a Tailscale IP or an exact MagicDNS name. A node found
-// that way is the host's node, and a short name of any node beside it is
-// only a direct address.
-//
-// Only when there is no such link can a single-label address make a node
-// the host's: it must name exactly one node by host name or first label,
-// and the system resolver, as a direct connection uses it, must answer with
-// that node's Tailscale IPs only (MagicDNS answering for it). Otherwise the
-// name is a LAN name that happens to match, as with /etc/hosts or corporate
-// DNS, and it stays direct.
-func place(h model.Host, ts *tailscale.Status, lookup Lookup) placement {
+// place sorts h's addresses into the tailnet's and the direct ones. Routing
+// never asks DNS: a node is the host's only through a link, in the order
+// HostOwnsNode trusts them (see linkedNodes): the stable node ID, the stored
+// MagicDNS name, and an address that is a Tailscale IP or an exact MagicDNS
+// name. A single-label name, even one that matches a node's host name, is
+// only a direct address: it may be a LAN name, and a host behind a jump host
+// is resolved by the bastion. SuggestLink points at such a name instead.
+func place(h model.Host, ts *tailscale.Status) placement {
 	var p placement
 	suffix := ""
 	if ts != nil {
 		suffix = ts.MagicDNSSuffix
 	}
-	linked := linkedNodes(h, ts.Nodes())
-	if len(linked) > 0 {
+	if linked := linkedNodes(h, ts.Nodes()); len(linked) > 0 {
 		p.node, p.haveNode = linked[0], true
 	}
 	for _, a := range h.Addresses {
 		if IsTailnetAddr(a, suffix) {
 			p.tailnet = append(p.tailnet, a)
-			continue
+		} else {
+			p.direct = append(p.direct, a)
 		}
-		if len(linked) == 0 {
-			// Several short names may name different nodes; the first
-			// decides, and the others stay direct.
-			if n, ok := namedByResolver(a, ts, lookup); ok && (!p.haveNode || n.ID == p.node.ID) {
-				p.node, p.haveNode = n, true
-				p.tailnet = append(p.tailnet, a)
-				continue
-			}
-		}
-		p.direct = append(p.direct, a)
 	}
 	return p
 }
 
-// namedByResolver is the node that the single-label address addr names, if
-// it names exactly one by host name or first MagicDNS label and lookup
-// answers with that node's Tailscale IPs and nothing else.
-func namedByResolver(addr string, ts *tailscale.Status, lookup Lookup) (tailscale.Node, bool) {
-	a := normAddr(addr)
-	if lookup == nil || a == "" || strings.Contains(a, ".") {
-		return tailscale.Node{}, false
+// SuggestLink is the hint for a host whose single-label address names
+// exactly one tailnet node by host name or first MagicDNS label, when the
+// host has no link and no jump host: "to route over Tailscale, link it". It
+// reports the node and the hint; ok is false when there is nothing to
+// suggest. It uses only the Tailscale status, never DNS.
+func SuggestLink(h model.Host, ts *tailscale.Status) (node tailscale.Node, hint string, ok bool) {
+	if !h.JumpHostID.IsZero() || ts == nil || !ts.Available {
+		return tailscale.Node{}, "", false
 	}
-	if _, err := netip.ParseAddr(a); err == nil {
-		return tailscale.Node{}, false
+	all := ts.Nodes()
+	if len(linkedNodes(h, all)) > 0 {
+		return tailscale.Node{}, "", false
 	}
-	found := ts.Find(a)
-	if len(found) != 1 {
-		return tailscale.Node{}, false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
-	defer cancel()
-	answers, err := lookup(ctx, a)
-	if err != nil || len(answers) == 0 {
-		return tailscale.Node{}, false
-	}
-	for _, s := range answers {
-		if !addrNamesNode(s, found[0]) {
-			return tailscale.Node{}, false
+	for _, a := range h.Addresses {
+		k := normAddr(a)
+		if k == "" || strings.Contains(k, ".") {
+			continue
+		}
+		if _, err := netip.ParseAddr(k); err == nil {
+			continue
+		}
+		if found := ts.Find(k); len(found) == 1 {
+			n := found[0]
+			name := cmp.Or(n.ShortName(), n.HostName)
+			return n, fmt.Sprintf("%s matches tailnet node %s; to route over Tailscale: hop ts link %s %s", a, name, h.Name, name), true
 		}
 	}
-	return found[0], true
+	return tailscale.Node{}, "", false
 }
 
 // tailnetAddress finds the host's tailnet address from its placement. A live

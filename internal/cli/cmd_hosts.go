@@ -74,6 +74,9 @@ type HostView struct {
 type InfoView struct {
 	HostView
 	SyncedAt *time.Time `json:"synced_at"`
+	// RouteHint is how to route the host over Tailscale, when its address
+	// names a tailnet node it is not linked to.
+	RouteHint string `json:"route_hint,omitempty"`
 }
 
 func hostView(h model.Host, l *daemon.ListResult) HostView {
@@ -245,7 +248,7 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 		v.Mark = rr.Mark
 	}
 	if *asJSON {
-		return printJSON(e, InfoView{HostView: v, SyncedAt: l.SyncedAt})
+		return printJSON(e, InfoView{HostView: v, SyncedAt: l.SyncedAt, RouteHint: rr.RouteHint})
 	}
 	if interactiveResolution(e, false) {
 		syncNotice(ctx, e)
@@ -275,6 +278,9 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 	e.printf("route:        %s\n", oneLine(string(v.Route)))
 	if v.ChosenRoute != nil {
 		e.printf("would use:    %s:%d via %s\n", oneLine(v.ChosenRoute.Address), v.ChosenRoute.Port, oneLine(v.ChosenRoute.Label()))
+	}
+	if rr.RouteHint != "" {
+		e.printf("hint:         %s\n", oneLine(rr.RouteHint))
 	}
 	e.printf("agent access: %s\n", oneLine(string(v.AgentAccess)))
 	if t := v.Tailscale; t != nil {
@@ -491,6 +497,11 @@ func reportHost(ctx context.Context, e *Env, asJSON bool, h model.Host, verb str
 		fmt.Fprintf(e.Stderr, "hop: note: %s is not usable with ssh yet: %s\n", oneLine(v.Name), oneLine(v.SSHProblem))
 	} else if len(v.HostKeys) == 0 {
 		fmt.Fprintf(e.Stderr, "hop: note: no host key is pinned for %s; pin it with: %s\n", oneLine(v.Name), oneLine(pinCommand(v.Name, v.JumpHost != "")))
+	}
+	if st, err := tailnetStatus(ctx, e); err == nil {
+		if _, hint, ok := resolve.SuggestLink(h, st); ok {
+			fmt.Fprintf(e.Stderr, "hop: note: %s\n", oneLine(hint))
+		}
 	}
 	return nil
 }
