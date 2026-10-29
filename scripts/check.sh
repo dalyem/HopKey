@@ -29,7 +29,10 @@ test)
 	;;
 race)
 	# Same as test, under the race detector, for the packages with goroutines.
-	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" go test -race ./internal/...
+	# Race binaries use several times the memory of plain ones; running
+	# packages side by side got the job killed for its memory limit on Kiln
+	# (the daemon package alone is the largest), so they run one at a time.
+	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" go test -race -p 1 ./internal/...
 	;;
 gofmt)
 	out=$(gofmt -l .)
