@@ -20,8 +20,8 @@ import (
 )
 
 // schemaVersion is stored in meta; Open refuses a database from a newer
-// server.
-const schemaVersion = "2"
+// server and moves an older one forward (migrate).
+const schemaVersion = "3"
 
 // schema is the multi-tenant SQLite schema. IDs and digests are BLOBs of
 // their raw bytes; times are Unix seconds.
@@ -171,6 +171,21 @@ CREATE TABLE IF NOT EXISTS enroll_messages (
 	body      BLOB NOT NULL,
 	PRIMARY KEY (enroll_id, n)
 ) STRICT;
+` + schemaV3
+
+// schemaV3 is what version 3 added: the admin audit trail. account_id is
+// not a foreign key, so a row outlives its account.
+const schemaV3 = `
+CREATE TABLE IF NOT EXISTS admin_audit (
+	id         INTEGER PRIMARY KEY,
+	at         INTEGER NOT NULL,
+	actor      TEXT NOT NULL,
+	action     TEXT NOT NULL,
+	account_id BLOB,
+	params     BLOB NOT NULL,
+	result     TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS admin_audit_account ON admin_audit (account_id, at);
 `
 
 // SQLite is the Store backed by one SQLite database in WAL mode. Writes go
@@ -200,12 +215,8 @@ func OpenSQLite(path string) (*SQLite, error) {
 	}
 	w.SetMaxOpenConns(1)
 	w.SetConnMaxIdleTime(0)
-	if _, err := w.Exec(schema); err != nil {
-		w.Close()
-		return nil, fmt.Errorf("server: creating schema: %w", err)
-	}
 	s := &SQLite{w: w}
-	if err := s.checkVersion(); err != nil {
+	if err := s.migrate(); err != nil {
 		w.Close()
 		return nil, err
 	}
@@ -219,19 +230,37 @@ func OpenSQLite(path string) (*SQLite, error) {
 	return s, nil
 }
 
-func (s *SQLite) checkVersion() error {
+// migrate creates any missing table and records or checks the schema
+// version, in one write transaction, so two processes opening the same file
+// cannot both migrate it. Every table is CREATE IF NOT EXISTS: a version 2
+// database gains admin_audit and moves to version 3, and no existing row
+// changes. A database from a newer server is refused before anything is
+// created. An older server refuses a migrated file; a hop-server backup
+// taken before upgrading is the way back.
+func (s *SQLite) migrate() error {
+	tx, err := s.w.Begin() // BEGIN IMMEDIATE (_txlock)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(schema); err != nil {
+		return fmt.Errorf("server: creating schema: %w", err)
+	}
 	var v []byte
-	err := s.w.QueryRow(`SELECT v FROM meta WHERE k = 'schema_version'`).Scan(&v)
+	err = tx.QueryRow(`SELECT v FROM meta WHERE k = 'schema_version'`).Scan(&v)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		_, err = s.w.Exec(`INSERT INTO meta (k, v) VALUES ('schema_version', ?)`, []byte(schemaVersion))
-		return err
+		_, err = tx.Exec(`INSERT INTO meta (k, v) VALUES ('schema_version', ?)`, []byte(schemaVersion))
 	case err != nil:
-		return err
+	case string(v) == "2":
+		_, err = tx.Exec(`UPDATE meta SET v = ? WHERE k = 'schema_version'`, []byte(schemaVersion))
 	case string(v) != schemaVersion:
-		return fmt.Errorf("server: database schema version %q is not %q", v, schemaVersion)
+		err = fmt.Errorf("server: database schema version %q is not %q", v, schemaVersion)
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *SQLite) Close() error {
@@ -647,7 +676,7 @@ func (t *sqliteTx) Registration(capHash crypto.Hash) (*Registration, error) {
 		if err := errors.Join(scanID(aid, &a.AccountID), scanID(vid, &a.VaultID), scanHash(digest, &a.Digest), scanHash(ackH, &a.Head.H)); err != nil {
 			return nil, err
 		}
-		r.Ack = a
+		r.Ack, r.ConsumedAt = a, fromUnix(consumed.Int64)
 	}
 	return &r, nil
 }
@@ -780,4 +809,202 @@ func (t *sqliteTx) DeleteExpired(now time.Time) error {
 		t.exec(`DELETE FROM challenges WHERE expires_at <= ?`, n),
 		t.DeleteExpiredMailboxes(now),
 	)
+}
+
+// --- administration (hop-server accounts, invites, audit) ---
+
+func (t *sqliteTx) AccountSummaries(only *model.ID) ([]*AccountSummary, error) {
+	where, args := ``, []any{}
+	if only != nil {
+		where, args = `WHERE a.account_id = ?`, []any{only[:]}
+	}
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT a.account_id, a.email, a.vault_id, a.used_bytes, a.quota_bytes, a.reserve, a.created_at,
+		coalesce(v.head_seq, 0), coalesce(v.last_bootstrap, -1), coalesce(v.last_checkpoint, -1),
+		(SELECT COUNT(*) FROM devices d WHERE d.account_id = a.account_id AND d.active = 1),
+		(SELECT COUNT(*) FROM devices d WHERE d.account_id = a.account_id),
+		(SELECT MAX(seen_at) FROM device_seen s WHERE s.account_id = a.account_id)
+		FROM accounts a LEFT JOIN vaults v ON v.vault_id = a.vault_id `+where+`
+		ORDER BY a.created_at, a.email`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*AccountSummary
+	for rows.Next() {
+		var a AccountSummary
+		var id, vid []byte
+		var created int64
+		var seen sql.NullInt64
+		if err := rows.Scan(&id, &a.Email, &vid, &a.UsedBytes, &a.QuotaBytes, &a.Reserve, &created,
+			&a.HeadSeq, &a.LastBootstrap, &a.LastCheckpoint, &a.ActiveDevices, &a.AllDevices, &seen); err != nil {
+			return nil, err
+		}
+		if err := errors.Join(scanID(id, &a.ID), scanID(vid, &a.VaultID)); err != nil {
+			return nil, err
+		}
+		a.CreatedAt = fromUnix(created)
+		if seen.Valid {
+			a.LastSeen = fromUnix(seen.Int64)
+		}
+		out = append(out, &a)
+	}
+	return out, rows.Err()
+}
+
+func (t *sqliteTx) Devices(accountID model.ID) ([]*Device, error) {
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT device_id, sig_pk, active, added_seq FROM devices
+		WHERE account_id = ? ORDER BY added_seq, device_id`, accountID[:])
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Device
+	for rows.Next() {
+		d := Device{AccountID: accountID}
+		var id []byte
+		if err := rows.Scan(&id, &d.SigPK, &d.Active, &d.AddedSeq); err != nil {
+			return nil, err
+		}
+		if err := scanID(id, &d.DeviceID); err != nil {
+			return nil, err
+		}
+		out = append(out, &d)
+	}
+	return out, rows.Err()
+}
+
+func (t *sqliteTx) LiveSessions(accountID model.ID, now time.Time) (map[model.ID]int, error) {
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT device_id, COUNT(*) FROM sessions
+		WHERE account_id = ? AND expires_at > ? GROUP BY device_id`, accountID[:], unix(now))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[model.ID]int{}
+	for rows.Next() {
+		var b []byte
+		var n int
+		if err := rows.Scan(&b, &n); err != nil {
+			return nil, err
+		}
+		var id model.ID
+		if err := scanID(b, &id); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+func (t *sqliteTx) CountLoginTokens(accountID model.ID, now time.Time) (int, error) {
+	var n int
+	err := t.row(`SELECT COUNT(*) FROM login_tokens WHERE account_id = ? AND expires_at > ?`, accountID[:], unix(now)).Scan(&n)
+	return n, mapErr(err)
+}
+
+func (t *sqliteTx) CountAccountMailboxes(accountID model.ID, now time.Time) (int, error) {
+	var n int
+	err := t.row(`SELECT COUNT(*) FROM enrollments WHERE account_id = ? AND expires_at > ?`, accountID[:], unix(now)).Scan(&n)
+	return n, mapErr(err)
+}
+
+func (t *sqliteTx) Registrations(email string) ([]*Registration, error) {
+	q := `SELECT cap_hash FROM registrations ORDER BY created_at, cap_hash`
+	var args []any
+	if email != "" {
+		q = `SELECT cap_hash FROM registrations WHERE email = ? ORDER BY created_at, cap_hash`
+		args = []any{email}
+	}
+	rows, err := t.tx.QueryContext(t.ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	var hashes []crypto.Hash
+	for rows.Next() {
+		var b []byte
+		var h crypto.Hash
+		if err := rows.Scan(&b); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := scanHash(b, &h); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		hashes = append(hashes, h)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	out := make([]*Registration, 0, len(hashes))
+	for _, h := range hashes {
+		r, err := t.Registration(h)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (t *sqliteTx) ExpireRegistration(capHash crypto.Hash, at time.Time) error {
+	res, err := t.tx.ExecContext(t.ctx, `UPDATE registrations SET expires_at = ?
+		WHERE cap_hash = ? AND consumed_at IS NULL AND expires_at > ?`, unix(at), capHash[:], unix(at))
+	if err != nil {
+		return mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (t *sqliteTx) InsertAudit(e *AuditEntry) error {
+	var aid []byte
+	if e.AccountID != nil {
+		aid = e.AccountID[:]
+	}
+	res, err := t.tx.ExecContext(t.ctx, `INSERT INTO admin_audit (at, actor, action, account_id, params, result)
+		VALUES (?, ?, ?, ?, ?, ?)`, unix(e.At), e.Actor, e.Action, aid, e.Params, e.Result)
+	if err != nil {
+		return mapErr(err)
+	}
+	e.ID, err = res.LastInsertId()
+	return err
+}
+
+func (t *sqliteTx) AuditEntries(f AuditFilter) ([]*AuditEntry, error) {
+	q := `SELECT id, at, actor, action, account_id, params, result FROM admin_audit WHERE at >= ?`
+	args := []any{unix(f.Since)}
+	if f.AccountID != nil {
+		q += ` AND account_id = ?`
+		args = append(args, f.AccountID[:])
+	}
+	rows, err := t.tx.QueryContext(t.ctx, q+` ORDER BY id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		var at int64
+		var aid []byte
+		if err := rows.Scan(&e.ID, &at, &e.Actor, &e.Action, &aid, &e.Params, &e.Result); err != nil {
+			return nil, err
+		}
+		e.At = fromUnix(at)
+		if aid != nil {
+			e.AccountID = new(model.ID)
+			if err := scanID(aid, e.AccountID); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, &e)
+	}
+	return out, rows.Err()
 }

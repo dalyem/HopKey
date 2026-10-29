@@ -11,7 +11,7 @@ hop <target>                      shell on a vault host: alias, hostname, IP, Ta
 hop exec <target> [--timeout D] [--sudo] [--json] -- <cmd...>
 hop check|which|trust <target>    diagnose, explain resolution, pin the server's host key
 hop ls [tag] | info <target> | add | edit | rm
-hop key add <path> | ls | rm | rotate <key>|--all [--hosts h1,h2] [--type ed25519|ecdsa|rsa] [--new-key K] [--dry-run] [--yes] [--keep-old]
+hop key add <path> | ls | pub <key> [--fingerprint] | rm | rotate <key>|--all [--hosts h1,h2] [--type ed25519|ecdsa|rsa] [--new-key K] [--dry-run] [--yes] [--keep-old]
 hop snippet add <name> [--description D] -- <cmd...> | ls | rm <name>
 hop import ssh-config [path] [--with-keys] [--dry-run] [--yes]
 hop ts import [--dry-run] | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
@@ -21,10 +21,12 @@ hop lock [--end-sessions] | unlock [--password] | passwd [--kit-file F]
 hop status | daemon [stop [--json]]
 hop sync [resolve]                sync now, settle a change the daemon held
 hop auth signup|login|approve|status|devices|logout|rotate|passwd|merge|resume
-hop mcp [--read-only] | mcp install [--client claude|codex|print] [--read-only] [--json]
+hop mcp [--read-only] [--tag T]... | mcp install [--client claude|codex|print] [--read-only] [--tag T]... [--json]
 ```
 
 `hop import ssh-config` reads your config with `ssh -G`, the way `ssh <host>` does, so it runs any `Match exec` commands in it and may do DNS lookups. It lists what its own scan found (best effort, not a guarantee) and asks before it runs ssh; without a terminal, or with `--json`, it refuses unless you pass `--yes`. Importing your config carries the same trust as using it.
+
+`hop key pub <key>` prints a vault key's public half as an `authorized_keys` line (`ssh-ed25519 AAAA... <key name>`), and `--fingerprint` prints its `SHA256:` fingerprint, as `ssh-keygen -l` shows it; `--json` gives the id, name, type, line and fingerprint. It reads only what the daemon already lists for `hop key ls`: no private byte is read or printed.
 
 Every command takes `--json`, except `hop <target>` (`hop connect`), which opens a shell, `hop daemon`, which runs in the foreground, `hop mcp` itself, which speaks MCP on stdin and stdout (`hop mcp install` takes it), and `hop passwd`, which prints the new Emergency Kit and so has no output that is safe to parse (on a server, `hop auth passwd --json` takes it, with the kit on stderr). A first word that is not a command, followed by more words, is refused as an unknown command, not taken as a target. hop's own failures exit 255, and `hop <target>` and `hop exec` pass the remote exit code through. `hop daemon` exits 75 when another hop process owns the vault: a command that started it then waits for that other daemon. Resolution is interactive (DNS, fuzzy match, picker, plain-ssh fallback) only when stdout is a terminal and `--json` is not given; otherwise it stops after the Tailscale step and returns candidates. `hop exec` is never fuzzy.
 
@@ -129,6 +131,7 @@ Register it once with the client's own CLI:
 hop mcp install --client claude          # runs: claude mcp add --scope user hop -- /path/to/hop mcp
 hop mcp install --client codex           # runs: codex mcp add hop -- /path/to/hop mcp
 hop mcp install --client claude --read-only
+hop mcp install --client claude --tag work --tag lab   # runs: ... hop mcp --tag work --tag lab
 hop mcp install                          # prints the commands, the JSON (mcpServers) and Codex TOML to paste
 ```
 
@@ -188,12 +191,43 @@ Safety rules:
 - An answer about a denied name looks like one about a name that does not exist: what you typed, as the target, the user or a tag, is echoed as you typed it, never masked, where hop echoes it and where ssh names your user on its login to the target. Everything else hop says, from the vault, is masked.
 - An agent never trusts a host key on first use. `exec` and `run_snippet` refuse a host with no pinned key, or one behind a jump host with none, and say to run `hop trust <host>`. ssh runs with `StrictHostKeyChecking yes` against the pinned keys only, so a changed key blocks the call.
 - Every `exec` and `run_snippet` is logged before and after it runs to `$XDG_STATE_HOME/hop/mcp-audit.jsonl` (mode 0600): time, tool, client name, hosts and exit codes, and for each host the `agent_output` policy that applied, how many markers of each kind the agent got, and whether the output was withheld. It never logs output or the values redacted. For `exec` it logs the command the agent sent, as sent: a secret the agent put in the command is in the log, scrubbed of hop's own values and key blocks but not of the vault's secrets or the well-known formats. For `run_snippet` it logs the snippet's name and the names of the parameters, never their values. Every string is scrubbed as answers are, and control characters are written as escapes. If the log cannot be written, nothing runs.
+- `hop mcp --tag work` (repeatable) shows the agent only the hosts that carry at least one of the tags, ignoring case, in every tool: `list_hosts`, `resolve_host`, `check_host`, `ssh_command`, `exec` and `run_snippet`, `tag:` selectors included. It narrows `agent_access`, and a host `agent_access` denies stays hidden whatever its tags. A host outside the tags is hidden exactly as a denied one is: it is left out of lists and candidates, a name or address that matches it answers as one that does not exist, and, as a jump host, it reads `(a host hidden from agents)` and `<hidden host>`. A tag no host carries leaves the agent no host. Use it to organize ("work" and "personal", or one client's hosts per agent); it is not a security boundary against a local attacker, for the reason below.
 - `hop mcp --read-only` offers no tool that runs a command: no `exec`, no `run_snippet`, and `check_host` skips its login step.
 - The hop auth secrets (`HOP_PASSWORD` and the others) and `HOP_DEVICE_PASSPHRASE` are removed from the server's environment, from ssh's, and from a daemon the server starts.
 
 **Known limits.** Redaction is best effort. The master password passes, since no part of hop holds it once the vault is open. So can a secret in an encoding or format hop does not recognise (base64 of a password, say, or under `redacted` a token format not on the list), a secret split across lines, and a secret that ssh's own limit on the length of a log line has already cut short. Only `agent_output: none` guarantees that no remote text reaches the agent: use it for a host whose output an agent should not read, and do not run commands that print secrets.
 
-`agent_access: deny` is a guardrail for well-behaved agents, not a security boundary. An agent runs as you and can use your agent socket and unlocked daemon directly. For a real boundary, run the agent in a container or VM.
+`agent_access: deny` and `hop mcp --tag` are guardrails for well-behaved agents, not a security boundary. An agent runs as you and can use your agent socket and unlocked daemon directly. For a real boundary, run the agent in a container or VM.
+
+## Running hop-server
+
+The `Dockerfile` describes the deployment: the image runs `hop-server serve` behind a TLS proxy, with its database in the `/data` volume. Every other `hop-server` command opens that database file directly, while `serve` keeps running:
+
+```
+docker exec -it hop hop-server accounts ls --data /data
+```
+
+There is no admin API. An admin is whoever can write the data directory, and the commands are local to the server host.
+
+| Command | What it does |
+| --- | --- |
+| `invite EMAIL [--ttl 7d]` | Issues a single-use registration code bound to the email and prints it, alone, on stdout. Only a hash of the code is stored, so it is never shown again. |
+| `invites ls [--all]` | Lists pending invites: ID, email, created, expires. `--all` adds used and expired ones, with the account a used invite created. |
+| `invites revoke INVITE\|EMAIL` | Ends a pending invite, given its ID (at least 8 digits of it) or an email (every pending invite for it). The running server sees it at once: the code gets the same answer as a wrong one. A used invite cannot be revoked; it stays for the signup acknowledgment. |
+| `invites reissue EMAIL [--ttl 7d]` | Revokes the email's pending invites and issues a new code, in one transaction. |
+| `accounts ls` | Every account: email, ID, created, storage used and quota, recovery reserve state, active and total devices, last seen, the vault's head seq and last checkpoint. |
+| `accounts show ACCOUNT_ID\|EMAIL` | One account in detail. Its devices, each with its name, `active`, `retired` or `revoked` (and at which seq), the seq that added it, last seen and live sessions. Also live sessions, outstanding login tokens, open enrollments and pending invites for its email. |
+| `quota ACCOUNT_ID\|EMAIL SIZE` | Sets the account's storage quota (`512MiB`, `2GiB`, ...). A quota that frees the whole recovery reserve also ends a capacity-exhausted state. |
+| `audit [--account A] [--since T]` | Reads the audit trail, oldest first. `--since` takes `7d`, `36h`, `2026-10-01` or an RFC 3339 time. |
+| `backup PATH` | Writes a consistent copy of the whole database to a new file. |
+
+Every command takes `--data DIR`; the listing commands take `--json` too. `invites revoke` and `invites reissue` show what they will change and ask on a terminal (`docker exec -it`); with `--json` they show it on stderr, so stdout holds only the result. Without a terminal they refuse unless `--yes` is given, and `--dry-run` shows the change and makes none. `invite` and `quota` change state without asking, as before.
+
+**Audit trail.** `invite`, `quota`, `invites revoke` and `invites reissue` each write one row to the `admin_audit` table: the time, the OS user running the command (`nonroot (uid 65532)` inside the image, whoever ran `docker exec`), the action, the account, the arguments and the result. The row is written in the transaction that makes the change, so a change and its record commit together. A change that fails after it was confirmed is recorded with its error code. No row holds an invite code, and `invites revoke` records an invite by its 12-digit ID however many digits it was given. The command also prints the row to stderr as one JSON line. Under `docker exec` that line stays in the exec session's output; `docker logs` does not see it. Read-only commands write nothing. The trail is accountability among honest operators, not a tamper-proof log: anyone with the data directory can edit it, or restore an older database file.
+
+**Untrusted text.** Emails and device names come from users and devices. In human output, control characters, invalid UTF-8, bidi overrides and other Unicode format characters are printed as `\xNN` or `\uNNNN` escapes, so a name cannot recolour, clear or reorder the terminal. `--json` keeps valid Unicode exact, with the same characters as JSON `\u` escapes; invalid UTF-8 becomes U+FFFD.
+
+**Upgrading.** Database schema version 3 adds the `admin_audit` table. The first time a newer `hop-server` opens a version 2 database, whether to serve or to run any command, it adds the table and records version 3. No existing row changes. A `hop-server` from before that refuses the upgraded database, so take a backup with the old binary before upgrading if you may need to go back. A database from a newer server is refused and left as it was.
 
 ## Checks
 

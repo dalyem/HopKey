@@ -205,36 +205,47 @@ type QuotaStatus struct {
 	Reserve      ReserveState
 }
 
+// quotaParams are a quota change's audit params. Sizes are decimal
+// strings: a quota may exceed the JSON safe integer range.
+type quotaParams struct {
+	Account    string `json:"account"`
+	QuotaBytes int64  `json:"quota_bytes,string"`
+	OldBytes   int64  `json:"old_quota_bytes,string"`
+}
+
 // SetQuota sets an account's storage quota: the operator raising capacity
 // (R13). who is an account ID or an email. When the new quota leaves the
 // whole recovery reserve free, the reserve is replenished and the account
 // returns to ReserveIntact; otherwise its reserve state is kept. lim must
-// be the limits the server runs with.
-func SetQuota(ctx context.Context, st Store, who string, quota int64, lim Limits) (*QuotaStatus, error) {
+// be the limits the server runs with. The audit row is written in the same
+// transaction.
+func SetQuota(ctx context.Context, st Store, op Operator, who string, quota int64, lim Limits) (*QuotaStatus, *AuditEntry, error) {
 	if quota <= 0 {
-		return nil, errors.New("server: the quota must be positive")
+		return nil, nil, errors.New("server: the quota must be positive")
 	}
 	var out *QuotaStatus
-	err := st.Update(ctx, func(tx Tx) error {
+	params := &quotaParams{Account: who, QuotaBytes: quota}
+	entry, err := op.change(ctx, st, ActionQuota, nil, params, func(tx Tx) (*model.ID, error) {
 		a, err := findAccount(tx, who)
 		if err != nil {
-			return err
+			return nil, err
 		}
+		params.Account, params.OldBytes = a.ID.String(), a.QuotaBytes
 		reserve := 2 * reserveHalf(lim)
 		a.QuotaBytes = quota
 		if a.UsedBytes+reserve <= quota {
 			a.Reserve = ReserveIntact
 		}
 		if err := tx.UpdateAccount(a); err != nil {
-			return err
+			return nil, err
 		}
 		out = &QuotaStatus{
 			AccountID: a.ID, Email: a.Email, UsedBytes: a.UsedBytes, QuotaBytes: a.QuotaBytes,
 			ReserveBytes: reserve, Reserve: a.Reserve,
 		}
-		return nil
+		return &a.ID, nil
 	})
-	return out, err
+	return out, entry, err
 }
 
 // findAccount looks an account up by ID or by email.
@@ -246,12 +257,12 @@ func findAccount(tx Tx, who string) (*Account, error) {
 	} else {
 		email, nerr := email.Normalize(who)
 		if nerr != nil {
-			return nil, errors.New("server: not an account ID or email")
+			return nil, adminErr("invalid", "not an account ID or email")
 		}
 		a, err = tx.AccountByEmail(email)
 	}
 	if errors.Is(err, ErrNotFound) {
-		return nil, errors.New("server: no such account")
+		return nil, adminErr("not_found", "no such account")
 	}
 	return a, err
 }

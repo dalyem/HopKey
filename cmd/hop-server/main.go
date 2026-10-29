@@ -3,9 +3,20 @@
 //	hop-server serve --listen ADDR --data DIR --origin URL [--tls-cert FILE --tls-key FILE]
 //	                 [--insecure-http] [--trusted-proxy CIDR]...
 //	hop-server invite EMAIL [--ttl 7d] --data DIR
+//	hop-server invites ls [--all] [--json] --data DIR
+//	hop-server invites revoke INVITE|EMAIL [--dry-run] [--yes] [--json] --data DIR
+//	hop-server invites reissue EMAIL [--ttl 7d] [--dry-run] [--yes] [--json] --data DIR
+//	hop-server accounts ls [--json] --data DIR
+//	hop-server accounts show ACCOUNT_ID|EMAIL [--json] --data DIR
 //	hop-server quota ACCOUNT_ID|EMAIL SIZE --data DIR
+//	hop-server audit [--account ACCOUNT_ID|EMAIL] [--since T] [--json] --data DIR
 //	hop-server backup PATH --data DIR
 //	hop-server version
+//
+// Every command but serve and version opens the database file directly,
+// while serve may be running: an admin is whoever can write the data
+// directory. invite, quota, invites revoke and invites reissue write a row
+// to the admin audit trail; audit reads it.
 package main
 
 import (
@@ -35,22 +46,28 @@ const dbName = "hop-server.db"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "hop-server:", err)
+		fmt.Fprintln(os.Stderr, "hop-server:", esc(err.Error()))
 		os.Exit(1)
 	}
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: hop-server serve|invite|quota|backup|version")
+		return errors.New("usage: hop-server serve|invite|invites|accounts|quota|audit|backup|version")
 	}
 	switch args[0] {
 	case "serve":
 		return serve(args[1:], stderr)
 	case "invite":
-		return invite(args[1:], stdout)
+		return invite(args[1:], stdout, stderr)
+	case "invites":
+		return invites(args[1:], stdout, stderr)
+	case "accounts":
+		return accounts(args[1:], stdout)
 	case "quota":
-		return quota(args[1:], stdout)
+		return quota(args[1:], stdout, stderr)
+	case "audit":
+		return audit(args[1:], stdout)
 	case "backup":
 		return backup(args[1:], stdout)
 	case "version":
@@ -204,7 +221,9 @@ func loopback(host string) bool {
 	return err == nil && a.IsLoopback()
 }
 
-func invite(args []string, stdout io.Writer) error {
+// invite prints the new code alone on stdout, for scripts; the audit row
+// goes to stderr.
+func invite(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("invite", flag.ContinueOnError)
 	data := fs.String("data", "", "data directory")
 	ttlText := fs.String("ttl", "7d", "how long the code is valid: Nd, or a Go duration such as 36h")
@@ -224,11 +243,12 @@ func invite(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer st.Close()
-	code, err := server.CreateInvite(context.Background(), st, pos[0], ttl, time.Now())
+	inv, entry, err := server.IssueInvite(context.Background(), st, operator(), pos[0], ttl)
+	printAudit(stderr, entry)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, code)
+	fmt.Fprintln(stdout, inv.Code)
 	return nil
 }
 
@@ -249,7 +269,7 @@ func parseTTL(s string) (time.Duration, error) {
 
 // quota sets an account's storage quota. Raising it far enough to free the
 // whole recovery reserve also ends a capacity-exhausted state (R13).
-func quota(args []string, stdout io.Writer) error {
+func quota(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("quota", flag.ContinueOnError)
 	data := fs.String("data", "", "data directory")
 	pos, err := parse(fs, args)
@@ -268,12 +288,13 @@ func quota(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer st.Close()
-	q, err := server.SetQuota(context.Background(), st, pos[0], size, server.DefaultLimits())
+	q, entry, err := server.SetQuota(context.Background(), st, operator(), pos[0], size, server.DefaultLimits())
+	printAudit(stderr, entry)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "account %s <%s>: quota %d bytes, used %d bytes, recovery reserve %d bytes, reserve %s\n",
-		q.AccountID, q.Email, q.QuotaBytes, q.UsedBytes, q.ReserveBytes, q.Reserve)
+		q.AccountID, esc(q.Email), q.QuotaBytes, q.UsedBytes, q.ReserveBytes, q.Reserve)
 	if q.Reserve != server.ReserveIntact {
 		fmt.Fprintf(stdout, "the reserve is still spent: a quota of at least %d bytes replenishes it\n", q.UsedBytes+q.ReserveBytes)
 	}

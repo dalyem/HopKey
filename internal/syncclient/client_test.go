@@ -928,6 +928,9 @@ func TestDeadlines(t *testing.T) {
 		case <-release:
 		case <-r.Context().Done():
 		}
+		// Never an answer: returning would send an empty 200, which the
+		// client may read as a malformed response before its deadline.
+		panic(http.ErrAbortHandler)
 	}), Options{Timeout: 500 * time.Millisecond})
 	start := time.Now()
 	_, err := cl.Health(bg)

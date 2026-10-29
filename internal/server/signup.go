@@ -19,26 +19,22 @@ const purposeSignup = "signup"
 
 // CreateInvite issues a single-use registration capability bound to the
 // normalized email (the admin invite of R3) and returns its code. Issuing
-// one reveals nothing about existing accounts and reserves nothing.
+// one reveals nothing about existing accounts and reserves nothing. It
+// writes no audit row; hop-server invite uses IssueInvite, which does.
 func CreateInvite(ctx context.Context, st Store, addr string, ttl time.Duration, now time.Time) (string, error) {
 	norm, err := email.Normalize(addr)
 	if err != nil {
 		return "", err
 	}
-	if ttl <= 0 {
-		return "", errors.New("server: invite TTL must be positive")
-	}
-	code, h, err := newSecret()
-	if err != nil {
-		return "", err
-	}
+	var inv *IssuedInvite
 	err = st.Update(ctx, func(tx Tx) error {
-		return tx.InsertRegistration(&Registration{CapHash: h, Email: norm, CreatedAt: now, ExpiresAt: now.Add(ttl)})
+		inv, err = insertInvite(tx, norm, ttl, now)
+		return err
 	})
 	if err != nil {
 		return "", err
 	}
-	return code, nil
+	return inv.Code, nil
 }
 
 type signupChallengeRequest struct {
