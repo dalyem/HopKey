@@ -204,6 +204,10 @@ type Info struct {
 	// this device is still in the account, so the vault is locked until
 	// it does (ErrServerUnconfirmed); LockReason says more.
 	ServerUnconfirmed bool `json:"server_unconfirmed,omitempty"`
+	// AdminLock is set when that answer was the server's operator
+	// refusing this device (an AdminRefusal): the account disabled or the
+	// device blocked, and the operator's reason, unescaped.
+	AdminLock *AdminRefusal `json:"admin_lock,omitempty"`
 	// Warnings are for the user, one sentence each.
 	Warnings []string `json:"warnings,omitempty"`
 }
@@ -1239,6 +1243,10 @@ func (s *Store) Info() Info {
 		info.LockReason = s.lockErr.Error()
 		info.OfflineTooLong = s.state == nil && errors.Is(s.lockErr, ErrOfflineTooLong)
 		info.ServerUnconfirmed = s.state == nil && errors.Is(s.lockErr, ErrServerUnconfirmed)
+		if ar := (*AdminRefusal)(nil); info.ServerUnconfirmed && errors.As(s.lockErr, &ar) {
+			c := *ar
+			info.AdminLock = &c
+		}
 	}
 	if s.state != nil {
 		info.Head = &Head{Seq: s.state.Head.Seq, H: s.state.Head.H.String()}

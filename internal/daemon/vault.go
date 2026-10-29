@@ -255,7 +255,7 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 		pass = []byte(p.DevicePassphrase)
 		defer clear(pass)
 	}
-	chk := &unlockCheck{parent: ctx}
+	chk := &unlockCheck{parent: ctx, admin: v.Info().AdminLock}
 	defer chk.done()
 	if v.Info().ServerReport != nil {
 		if err := d.recheckReportLocked(chk, pass); err != nil {

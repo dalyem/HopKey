@@ -252,6 +252,9 @@ func errInvalidEntry(err error) *apiError {
 type errorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Reason is the operator's reason for an admin refusal
+	// (account_disabled, device_blocked), absent when none was given.
+	Reason string `json:"reason,optional"`
 }
 
 type errorResponse struct {
@@ -264,9 +267,15 @@ type headConflictResponse struct {
 }
 
 func writeError(w http.ResponseWriter, e *apiError) {
-	var v any = errorResponse{errorBody{e.code, e.msg}}
+	writeErrorReason(w, e, "")
+}
+
+// writeErrorReason is writeError with the operator's reason of an admin
+// refusal ("" for none: the member is then absent).
+func writeErrorReason(w http.ResponseWriter, e *apiError, reason string) {
+	var v any = errorResponse{errorBody{e.code, e.msg, reason}}
 	if e.head != nil {
-		v = headConflictResponse{errorBody{e.code, e.msg}, *e.head}
+		v = headConflictResponse{errorBody{e.code, e.msg, ""}, *e.head}
 	}
 	writeJSON(w, e.status, v)
 }
@@ -387,6 +396,10 @@ func (s *Server) wrap(rt *route) http.Handler {
 		c := &call{route: rt, ip: s.clientIP(r), writeBy: writeBy}
 		err := s.serve(w, r, c)
 		if err == nil {
+			return
+		}
+		if ar := (*adminRefusalError)(nil); errors.As(err, &ar) {
+			writeErrorReason(w, ar.api, ar.reason)
 			return
 		}
 		var ae *apiError

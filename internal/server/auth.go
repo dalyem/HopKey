@@ -142,6 +142,11 @@ func (s *Server) issueLoginToken(w http.ResponseWriter, r *http.Request, c *call
 		if a == nil || !match {
 			return nil
 		}
+		// Only after the secret matched: a disable is never shown to
+		// whoever proved nothing.
+		if err := adminRefusal(tx, a.ID, nil); err != nil {
+			return err
+		}
 		ok = true
 		resp = loginResponse{LoginToken: tok, VaultID: a.VaultID}
 		return tx.InsertLoginToken(&LoginToken{
@@ -264,8 +269,10 @@ type sessionResponse struct {
 // every commit (R2): the challenge must be a device challenge for operation
 // "session", bound to this account and device and to the configured
 // origin, and unexpired; the device must be active; the signature must
-// verify over the object rebuilt from the bound values (R5); and the
-// account's bucket must admit the request (R14). Only then is the
+// verify over the object rebuilt from the bound values (R5); the account
+// must not be disabled, nor the device blocked, by the operator (403
+// account_disabled or device_blocked); and the account's bucket must
+// admit the request (R14). Only then is the
 // challenge consumed and the session issued, so a refusal changes nothing.
 func (s *Server) authSession(w http.ResponseWriter, r *http.Request, c *call) error {
 	var req sessionRequest
@@ -310,6 +317,12 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request, c *call) er
 		}
 		if crypto.VerifyDeviceAuth(ed25519.PublicKey(d.SigPK), obj, req.Sig) != nil {
 			return errUnauthorized
+		}
+		// The signature proved the device's key, so the operator's
+		// refusal may be shown. It comes before the account's bucket: a
+		// 429 is "unreachable" to a client, which would let it load keys.
+		if err := adminRefusal(tx, ch.AccountID, &ch.DeviceID); err != nil {
+			return err
 		}
 		// The signature established the account; its bucket must admit the
 		// request before anything is consumed or issued.
@@ -392,6 +405,11 @@ func (s *Server) authenticate(tx Tx, tokHash crypto.Hash) (*principal, error) {
 	}
 	if a.CredGen != lt.CredGen {
 		return nil, errUnauthorized
+	}
+	// A disable deletes the account's tokens; this keeps one from outliving
+	// it all the same.
+	if err := adminRefusal(tx, a.ID, nil); err != nil {
+		return nil, err
 	}
 	p := &principal{
 		kind: credLogin, tokenHash: tokHash, accountID: lt.AccountID, vaultID: lt.VaultID,

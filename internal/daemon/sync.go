@@ -629,6 +629,10 @@ func (e *syncer) fail(ctx context.Context, gen uint64, err error) time.Duration 
 		if e.sessionEnded(ctx, gen) {
 			return stepIdle
 		}
+	case errors.Is(err, store.ErrAdminRefused):
+		if e.adminRefused(gen, err) {
+			return stepIdle
+		}
 	}
 	var wait time.Duration
 	e.set(func() {
@@ -752,6 +756,25 @@ func (e *syncer) sessionEnded(ctx context.Context, gen uint64) bool {
 	// The refusal is the server's answer (unconfirmedLocked ends the
 	// sessions too when the check saw one).
 	e.d.endSessions(whyRefused)
+	return true
+}
+
+// adminRefused handles the server's operator refusing this device a
+// session (err matches store.ErrAdminRefused): the account disabled, or
+// the device blocked. That is the server's answer, so the vault locks in
+// memory as for any answer that does not confirm the device
+// (unconfirmedLocked), with the operator's reason in status: the agent
+// empties and the ssh sessions hop started end. Nothing is recorded or
+// deleted, and the loop asks again (retryUnconfirmed), which unlocks once
+// the operator lets the device in. Only while the store is still in gen,
+// as for sessionEnded. It reports whether the vault locked.
+func (e *syncer) adminRefused(gen uint64, err error) bool {
+	e.d.mu.Lock()
+	defer e.d.mu.Unlock()
+	if e.st.Generation() != gen {
+		return false
+	}
+	e.d.unconfirmedLocked(err)
 	return true
 }
 
@@ -1084,6 +1107,8 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 			e.noteHalt(err.Error(), eq != nil)
 		case errors.Is(err, store.ErrSessionEnded):
 			e.sessionEnded(ctx, gen)
+		case errors.Is(err, store.ErrAdminRefused):
+			e.adminRefused(gen, err)
 		}
 		if req.kind == reqSyncNow {
 			e.set(func() { e.lastErr, e.lastErrAt = err.Error(), time.Now() })
