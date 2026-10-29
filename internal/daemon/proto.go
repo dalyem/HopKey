@@ -301,6 +301,11 @@ type ServerRetirement struct {
 	Wiped bool `json:"wiped,omitempty"`
 	// WipeError says why a proven revocation's wipe has not finished yet.
 	WipeError string `json:"wipe_error,omitempty"`
+	// SSHFilesLeft means only the ssh files are left: this device's copy
+	// of the vault and its device key are wiped, but the cleanup of the
+	// ssh config hop generated from it has not finished (CleanupLeft).
+	// The daemon retries it.
+	SSHFilesLeft bool `json:"ssh_files_left,omitempty"`
 	// ProofError says why the proof did not verify, or could not be had.
 	ProofError string `json:"proof_error,omitempty"`
 	// ReportCorrupt means the record of the server's report here does not

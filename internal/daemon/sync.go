@@ -380,9 +380,10 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		// store stays halted until it is opened again.
 		return stepIdle
 	}
+	gen := e.st.Generation()
 	// A logout in progress resumes first. It needs no unlock.
 	if state, err := e.st.Retirement(); err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	} else if state != "" {
 		return e.resumeLogout(ctx)
 	}
@@ -418,13 +419,15 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 			e.phase, e.retired = SyncStarting, nil
 		}
 	})
-	gen := e.st.Generation()
+	// The generation the requests below are made in: a refusal is acted
+	// on only while the store is still in it (sessionEnded).
+	gen = e.st.Generation()
 	if d, done := e.resumeUnlocked(ctx, gen); !done {
 		return d
 	}
 	r, err := e.remoteFor(gen)
 	if err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	}
 	if r == nil {
 		e.setPhase(SyncOff)
@@ -432,7 +435,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 	}
 	st, err := e.st.Status()
 	if err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	}
 	if st.Halted != "" {
 		e.noteHalt(st.Halted, false)
@@ -442,7 +445,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		res, err := e.pushHead(ctx, r)
 		if err != nil {
 			e.reconcile(ctx, gen, &st)
-			return e.fail(ctx, err)
+			return e.fail(ctx, gen, err)
 		}
 		e.pushed(ctx, gen, res)
 		if res.Outcome != store.PushEmpty {
@@ -485,7 +488,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		return stepNow
 	}
 	if err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	}
 	e.pulled(ctx, gen)
 	return stepNow
@@ -561,8 +564,9 @@ func (e *syncer) pushed(ctx context.Context, gen uint64, res store.PushResult) {
 
 // fail records err and says what to do next: wait for a wake when the
 // vault is locked or sync has halted, stop on a revocation, and otherwise
-// back off.
-func (e *syncer) fail(ctx context.Context, err error) time.Duration {
+// back off. gen is the store's generation the failed request was made in
+// (sessionEnded).
+func (e *syncer) fail(ctx context.Context, gen uint64, err error) time.Duration {
 	if ctx.Err() != nil || errors.Is(err, store.ErrClosed) {
 		return stepStop
 	}
@@ -589,7 +593,7 @@ func (e *syncer) fail(ctx context.Context, err error) time.Duration {
 		e.setPhase(SyncOff)
 		return stepIdle
 	case errors.Is(err, store.ErrSessionEnded):
-		if e.sessionEnded(ctx) {
+		if e.sessionEnded(ctx, gen) {
 			return stepIdle
 		}
 	}
@@ -686,9 +690,14 @@ func (e *syncer) revoked(err error) {
 // proof is asked for. Any other outcome but the server accepting the
 // device, a server that can't be asked again included, locks the vault
 // until it does (unconfirmedLocked): the refusal was the server's answer.
-// It reports whether sync stopped.
-func (e *syncer) sessionEnded(ctx context.Context) bool {
-	gen := e.st.Generation()
+// gen is the store's generation the refused request was made in: a lock
+// or an unlock since (hop lock, say, while the request was out) is not
+// taken over, so a refusal only locks, or labels a lock unconfirmed, while
+// the store is still in gen. It reports whether sync stopped.
+func (e *syncer) sessionEnded(ctx context.Context, gen uint64) bool {
+	if e.d.opts.sessionRefused != nil {
+		e.d.opts.sessionRefused()
+	}
 	res, err := e.d.checkServer(ctx, sessionCheckTimeout, nil, gen)
 	switch {
 	case err == nil && res.Report != nil:
@@ -714,20 +723,21 @@ func (e *syncer) sessionEnded(ctx context.Context) bool {
 // resolution and RETIRED its cleanup.
 func (e *syncer) resumeLogout(ctx context.Context) time.Duration {
 	e.setPhase(SyncLoggingOut)
+	gen := e.st.Generation()
 	var r store.Retirer
 	if info, err := e.st.ServerInfo(); err == nil && info.Server != "" && !info.VaultID.IsZero() {
 		c, err := e.client(info.Server)
 		if err != nil {
-			return e.fail(ctx, err)
+			return e.fail(ctx, gen, err)
 		}
 		r = c.Retirer(info.VaultID)
 	}
 	res, err := e.st.Logout(ctx, r, store.LogoutOptions{})
 	if err != nil {
 		if errors.Is(err, store.ErrDeviceRevoked) || errors.Is(err, store.ErrClosed) || ctx.Err() != nil {
-			return e.fail(ctx, err)
+			return e.fail(ctx, gen, err)
 		}
-		d := e.fail(ctx, err)
+		d := e.fail(ctx, gen, err)
 		e.setPhase(SyncLoggingOut)
 		return d
 	}
@@ -777,7 +787,7 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 	}
 	if p, err := e.st.Publication(); err != nil {
 		if retry(err) {
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		}
 		note("the pending publication can't be read", err)
 	} else if p != nil {
@@ -796,7 +806,7 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 			e.noteHalt(err.Error(), true)
 			return stepIdle, false
 		case err != nil && retry(err):
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		case err != nil:
 			note("the pending publication did not finish (run hop auth signup again)", err)
 		default:
@@ -807,13 +817,13 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 	}
 	if cp, err := e.st.PendingCheckpoint(); err != nil {
 		if retry(err) {
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		}
 		note("the pending checkpoint can't be read", err)
 	} else if cp != nil && !cp.Committed {
 		r, err := e.remoteFor(gen)
 		if err != nil {
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		}
 		if r != nil {
 			_, err := e.st.ResumeCheckpoint(ctx, r)
@@ -823,7 +833,7 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 			switch {
 			case errors.Is(err, store.ErrNoCheckpoint):
 			case err != nil && retry(err):
-				return e.fail(ctx, err), false
+				return e.fail(ctx, gen, err), false
 			case err != nil:
 				note("a "+cp.Kind+" checkpoint did not finish (run the same command again)", err)
 			default:
@@ -1003,7 +1013,7 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 		case errors.As(err, &eq), errors.Is(err, store.ErrSyncHalted):
 			e.noteHalt(err.Error(), eq != nil)
 		case errors.Is(err, store.ErrSessionEnded):
-			e.sessionEnded(ctx)
+			e.sessionEnded(ctx, gen)
 		}
 		if req.kind == reqSyncNow {
 			e.set(func() { e.lastErr, e.lastErrAt = err.Error(), time.Now() })

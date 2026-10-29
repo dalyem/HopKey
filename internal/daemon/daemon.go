@@ -94,9 +94,12 @@ type Options struct {
 	now          func() time.Time
 	// unconfirmedRead runs once retryUnconfirmed has read that the vault
 	// is locked as unconfirmed, and beforeCheck just before checkServer
-	// asks the store (CheckServer).
+	// asks the store (CheckServer). sessionRefused runs once a request
+	// the server refused a session has returned, before sessionEnded
+	// acts on it.
 	unconfirmedRead func()
 	beforeCheck     func()
+	sessionRefused  func()
 }
 
 // Daemon is a running daemon.

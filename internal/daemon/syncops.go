@@ -153,8 +153,14 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 	}
 	if r := out.ServerRetirement; r != nil && !r.Unverified {
 		// Proven. Wiped once the store's wipe and the ssh files are done.
-		if p := d.pendingClear(); r.WipeError == "" && p != "" {
-			r.WipeError = "the ssh files hop wrote are not removed yet: " + p
+		if r.WipeError == "" {
+			left := d.pendingClear()
+			if left == "" {
+				left = d.cleanupLeft()
+			}
+			if left != "" {
+				r.WipeError, r.SSHFilesLeft = "the ssh files hop wrote are not removed yet: "+left, true
+			}
 		}
 		r.Wiped = r.WipeError == ""
 	}

@@ -721,14 +721,14 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	if s := st.Sync; s != nil && s.State != daemon.SyncOff {
 		a.Revoked = s.State == daemon.SyncRevoked
 		if r := s.ServerRetirement; a.Revoked && r != nil {
+			// The daemon decides whether the ssh files are gone too
+			// (daemon.CleanupLeft), so this and its sync block agree.
 			a.Wiped, a.RevokedUnverified, a.WipePending = r.Wiped, r.Unverified, !r.Unverified && !r.Wiped
+			sshPending = a.WipePending && r.SSHFilesLeft
 		}
-		if a.Wiped {
+		if a.Wiped || sshPending {
 			a.Vault = false
 			a.Revocation, _ = store.ReadRevocation(e.storeConfig().DataDir)
-			if sshCleanupPending(e) {
-				a.Wiped, a.WipePending, sshPending = false, true, true
-			}
 		}
 		a.SignedIn = !a.Revoked
 		a.Server, a.Email, a.VaultID = s.Server, s.Email, s.VaultID
@@ -1154,17 +1154,20 @@ var testHookLogoutCleanup func()
 // finishLogoutCleanup empties the ssh config, as wipeSSHConfig does, if a
 // finished logout still owes it (store.LogoutCleanupPending): one a crash
 // cut short after it was recorded, which store.Open has just finished, or
-// one whose wipe failed. The mark is read, the config emptied and the mark
-// cleared in one hold of config.lock (sshconfig.WipeIf), the lock every
-// config write takes: a new sign-in clears the mark this way before its
-// daemon writes, so a mark read before that sign-in can't wipe its
-// config.
+// one whose wipe failed. A device wiped after a verified revocation whose
+// ssh config still holds what the vault decrypted owes it too, with no
+// mark (store.OweSSHCleanup marks it then). The mark is read, the config
+// emptied and the mark cleared in one hold of config.lock
+// (sshconfig.WipeIf), the lock every config write takes: a new sign-in
+// clears the mark this way before its daemon writes, so a mark read before
+// that sign-in can't wipe its config.
 func finishLogoutCleanup(e *Env, asJSON bool) {
 	dataDir := e.storeConfig().DataDir
+	o := sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()}
 	var readErr error
-	err := sshconfig.WipeIf(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()},
+	err := sshconfig.WipeIf(o,
 		func() (bool, error) {
-			pending, err := store.LogoutCleanupPending(dataDir)
+			pending, err := store.OweSSHCleanup(dataDir, func() (bool, error) { return sshconfig.Generated(o) })
 			if testHookLogoutCleanup != nil {
 				testHookLogoutCleanup()
 			}
@@ -1429,16 +1432,12 @@ func printWipePending(e *Env, r *store.RevocationRecord) {
 }
 
 // sshCleanupPending reports whether the ssh files hop wrote may still be
-// there on a device whose vault was wiped: the mark of the cleanup a
-// logout or a revocation owes is still there (store.LogoutCleanupPending),
-// or the hop ssh directory still holds what the vault decrypted
-// (sshconfig.Generated). One that can't be read counts as pending.
+// there on a device whose vault was wiped, as the daemon's status decides
+// it (daemon.CleanupLeft): for hop auth status with no daemon.
 func sshCleanupPending(e *Env) bool {
-	if pending, err := store.LogoutCleanupPending(e.storeConfig().DataDir); pending || err != nil {
-		return true
-	}
-	left, err := sshconfig.Generated(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()})
-	return left || err != nil
+	dataDir := e.storeConfig().DataDir
+	return daemon.CleanupLeft(func() (bool, error) { return store.LogoutCleanupPending(dataDir) },
+		sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()}) != ""
 }
 
 // homePath writes p under the home directory as ~/....

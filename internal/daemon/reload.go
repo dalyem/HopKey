@@ -332,6 +332,94 @@ func (d *Daemon) clearWarning(why string) string {
 // still owes the ssh config (*store.Store).
 type logoutCleaner interface{ ClearLogoutCleanup() error }
 
+// sshCleaner is the encrypted store's side of the cleanup a wiped device
+// owes outside it (*store.Store).
+type sshCleaner interface {
+	logoutCleaner
+	LogoutCleanupPending() (bool, error)
+	OweSSHCleanup(left func() (bool, error)) (bool, error)
+}
+
+// CleanupLeft says what is left of the cleanup a logout or a verified
+// revocation owes outside the store, or "" once nothing is: the mark that
+// it is owed (pending, store.LogoutCleanupPending), or what the vault
+// decrypted still in the ssh config directory (sshconfig.Generated). What
+// can't be read counts as left. The daemon's sync status and hop auth
+// status with no daemon both go by it, so they agree on whether a device
+// is wiped.
+func CleanupLeft(pending func() (bool, error), o sshconfig.Options) string {
+	if p, err := pending(); err != nil {
+		return fmt.Sprintf("whether the cleanup is still owed can't be read (%v)", err)
+	} else if p {
+		return "the cleanup of the ssh config is still marked owed"
+	}
+	switch left, err := sshconfig.Generated(o); {
+	case err != nil:
+		return fmt.Sprintf("%s can't be read (%v)", o.Dir, err)
+	case left:
+		return fmt.Sprintf("%s still holds what the vault decrypted", o.Dir)
+	}
+	return ""
+}
+
+// sshOptions is where the daemon writes the ssh config.
+func (d *Daemon) sshOptions() sshconfig.Options {
+	return sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}
+}
+
+// cleanupLeft is CleanupLeft for this daemon's store and ssh config, ""
+// for a store that has no cleanup mark.
+func (d *Daemon) cleanupLeft() string {
+	c, ok := d.store.(sshCleaner)
+	if !ok {
+		return ""
+	}
+	return CleanupLeft(c.LogoutCleanupPending, d.sshOptions())
+}
+
+// wipedLeft reports whether this device's copy of the vault is wiped
+// after a verified revocation, while the ssh config hop generated from it
+// is still there with no wipe pending (clearErr): files written after the
+// wipe, say. Nothing would remove them, so retryConfig does
+// (reclaimConfigLocked).
+func (d *Daemon) wipedLeft() bool {
+	if d.sync == nil || d.pendingClear() != "" {
+		return false
+	}
+	r := d.sync.status().ServerRetirement
+	return r != nil && !r.Unverified && r.WipeError == "" && d.cleanupLeft() != ""
+}
+
+// reclaimConfigLocked empties the ssh config of a wiped device that still
+// holds what the vault decrypted (wipedLeft). It is the cleanup a logout
+// owes, guarded as hop does it (store.OweSSHCleanup, sshconfig.WipeIf):
+// under config.lock, only with no vault here (a new sign-in's config is
+// never wiped) and a revocation record, the mark that the cleanup is owed
+// goes down first, the files go, and the mark is cleared. A failure is
+// kept in clearErr, which retryConfig retries and status shows. The
+// caller holds d.mu.
+func (d *Daemon) reclaimConfigLocked() {
+	c, ok := d.store.(sshCleaner)
+	if !ok {
+		return
+	}
+	o := d.sshOptions()
+	owed := false
+	err := sshconfig.WipeIf(o, func() (bool, error) {
+		var err error
+		owed, err = c.OweSSHCleanup(func() (bool, error) { return sshconfig.Generated(o) })
+		return owed, err
+	}, c.ClearLogoutCleanup)
+	switch {
+	case err != nil:
+		why := err.Error()
+		d.clearErr.Store(&why)
+		d.logf("clearing the ssh config the wiped vault left: %v", err)
+	case owed:
+		d.logf("the ssh config the wiped vault left is emptied")
+	}
+}
+
 // clearConfigLocked wipes what the vault decrypted into the ssh config
 // directory, so nothing of it stays behind (§5.5): a config with no hosts,
 // and no key files or pins (sshconfig.Wipe). Once that worked, and while
@@ -344,7 +432,7 @@ func (d *Daemon) clearConfigLocked() {
 	if c, ok := d.store.(logoutCleaner); ok {
 		done = c.ClearLogoutCleanup
 	}
-	err := d.wipeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, done)
+	err := d.wipeConfig(d.sshOptions(), done)
 	if err != nil {
 		why := err.Error()
 		d.clearErr.Store(&why)
@@ -386,7 +474,7 @@ func (d *Daemon) configRetry() time.Duration {
 func (d *Daemon) retryConfig() {
 	dirty := func() bool {
 		cur := d.state.Load()
-		return d.pendingClear() != "" || (cur != nil && cur.configErr != "")
+		return d.pendingClear() != "" || (cur != nil && cur.configErr != "") || d.wipedLeft()
 	}
 	d.wg.Add(1)
 	go func() {
@@ -405,6 +493,8 @@ func (d *Daemon) retryConfig() {
 			d.mu.Lock()
 			if d.pendingClear() != "" && d.ctx.Err() == nil {
 				d.clearConfigLocked()
+			} else if d.ctx.Err() == nil && d.wipedLeft() {
+				d.reclaimConfigLocked()
 			}
 			if cur := d.state.Load(); cur != nil && cur.configErr != "" && d.ctx.Err() == nil {
 				d.reloadLocked(d.ctx) // a failure is recorded and logged

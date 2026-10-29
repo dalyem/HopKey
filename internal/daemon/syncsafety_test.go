@@ -484,7 +484,7 @@ func TestServerRetirementChecksTheReceipt(t *testing.T) {
 		"an unknown how": retireStatusBody(t, laptop, "suspended", 7),
 	} {
 		rc.Store(&body)
-		if !e.sessionEnded(context.Background()) {
+		if !e.sessionEnded(context.Background(), e.st.Generation()) {
 			t.Errorf("%s: sync went on after a refused session", name)
 		}
 		if info := x.n2.st.Info(); !info.Locked || !info.ServerUnconfirmed || x.n2.agentKeys() != 0 {
@@ -502,7 +502,7 @@ func TestServerRetirementChecksTheReceipt(t *testing.T) {
 	}
 	good := retireStatusBody(t, laptop, "revoked", 7)
 	rc.Store(&good)
-	if !e.sessionEnded(context.Background()) {
+	if !e.sessionEnded(context.Background(), e.st.Generation()) {
 		t.Fatal("did not act on a good receipt")
 	}
 	if !x.n2.st.Info().Locked || x.n2.agentKeys() != 0 {

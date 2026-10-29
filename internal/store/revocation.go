@@ -477,7 +477,9 @@ func (s *Store) checkKeyLocked(passphrase []byte) (*checkKey, error) {
 // gen is the generation the caller decided to ask in (Generation). A
 // refusal locks the vault, or labels its lock unconfirmed, only while the
 // store is still in gen: a lock or an unlock that came before the request
-// registered is not taken for the one the caller saw. A report recorded on
+// registered is not taken for the one the caller saw. A session granted
+// clears the reason of an unconfirmed lock only while the store is still
+// in gen, too. A report recorded on
 // a locked vault is a new lock (it moves the generation), so it ends the
 // permission an unconfirmed lock gave (UnconfirmedLock).
 //
@@ -513,8 +515,10 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.noteContact()
-		if s.state == nil && errors.Is(s.lockErr, ErrServerUnconfirmed) {
-			// Confirmed now: an unlock opens it again.
+		if s.gen.Load() == gen && s.state == nil && errors.Is(s.lockErr, ErrServerUnconfirmed) {
+			// Confirmed now: an unlock opens it again. Only the lock the
+			// check was made for: a newer one (a refused unlock since)
+			// keeps its reason, and its own retry.
 			s.lockErr = nil
 		}
 		return ServerCheck{Active: true}, s.clearReport()
