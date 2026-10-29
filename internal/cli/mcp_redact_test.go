@@ -883,3 +883,99 @@ func TestMCPOutputLimitHoldsForBytesNotUTF8(t *testing.T) {
 		}
 	}
 }
+
+// mcpWithSecret is hop mcp started with value as one of hop's own secrets
+// (HOP_KIT_CONFIRM), which it scrubs from every answer.
+func mcpWithSecret(t *testing.T, e *e2e, value string) *mcpSession {
+	t.Helper()
+	env := e.env(t, nil, nil, nil)
+	env.Environ = append(os.Environ(), "HOP_KIT_CONFIRM="+value)
+	return startMCP(t, env)
+}
+
+// What hop writes into a check's detail after it scanned the server's
+// text is scanned too: oneLine turns ssh's stderr "left<TAB>right" into
+// "left?right", hop's own secret, which goes as a whole. A person's hop
+// check is unchanged.
+func TestMCPCheckScrubsWhatFormattingMakes(t *testing.T) {
+	e := newE2E(t)
+	e.server.mu.Lock()
+	e.server.trueErr = "left\tright\n"
+	e.server.mu.Unlock()
+	if _, stdout, _ := e.hop(t, "check", "web-1"); !strings.Contains(stdout, "ssh did not log in: left?right") {
+		t.Errorf("hop check: no %q in %q", "ssh did not log in: left?right", stdout)
+	}
+	m := mcpWithSecret(t, e, "left?right")
+	for _, policy := range []string{"redacted", "full"} {
+		if code, _, stderr := e.hop(t, "edit", "web-1", "--agent-output", policy); code != 0 {
+			t.Fatalf("hop edit --agent-output %s: exit %d: %s", policy, code, stderr)
+		}
+		status, detail := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "web-1"}).step(t, "auth_ok")
+		if want := "ssh did not log in: [redacted by hop]"; status != "fail" || detail != want {
+			t.Errorf("%s: auth_ok %s %q, want %q", policy, status, detail, want)
+		}
+		if raw := m.raw[len(m.raw)-1]; strings.Contains(raw, "left") || strings.Contains(raw, "right") {
+			t.Errorf("%s: the agent got part of the secret: %.300s", policy, raw)
+		}
+	}
+}
+
+// hop's own words in a check's detail, the lead and the note on what is
+// withheld, are scrubbed as the server's text is: hop's secret "ssh"
+// stands nowhere in what the agent gets, under every policy. A person's
+// hop check is unchanged.
+func TestMCPCheckScrubsItsOwnWords(t *testing.T) {
+	e := newE2E(t)
+	e.server.mu.Lock()
+	e.server.trueErr = "startup failed\n"
+	e.server.mu.Unlock()
+	if _, stdout, _ := e.hop(t, "check", "web-1"); !strings.Contains(stdout, "ssh did not log in: startup failed") {
+		t.Errorf("hop check: no %q in %q", "ssh did not log in: startup failed", stdout)
+	}
+	m := mcpWithSecret(t, e, "ssh")
+	for _, c := range []struct{ policy, want string }{
+		{"redacted", "[redacted by hop] did not log in: startup failed"},
+		{"full", "[redacted by hop] did not log in: startup failed"},
+		{"none", "[redacted by hop] did not log in: (withheld: the host's agent_output policy is none)"},
+	} {
+		if code, _, stderr := e.hop(t, "edit", "web-1", "--agent-output", c.policy); code != 0 {
+			t.Fatalf("hop edit --agent-output %s: exit %d: %s", c.policy, code, stderr)
+		}
+		status, detail := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "web-1"}).step(t, "auth_ok")
+		if status != "fail" || detail != c.want {
+			t.Errorf("%s: auth_ok %s %q, want %q", c.policy, status, detail, c.want)
+		}
+	}
+	// The note on what is withheld names nothing hop could not scrub.
+	m = mcpWithSecret(t, e, "withheld")
+	status, detail := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "web-1"}).step(t, "auth_ok")
+	if want := "ssh did not log in: ([redacted by hop]: the host's agent_output policy is none)"; status != "fail" || detail != want {
+		t.Errorf("none, secret %q: auth_ok %s %q, want %q", "withheld", status, detail, want)
+	}
+}
+
+// exec's streams are scanned after hop writes each byte that is not
+// UTF-8 as U+FFFD, as the agent gets them: output "a\xffb" is hop's
+// secret "a�b" there, and goes as a whole. A person's hop exec gets
+// the bytes.
+func TestMCPExecScrubsWhatEncodingMakes(t *testing.T) {
+	e := newE2E(t)
+	leak := "a\xffb\n"
+	e.server.mu.Lock()
+	e.server.leak = leak
+	e.server.mu.Unlock()
+	if code, stdout, _ := e.hop(t, "exec", "web-1", "--", "leak"); code != 0 || stdout != leak {
+		t.Errorf("hop exec: exit %d, stdout %q, want %q", code, stdout, leak)
+	}
+	m := mcpWithSecret(t, e, "a�b")
+	for _, cmd := range []string{"leak", "leakerr"} {
+		r := mcpCall[agentExec](m, "exec", map[string]any{"hosts": "web-1", "command": cmd}).Results[0]
+		got := r.Stdout
+		if cmd == "leakerr" {
+			got = r.Stderr
+		}
+		if got != "[redacted by hop]\n" || r.Redactions["hop-secret"] != 1 {
+			t.Errorf("%s: %q, redactions %v; want the secret replaced and counted", cmd, got, r.Redactions)
+		}
+	}
+}

@@ -410,3 +410,27 @@ func TestCapSpansKeepsWholeEscapes(t *testing.T) {
 		}
 	}
 }
+
+// scrubSpans leaves the markers and placeholders hop put in whole, though
+// its secrets stand in them, and hides a denied name that a marker it
+// puts in leaves standing on its own.
+func TestScrubSpansKeepsWholesAndMasksAgain(t *testing.T) {
+	l := &daemon.ListResult{Hosts: []model.Host{
+		{Header: model.Header{ItemID: model.ID{1}}, Name: "db", AgentAccess: "deny"},
+	}}
+	s := &mcpServer{secrets: []string{"h", "q"}}
+	m := s.masker(l)
+	mk := span{text: "[redacted by hop: x]", kind: markerText, what: "x"}
+	in := m.maskSpans([]span{{text: "db:22 qdb"}, mk})
+	got, err := s.scrubSpans(context.Background(), [][]span{in}, []bool{true}, m, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := hiddenHost + ":22 [redacted by hop]" + hiddenHost + "[redacted by hop: x]"
+	if s := joinSpans(got[0]); s != want {
+		t.Errorf("got %q, want %q", s, want)
+	}
+	if got, _ := s.scrubSpans(context.Background(), [][]span{{mk}}, []bool{false}, m, false, false); joinSpans(got[0]) != mk.text {
+		t.Errorf("a marker alone: %q", joinSpans(got[0]))
+	}
+}
