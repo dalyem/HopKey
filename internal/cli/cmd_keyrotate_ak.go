@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
@@ -15,7 +16,7 @@ import (
 // The authorized_keys edits of hop key rotate. hop reads the file over ssh,
 // works out the new content here, and has one small POSIX sh script on the
 // host swap it in. The script takes a lock that other hop runs respect
-// (see akLockFile), checks that the file is still byte for byte what hop
+// (see akLockDir), checks that the file is still byte for byte what hop
 // read (cksum and size), writes a temp file in ~/.ssh with the old file's
 // mode and owner (cp -p) and the new content, checks the file once more,
 // and renames the temp file over it. A mismatch anywhere stops it with
@@ -41,27 +42,21 @@ const (
 // akMaxSize bounds the authorized_keys file hop will edit.
 const akMaxSize = 1 << 20
 
-// The lock of the write script, in ~/.ssh. Where flock(1) is installed
-// (util-linux, so most Linux), the script holds an exclusive flock on the
-// file akLockFile for as long as it runs. The kernel lets go of it when the
-// script's processes exit, however they end, so a lock is never left
-// behind and nothing is ever reclaimed. The file itself stays: removing it
-// would let a run that opens the path afresh lock a new file beside one
-// still locked.
-//
-// Without flock, the lock is the directory akLockDir, which mkdir makes or
-// fails to make in one step, with a file "owner" in it that holds a token
-// of this run. The script removes the directory on the way out only if it
-// still holds its token, so it never removes another run's lock. hop never
-// takes a lock over because of its age: a remote script can outlive the
-// ssh that started it, so an old lock does not prove its run has stopped.
-// A lock that stays for akLockWait seconds stops the edit with nothing
-// changed (akExitLocked), and the message names the directory to remove if
-// no hop rotation is running.
-const (
-	akLockFile = ".hop-authorized_keys.lock"
-	akLockDir  = ".hop-authorized_keys.lock.d"
-)
+// The lock of the write script, in ~/.ssh, is the directory akLockDir,
+// which mkdir makes or fails to make in one step, and every hop run takes
+// it the same way, whatever the host has installed. Inside it, the file
+// "owner" says who holds it: a random token of the run, the PID of the
+// remote shell, and the time it took the lock. The script removes the
+// directory on the way out (exit, or HUP, INT, TERM or PIPE) only if
+// "owner" still holds its token, so it never removes another run's lock.
+// hop never takes a lock over: a remote script can outlive the ssh that
+// started it, so neither an old lock nor a dead PID proves that its run
+// has stopped (the PID may be on another machine that shares the home
+// directory). A lock that stays for akLockWait seconds stops the edit with
+// nothing changed (akExitLocked), and the message names the directory, its
+// owner's PID and time, whether that PID is running on the host, and the
+// command that removes it.
+const akLockDir = ".hop-authorized_keys.lock.d"
 
 // akLockWait is how many seconds the write script waits for the lock.
 var akLockWait = 10
@@ -81,23 +76,23 @@ func akWriteScript(from, to string) string {
 	}
 	tok := make([]byte, 16)
 	rand.Read(tok)
-	token := hex.EncodeToString(tok)
-	return `umask 077; f="$HOME/.ssh/authorized_keys"; t="$HOME/.ssh/.authorized_keys.hop-$$"; ` +
-		`l="$HOME/.ssh/` + akLockFile + `"; d="$HOME/.ssh/` + akLockDir + `"; ` +
+	lock := strings.NewReplacer("TOKEN", hex.EncodeToString(tok), "LOCK", "~/.ssh/"+akLockDir, "WAIT", strconv.Itoa(akLockWait)).Replace(
+		// hop_unlock removes the lock only while "owner" names this run.
+		`hop_unlock() { rm -f "$t"; if { read -r ot op ow < "$d/owner"; } 2>/dev/null && [ "$ot" = "TOKEN" ]; then rm -f "$d/owner"; rmdir "$d"; fi; }; ` +
+			`trap hop_unlock EXIT; trap 'hop_unlock; exit 86' HUP INT TERM PIPE; ` +
+			`n=0; until mkdir "$d" 2>/dev/null; do n=$((n+1)); if [ $n -gt WAIT ]; then ` +
+			`if { read -r ot op ow < "$d/owner"; } 2>/dev/null; then ` +
+			`if kill -0 "$op" 2>/dev/null; then st="is still running"; else st="is not running"; fi; ` +
+			`echo "LOCK is held by another hop run: process $op on this host took it at $ow, and that process $st; if no hop key rotate is running for this account, remove the lock (rm -r LOCK)" >&2; ` +
+			`else echo "LOCK exists, with no owner in it: another hop run is taking it, or one was cut off; if no hop key rotate is running for this account, remove the lock (rm -r LOCK)" >&2; fi; ` +
+			`exit 85; fi; sleep 1; done; ` +
+			`if { echo "TOKEN $$ $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$d/owner"; } 2>/dev/null; then :; else rm -f "$d/owner"; rmdir "$d"; echo "cannot write the lock LOCK" >&2; exit 84; fi; `)
+	return `umask 077; f="$HOME/.ssh/authorized_keys"; t="$HOME/.ssh/.authorized_keys.hop-$$"; d="$HOME/.ssh/` + akLockDir + `"; ` +
 		`if [ -L "$f" ]; then echo "~/.ssh/authorized_keys is a symbolic link; hop does not edit it" >&2; exit 81; fi; ` +
 		`if [ -f "$f" ]; then :; else echo "~/.ssh/authorized_keys does not exist" >&2; exit 82; fi; ` +
 		// From here the exit status of a signal is not one of the above:
-		// the rename may have happened. The EXIT trap removes the mkdir
-		// lock only while it holds this run's token.
-		`trap 'rm -f "$t"; if [ "$(cat "$d/owner" 2>/dev/null)" = "` + token + `" ]; then rm -f "$d/owner"; rmdir "$d"; fi' EXIT; trap 'exit 86' HUP INT TERM PIPE; ` +
-		fmt.Sprintf(`if command -v flock >/dev/null 2>&1; then `+
-			`if (: >> "$l") 2>/dev/null; then :; else echo "cannot open the lock file %[2]s" >&2; exit 84; fi; exec 9>>"$l"; `+
-			`n=0; until flock -x -n 9; do n=$((n+1)); `+
-			`if [ $n -gt %[1]d ]; then echo "~/.ssh/authorized_keys is being edited by another hop run (it holds a lock on %[2]s)" >&2; exit 85; fi; sleep 1; done; `+
-			`else n=0; until mkdir "$d" 2>/dev/null; do n=$((n+1)); `+
-			`if [ $n -gt %[1]d ]; then echo "%[3]s exists: another hop run is editing ~/.ssh/authorized_keys, or one was cut off; if no hop key rotate is running for this account, remove it (rm -r %[3]s)" >&2; exit 85; fi; sleep 1; done; `+
-			`if (echo "%[4]s" > "$d/owner") 2>/dev/null; then :; else rmdir "$d"; echo "cannot write the lock %[3]s" >&2; exit 84; fi; fi; `,
-			akLockWait, "~/.ssh/"+akLockFile, "~/.ssh/"+akLockDir, token) +
+		// the rename may have happened.
+		lock +
 		check("$f", from, akExitChanged, "~/.ssh/authorized_keys changed while hop was editing it") +
 		`(set -C; : > "$t") 2>/dev/null || { echo "cannot create a temporary file in ~/.ssh" >&2; exit 84; }; ` +
 		`cp -p "$f" "$t" || exit 84; cat >| "$t" || exit 84; ` +

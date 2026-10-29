@@ -105,6 +105,11 @@ func (s *akServer) authorize(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissi
 	if err != nil {
 		return nil, err
 	}
+	// sshd's default AuthorizedKeysFile also reads authorized_keys2, which
+	// hop does not edit.
+	if more, err := os.ReadFile(filepath.Join(s.home, ".ssh", "authorized_keys2")); err == nil {
+		data = append(append(data, '\n'), more...)
+	}
 	ip, _, _ := net.SplitHostPort(c.RemoteAddr().String())
 	s.mu.Lock()
 	refuse := s.refuse
@@ -497,7 +502,7 @@ func TestKeyRotateTwoHosts(t *testing.T) {
 	}
 	rk := res.Keys[0]
 	for _, name := range []string{"web-1", "web-2"} {
-		if h := hostStatus(res)[name]; h.Status != "rotated" || h.Warning != "" {
+		if h := hostStatus(res)[name]; h.Status != "rotated" || h.Reason != "" {
 			t.Errorf("%s: %+v", name, h)
 		}
 	}
@@ -540,10 +545,10 @@ func TestKeyRotateTwoHosts(t *testing.T) {
 		if err := login(s, newSignerKey); err != nil {
 			t.Errorf("server %d refuses the new key: %v", i+1, err)
 		}
-		// No temp file is left; the flock lock file stays, by design.
+		// No temp file is left, and no lock.
 		entries, _ := os.ReadDir(filepath.Join(s.home, ".ssh"))
 		for _, e := range entries {
-			if e.Name() != "authorized_keys" && e.Name() != ".hop-authorized_keys.lock" {
+			if e.Name() != "authorized_keys" {
 				t.Errorf("server %d: left in ~/.ssh: %s", i+1, e.Name())
 			}
 		}
@@ -620,7 +625,7 @@ func TestKeyRotateThroughAJumpHost(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d", code)
 	}
-	if !strings.Contains(stdout, "rotated") || strings.Contains(stdout, "failed") {
+	if !strings.Contains(stdout, "rotated") || strings.Contains(stdout, "failed") || strings.Contains(stdout, "needs-attention") {
 		t.Errorf("stdout:\n%s", stdout)
 	}
 	for i, s := range w.srv {
@@ -729,7 +734,6 @@ type rotHostJSON struct {
 	Host        string `json:"host"`
 	Status      string `json:"status"`
 	Reason      string `json:"reason"`
-	Warning     string `json:"warning"`
 	RemoteState string `json:"remote_state"`
 	Fix         string `json:"fix"`
 }
@@ -918,17 +922,14 @@ func TestKeyRotateConflictDoesNotRepointAMovedHost(t *testing.T) {
 	}
 }
 
-// Another hop run holds the authorized_keys lock (an flock, as on any
-// server with util-linux) and edits the file while it does. hop waits for
-// the lock, finds the file changed from what it read, and changes nothing.
+// Another hop run holds the authorized_keys lock and edits the file while
+// it does. hop waits for the lock, finds the file changed from what it
+// read, and changes nothing.
 func TestKeyRotateWaitsForTheAuthorizedKeysLock(t *testing.T) {
-	if _, err := exec.LookPath("flock"); err != nil {
-		t.Skip("flock(1) is not installed")
-	}
 	w := newRotWorld(t, rotWorldOpts{})
 	s := w.srv[0]
 	f := filepath.Join(s.home, ".ssh", "authorized_keys")
-	lock := filepath.Join(s.home, ".ssh", ".hop-authorized_keys.lock")
+	lock := filepath.Join(s.home, ".ssh", ".hop-authorized_keys.lock.d")
 	held := filepath.Join(w.base, "held")
 	const theirs = "# added by another hop\n"
 	var once sync.Once
@@ -940,7 +941,7 @@ func TestKeyRotateWaitsForTheAuthorizedKeysLock(t *testing.T) {
 		once.Do(func() {
 			// It prints the file as it found it after holding the lock a
 			// while, and then adds a line.
-			c := exec.Command("flock", lock, "sh", "-c", `: > "$3"; sleep 1.5; cat "$1"; printf '%s' "$2" >> "$1"`, "sh", f, theirs, held)
+			c := exec.Command("sh", "-c", `mkdir "$4" && echo "other-token $$ 2026-10-28T09:15:00Z" > "$4/owner" && : > "$3" && sleep 1.5 && cat "$1" && printf '%s' "$2" >> "$1" && rm -r "$4"`, "sh", f, theirs, held, lock)
 			go func() {
 				out, err := c.Output()
 				switch {
@@ -977,8 +978,8 @@ func TestKeyRotateWaitsForTheAuthorizedKeysLock(t *testing.T) {
 	if got, _ := w.authorizedKeys(t, 0); got != w.orig[0]+theirs {
 		t.Errorf("authorized_keys:\n%s\nwant the original plus the other writer's line", got)
 	}
-	if err := exec.Command("flock", "-n", lock, "true").Run(); err != nil {
-		t.Errorf("the lock is still held after the run: %v", err)
+	if _, err := os.Stat(lock); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the lock is still there after the run: %v", err)
 	}
 	if w.hostKeyID(t, "web-1") != w.keyID {
 		t.Error("web-1 moved to the new key")

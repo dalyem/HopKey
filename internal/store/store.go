@@ -122,6 +122,11 @@ var (
 	// unlocked vault. It is for a lost device key, so it runs only locked.
 	ErrAlreadyUnlocked = errors.New("store: the vault is already unlocked; hop lock first to replace the device key with the password")
 
+	// ErrChanged refuses a conditional write (PutHostIfChain): an item it
+	// depends on changed, or is gone, since the caller looked. Nothing is
+	// written.
+	ErrChanged = errors.New("store: an item this write depends on changed")
+
 	// ErrClosed means the Store is closed, or closing: Close refuses every
 	// operation that would wait on the server once it has begun.
 	ErrClosed = errors.New("store: the vault store is closed")
@@ -1398,21 +1403,63 @@ func cloneHost(h model.Host) model.Host {
 }
 
 func (s *Store) PutHost(_ context.Context, h model.Host) (model.Host, error) {
+	return s.putHost(h, nil)
+}
+
+// ChangedError refuses a conditional write: the item ID is gone, or no
+// longer at the version the caller named. It matches ErrChanged.
+type ChangedError struct{ ID model.ID }
+
+func (e *ChangedError) Error() string {
+	return fmt.Sprintf("store: item %s changed; nothing was written", e.ID)
+}
+
+func (e *ChangedError) Is(target error) bool { return target == ErrChanged }
+
+// PutHostIfChain is PutHost, written only while every item in expect is
+// live at the version it names: the host and each jump host on its way.
+// The check runs in the write's own transaction, under s.mu and the file
+// lock, so a pull that commits after the caller's snapshot is seen. A
+// mismatch is a *ChangedError, and nothing is written.
+func (s *Store) PutHostIfChain(_ context.Context, h model.Host, expect map[model.ID]uint64) (model.Host, error) {
+	if expect == nil {
+		expect = map[model.ID]uint64{}
+	}
+	return s.putHost(h, expect)
+}
+
+func (s *Store) putHost(h model.Host, expect map[model.ID]uint64) (model.Host, error) {
 	h = cloneHost(h)
 	for _, l := range []*[]string{&h.Aliases, &h.Addresses, &h.Tags, &h.HostKeys} {
 		if *l == nil {
 			*l = []string{}
 		}
 	}
-	out, err := put(s, &h, model.TypeHost)
+	out, err := put(s, &h, model.TypeHost, expect)
 	if err != nil {
 		return model.Host{}, err
 	}
 	return cloneHost(*out), nil
 }
 
+// checkExpect refuses the write unless each item in expect is live at the
+// version it names. at reads an item's current version.
+func checkExpect(expect map[model.ID]uint64, at func(model.ID) (uint64, bool)) error {
+	ids := make([]model.ID, 0, len(expect))
+	for id := range expect {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b model.ID) int { return strings.Compare(a.String(), b.String()) })
+	for _, id := range ids {
+		if v, ok := at(id); !ok || v != expect[id] {
+			return &ChangedError{ID: id}
+		}
+	}
+	return nil
+}
+
 func (s *Store) PutKey(_ context.Context, k model.Key) (model.Key, error) {
-	out, err := put(s, &k, model.TypeKey)
+	out, err := put(s, &k, model.TypeKey, nil)
 	if err != nil {
 		return model.Key{}, err
 	}
@@ -1420,7 +1467,7 @@ func (s *Store) PutKey(_ context.Context, k model.Key) (model.Key, error) {
 }
 
 func (s *Store) PutCredential(_ context.Context, c model.Credential) (model.Credential, error) {
-	out, err := put(s, &c, model.TypeCredential)
+	out, err := put(s, &c, model.TypeCredential, nil)
 	if err != nil {
 		return model.Credential{}, err
 	}
@@ -1432,7 +1479,7 @@ func (s *Store) PutSnippet(_ context.Context, sn model.Snippet) (model.Snippet, 
 	if sn.Params == nil {
 		sn.Params = []string{}
 	}
-	out, err := put(s, &sn, model.TypeSnippet)
+	out, err := put(s, &sn, model.TypeSnippet, nil)
 	if err != nil {
 		return model.Snippet{}, err
 	}
@@ -1459,8 +1506,9 @@ func header(it crypto.Item) *model.Header {
 // put creates (zero ItemID) or replaces an item. A replacement names the
 // live item's current version; the store writes version + 1. In a
 // server-backed vault the write is queued in the outbox, and the result is
-// the overlay item it shows.
-func put[T any](s *Store, it *T, typ model.Type) (*T, error) {
+// the overlay item it shows. A non-nil expect makes the write conditional
+// (checkExpect), on the state the write itself is checked against.
+func put[T any](s *Store, it *T, typ model.Type, expect map[model.ID]uint64) (*T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
@@ -1477,12 +1525,23 @@ func put[T any](s *Store, it *T, typ model.Type) (*T, error) {
 	}
 	h.V, h.Type = crypto.Version, typ
 	if s.server {
-		if err := s.queuePut(it, isNew); err != nil {
+		if err := s.queuePut(it, isNew, expect); err != nil {
 			return nil, err
 		}
 		return it, nil
 	}
-	check := func() error { return s.checkPut(it, isNew) }
+	check := func() error {
+		if expect != nil {
+			err := checkExpect(expect, func(id model.ID) (uint64, bool) {
+				cur, ok := s.state.Items[id]
+				return cur.ItemVersion, ok
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return s.checkPut(it, isNew)
+	}
 	if err := s.write(vaultlog.Changes{Put: []crypto.Item{it}}, check); err != nil {
 		return nil, err
 	}

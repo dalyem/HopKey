@@ -69,9 +69,6 @@ type RotateHost struct {
 	Status string `json:"status"`
 	// Reason says why a host was skipped or failed.
 	Reason string `json:"reason,omitempty"`
-	// Warning is set on a rotated host when something after the rotation
-	// is not as it should be: the old key still logs in, say.
-	Warning string `json:"warning,omitempty"`
 	// RemoteState is where the host's authorized_keys stands after the
 	// run, for a host hop started on: unchanged, new_key_added,
 	// old_key_removed or unknown.
@@ -268,7 +265,7 @@ func runKeyRotate(ctx context.Context, e *Env, args []string) error {
 			}
 		}
 		for _, h := range p.hosts {
-			if h.out.Status == rotFailed || h.out.Status == rotAttention || h.out.Warning != "" {
+			if h.out.Status == rotFailed || h.out.Status == rotAttention {
 				res.OK = false
 			}
 		}
@@ -578,9 +575,6 @@ func printRotateResult(e *Env, res *RotateResult) {
 				if h.Status == rotAlready {
 					detail += "; " + h.Reason
 				}
-				if h.Warning != "" {
-					detail += "; warning: " + h.Warning
-				}
 			case rotAttention:
 				if h.Fix != "" {
 					detail += "; to finish, run: " + h.Fix
@@ -749,6 +743,11 @@ type rotKeys struct {
 // oldCheck, that offer one key alone.
 type rotWays struct {
 	old, new, oldCheck rotSSH
+	// For oldRefused: the old key, the port oldCheck connects to, and the
+	// jump host, if any.
+	oldPub ssh.PublicKey
+	port   int
+	jump   string
 }
 
 func (e *Env) rotWays(h *rotHost, k *rotKeys, addr string) (*rotWays, error) {
@@ -764,6 +763,9 @@ func (e *Env) rotWays(h *rotHost, k *rotKeys, addr string) (*rotWays, error) {
 		old:      rotSSH{e: e, t: h.t, addr: addr},
 		new:      rotSSH{e: e, t: h.t, addr: addr, cfg: newCfg, dir: k.run.dir},
 		oldCheck: rotSSH{e: e, t: h.t, addr: addr, cfg: oldCfg, dir: k.run.dir},
+		oldPub:   k.oldPub,
+		port:     checkPort(h.t.rr.Host),
+		jump:     h.jump,
 	}, nil
 }
 
@@ -896,13 +898,19 @@ func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp stri
 	}
 	h.state = remOldRemoved
 
-	// 5. The old key should now be refused.
-	h.out.Warning = w.oldRefused(ctx)
+	// 5. The old key should now be refused. Unless that is shown, the host
+	// needs attention, and the old key stays in the vault.
+	problem := w.oldRefused(ctx)
 
-	// 6. Point the host at the new key.
-	if e.repoint(ctx, h, k, w, ed, asJSON) {
-		h.out.Status, h.out.Reason = rotRotated, ""
+	// 6. Point the host at the new key, which logs in alone.
+	if !e.repoint(ctx, h, k, w, ed, asJSON) {
+		return
 	}
+	if problem != "" {
+		h.attention(k, "the host now uses the new key, but "+problem)
+		return
+	}
+	h.out.Status, h.out.Reason = rotRotated, ""
 }
 
 // finishOnNewKey finishes a host whose server takes the new key already.
@@ -954,17 +962,115 @@ func (w *rotWays) removeOld(ctx context.Context, h *rotHost, k *rotKeys) string 
 	return ""
 }
 
-// oldRefused offers the old key alone and says, unless the server refuses
-// it, what it saw instead.
+// oldRefused offers the old key alone and says, unless the server is
+// shown to refuse it, what it saw instead. The proof is the ssh client's
+// own debug log, in a file of its own: the ProxyCommand's ssh writes to
+// stderr, so a jump host's "Permission denied" can't pass for the
+// server's.
 func (w *rotWays) oldRefused(ctx context.Context) string {
-	switch res, err := w.oldCheck.run(ctx, "true", nil, nil); {
+	f, err := os.CreateTemp(w.oldCheck.dir, "oldcheck-*.log")
+	if err != nil {
+		return safef("hop could not confirm that the old key is refused (no file for the ssh log: %v)", err)
+	}
+	logFile := f.Name()
+	f.Close()
+	defer os.Remove(logFile)
+	res, err := w.oldCheck.runOpts(ctx, []string{"-vv", "-E", logFile}, "true", nil, nil)
+	switch {
+	case err != nil:
+		return "hop could not confirm that the old key is refused (" + sshFailure(res, err) + ")"
 	case sshOK(res, err):
 		return "the old key still logs in: the server accepts it from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
-	case err == nil && strings.Contains(res.Stderr, "Permission denied"):
-		return ""
-	default:
-		return "hop could not confirm that the old key is refused (" + sshFailure(res, err) + ")"
 	}
+	log, rerr := readCapped(logFile, sshLogMax)
+	if rerr != nil {
+		return safef("hop could not confirm that the old key is refused (it could not read the ssh log: %v)", rerr)
+	}
+	why := oldKeyVerdict(log, ssh.FingerprintSHA256(w.oldPub), w.oldCheck.addr, w.port)
+	if why == "" {
+		return ""
+	}
+	if why == whyNotReached && w.jump != "" {
+		why = safef("the check did not get through the jump host %s to the server", w.jump)
+	}
+	// stderr has the ProxyCommand's errors and the remote's; ssh's own
+	// are in the log.
+	if strings.TrimSpace(res.Stderr) != "" || res.Error != "" {
+		why += " (" + sshFailure(res, nil) + ")"
+	}
+	return "hop could not confirm that the old key is refused: " + why
+}
+
+// sshLogMax bounds the ssh debug log hop reads.
+const sshLogMax = 1 << 20
+
+func readCapped(name string, max int64) (string, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, max))
+	return string(b), err
+}
+
+const whyNotReached = "the check did not reach the server"
+
+// oldKeyVerdict reads the -vv log of a login that offered the old key, of
+// fingerprint fp, alone to addr:port, and returns "" only if it shows that
+// server refuse it; otherwise what it shows instead. All four must hold:
+// the server's transport came up ("Remote protocol version", "Authenticating
+// to addr:port"), ssh offered the old key ("Offering public key: ... fp"),
+// the server never accepted it ("Server accepts key: ... fp"), and the
+// login ended in the server's "Permission denied (publickey...)". These
+// are OpenSSH's debug1 and error lines, the same from 8.x to 9.x; checked
+// against 9.2 (Debian 12) and 9.6 (Ubuntu 24.04). The refusal comes after
+// the key exchange, so from the server whose pinned host key ssh checked;
+// the jump host's ssh and the server's banner write to stderr, not to the
+// log.
+func oldKeyVerdict(log, fp, addr string, port int) string {
+	var reached, authTo, offered, accepted, signFailed, denied bool
+	authPrefix := strings.ToLower(fmt.Sprintf("Authenticating to %s:%d ", strings.Trim(addr, "[]"), port))
+	for _, l := range strings.Split(log, "\n") {
+		l = strings.TrimSpace(l)
+		if p, rest, ok := strings.Cut(l, ": "); ok && strings.HasPrefix(p, "debug") {
+			l = rest
+		}
+		if strings.HasPrefix(l, "Remote: ") {
+			continue // a debug message the server sent
+		}
+		hasFP := slices.Contains(strings.Fields(l), fp)
+		switch {
+		case strings.HasPrefix(l, "Remote protocol version "):
+			reached = true
+		case strings.HasPrefix(strings.ToLower(l), authPrefix):
+			authTo = true
+		case strings.HasPrefix(l, "Offering public key: ") && hasFP:
+			offered = true
+		case strings.HasPrefix(l, "Server accepts key: ") && hasFP:
+			accepted = true
+		case strings.Contains(l, "signing failed") || strings.Contains(l, "no such identity") || strings.HasPrefix(l, "Load key "):
+			signFailed = true
+		}
+		if i := strings.Index(l, "Permission denied ("); i >= 0 && strings.Contains(l[i:], "publickey") {
+			denied = true
+		}
+	}
+	switch {
+	case !reached:
+		return whyNotReached
+	case !authTo:
+		return safef("the ssh log does not show a login to %s port %d", addr, port)
+	case accepted && signFailed:
+		return "the server still accepts the old key, from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2); hop could not sign with it, so the login itself failed"
+	case accepted:
+		return "the server still accepts the old key, from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
+	case !offered:
+		return "ssh did not offer the old key (hop's agent could not list it)"
+	case !denied:
+		return "the login ended without the server refusing the old key"
+	}
+	return ""
 }
 
 // putBack undoes ed on the host after why, and reports the host as failed
@@ -1208,7 +1314,12 @@ type rotSSH struct {
 const rotCheckAlias = "hop-rotate-check"
 
 func (r rotSSH) run(ctx context.Context, command string, stdin []byte, stdout io.Writer) (ExecResult, error) {
-	opts := []string{"-T", "-o", "ConnectTimeout=10"}
+	return r.runOpts(ctx, nil, command, stdin, stdout)
+}
+
+// runOpts is run with extra ssh options.
+func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, stdin []byte, stdout io.Writer) (ExecResult, error) {
+	opts := append([]string{"-T", "-o", "ConnectTimeout=10"}, extra...)
 	if stdin == nil {
 		opts = append(opts, "-n")
 	}
@@ -1409,10 +1520,7 @@ func (e *Env) checkConfig(h *rotHost, addr string, a *keyAgent) (string, error) 
 	if user == "" {
 		user = rec.User
 	}
-	port := int(rec.Port)
-	if port == 0 {
-		port = 22
-	}
+	port := checkPort(rec)
 	for _, v := range []string{addr, alias, user} {
 		if strings.ContainsFunc(v, func(r rune) bool { return r <= ' ' || r == 0x7f || strings.ContainsRune(`"\%#'`, r) }) {
 			return "", fmt.Errorf("%q cannot go in an ssh config", v)
@@ -1443,7 +1551,7 @@ func (e *Env) checkConfig(h *rotHost, addr string, a *keyAgent) (string, error) 
 		fmt.Fprintf(&c, "  User %s\n", user)
 	}
 	fmt.Fprintf(&c, "  HostKeyAlias %s\n  GlobalKnownHostsFile none\n  UserKnownHostsFile %s\n", alias, paths["kh"])
-	c.WriteString("  StrictHostKeyChecking yes\n  UpdateHostKeys no\n")
+	c.WriteString("  StrictHostKeyChecking yes\n  UpdateHostKeys no\n  FingerprintHash sha256\n")
 	fmt.Fprintf(&c, "  IdentityAgent %s\n  IdentityFile none\n  IdentityFile %s\n", paths["agent"], paths["id"])
 	c.WriteString("  IdentitiesOnly yes\n  PubkeyAuthentication yes\n  PreferredAuthentications publickey\n" +
 		"  PasswordAuthentication no\n  KbdInteractiveAuthentication no\n  GSSAPIAuthentication no\n  HostbasedAuthentication no\n" +
@@ -1464,6 +1572,14 @@ func (e *Env) checkConfig(h *rotHost, addr string, a *keyAgent) (string, error) 
 		return "", err
 	}
 	return file, nil
+}
+
+// checkPort is the port a check connects to.
+func checkPort(rec *model.Host) int {
+	if rec.Port == 0 {
+		return 22
+	}
+	return int(rec.Port)
 }
 
 // sshCfgPath quotes a path for an ssh config, with % doubled. A path that

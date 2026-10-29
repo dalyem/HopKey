@@ -603,6 +603,7 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 		return nil, &Error{Code: CodeNotFound, Message: "no host " + hostID.String()}
 	}
 	cur := host
+	expect := map[model.ID]uint64{}
 	for i, want := range p.Chain {
 		if cur.ItemID.String() != want.ID || cur.ItemVersion != want.Version {
 			if i == 0 {
@@ -610,6 +611,7 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 			}
 			return nil, changed("the way to " + host.Name + " (jump host " + cur.Name + ")")
 		}
+		expect[cur.ItemID] = cur.ItemVersion
 		if cur.JumpHostID.IsZero() {
 			if i != len(p.Chain)-1 {
 				return nil, changed("the way to " + host.Name)
@@ -628,12 +630,40 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 	if err != nil {
 		return nil, err
 	}
-	saved, err := d.store.PutHost(ctx, h)
+	if d.opts.beforeHostKeyWrite != nil {
+		d.opts.beforeHostKeyWrite()
+	}
+	// d.mu does not hold off a background pull, which can change a jump
+	// host after the snapshot: the encrypted store checks the versions again
+	// in the write's own transaction. Every other store has no writer
+	// outside d.mu.
+	var saved model.Host
+	if cs, ok := d.store.(conditionalHostStore); ok {
+		saved, err = cs.PutHostIfChain(ctx, h, expect)
+	} else {
+		saved, err = d.store.PutHost(ctx, h)
+	}
+	if ce := (*store.ChangedError)(nil); errors.As(err, &ce) {
+		if ce.ID == hostID {
+			return nil, changed("the host " + host.Name)
+		}
+		name := ce.ID.String()
+		if j, ok := byID[ce.ID]; ok {
+			name = j.Name
+		}
+		return nil, changed("the way to " + host.Name + " (jump host " + name + ")")
+	}
 	if err != nil {
 		return nil, storeError(err)
 	}
 	d.localWrite()
 	return &saved, d.reloadAfter(ctx, "saved")
+}
+
+// conditionalHostStore is a store that checks a write's preconditions in
+// the write's own transaction (*store.Store).
+type conditionalHostStore interface {
+	PutHostIfChain(ctx context.Context, h model.Host, expect map[model.ID]uint64) (model.Host, error)
 }
 
 func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error) {

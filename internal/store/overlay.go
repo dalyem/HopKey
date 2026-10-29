@@ -240,9 +240,10 @@ func (ov *overlay) snapshot() (model.Snapshot, error) {
 // are checked against the overlay, which is what the user sees: a
 // replacement names a live overlay item of the same type at its overlay
 // version, and every reference names a live overlay item of the right
-// type. seen is the overlay item. The record is durable when it returns.
+// type. seen is the overlay item. A non-nil expect is checked against the
+// overlay too (checkExpect). The record is durable when it returns.
 // The caller holds s.mu.
-func (s *Store) queuePut(it crypto.Item, isNew bool) error {
+func (s *Store) queuePut(it crypto.Item, isNew bool, expect map[model.ID]uint64) error {
 	unlock, err := s.lockFile()
 	if err != nil {
 		return err
@@ -254,6 +255,15 @@ func (s *Store) queuePut(it crypto.Item, isNew bool) error {
 	ov, err := s.overlayLocked()
 	if err != nil {
 		return err
+	}
+	if expect != nil {
+		err := checkExpect(expect, func(id model.ID) (uint64, bool) {
+			cur, ok := ov.items[id]
+			return version(cur), ok
+		})
+		if err != nil {
+			return err
+		}
 	}
 	h := header(it)
 	in := merge.Intent{Action: merge.ActionCreate, ItemID: h.ItemID, Type: h.Type}

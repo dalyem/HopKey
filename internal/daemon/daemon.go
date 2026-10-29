@@ -84,10 +84,12 @@ type Options struct {
 
 	// Test hooks: writeConfig replaces sshconfig.Write, wipeConfig
 	// sshconfig.WipeIf with no condition, and configRetry
-	// configRetryInterval.
-	writeConfig func(sshconfig.Options, []sshconfig.Host) error
-	wipeConfig  func(o sshconfig.Options, done func() error) error
-	configRetry time.Duration
+	// configRetryInterval. beforeHostKeyWrite runs in set_host_key between
+	// the daemon's own checks and the store write.
+	writeConfig        func(sshconfig.Options, []sshconfig.Host) error
+	wipeConfig         func(o sshconfig.Options, done func() error) error
+	configRetry        time.Duration
+	beforeHostKeyWrite func()
 }
 
 // Daemon is a running daemon.

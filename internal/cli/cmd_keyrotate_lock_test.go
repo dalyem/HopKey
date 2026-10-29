@@ -4,22 +4,21 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
 
-// The lock of the authorized_keys write script. The paths are spelled out:
-// they are what a user finds in ~/.ssh and may have to remove.
-const (
-	testLockFile = ".hop-authorized_keys.lock"
-	testLockDir  = ".hop-authorized_keys.lock.d"
-)
+// The lock of the authorized_keys write script. The path is spelled out:
+// it is what a user finds in ~/.ssh and may have to remove.
+const testLockDir = ".hop-authorized_keys.lock.d"
 
 func akHome(t *testing.T, content []byte) (home, file string) {
 	t.Helper()
@@ -73,8 +72,16 @@ type akWriter struct {
 
 func startAKWriter(t *testing.T, home, path, script string) *akWriter {
 	t.Helper()
+	return startAKShell(t, home, path, sh(script))
+}
+
+// startAKShell is startAKWriter with the script as the shell's own command,
+// not under a login shell, so that the process the test signals and waits
+// for is the script's shell.
+func startAKShell(t *testing.T, home, path, script string) *akWriter {
+	t.Helper()
 	w := &akWriter{done: make(chan int, 1)}
-	w.cmd = exec.Command("sh", "-c", sh(script))
+	w.cmd = exec.Command("sh", "-c", script)
 	w.cmd.Env = []string{"HOME=" + home, "PATH=" + path}
 	w.cmd.Stderr = &w.err
 	w.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -117,65 +124,6 @@ func holdsTemp(home string) bool {
 	return len(m) > 0
 }
 
-// With flock, a second writer waits for the first and then finds the file
-// changed under it: the two never edit at once.
-func TestAKWriteScriptFlockSerializesWriters(t *testing.T) {
-	requireFlock(t)
-	defer func(w int) { akLockWait = w }(akLockWait)
-	akLockWait = 5
-	orig := []byte("a\n")
-	home, f := akHome(t, orig)
-	first, second := []byte("a\nfirst\n"), []byte("a\nsecond\n")
-
-	a := startAKWriter(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(first)))
-	waitFor(t, "the first writer to take the lock", func() bool { return holdsTemp(home) })
-	b := startAKWriter(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(second)))
-	b.stdin.Write(second)
-	b.stdin.Close()
-	select {
-	case code := <-b.done:
-		t.Fatalf("the second writer ran while the first held the lock: exit %d %s", code, b.err.String())
-	case <-time.After(1500 * time.Millisecond):
-	}
-	a.stdin.Write(first)
-	a.stdin.Close()
-	if code := <-a.done; code != 0 {
-		t.Fatalf("first writer: exit %d %s", code, a.err.String())
-	}
-	if code := <-b.done; code != akExitChanged {
-		t.Errorf("second writer: exit %d %s, want %d (changed)", code, b.err.String(), akExitChanged)
-	}
-	if got, _ := os.ReadFile(f); !bytes.Equal(got, first) {
-		t.Errorf("authorized_keys: %q", got)
-	}
-	if fi, err := os.Stat(filepath.Join(home, ".ssh", testLockFile)); err != nil || !fi.Mode().IsRegular() {
-		t.Errorf("the flock lock is not a file: %v", err)
-	}
-}
-
-// A writer that is killed holding the flock does not keep the next one
-// out, though the lock file is still there: the kernel let go of the lock
-// with the process.
-func TestAKWriteScriptFlockIsReleasedWhenTheWriterDies(t *testing.T) {
-	requireFlock(t)
-	defer func(w int) { akLockWait = w }(akLockWait)
-	akLockWait = 2
-	orig := []byte("a\n")
-	home, f := akHome(t, orig)
-	a := startAKWriter(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum([]byte("x\n"))))
-	waitFor(t, "the writer to take the lock", func() bool { return holdsTemp(home) })
-	syscall.Kill(-a.cmd.Process.Pid, syscall.SIGKILL)
-	<-a.done
-
-	next := []byte("a\nb\n")
-	if code, _, stderr := runAKScript(t, home, akWriteScript(cksum(orig), cksum(next)), next); code != 0 {
-		t.Fatalf("after a killed writer: exit %d %q", code, stderr)
-	}
-	if got, _ := os.ReadFile(f); !bytes.Equal(got, next) {
-		t.Errorf("authorized_keys: %q", got)
-	}
-}
-
 func runAKScriptPath(t *testing.T, home, path, script string, stdin []byte) (int, string) {
 	t.Helper()
 	cmd := exec.Command("sh", "-c", sh(script))
@@ -193,14 +141,82 @@ func runAKScriptPath(t *testing.T, home, path, script string, stdin []byte) (int
 	return code, errOut.String()
 }
 
-// Without flock, the lock is a directory with this run's token in it,
-// removed when the run ends.
-func TestAKWriteScriptMkdirLock(t *testing.T) {
-	path := noFlockPath(t)
+// lockOwner is the owner file of the lock, or "" when there is none.
+func lockOwner(home string) string {
+	b, _ := os.ReadFile(filepath.Join(home, ".ssh", testLockDir, "owner"))
+	return string(b)
+}
+
+// Two writers never edit at once: the second waits for the first's lock,
+// and then finds the file changed under it. A host where one run has
+// flock(1) on its PATH and another has not is no different: there is one
+// lock.
+func TestAKWriteScriptSerializesWriters(t *testing.T) {
+	requireFlock(t)
+	defer func(w int) { akLockWait = w }(akLockWait)
+	akLockWait = 5
+	for _, c := range []struct {
+		name         string
+		pathA, pathB string
+	}{
+		{"same PATH", os.Getenv("PATH"), os.Getenv("PATH")},
+		{"flock on one PATH only", os.Getenv("PATH"), noFlockPath(t)},
+		{"flock on the other PATH only", noFlockPath(t), os.Getenv("PATH")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			orig := []byte("a\n")
+			home, f := akHome(t, orig)
+			first, second := []byte("a\nfirst\n"), []byte("a\nsecond\n")
+
+			a := startAKWriter(t, home, c.pathA, akWriteScript(cksum(orig), cksum(first)))
+			waitFor(t, "the first writer to take the lock", func() bool { return holdsTemp(home) })
+			b := startAKWriter(t, home, c.pathB, akWriteScript(cksum(orig), cksum(second)))
+			b.stdin.Write(second)
+			b.stdin.Close()
+			select {
+			case code := <-b.done:
+				t.Fatalf("the second writer ran while the first held the lock: exit %d %s", code, b.err.String())
+			case <-time.After(1500 * time.Millisecond):
+			}
+			a.stdin.Write(first)
+			a.stdin.Close()
+			if code := <-a.done; code != 0 {
+				t.Fatalf("first writer: exit %d %s", code, a.err.String())
+			}
+			if code := <-b.done; code != akExitChanged {
+				t.Errorf("second writer: exit %d %s, want %d (changed)", code, b.err.String(), akExitChanged)
+			}
+			if got, _ := os.ReadFile(f); !bytes.Equal(got, first) {
+				t.Errorf("authorized_keys: %q", got)
+			}
+			if entries, _ := os.ReadDir(filepath.Join(home, ".ssh")); len(entries) != 1 {
+				t.Errorf("~/.ssh holds %d entries, want only authorized_keys", len(entries))
+			}
+		})
+	}
+}
+
+// The lock is a directory with this run's token, PID and time in it while
+// the run holds it, and gone when the run ends.
+func TestAKWriteScriptLockNamesItsOwner(t *testing.T) {
 	orig, next := []byte("a\n"), []byte("a\nb\n")
 	home, f := akHome(t, orig)
-	if code, stderr := runAKScriptPath(t, home, path, akWriteScript(cksum(orig), cksum(next)), next); code != 0 {
-		t.Fatalf("exit %d %q", code, stderr)
+	a := startAKWriter(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)))
+	waitFor(t, "the writer to take the lock", func() bool { return holdsTemp(home) })
+	fields := strings.Fields(lockOwner(home))
+	if len(fields) != 3 || len(fields[0]) != 32 {
+		t.Fatalf("owner %q, want the token, PID and time", lockOwner(home))
+	}
+	if pid, err := strconv.Atoi(fields[1]); err != nil || syscall.Kill(pid, 0) != nil {
+		t.Errorf("owner PID %q is not a running process: %v", fields[1], err)
+	}
+	if _, err := time.Parse(time.RFC3339, fields[2]); err != nil {
+		t.Errorf("owner time: %v", err)
+	}
+	a.stdin.Write(next)
+	a.stdin.Close()
+	if code := <-a.done; code != 0 {
+		t.Fatalf("exit %d %s", code, a.err.String())
 	}
 	if got, _ := os.ReadFile(f); !bytes.Equal(got, next) {
 		t.Errorf("authorized_keys: %q", got)
@@ -210,62 +226,136 @@ func TestAKWriteScriptMkdirLock(t *testing.T) {
 	}
 }
 
-// An old mkdir lock is never taken over: its run may still be going on the
-// server after its ssh died. The edit stops with nothing changed, and the
-// message names the directory to remove.
-func TestAKWriteScriptStaleMkdirLockFailsClosed(t *testing.T) {
+// A lock left over is never taken over, whatever its age and whether its
+// PID still runs: its run may still be going. The edit stops with nothing
+// changed, and the message says who holds the lock and how to remove it.
+func TestAKWriteScriptLeftOverLockFailsClosed(t *testing.T) {
 	defer func(w int) { akLockWait = w }(akLockWait)
 	akLockWait = 1
-	path := noFlockPath(t)
-	orig, next := []byte("a\n"), []byte("a\nb\n")
-	home, f := akHome(t, orig)
-	lock := filepath.Join(home, ".ssh", testLockDir)
-	if err := os.Mkdir(lock, 0o700); err != nil {
+	gone := exec.Command("sh", "-c", "exit 0")
+	if err := gone.Run(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(lock, "owner"), []byte("someone-else\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-time.Hour)
-	os.Chtimes(lock, old, old)
+	const at = "2026-10-28T09:15:00Z"
+	for _, c := range []struct {
+		name, owner string
+		want        []string
+	}{
+		{"its process is gone", fmt.Sprintf("other-token %d %s\n", gone.Process.Pid, at),
+			[]string{fmt.Sprintf("process %d on this host took it at %s", gone.Process.Pid, at), "that process is not running"}},
+		{"its process still runs", fmt.Sprintf("other-token %d %s\n", os.Getpid(), at),
+			[]string{fmt.Sprintf("process %d on this host took it at %s", os.Getpid(), at), "that process is still running"}},
+		{"no owner", "", []string{"with no owner in it"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			orig, next := []byte("a\n"), []byte("a\nb\n")
+			home, f := akHome(t, orig)
+			lock := filepath.Join(home, ".ssh", testLockDir)
+			if err := os.Mkdir(lock, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if c.owner != "" {
+				if err := os.WriteFile(filepath.Join(lock, "owner"), []byte(c.owner), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			old := time.Now().Add(-24 * time.Hour)
+			os.Chtimes(lock, old, old)
 
-	code, stderr := runAKScriptPath(t, home, path, akWriteScript(cksum(orig), cksum(next)), next)
-	if code != akExitLocked || !strings.Contains(stderr, "~/.ssh/"+testLockDir) || !strings.Contains(stderr, "remove it") {
-		t.Errorf("stale lock: exit %d %q", code, stderr)
-	}
-	if got, _ := os.ReadFile(f); !bytes.Equal(got, orig) {
-		t.Errorf("written under another's lock: %q", got)
-	}
-	if b, err := os.ReadFile(filepath.Join(lock, "owner")); err != nil || string(b) != "someone-else\n" {
-		t.Errorf("the other run's lock was touched: %q %v", b, err)
+			code, stderr := runAKScriptPath(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)), next)
+			want := append(c.want, "~/.ssh/"+testLockDir+" ", "rm -r ~/.ssh/"+testLockDir+")")
+			if code != akExitLocked {
+				t.Errorf("exit %d %q, want %d", code, stderr, akExitLocked)
+			}
+			for _, w := range want {
+				if !strings.Contains(stderr, w) {
+					t.Errorf("the message %q does not say %q", stderr, w)
+				}
+			}
+			if got, _ := os.ReadFile(f); !bytes.Equal(got, orig) {
+				t.Errorf("written under another's lock: %q", got)
+			}
+			if fi, err := os.Stat(lock); err != nil || !fi.IsDir() || lockOwner(home) != c.owner {
+				t.Errorf("the other run's lock was touched: %q %v", lockOwner(home), err)
+			}
+		})
 	}
 }
 
-// The lock is replaced while a run holds it (a user removed it, and
-// another run took it): the first run's exit does not remove the new
-// owner's lock.
-func TestAKWriteScriptKeepsAnotherOwnersLock(t *testing.T) {
-	path := noFlockPath(t)
+// A run's traps remove its own lock and never another's: not when the lock
+// was replaced while the run held it (a user removed it, and another run
+// took it), and not when a run waiting for another's lock is stopped.
+func TestAKWriteScriptTrapsKeepAnotherOwnersLock(t *testing.T) {
+	const theirs = "other-token 1 2026-10-28T09:15:00Z\n"
 	orig, next := []byte("a\n"), []byte("a\nb\n")
-	home, _ := akHome(t, orig)
-	lock := filepath.Join(home, ".ssh", testLockDir)
-	a := startAKWriter(t, home, path, akWriteScript(cksum(orig), cksum(next)))
-	waitFor(t, "the writer to take the lock", func() bool {
-		b, err := os.ReadFile(filepath.Join(lock, "owner"))
-		return err == nil && len(b) > 0 && holdsTemp(home)
+	takeOver := func(t *testing.T, home string) {
+		t.Helper()
+		lock := filepath.Join(home, ".ssh", testLockDir)
+		if err := os.RemoveAll(lock); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(lock, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(lock, "owner"), []byte(theirs), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held := func(home string) bool { return holdsTemp(home) && lockOwner(home) != "" }
+
+	t.Run("replaced, the run exits", func(t *testing.T) {
+		home, _ := akHome(t, orig)
+		a := startAKShell(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)))
+		waitFor(t, "the writer to take the lock", func() bool { return held(home) })
+		takeOver(t, home)
+		a.stdin.Write(next)
+		a.stdin.Close()
+		if code := <-a.done; code != 0 {
+			t.Fatalf("exit %d %s", code, a.err.String())
+		}
+		if lockOwner(home) != theirs {
+			t.Errorf("the writer removed another owner's lock: owner %q", lockOwner(home))
+		}
 	})
-	if err := os.RemoveAll(lock); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(lock, 0o700); err != nil { // another run's, as an empty directory
-		t.Fatal(err)
-	}
-	a.stdin.Write(next)
-	a.stdin.Close()
-	if code := <-a.done; code != 0 {
-		t.Fatalf("exit %d %s", code, a.err.String())
-	}
-	if fi, err := os.Stat(lock); err != nil || !fi.IsDir() {
-		t.Errorf("the writer removed another owner's lock: %v", err)
-	}
+	t.Run("replaced, the run is stopped", func(t *testing.T) {
+		home, _ := akHome(t, orig)
+		a := startAKShell(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)))
+		waitFor(t, "the writer to take the lock", func() bool { return held(home) })
+		takeOver(t, home)
+		syscall.Kill(-a.cmd.Process.Pid, syscall.SIGTERM)
+		if code := <-a.done; code != 86 {
+			t.Errorf("exit %d %s, want 86", code, a.err.String())
+		}
+		if lockOwner(home) != theirs {
+			t.Errorf("the stopped writer removed another owner's lock: owner %q", lockOwner(home))
+		}
+	})
+	t.Run("waiting, the run is stopped", func(t *testing.T) {
+		home, _ := akHome(t, orig)
+		takeOver(t, home)
+		a := startAKShell(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)))
+		time.Sleep(1500 * time.Millisecond) // in its wait loop
+		syscall.Kill(-a.cmd.Process.Pid, syscall.SIGTERM)
+		if code := <-a.done; code != 86 {
+			t.Errorf("exit %d %s, want 86", code, a.err.String())
+		}
+		if lockOwner(home) != theirs {
+			t.Errorf("a stopped waiter removed another owner's lock: owner %q", lockOwner(home))
+		}
+	})
+	t.Run("its own, the run is stopped", func(t *testing.T) {
+		home, f := akHome(t, orig)
+		a := startAKShell(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)))
+		waitFor(t, "the writer to take the lock", func() bool { return held(home) })
+		syscall.Kill(-a.cmd.Process.Pid, syscall.SIGTERM)
+		if code := <-a.done; code != 86 {
+			t.Errorf("exit %d %s, want 86", code, a.err.String())
+		}
+		if entries, _ := os.ReadDir(filepath.Join(home, ".ssh")); len(entries) != 1 {
+			t.Errorf("~/.ssh holds %d entries after a stopped run, want only authorized_keys", len(entries))
+		}
+		if got, _ := os.ReadFile(f); !bytes.Equal(got, orig) {
+			t.Errorf("authorized_keys: %q", got)
+		}
+	})
 }
