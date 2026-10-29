@@ -438,10 +438,8 @@ func (r *resolver) held() ([]daemon.HeldChange, error) {
 	for i := range res.Held {
 		h := &res.Held[i]
 		h.Seen, h.Want, h.Current = stripSecrets(h.Seen), stripSecrets(h.Want), stripSecrets(h.Current)
-		for _, p := range []*daemon.Proposal{h.KeepMine, h.KeepMineMerge, h.TakeTheirsMerge} {
-			if p != nil {
-				p.Seen, p.Want = stripSecrets(p.Seen), stripSecrets(p.Want)
-			}
+		if p := h.KeepMine; p != nil {
+			p.Seen, p.Want = stripSecrets(p.Seen), stripSecrets(p.Want)
 		}
 	}
 	if res.Held == nil {
@@ -485,20 +483,84 @@ func members(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	return m, true
 }
 
+// heldListing is the JSON of the listing: the daemon's held changes, each
+// with the proposals of the --merge choices it offers, as §2.11 asks of a
+// listing without a terminal.
+type heldListing struct {
+	Held []heldEntry `json:"held"`
+}
+
+type heldEntry struct {
+	daemon.HeldChange
+	KeepMineMerge   *daemon.Proposal `json:"keep_mine_merge,omitempty"`
+	TakeTheirsMerge *daemon.Proposal `json:"take_theirs_merge,omitempty"`
+}
+
+// withMergeProposals fetches the proposals of the --merge choices h
+// offers. One the daemon can no longer propose (the held change moved on
+// since the listing) is dropped from the choices, and its refusal says
+// why.
+func (r *resolver) withMergeProposals(h daemon.HeldChange) heldEntry {
+	out := heldEntry{HeldChange: h}
+	out.Choices = slices.Clone(h.Choices)
+	for _, f := range []struct {
+		choice  string
+		into    **daemon.Proposal
+		refused *string
+	}{
+		{daemon.ChoiceKeepMineMerge, &out.KeepMineMerge, &out.KeepMineMergeRefused},
+		{daemon.ChoiceTakeTheirsMerge, &out.TakeTheirsMerge, &out.TakeTheirsMergeRefused},
+	} {
+		if !slices.Contains(out.Choices, f.choice) {
+			continue
+		}
+		p, err := r.mergeProposal(h.N, f.choice)
+		if err != nil {
+			*f.refused = "its proposal could not be read: " + err.Error()
+			out.Choices = slices.DeleteFunc(out.Choices, func(c string) bool { return c == f.choice })
+			continue
+		}
+		*f.into = p
+	}
+	return out
+}
+
+// mergeProposal asks the daemon for the proposal of a --merge choice for
+// the held change n. The listing names these choices but leaves their
+// proposals out, so that it stays within one response for a large item.
+func (r *resolver) mergeProposal(n uint64, choice string) (*daemon.Proposal, error) {
+	var res daemon.SyncProposalResult
+	if err := r.c.Call(r.ctx, daemon.OpSyncProposal, daemon.SyncProposalParams{N: n, Choice: choice}, &res); err != nil {
+		return nil, r.resolveError(n, err)
+	}
+	p := res.Proposal
+	if p == nil || p.N != n || p.Choice != choice {
+		return nil, failf("the daemon returned no %s proposal for change %d", strings.TrimPrefix(choiceFlags(choice), "--"), n)
+	}
+	p.Seen, p.Want = stripSecrets(p.Seen), stripSecrets(p.Want)
+	return p, nil
+}
+
 // list prints the held changes and how to resolve each. It applies
-// nothing. The JSON carries each keep-mine proposal with its token.
+// nothing. The JSON carries each keep-mine and --merge proposal with its
+// token.
 func (r *resolver) list(held []daemon.HeldChange) error {
+	entries := []heldEntry{}
+	for _, h := range held {
+		entries = append(entries, r.withMergeProposals(h))
+	}
 	if r.asJSON {
-		return printJSON(r.e, daemon.SyncHeldResult{Held: held})
+		return printJSON(r.e, heldListing{Held: entries})
 	}
 	if len(held) == 0 {
 		r.e.printf("nothing is held\n")
 		return nil
 	}
-	for i := range held {
-		h := &held[i]
+	for i := range entries {
+		x := &entries[i]
+		h := &x.HeldChange
 		r.describe(h)
-		for _, p := range []*daemon.Proposal{h.KeepMine, h.KeepMineMerge, h.TakeTheirsMerge} {
+		for _, p := range []*daemon.Proposal{h.KeepMine, x.KeepMineMerge, x.TakeTheirsMerge} {
 			if p != nil {
 				r.showProposal(h, p)
 			}
@@ -510,7 +572,14 @@ func (r *resolver) list(held []daemon.HeldChange) error {
 		for _, ch := range h.Choices {
 			switch ch {
 			case daemon.ChoiceKeepMine, daemon.ChoiceKeepMineMerge, daemon.ChoiceTakeTheirsMerge:
-				if p := proposalFor(h, ch); p != nil {
+				p := h.KeepMine
+				switch ch {
+				case daemon.ChoiceKeepMineMerge:
+					p = x.KeepMineMerge
+				case daemon.ChoiceTakeTheirsMerge:
+					p = x.TakeTheirsMerge
+				}
+				if p != nil {
 					r.e.printf("  hop sync resolve %d %s --confirm %s\n", h.N, choiceFlags(ch), oneLine(p.Confirm))
 				}
 			case daemon.ChoiceEdit:
@@ -521,19 +590,6 @@ func (r *resolver) list(held []daemon.HeldChange) error {
 				r.e.printf("  hop sync resolve %d --retry\n", h.N)
 			}
 		}
-	}
-	return nil
-}
-
-// proposalFor is h's proposal for a choice offered in the listing, or nil.
-func proposalFor(h *daemon.HeldChange, choice string) *daemon.Proposal {
-	switch choice {
-	case daemon.ChoiceKeepMine:
-		return h.KeepMine
-	case daemon.ChoiceKeepMineMerge:
-		return h.KeepMineMerge
-	case daemon.ChoiceTakeTheirsMerge:
-		return h.TakeTheirsMerge
 	}
 	return nil
 }
@@ -689,10 +745,10 @@ func (r *resolver) describe(h *daemon.HeldChange) {
 		e.printf("  keep mine is not offered: %s\n", oneLine(h.KeepMineRefused))
 	}
 	if h.Hold != nil && len(h.Hold.Conflicts) > 0 {
-		if h.KeepMineMerge == nil && h.KeepMineMergeRefused != "" {
+		if h.KeepMineMergeRefused != "" {
 			e.printf("  keep mine --merge is not offered: %s\n", oneLine(h.KeepMineMergeRefused))
 		}
-		if h.TakeTheirsMerge == nil && h.TakeTheirsMergeRefused != "" {
+		if h.TakeTheirsMergeRefused != "" {
 			e.printf("  take theirs --merge is not offered: %s\n", oneLine(h.TakeTheirsMergeRefused))
 		}
 	}
@@ -766,9 +822,10 @@ func memberText(raw json.RawMessage, member string) string {
 
 // showProposal prints what a keep-mine, edit or --merge choice would
 // write: for a delete, that it deletes; otherwise every field of each
-// conflict, and every other field the replacement changes against the
-// server's version (marked), beside the server's. A secret field is named
-// but never shown.
+// conflict, whole (every member of a conflicting unit, and of a
+// coupling's group, changed or not), and every other field the
+// replacement changes against the server's version (marked), beside the
+// server's. A secret field is named but never shown.
 func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 	e := r.e
 	what := "keep mine"
@@ -796,7 +853,7 @@ func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 			shown[k] = true
 		}
 		for _, c := range h.Hold.Conflicts {
-			for _, k := range append(slices.Clone(c.Local), c.Remote...) {
+			for _, k := range merge.ConflictMembers(h.Type, c) {
 				shown[k] = true
 			}
 		}
@@ -963,15 +1020,19 @@ func (r *resolver) apply(h *daemon.HeldChange, choice string, req request) error
 	return r.report(h, choice, res, err)
 }
 
-// propose returns the proposal for keep-mine and the --merge choices (from
-// the held listing) or for edit (from the daemon, for the edited item).
+// propose returns the proposal for keep-mine (from the held listing), for
+// a --merge choice (from the daemon, one at a time) or for edit (from the
+// daemon, for the edited item).
 func (r *resolver) propose(h *daemon.HeldChange, choice string, req request) (*daemon.Proposal, json.RawMessage, error) {
-	if choice != daemon.ChoiceEdit {
-		p := proposalFor(h, choice)
-		if p == nil {
-			return nil, nil, failf("%s is not offered for change %d: %s", strings.TrimPrefix(choiceFlags(choice), "--"), h.N, orUnknown(refusedFor(h, choice)))
+	switch choice {
+	case daemon.ChoiceKeepMine:
+		if h.KeepMine == nil {
+			return nil, nil, failf("keep-mine is not offered for change %d: %s", h.N, orUnknown(h.KeepMineRefused))
 		}
-		return p, nil, nil
+		return h.KeepMine, nil, nil
+	case daemon.ChoiceKeepMineMerge, daemon.ChoiceTakeTheirsMerge:
+		p, err := r.mergeProposal(h.N, choice)
+		return p, nil, err
 	}
 	sets := req.sets
 	if len(sets) == 0 && r.interactive {

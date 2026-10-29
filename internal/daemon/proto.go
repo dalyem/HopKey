@@ -32,12 +32,14 @@ const (
 	OpShutdown   = "shutdown"
 
 	// Sync ops (sync.go). They need the encrypted store; sync.now,
-	// sync.held, sync.resolve and devices.list need it unlocked too.
-	OpSyncStatus  = "sync.status"
-	OpSyncNow     = "sync.now"
-	OpSyncHeld    = "sync.held"
-	OpSyncResolve = "sync.resolve"
-	OpDevicesList = "devices.list"
+	// sync.held, sync.proposal, sync.resolve and devices.list need it
+	// unlocked too.
+	OpSyncStatus   = "sync.status"
+	OpSyncNow      = "sync.now"
+	OpSyncHeld     = "sync.held"
+	OpSyncProposal = "sync.proposal"
+	OpSyncResolve  = "sync.resolve"
+	OpDevicesList  = "devices.list"
 )
 
 // Error codes.
@@ -397,14 +399,26 @@ type HeldChange struct {
 	// when keep-mine is refused (KeepMineRefused says why).
 	KeepMine        *Proposal `json:"keep_mine,omitempty"`
 	KeepMineRefused string    `json:"keep_mine_refused,omitempty"`
-	// KeepMineMerge and TakeTheirsMerge are the computed edits of a hold
-	// on a unit, class or coupling conflict (rev 17): the conflicts as
-	// this device's or as the server's, everything else merged. Each is
-	// nil when refused, and the matching *Refused says why.
-	KeepMineMerge          *Proposal `json:"keep_mine_merge,omitempty"`
-	KeepMineMergeRefused   string    `json:"keep_mine_merge_refused,omitempty"`
-	TakeTheirsMerge        *Proposal `json:"take_theirs_merge,omitempty"`
-	TakeTheirsMergeRefused string    `json:"take_theirs_merge_refused,omitempty"`
+	// KeepMineMergeRefused and TakeTheirsMergeRefused say why a hold on a
+	// unit, class or coupling conflict (rev 17) does not offer
+	// keep-mine-merge or take-theirs-merge. The proposals themselves come
+	// from OpSyncProposal, one at a time: each is a full copy of the item
+	// twice over, and with them a large item would not fit in one response.
+	KeepMineMergeRefused   string `json:"keep_mine_merge_refused,omitempty"`
+	TakeTheirsMergeRefused string `json:"take_theirs_merge_refused,omitempty"`
+}
+
+// SyncProposalParams is the request for OpSyncProposal: the proposal of
+// one computed choice, keep-mine-merge or take-theirs-merge, for the held
+// record N.
+type SyncProposalParams struct {
+	N      uint64 `json:"n"`
+	Choice string `json:"choice"`
+}
+
+// SyncProposalResult answers OpSyncProposal.
+type SyncProposalResult struct {
+	Proposal *Proposal `json:"proposal"`
 }
 
 // Proposal is the replacement a keep-mine, edit or --merge resolution
@@ -440,10 +454,10 @@ const (
 // SyncResolveParams is the request for OpSyncResolve. N names the held
 // record (HeldChange.N). keep-mine, edit and the two -merge choices write
 // only with Confirm, the token of the proposal (from HeldChange.KeepMine,
-// KeepMineMerge or TakeTheirsMerge, or from a Propose call); with Propose
-// they return the proposal and write nothing. Edited is the edited item's plaintext JSON, for edit only, and
-// only for hosts and snippets: a key's or credential's secret never
-// crosses the control socket.
+// from OpSyncProposal, or from a Propose call); with Propose they return
+// the proposal and write nothing. Edited is the edited item's plaintext
+// JSON, for edit only, and only for hosts and snippets: a key's or
+// credential's secret never crosses the control socket.
 type SyncResolveParams struct {
 	N       uint64          `json:"n"`
 	Choice  string          `json:"choice"`

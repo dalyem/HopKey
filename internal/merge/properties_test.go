@@ -3,10 +3,12 @@ package merge
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"math/rand/v2"
 	"slices"
 	"strconv"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/model"
@@ -35,14 +37,16 @@ var (
 	genAddrs   = [][]string{{"old.example"}, {"new.example"}, {"old.example", "new.example"}, {}}
 	genKeys    = [][]string{{}, {"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey1"}, {"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey2"}}
 	genIDs     = []string{"", idCred, idCred2}
+	genJumps   = []string{"", idHost2, idSnip}
 	genOutput  = []string{"", model.AgentOutputNone, model.AgentOutputFull}
+	genParams  = [][]string{{}, {"unit"}, {"unit", "since"}, {"since", "unit"}}
 )
 
 // mutateHost changes each member of h with probability p.
 func (g gen) mutateHost(t testing.TB, h model.Host, p float64) model.Host {
 	ch := func() bool { return g.r.Float64() < p }
-	id := func() model.ID {
-		s := genIDs[g.pick(len(genIDs))]
+	id := func(from []string) model.ID {
+		s := from[g.pick(len(from))]
 		if s == "" {
 			return model.ID{}
 		}
@@ -82,10 +86,13 @@ func (g gen) mutateHost(t testing.TB, h model.Host, p float64) model.Host {
 		h.HostKeys = slices.Clone(genKeys[g.pick(len(genKeys))])
 	}
 	if ch() {
-		h.KeyID = id()
+		h.KeyID = id(genIDs)
 	}
 	if ch() {
-		h.CredentialID = id()
+		h.CredentialID = id(genIDs)
+	}
+	if ch() {
+		h.JumpHostID = id(genJumps)
 	}
 	if ch() {
 		h.Route = []string{"auto", "direct", "tailnet"}[g.pick(3)]
@@ -131,50 +138,94 @@ func itemOf(t testing.TB, v any, ver uint64) *Item {
 	return it
 }
 
-// triple draws (seen, want, S) of one type.
-func (g gen) triple(t testing.TB) (seen, want, s *Item) {
-	switch g.pick(6) {
+// itemGen draws items of one type: a base, and edits of a version, each
+// a new version as one device would write it.
+type itemGen struct {
+	base   func() any
+	mutate func(x any) any
+}
+
+// kind picks a type and returns its generator. Half the draws are hosts,
+// which have the most members, units and couplings.
+func (g gen) kind(t testing.TB) itemGen {
+	half := func() bool { return g.pick(2) == 0 }
+	switch g.pick(8) {
 	case 0:
-		sn := model.Snippet{Header: model.Header{V: 1, ItemID: mustID(t, idSnip), Type: model.TypeSnippet, ItemVersion: 1}, Name: "restart", Command: "c", Params: []string{}, Description: "d"}
 		mut := func(x model.Snippet) model.Snippet {
-			if g.pick(2) == 0 {
+			x.Params = slices.Clone(x.Params)
+			if half() {
 				x.Name = []string{"restart", "status"}[g.pick(2)]
 			}
-			if g.pick(2) == 0 {
+			if half() {
 				x.Command = []string{"c", "d"}[g.pick(2)]
 			}
-			if g.pick(2) == 0 {
+			if g.pick(3) == 0 {
+				x.Params = slices.Clone(genParams[g.pick(len(genParams))])
+			}
+			if half() {
 				x.Description = []string{"d", "e", "f"}[g.pick(3)]
 			}
 			return x
 		}
-		b := mut(sn)
-		return itemOf(t, b, 1), itemOf(t, mut(b), 2), itemOf(t, mut(b), 7)
+		sn := model.Snippet{Header: model.Header{V: 1, ItemID: mustID(t, idSnip), Type: model.TypeSnippet, ItemVersion: 1}, Name: "restart", Command: "c", Params: []string{}, Description: "d"}
+		return itemGen{func() any { return mut(sn) }, func(x any) any { return mut(x.(model.Snippet)) }}
 	case 1:
-		c := model.Credential{Header: model.Header{V: 1, ItemID: mustID(t, idCred), Type: model.TypeCredential, ItemVersion: 1}, Name: "n", Username: "u", Password: "p"}
 		mut := func(x model.Credential) model.Credential {
-			if g.pick(2) == 0 {
+			if g.pick(3) == 0 {
+				x.Name = []string{"n", "m"}[g.pick(2)]
+			}
+			if half() {
 				x.Username = []string{"u", "v"}[g.pick(2)]
 			}
-			if g.pick(2) == 0 {
+			if half() {
 				x.Password = []string{"p", "q"}[g.pick(2)]
 			}
 			return x
 		}
-		return itemOf(t, c, 1), itemOf(t, mut(c), 2), itemOf(t, mut(c), 7)
+		c := model.Credential{Header: model.Header{V: 1, ItemID: mustID(t, idCred), Type: model.TypeCredential, ItemVersion: 1}, Name: "n", Username: "u", Password: "p"}
+		return itemGen{func() any { return c }, func(x any) any { return mut(x.(model.Credential)) }}
 	case 2:
-		p := model.Policy{Header: model.Header{V: 1, ItemID: mustID(t, idHost2), Type: model.TypePolicy, ItemVersion: 1}}
 		mut := func(x model.Policy) model.Policy {
-			if g.pick(2) == 0 {
+			if half() {
 				x.MaxOffline = []uint64{0, 3600, 7200}[g.pick(3)]
 			}
 			return x
 		}
-		return itemOf(t, p, 1), itemOf(t, mut(p), 2), itemOf(t, mut(p), 7)
+		p := model.Policy{Header: model.Header{V: 1, ItemID: mustID(t, idHost2), Type: model.TypePolicy, ItemVersion: 1}}
+		return itemGen{func() any { return p }, func(x any) any { return mut(x.(model.Policy)) }}
+	case 3:
+		// The key unit is every member: a rotation changes the type and
+		// both halves together, a rename only the name.
+		mut := func(x model.Key) model.Key {
+			if g.pick(3) == 0 {
+				x.Name = []string{"k", "deploy"}[g.pick(2)]
+			}
+			if g.pick(3) == 0 {
+				i := g.pick(3)
+				x.KeyType = []string{"ed25519", "ecdsa-p256", "rsa"}[i]
+				x.PrivateKey = []string{"PRIV-ed", "PRIV-ec", "PRIV-rsa"}[i]
+				x.PublicKey = []string{"ssh-ed25519 AAAAed", "ecdsa-sha2-nistp256 AAAAec", "ssh-rsa AAAArsa"}[i]
+			}
+			if g.pick(4) == 0 {
+				x.DedicatedGrant = []model.ID{{}, mustID(t, idHost2)}[g.pick(2)]
+			}
+			return x
+		}
+		k := model.Key{Header: model.Header{V: 1, ItemID: mustID(t, idKey), Type: model.TypeKey, ItemVersion: 1},
+			Name: "k", KeyType: "ed25519", PrivateKey: "PRIV-ed", PublicKey: "ssh-ed25519 AAAAed"}
+		return itemGen{func() any { return mut(k) }, func(x any) any { return mut(x.(model.Key)) }}
 	}
-	b := g.baseHost(t)
-	pw, ps := 0.15+0.3*g.r.Float64(), 0.15+0.3*g.r.Float64()
-	return itemOf(t, b, 1), itemOf(t, g.mutateHost(t, b, pw), 2), itemOf(t, g.mutateHost(t, b, ps), 7)
+	return itemGen{
+		func() any { return g.baseHost(t) },
+		func(x any) any { return g.mutateHost(t, x.(model.Host), 0.15+0.3*g.r.Float64()) },
+	}
+}
+
+// triple draws (seen, want, S) of one type.
+func (g gen) triple(t testing.TB) (seen, want, s *Item) {
+	k := g.kind(t)
+	b := k.base()
+	return itemOf(t, b, 1), itemOf(t, k.mutate(b), 2), itemOf(t, k.mutate(b), 7)
 }
 
 func sameResult(a, b Result) bool {
@@ -407,13 +458,200 @@ func TestRev17Properties(t *testing.T) {
 	}
 }
 
+// P6, chained queues: this device queues several changes to one item,
+// each seen as the one before it, while another device's change is
+// already on the server. They are rebased one after the other, each
+// against what the one before left (§2.5: a later record keeps its
+// original seen), and a held one is resolved with take theirs (the record
+// is dropped), keep mine or a --merge proposal. Every step has the
+// properties above (P6 among them: a member the step's change did not
+// touch keeps the value before it, so a change take theirs dropped never
+// comes back with the next one). Over the whole chain, a member that no
+// change still standing touched keeps the server's value, unless the user
+// confirmed a --merge proposal that set it; and every value comes from the
+// base, the server's version or a queued change (no invention).
+func TestRev17ChainedQueues(t *testing.T) {
+	g := gen{rand.New(rand.NewPCG(17, 6))}
+	var steps, holds, afterHold, resolved int
+	for range 4000 {
+		k := g.kind(t)
+		vs := []any{k.base()}
+		for range 2 + g.pick(3) {
+			vs = append(vs, k.mutate(vs[len(vs)-1]))
+		}
+		ws := make([]*Item, len(vs))
+		for i, v := range vs {
+			ws[i] = itemOf(t, v, uint64(1+i))
+		}
+		s0 := itemOf(t, k.mutate(vs[0]), 9)
+		cur, held := s0, false
+		confirmed := map[string]bool{} // set by a confirmed --merge proposal
+		kept := map[string]bool{}      // touched by a change that was written
+		for i := 1; i < len(ws); i++ {
+			in := put(ws[i-1], ws[i])
+			checkProperties(t, ws[i-1], ws[i], cur)
+			steps++
+			if held {
+				afterHold++
+			}
+			res := Rebuild(in, cur, true, false)
+			fail := func(what string) {
+				t.Helper()
+				t.Fatalf("step %d: %s\n seen %s\n want %s\n cur  %s\n %+v", i, what, ws[i-1].Plaintext(), ws[i].Plaintext(), cur.Plaintext(), res)
+			}
+			keep := func() {
+				for _, m := range diff(ws[i], ws[i-1]) {
+					kept[m] = true
+				}
+			}
+			switch res.Kind {
+			case KindWrite:
+				keep()
+				cur = res.Plaintext
+			case KindHold:
+				holds++
+				held = true
+				var r Intent
+				var err error
+				choice := g.pick(4)
+				switch choice {
+				case 0:
+					continue // take theirs: the record is dropped
+				case 1:
+					r, err = KeepMine(in, res.Cause, cur)
+				case 2:
+					r, err = KeepMineMerge(in, res.Cause, cur)
+				default:
+					r, err = TakeTheirsMerge(in, res.Cause, cur)
+				}
+				if errors.Is(err, ErrRefused) {
+					continue // not offered: take theirs instead
+				}
+				if err != nil {
+					fail("resolution: " + err.Error())
+				}
+				w := Rebuild(r, cur, true, false)
+				if w.Kind != KindWrite {
+					fail("a resolution against the S it was made for does not write")
+				}
+				resolved++
+				keep()
+				if choice >= 2 {
+					for _, m := range diff(w.Plaintext, cur) {
+						confirmed[m] = true
+					}
+				}
+				cur = w.Plaintext
+			}
+		}
+		for _, m := range names(append([]*Item{s0, cur}, ws...)...) {
+			if headerMember(m) {
+				continue
+			}
+			if !kept[m] && !confirmed[m] && !memberEqual(cur, s0, m) {
+				t.Fatalf("P6: no change still standing touched %s, and the server's value did not survive\n S %s\n end %s", m, s0.Plaintext(), cur.Plaintext())
+			}
+			if fromAny(cur, m, s0, ws...) {
+				continue
+			}
+			t.Fatalf("P5 over the chain: %s was invented\n end %s", m, cur.Plaintext())
+		}
+	}
+	t.Logf("%d steps, %d holds, %d steps after a hold, %d resolved", steps, holds, afterHold, resolved)
+	if holds < 300 || afterHold < 300 || resolved < 100 {
+		t.Errorf("weak chains: %d steps, %d holds, %d steps after a hold, %d resolved", steps, holds, afterHold, resolved)
+	}
+}
+
+func headerMember(m string) bool { return slices.Contains(headerMembers[:], m) }
+
+// fromAny reports whether w's m is the value of m in one of the sources or,
+// for a set member, whether each of its strings is in one of them.
+func fromAny(w *Item, m string, s *Item, ws ...*Item) bool {
+	srcs := append([]*Item{s}, ws...)
+	for _, src := range srcs {
+		if memberEqual(w, src, m) {
+			return true
+		}
+	}
+	cl := classifications[w.typ]
+	if cl == nil || cl.sets[m] == nil {
+		return false
+	}
+	got, _ := stringList(w, m)
+	for _, x := range got {
+		found := false
+		for _, src := range srcs {
+			l, _ := stringList(src, m)
+			found = found || slices.Contains(l, x)
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// inject puts an arbitrary string into one of the three versions, beyond
+// the generator's small domains: as a tag or an alias (any spelling, any
+// class key), as the name, or as the value of a member no classification
+// lists, which sends the item to the rev 16 fallback.
+func inject(items []*Item, which uint8, extra string) ([]*Item, bool) {
+	if !utf8.ValidString(extra) {
+		return nil, false
+	}
+	raw, err := canonjson.Marshal(extra)
+	if err != nil {
+		return nil, false
+	}
+	i := int(which/4) % len(items)
+	it := items[i]
+	var set map[string]canonjson.Raw
+	switch m := []string{"tags", "aliases", "name", "x_unlisted"}[which%4]; m {
+	case "tags", "aliases":
+		l, ok := stringList(it, m)
+		if !ok {
+			return items, true
+		}
+		set = map[string]canonjson.Raw{m: encodeList(append(l, extra))}
+	case "name":
+		if _, ok := it.members[m]; !ok {
+			return items, true
+		}
+		set = map[string]canonjson.Raw{m: raw}
+	default:
+		set = map[string]canonjson.Raw{m: raw}
+	}
+	nit, err := it.with(set)
+	if err != nil {
+		return nil, false
+	}
+	out := slices.Clone(items)
+	out[i] = nit
+	return out, true
+}
+
+// The fuzz target draws from the generator and then injects an arbitrary
+// string, so that fuzzing reaches strings, class keys and unclassified
+// members the small domains above never produce. Without -fuzz, go test
+// runs the seeds below.
 func FuzzRev17Properties(f *testing.F) {
 	for i := range uint64(32) {
-		f.Add(i, i*7919)
+		f.Add(i, i*7919, "", uint8(i))
 	}
-	f.Fuzz(func(t *testing.T, a, b uint64) {
+	for i, s := range []string{"PROD", "ſ", "K", "İ", "ß", "ﬀ", " db", "db.", "web", "Web", "\u00a0prod", "ǅ"} {
+		f.Add(uint64(100+i), uint64(i), s, uint8(i))
+	}
+	f.Fuzz(func(t *testing.T, a, b uint64, extra string, which uint8) {
 		g := gen{rand.New(rand.NewPCG(a, b))}
 		seen, want, s := g.triple(t)
+		if extra != "" {
+			items, ok := inject([]*Item{seen, want, s}, which, extra)
+			if !ok {
+				t.Skip("not a string an item can hold")
+			}
+			seen, want, s = items[0], items[1], items[2]
+		}
 		checkProperties(t, seen, want, s)
 	})
 }

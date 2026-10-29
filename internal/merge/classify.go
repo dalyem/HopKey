@@ -119,3 +119,31 @@ func (c *classification) unit(name string) unit {
 	}
 	return unit{}
 }
+
+// ConflictMembers is every member of a conflict on an item of type t, for
+// showing it whole (§2.11): for a unit conflict, every member of the unit;
+// for a class conflict, its set member; for a coupling, every member of
+// the coupled group and the members of its trigger. Whatever either side
+// changed in it is included too. Sorted.
+func ConflictMembers(t model.Type, c Conflict) []string {
+	cl := classifications[t]
+	out := slices.Concat(c.Local, c.Remote)
+	switch c.Kind {
+	case ConflictUnit:
+		if cl != nil {
+			out = append(out, cl.unit(c.Name).members...)
+		}
+	case ConflictClass:
+		out = append(out, c.Name)
+	case ConflictCoupling:
+		if cl != nil {
+			for _, cp := range cl.couplings {
+				if cp.name == c.Name {
+					out = append(out, cl.unit(cp.group).members...)
+				}
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}

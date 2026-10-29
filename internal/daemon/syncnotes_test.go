@@ -471,14 +471,26 @@ func TestCouplingHoldOffersMergeProposals(t *testing.T) {
 	x.n2.must(OpSyncHeld, nil, &held)
 	hc := held.Held[0]
 	if hc.Hold == nil || len(hc.Hold.Conflicts) != 1 || hc.Hold.Conflicts[0].Name != merge.CouplingSelectorAdded ||
-		hc.KeepMineMerge == nil || hc.TakeTheirsMerge == nil ||
+		hc.KeepMineMergeRefused != "" || hc.TakeTheirsMergeRefused != "" ||
 		!slices.Contains(hc.Choices, ChoiceKeepMineMerge) || !slices.Contains(hc.Choices, ChoiceTakeTheirsMerge) {
 		t.Fatalf("held %+v", hc)
+	}
+	// The listing names the --merge choices; sync.proposal has their
+	// proposals. Keep mine's stays in the listing, as before rev 17.
+	var km, tm SyncProposalResult
+	x.n2.must(OpSyncProposal, SyncProposalParams{N: hc.N, Choice: ChoiceKeepMineMerge}, &km)
+	x.n2.must(OpSyncProposal, SyncProposalParams{N: hc.N, Choice: ChoiceTakeTheirsMerge}, &tm)
+	if hc.KeepMine == nil || km.Proposal == nil || tm.Proposal == nil || km.Proposal.Confirm == tm.Proposal.Confirm ||
+		km.Proposal.Confirm == hc.KeepMine.Confirm {
+		t.Fatalf("proposals: keep mine %+v, --merge %+v and %+v", hc.KeepMine, km.Proposal, tm.Proposal)
+	}
+	if err := x.n2.call(OpSyncProposal, SyncProposalParams{N: hc.N + 1, Choice: ChoiceKeepMineMerge}, nil); !IsCode(err, CodeNotHeld) {
+		t.Errorf("a record that is not the held one: %v", err)
 	}
 	// take theirs --merge: the desk's address, no alias, the laptop's
 	// description.
 	var res SyncResolveResult
-	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceTakeTheirsMerge, Confirm: hc.TakeTheirsMerge.Confirm}, &res)
+	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceTakeTheirsMerge, Confirm: tm.Proposal.Confirm}, &res)
 	eventually(t, 5*time.Second, "the merge reaches the desk", func() bool {
 		got := x.n1.host("web3")
 		return got != nil && got.Description == "from the laptop"

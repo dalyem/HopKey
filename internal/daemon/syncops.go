@@ -21,7 +21,7 @@ import (
 // dispatchSync handles the sync ops. handled is false for any other op.
 func (d *Daemon) dispatchSync(ctx context.Context, req Request) (result any, handled bool, err error) {
 	switch req.Op {
-	case OpSyncStatus, OpSyncNow, OpSyncHeld, OpSyncResolve, OpDevicesList:
+	case OpSyncStatus, OpSyncNow, OpSyncHeld, OpSyncProposal, OpSyncResolve, OpDevicesList:
 	default:
 		return nil, false, nil
 	}
@@ -47,6 +47,13 @@ func (d *Daemon) dispatchSync(ctx context.Context, req Request) (result any, han
 			return nil, true, err
 		}
 		res, err := d.opSyncHeld()
+		return res, true, err
+	case OpSyncProposal:
+		var p SyncProposalParams
+		if err := decodeStrict(req, &p); err != nil {
+			return nil, true, err
+		}
+		res, err := d.opSyncProposal(p)
 		return res, true, err
 	case OpSyncResolve:
 		var p SyncResolveParams
@@ -287,7 +294,11 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 	return &out
 }
 
-// opSyncHeld lists the held outbox head with its keep-mine proposal.
+// opSyncHeld lists the held outbox head with its keep-mine proposal. It
+// names the --merge choices it offers but leaves their proposals to
+// opSyncProposal: the response carries the item at most five times over
+// (seen, want, current, and keep-mine's seen and want), which is what it
+// always carried.
 func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 	st := d.sync.st
 	h, err := st.HeldHead()
@@ -304,36 +315,70 @@ func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 		Choices: []string{},
 	}
 	if !h.Import {
-		propose := func(c merge.Choice, into **Proposal, refused *string) {
-			if p, err := st.Propose(store.Resolution{Choice: c}); err == nil {
-				*into = d.sync.proposalOf(p)
-			} else {
-				*refused = err.Error()
-			}
+		if p, err := st.Propose(store.Resolution{Choice: merge.ChoiceKeepMine}); err == nil {
+			hc.KeepMine = d.sync.proposalOf(p)
+		} else {
+			hc.KeepMineRefused = err.Error()
 		}
-		propose(merge.ChoiceKeepMine, &hc.KeepMine, &hc.KeepMineRefused)
 		// The --merge proposals exist only for a hold on a unit, class or
 		// coupling conflict; there is nothing to say otherwise.
-		if h.Hold != nil && len(h.Hold.Conflicts) > 0 {
-			propose(merge.ChoiceKeepMineMerge, &hc.KeepMineMerge, &hc.KeepMineMergeRefused)
-			propose(merge.ChoiceTakeTheirsMerge, &hc.TakeTheirsMerge, &hc.TakeTheirsMergeRefused)
+		offered := func(c merge.Choice, refused *string) bool {
+			if h.Hold == nil || len(h.Hold.Conflicts) == 0 {
+				return false
+			}
+			if _, err := st.Propose(store.Resolution{Choice: c}); err != nil {
+				*refused = err.Error()
+				return false
+			}
+			return true
 		}
+		keepMerge := offered(merge.ChoiceKeepMineMerge, &hc.KeepMineMergeRefused)
+		theirsMerge := offered(merge.ChoiceTakeTheirsMerge, &hc.TakeTheirsMergeRefused)
 		if hc.KeepMine != nil {
 			hc.Choices = append(hc.Choices, ChoiceKeepMine)
 		}
-		if hc.KeepMineMerge != nil {
+		if keepMerge {
 			hc.Choices = append(hc.Choices, ChoiceKeepMineMerge)
 		}
 		if h.Hold != nil && editable(h.Type) {
 			hc.Choices = append(hc.Choices, ChoiceEdit)
 		}
-		if hc.TakeTheirsMerge != nil {
+		if theirsMerge {
 			hc.Choices = append(hc.Choices, ChoiceTakeTheirsMerge)
 		}
 		hc.Choices = append(hc.Choices, ChoiceTakeTheirs, ChoiceRetry)
 	}
 	out.Held = append(out.Held, hc)
 	return out, nil
+}
+
+// opSyncProposal returns the proposal of one --merge choice for the held
+// record p.N, with its token: one item twice over, whatever its size.
+func (d *Daemon) opSyncProposal(p SyncProposalParams) (*SyncProposalResult, error) {
+	choice, err := parseChoice(p.Choice)
+	if err != nil {
+		return nil, err
+	}
+	if choice != merge.ChoiceKeepMineMerge && choice != merge.ChoiceTakeTheirsMerge {
+		return nil, invalidf("only %s and %s are proposed here; keep-mine's proposal is in %s, and edit's comes from %s with propose",
+			ChoiceKeepMineMerge, ChoiceTakeTheirsMerge, OpSyncHeld, OpSyncResolve)
+	}
+	st := d.sync.st
+	h, err := st.HeldHead()
+	if err != nil {
+		return nil, syncError(err)
+	}
+	if h == nil || h.N != p.N {
+		return nil, &Error{Code: CodeNotHeld, Message: fmt.Sprintf("queued change %d is not the held one; list it again with hop sync", p.N)}
+	}
+	prop, err := st.Propose(store.Resolution{Choice: choice})
+	if err != nil {
+		return nil, syncError(err)
+	}
+	if prop.N != p.N {
+		return nil, &Error{Code: CodeNotHeld, Message: fmt.Sprintf("queued change %d is not the held one; list it again with hop sync", p.N)}
+	}
+	return &SyncProposalResult{Proposal: d.sync.proposalOf(prop)}, nil
 }
 
 // editable reports whether an item type can be edited over the control
