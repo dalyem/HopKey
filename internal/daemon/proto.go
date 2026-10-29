@@ -389,21 +389,26 @@ type HeldChange struct {
 	Seen    json.RawMessage `json:"seen"`
 	Want    json.RawMessage `json:"want"`
 	Current json.RawMessage `json:"current"`
-	// Hold says why it is held now; nil if a retry would apply it.
+	// Hold says why it is held now; nil if a retry would apply it. Its
+	// conflicts name members, never values: whatever strings a class
+	// conflict is about are in Seen, Want and Current
+	// (merge.ConflictSpellings).
 	Hold *store.HoldInfo `json:"hold"`
 	// Choices are the resolutions on offer: keep-mine, keep-mine-merge,
 	// edit, take-theirs-merge, take-theirs and retry, less what the hold
 	// refuses.
 	Choices []string `json:"choices"`
 	// KeepMine is what keep-mine would write, with its token, or nil
-	// when keep-mine is refused (KeepMineRefused says why).
+	// when keep-mine is refused (KeepMineRefused says why). It was
+	// computed from this Current and Hold, so it leaves its own out.
 	KeepMine        *Proposal `json:"keep_mine,omitempty"`
 	KeepMineRefused string    `json:"keep_mine_refused,omitempty"`
 	// KeepMineMergeRefused and TakeTheirsMergeRefused say why a hold on a
 	// unit, class or coupling conflict (rev 17) does not offer
 	// keep-mine-merge or take-theirs-merge. The proposals themselves come
 	// from OpSyncProposal, one at a time: each is a full copy of the item
-	// twice over, and with them a large item would not fit in one response.
+	// three times over, and with them a large item would not fit in one
+	// response.
 	KeepMineMergeRefused   string `json:"keep_mine_merge_refused,omitempty"`
 	TakeTheirsMergeRefused string `json:"take_theirs_merge_refused,omitempty"`
 }
@@ -416,7 +421,9 @@ type SyncProposalParams struct {
 	Choice string `json:"choice"`
 }
 
-// SyncProposalResult answers OpSyncProposal.
+// SyncProposalResult answers OpSyncProposal. The proposal carries the
+// server's version and the hold it was computed from, which may be newer
+// than the listing's.
 type SyncProposalResult struct {
 	Proposal *Proposal `json:"proposal"`
 }
@@ -426,7 +433,8 @@ type SyncProposalResult struct {
 // this daemon process holds, of the proposal's §5.4 digest, which covers
 // the secrets left out of Seen and Want. It reveals nothing about them,
 // and it no longer confirms once the daemon restarts or anything in the
-// replacement changes, secrets included.
+// replacement changes, secrets included, or the server's version or the
+// hold it was computed from does.
 type Proposal struct {
 	N       uint64          `json:"n"`
 	Choice  string          `json:"choice"`
@@ -437,6 +445,13 @@ type Proposal struct {
 	Want    json.RawMessage `json:"want"`
 	NewID   string          `json:"new_id,omitempty"` // pass back in SyncResolveParams
 	Confirm string          `json:"confirm"`          // pass back as SyncResolveParams.Confirm
+	// Current (null when absent) and Hold are the server's version of the
+	// item, redacted, and why the record is held, as the proposal was
+	// computed from them: what to show beside it. OpSyncProposal and a
+	// Propose call carry them; the listing's keep-mine proposal leaves them
+	// out (HeldChange.KeepMine), as does a daemon older than rev 17.
+	Current json.RawMessage `json:"current,omitempty"`
+	Hold    *store.HoldInfo `json:"hold,omitempty"`
 }
 
 // Resolution choices.

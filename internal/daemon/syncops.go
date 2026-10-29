@@ -294,16 +294,44 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 	return &out
 }
 
+// heldTries is how many times opSyncHeld reads the held head again when
+// the server's version moved between reading it and proposing keep-mine.
+const heldTries = 3
+
 // opSyncHeld lists the held outbox head with its keep-mine proposal. It
 // names the --merge choices it offers but leaves their proposals to
 // opSyncProposal: the response carries the item at most five times over
 // (seen, want, current, and keep-mine's seen and want), which is what it
-// always carried.
+// always carried. The hold's conflicts name members only, so they add
+// nothing of the item's size.
 func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 	st := d.sync.st
-	h, err := st.HeldHead()
-	if err != nil {
-		return nil, syncError(err)
+	var h *store.HeldRecord
+	var km *store.Proposal
+	kmErr := ""
+	for try := 1; ; try++ {
+		var err error
+		if h, err = st.HeldHead(); err != nil {
+			return nil, syncError(err)
+		}
+		if h == nil || h.Import {
+			break
+		}
+		p, err := st.Propose(store.Resolution{Choice: merge.ChoiceKeepMine})
+		if err != nil {
+			km, kmErr = nil, err.Error()
+			break
+		}
+		// The listing shows keep-mine beside its own Current and Hold, so
+		// they must be the ones it was computed from.
+		if p.N == h.N && bytes.Equal(p.Current, h.Current) && sameHold(p.Hold, h.Hold) {
+			km, kmErr = &p, ""
+			break
+		}
+		if try == heldTries {
+			km, kmErr = nil, "the server's version kept changing while it was listed: list it again"
+			break
+		}
 	}
 	out := &SyncHeldResult{Held: []HeldChange{}}
 	if h == nil {
@@ -315,10 +343,11 @@ func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 		Choices: []string{},
 	}
 	if !h.Import {
-		if p, err := st.Propose(store.Resolution{Choice: merge.ChoiceKeepMine}); err == nil {
-			hc.KeepMine = d.sync.proposalOf(p)
+		if km != nil {
+			hc.KeepMine = d.sync.proposalOf(*km)
+			hc.KeepMine.Current, hc.KeepMine.Hold = nil, nil
 		} else {
-			hc.KeepMineRefused = err.Error()
+			hc.KeepMineRefused = kmErr
 		}
 		// The --merge proposals exist only for a hold on a unit, class or
 		// coupling conflict; there is nothing to say otherwise.
@@ -353,7 +382,8 @@ func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 }
 
 // opSyncProposal returns the proposal of one --merge choice for the held
-// record p.N, with its token: one item twice over, whatever its size.
+// record p.N, with its token and the server's version and hold it was
+// computed from: one item three times over, whatever its size.
 func (d *Daemon) opSyncProposal(p SyncProposalParams) (*SyncProposalResult, error) {
 	choice, err := parseChoice(p.Choice)
 	if err != nil {
@@ -381,6 +411,25 @@ func (d *Daemon) opSyncProposal(p SyncProposalParams) (*SyncProposalResult, erro
 	return &SyncProposalResult{Proposal: d.sync.proposalOf(prop)}, nil
 }
 
+// sameHold reports whether a and b hold for the same reason. Reason, an
+// error's text, is left out.
+func sameHold(a, b *store.HoldInfo) bool {
+	return bytes.Equal(holdBytes(a), holdBytes(b))
+}
+
+// holdBytes encodes what a hold says, less its Reason: the cause, the
+// members each side changed and the conflicts.
+func holdBytes(h *store.HoldInfo) []byte {
+	if h == nil {
+		return nil
+	}
+	b, err := json.Marshal(store.HoldInfo{Cause: h.Cause, Local: h.Local, Remote: h.Remote, Conflicts: h.Conflicts})
+	if err != nil {
+		panic(err) // strings and lists of strings
+	}
+	return b
+}
+
 // editable reports whether an item type can be edited over the control
 // socket: keys and credentials hold secrets that never cross it.
 func editable(t model.Type) bool { return t == model.TypeHost || t == model.TypeSnippet }
@@ -391,6 +440,7 @@ func (e *syncer) proposalOf(p store.Proposal) *Proposal {
 	out := &Proposal{
 		N: p.N, Choice: choiceName(p.Choice), Action: p.Action, ItemID: p.ItemID.String(), Type: p.Type,
 		Seen: redacted(p.Type, p.Seen), Want: redacted(p.Type, p.Want), Confirm: e.confirmToken(p).String(),
+		Current: redacted(p.Type, p.Current), Hold: p.Hold,
 	}
 	if !p.NewID.IsZero() {
 		out.NewID = p.NewID.String()
@@ -399,16 +449,23 @@ func (e *syncer) proposalOf(p store.Proposal) *Proposal {
 }
 
 // confirmToken is the token that confirms p: HMAC-SHA256, keyed with
-// this daemon's random confirmKey, of n and the store's digest c (§5.4).
-// c hashes the full replacement, a credential's password and a key's
+// this daemon's random confirmKey, of n, the store's digest c (§5.4), and
+// the server's version and the hold the proposal was computed from. c
+// hashes the full replacement, a credential's password and a key's
 // private key included, so on its own it would let anyone holding the
 // redacted proposal test guesses at them; the token is useless without
-// the key, and it still changes whenever c does.
+// the key, and it still changes whenever c does. With the server's version
+// and the hold in it, it also stops confirming once what was shown beside
+// the proposal is out of date, even if the replacement is not.
 func (e *syncer) confirmToken(p store.Proposal) crypto.Hash {
 	m := hmac.New(sha256.New, e.confirmKey[:])
-	m.Write([]byte("hopkey/daemon/resolve-confirm\x00"))
+	m.Write([]byte("hopkey/daemon/resolve-confirm\x01"))
 	m.Write(binary.BigEndian.AppendUint64(nil, p.N))
 	m.Write(p.Digest[:])
+	for _, b := range [][]byte{p.Current, holdBytes(p.Hold)} {
+		m.Write(binary.BigEndian.AppendUint64(nil, uint64(len(b))))
+		m.Write(b)
+	}
 	var out crypto.Hash
 	copy(out[:], m.Sum(nil))
 	return out

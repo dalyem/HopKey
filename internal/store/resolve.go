@@ -82,6 +82,12 @@ type Proposal struct {
 	Seen, Want []byte
 	NewID      model.ID
 	Digest     crypto.Hash
+	// Current is the item in verified state (nil when absent) and Hold
+	// why the record is held, as they were when the replacement was
+	// computed from them, under the same lock: what a confirmation shows
+	// beside the replacement.
+	Current []byte
+	Hold    *HoldInfo
 }
 
 // HeldHead returns the held outbox head, or nil if the head is not held.
@@ -151,6 +157,12 @@ func (s *Store) Propose(r Resolution) (Proposal, error) {
 		return Proposal{}, err
 	}
 	p.Action, p.ItemID, p.Type, p.NewID, p.Digest = repl.Action, repl.ItemID, repl.Type, newID, d
+	p.Hold = holdInfo(ev.res)
+	if cur, err := s.verifiedItem(rec.Intent.ItemID); err != nil {
+		return Proposal{}, err
+	} else if cur != nil {
+		p.Current = cur.Plaintext()
+	}
 	if repl.Seen != nil {
 		p.Seen = repl.Seen.Plaintext()
 	}

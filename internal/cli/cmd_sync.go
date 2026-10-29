@@ -17,6 +17,7 @@ import (
 	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/shellcmd"
+	"github.com/dalyem/hopkey/internal/store"
 )
 
 // The daemon syncs on its own (design: "Automatic sync"). hop sync is an
@@ -537,7 +538,7 @@ func (r *resolver) mergeProposal(n uint64, choice string) (*daemon.Proposal, err
 	if p == nil || p.N != n || p.Choice != choice {
 		return nil, failf("the daemon returned no %s proposal for change %d", strings.TrimPrefix(choiceFlags(choice), "--"), n)
 	}
-	p.Seen, p.Want = stripSecrets(p.Seen), stripSecrets(p.Want)
+	p.Seen, p.Want, p.Current = stripSecrets(p.Seen), stripSecrets(p.Want), stripSecrets(p.Current)
 	return p, nil
 }
 
@@ -629,8 +630,9 @@ func unitText(name string) string {
 }
 
 // conflictText explains one conflict of a held change: which fields, what
-// each side did, and, for a coupling, its name and why it holds.
-func conflictText(c merge.Conflict) string {
+// each side did, and, for a coupling, its name and why it holds. spellings
+// are the strings it is about (merge.ConflictSpellings).
+func conflictText(c merge.Conflict, spellings []string) string {
 	here, there := dash(joinOne(c.Local, ", ")), dash(joinOne(c.Remote, ", "))
 	switch c.Kind {
 	case merge.ConflictUnit:
@@ -640,7 +642,7 @@ func conflictText(c merge.Conflict) string {
 		if c.Name == "aliases" {
 			what = "alias"
 		}
-		return fmt.Sprintf("%s: the same %s was changed differently on each side (%s)", oneLine(c.Name), what, quotedList(c.Spellings))
+		return fmt.Sprintf("%s: the same %s was changed differently on each side (%s)", oneLine(c.Name), what, quotedList(spellings))
 	case merge.ConflictCoupling:
 		who, other := "this device", "the server"
 		trig, grp := c.Local, c.Remote
@@ -652,8 +654,8 @@ func conflictText(c merge.Conflict) string {
 		switch c.Name {
 		case merge.CouplingSelectorAdded:
 			what = fmt.Sprintf("%s gave it a new name, alias or tag (%s", who, joinOne(trig, ", "))
-			if len(c.Spellings) > 0 {
-				what += ": " + quotedList(c.Spellings)
+			if len(spellings) > 0 {
+				what += ": " + quotedList(spellings)
 			}
 			what += ")"
 		case merge.CouplingAgentWidening:
@@ -667,9 +669,33 @@ func conflictText(c merge.Conflict) string {
 	return fmt.Sprintf("%s %s: here %s; on the server %s", oneLine(string(c.Kind)), oneLine(c.Name), here, there)
 }
 
+// conflictLines explain each conflict of hold, a hold on a put from seen to
+// want while the server has cur. The daemon names a conflict's members
+// only; the strings a class conflict or an added selector is about come
+// from the three versions.
+func conflictLines(t model.Type, seen, want, cur json.RawMessage, hold *store.HoldInfo) []string {
+	if hold == nil || len(hold.Conflicts) == 0 {
+		return nil
+	}
+	items := make([]*merge.Item, 3)
+	for i, raw := range []json.RawMessage{seen, want, cur} {
+		if _, ok := members(raw); ok {
+			items[i], _ = merge.ParseItem(raw)
+		}
+	}
+	var out []string
+	for _, c := range hold.Conflicts {
+		out = append(out, conflictText(c, merge.ConflictSpellings(t, items[0], items[1], items[2], c)))
+	}
+	return out
+}
+
 // quotedList shows strings as a JSON list, through exact, so that no two
 // values look alike.
 func quotedList(ss []string) string {
+	if ss == nil {
+		ss = []string{}
+	}
 	b, err := json.Marshal(ss)
 	if err != nil {
 		return "-"
@@ -725,8 +751,8 @@ func (r *resolver) describe(h *daemon.HeldChange) {
 		if len(h.Hold.Local) > 0 || len(h.Hold.Remote) > 0 {
 			e.printf("  changed: here %s; on the server %s\n", dash(joinOne(h.Hold.Local, ", ")), dash(joinOne(h.Hold.Remote, ", ")))
 		}
-		for _, c := range h.Hold.Conflicts {
-			e.printf("  conflict: %s\n", conflictText(c))
+		for _, l := range conflictLines(h.Type, h.Seen, h.Want, h.Current, h.Hold) {
+			e.printf("  conflict: %s\n", l)
 		}
 		if h.Hold.Reason != "" {
 			e.printf("  reason:  %s\n", oneLine(h.Hold.Reason))
@@ -820,14 +846,76 @@ func memberText(raw json.RawMessage, member string) string {
 	return exact(compact(v))
 }
 
+// snapshot is the server's version and the hold p was computed from: its
+// own, from sync.proposal or a propose call, or else the listing's (the
+// listing's keep-mine proposal, or a daemon older than rev 17).
+func snapshot(h *daemon.HeldChange, p *daemon.Proposal) (json.RawMessage, *store.HoldInfo) {
+	if p.Current == nil {
+		return h.Current, h.Hold
+	}
+	return p.Current, p.Hold
+}
+
+// moved reports whether the server's version or the hold p was computed
+// from is not the listing's: the server changed in between.
+func moved(h *daemon.HeldChange, p *daemon.Proposal) bool {
+	cur, hold := snapshot(h, p)
+	return compact(cur) != compact(h.Current) || !sameHold(hold, h.Hold)
+}
+
+// sameHold reports whether a and b say the same of a hold, Reason (an
+// error's text) aside.
+func sameHold(a, b *store.HoldInfo) bool {
+	enc := func(h *store.HoldInfo) string {
+		if h == nil {
+			return ""
+		}
+		j, _ := json.Marshal(store.HoldInfo{Cause: h.Cause, Local: h.Local, Remote: h.Remote, Conflicts: h.Conflicts})
+		return string(j)
+	}
+	return enc(a) == enc(b)
+}
+
+// showMoved says that the server changed between the listing and p, and
+// shows what p was computed from: why it is held now, and every field of
+// the server's version that is not as listed.
+func (r *resolver) showMoved(h *daemon.HeldChange, p *daemon.Proposal) {
+	if !moved(h, p) {
+		return
+	}
+	e := r.e
+	cur, hold := snapshot(h, p)
+	e.printf("the server's version of change %d's item changed since it was listed; this proposal is against it as it is now:\n", h.N)
+	if hold != nil {
+		e.printf("  why now:  %s\n", causeText(hold.Cause))
+		for _, l := range conflictLines(h.Type, h.Seen, h.Want, cur, hold) {
+			e.printf("  conflict: %s\n", l)
+		}
+	} else {
+		e.printf("  why now:  nothing holds it any more\n")
+	}
+	if fields := differing(h.Current, cur); len(fields) > 0 {
+		tw := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "  FIELD\tLISTED\tSERVER NOW")
+		for _, f := range fields {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\n", oneLine(f), memberText(h.Current, f), memberText(cur, f))
+		}
+		tw.Flush()
+	}
+}
+
 // showProposal prints what a keep-mine, edit or --merge choice would
 // write: for a delete, that it deletes; otherwise every field of each
 // conflict, whole (every member of a conflicting unit, and of a
 // coupling's group, changed or not), and every other field the
 // replacement changes against the server's version (marked), beside the
-// server's. A secret field is named but never shown.
+// server's. A secret field is named but never shown. The server's version
+// and the conflicts are those p was computed from, which its token
+// confirms; if they are not the listing's, it says so first.
 func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 	e := r.e
+	r.showMoved(h, p)
+	current, hold := snapshot(h, p)
 	what := "keep mine"
 	switch p.Choice {
 	case daemon.ChoiceEdit:
@@ -838,7 +926,7 @@ func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 		what = "take theirs --merge"
 	}
 	if p.Action == merge.ActionDelete {
-		e.printf("%s deletes %s %q (%s)\n", what, oneLine(string(p.Type)), oneLine(itemName(p.Seen, h.Current)), oneLine(p.ItemID))
+		e.printf("%s deletes %s %q (%s)\n", what, oneLine(string(p.Type)), oneLine(itemName(p.Seen, current)), oneLine(p.ItemID))
 		return
 	}
 	id := p.ItemID
@@ -848,19 +936,19 @@ func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 	e.printf("%s writes %s %s %q (%s); its fields would be:\n", what, oneLine(string(p.Action)), oneLine(string(p.Type)), oneLine(itemName(p.Want)), oneLine(id))
 	m, _ := members(p.Want)
 	shown := map[string]bool{}
-	if h.Hold != nil {
-		for _, k := range append(slices.Clone(h.Hold.Local), h.Hold.Remote...) {
+	if hold != nil {
+		for _, k := range append(slices.Clone(hold.Local), hold.Remote...) {
 			shown[k] = true
 		}
-		for _, c := range h.Hold.Conflicts {
+		for _, c := range hold.Conflicts {
 			for _, k := range merge.ConflictMembers(h.Type, c) {
 				shown[k] = true
 			}
 		}
 	}
-	cur, _ := members(h.Current)
+	cur, _ := members(current)
 	for k := range m {
-		if !slices.Contains(headerMembers, k) && compact(m[k]) != compactMember(h.Current, k) {
+		if !slices.Contains(headerMembers, k) && compact(m[k]) != compactMember(current, k) {
 			shown[k] = true
 		}
 	}
@@ -882,10 +970,10 @@ func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 			continue
 		}
 		mark := ""
-		if compact(m[k]) != compactMember(h.Current, k) {
+		if compact(m[k]) != compactMember(current, k) {
 			mark = "  (changes)"
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%s%s\n", oneLine(k), memberText(p.Want, k), memberText(h.Current, k), mark)
+		fmt.Fprintf(tw, "  %s\t%s\t%s%s\n", oneLine(k), memberText(p.Want, k), memberText(current, k), mark)
 	}
 	tw.Flush()
 	if len(fields) == 0 {
@@ -895,8 +983,8 @@ func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 	// server's version: past a coupling that is the very combination the
 	// coupling held apart. It stays allowed, as the user confirms it, but
 	// it says so.
-	if p.Choice == daemon.ChoiceKeepMine && h.Hold != nil {
-		for _, c := range h.Hold.Conflicts {
+	if p.Choice == daemon.ChoiceKeepMine && hold != nil {
+		for _, c := range hold.Conflicts {
 			if c.Kind == merge.ConflictCoupling {
 				e.printf("  note: this combines what coupling %s held apart; --keep-mine --merge keeps how it connects as yours\n", oneLine(c.Name))
 			}
@@ -1057,7 +1145,7 @@ func (r *resolver) propose(h *daemon.HeldChange, choice string, req request) (*d
 		return nil, nil, failf("the daemon returned no proposal for the edit")
 	}
 	p := res.Proposal
-	p.Seen, p.Want = stripSecrets(p.Seen), stripSecrets(p.Want)
+	p.Seen, p.Want, p.Current = stripSecrets(p.Seen), stripSecrets(p.Want), stripSecrets(p.Current)
 	return p, edited, nil
 }
 

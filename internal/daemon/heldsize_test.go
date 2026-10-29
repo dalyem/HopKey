@@ -1,10 +1,14 @@
 package daemon
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/dalyem/hopkey/internal/merge"
 )
 
 // bigTags is about 600 KiB of tags, as JSON.
@@ -104,5 +108,84 @@ func TestSyncProposalSchema(t *testing.T) {
 	}
 	if err := x.n1.call(OpSyncProposal, SyncProposalParams{N: 1, Choice: ChoiceKeepMineMerge}, nil); !IsCode(err, CodeNotHeld) {
 		t.Errorf("nothing held: %v", err)
+	}
+}
+
+// Every tag class respelled three ways (lower case where this device's
+// change started, upper case in its change, capitalized on the server)
+// races every class. The listing still fits, and so does each --merge
+// proposal, with take theirs resolving it: the conflicts name the tags
+// member only, never the 54,000 raced strings, which with the five copies
+// of the item would not fit in 4 MiB.
+func TestHeldRespelledTagsListAndResolve(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.w.start(x.n2, x.n2.st, SyncOptions{})
+	tags := bigTags()
+	respell := func(f func(string) string) []string {
+		out := make([]string, len(tags))
+		for i, s := range tags {
+			out[i] = f(s)
+		}
+		return out
+	}
+	upper := respell(strings.ToUpper)
+	capital := respell(func(s string) string { return strings.ToUpper(s[:1]) + s[1:] })
+	h := webHost("big", x.keyID, "203.0.113.61")
+	h.Tags = tags
+	x.n1.putHost(h)
+	eventually(t, 20*time.Second, "big reaches the laptop", func() bool { return x.n2.host("big") != nil })
+
+	x.n2.pause(true)
+	time.Sleep(100 * time.Millisecond)
+	desk := *x.n1.host("big")
+	desk.User, desk.Tags = "root", capital
+	x.n1.putHost(desk)
+	eventually(t, 20*time.Second, "the desk's edit is pushed", func() bool { return x.n1.status().Pending == 0 })
+	laptop := *x.n2.host("big")
+	laptop.Port, laptop.Description, laptop.Tags = 2222, "laptop", upper
+	x.n2.putHost(laptop)
+	x.n2.pause(false)
+	eventually(t, 20*time.Second, "the laptop's change is held", func() bool { return x.n2.status().Held == 1 })
+
+	var raw json.RawMessage
+	x.n2.must(OpSyncHeld, nil, &raw)
+	if len(raw) > maxRequest {
+		t.Fatalf("the listing is %d bytes", len(raw))
+	}
+	var held SyncHeldResult
+	if err := json.Unmarshal(raw, &held); err != nil || len(held.Held) != 1 {
+		t.Fatalf("held %s: %v", raw[:min(len(raw), 200)], err)
+	}
+	hc := held.Held[0]
+	if hc.Hold == nil || !slices.ContainsFunc(hc.Hold.Conflicts, func(c merge.Conflict) bool { return c.Kind == merge.ConflictClass && c.Name == "tags" }) {
+		t.Fatalf("hold %+v", hc.Hold)
+	}
+	// A regression only if the raced strings, every spelling of every
+	// tag, beside the five copies would not have fitted.
+	raced, _ := json.Marshal(slices.Concat(tags, upper, capital))
+	if n := 5*len(hc.Current) + len(raced); n <= maxRequest {
+		t.Fatalf("five copies and the raced strings are %d bytes: too small to test the limit", n)
+	}
+	if strings.Contains(string(raw), `"spellings"`) {
+		t.Error("the listing carries spellings")
+	}
+	if !slices.Contains(hc.Choices, ChoiceKeepMineMerge) || !slices.Contains(hc.Choices, ChoiceTakeTheirsMerge) || hc.KeepMine == nil {
+		t.Fatalf("choices %v, keep mine %v (%s)", hc.Choices, hc.KeepMine != nil, hc.KeepMineRefused)
+	}
+	for _, ch := range []string{ChoiceKeepMineMerge, ChoiceTakeTheirsMerge} {
+		var res SyncProposalResult
+		x.n2.must(OpSyncProposal, SyncProposalParams{N: hc.N, Choice: ch}, &res)
+		if p := res.Proposal; p == nil || p.N != hc.N || p.Choice != ch || p.Confirm == "" {
+			t.Fatalf("%s: %+v", ch, p)
+		}
+	}
+
+	var res SyncResolveResult
+	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceTakeTheirs}, &res)
+	eventually(t, 20*time.Second, "nothing is held", func() bool { return x.n2.status().Held == 0 })
+	got := x.n2.host("big")
+	if got == nil || got.User != "root" || got.Port != 22 || got.Description != "" || !slices.Equal(got.Tags, capital) {
+		t.Errorf("the laptop's host after take theirs: %+v", got)
 	}
 }

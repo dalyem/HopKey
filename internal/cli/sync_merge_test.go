@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dalyem/hopkey/internal/cli"
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/model"
@@ -41,7 +42,7 @@ func heldCoupling() daemon.SyncHeldResult {
 			Cause: merge.CauseGuardedConflict, Local: []string{"aliases"}, Remote: []string{"addresses"},
 			Conflicts: []merge.Conflict{{
 				Kind: merge.ConflictCoupling, Name: merge.CouplingSelectorAdded, Trigger: merge.TriggerLocal,
-				Local: []string{"aliases"}, Remote: []string{"addresses"}, Spellings: []string{"test-db"},
+				Local: []string{"aliases"}, Remote: []string{"addresses"},
 			}},
 		},
 		Choices: []string{daemon.ChoiceKeepMine, daemon.ChoiceKeepMineMerge, daemon.ChoiceEdit, daemon.ChoiceTakeTheirs, daemon.ChoiceRetry},
@@ -361,5 +362,118 @@ func TestSyncResolveShowsTheCoupledGroupAndNamesSecrets(t *testing.T) {
 	got = proposalFields(t, out, "keep mine writes")
 	if !slices.Contains(got, "password") || !regexp.MustCompile(`(?m)^  password +\(secret, not shown\)`).MatchString(out) {
 		t.Errorf("the credential's password is not named as a secret (shows %v):\n%s", got, out)
+	}
+}
+
+// heldPortUser is a connection conflict: this device changed the port and
+// the server the user.
+func heldPortUser() (daemon.SyncHeldResult, json.RawMessage) {
+	id := model.ID{1}.String()
+	seen := hostJSON(3, "old.example", "")
+	cur := withMembers(seen, map[string]any{"user": "root", "item_version": "4"})
+	return daemon.SyncHeldResult{Held: []daemon.HeldChange{{
+		N: 7, Action: merge.ActionPut, ItemID: id, Type: model.TypeHost, Seen: seen, Want: withMembers(seen, map[string]any{"port": 2222}), Current: cur,
+		Hold: &store.HoldInfo{
+			Cause: merge.CauseGuardedConflict, Local: []string{"port"}, Remote: []string{"user"},
+			Conflicts: []merge.Conflict{{Kind: merge.ConflictUnit, Name: merge.UnitConnection, Local: []string{"port"}, Remote: []string{"user"}}},
+		},
+		Choices: []string{daemon.ChoiceKeepMine, daemon.ChoiceKeepMineMerge, daemon.ChoiceEdit, daemon.ChoiceTakeTheirs, daemon.ChoiceRetry},
+		KeepMine: &daemon.Proposal{N: 7, Choice: daemon.ChoiceKeepMine, Action: merge.ActionPut, ItemID: id, Type: model.TypeHost,
+			Seen: cur, Want: withMembers(cur, map[string]any{"port": 2222}), Confirm: token1},
+	}}}, cur
+}
+
+// The server changes between the listing and the proposal: it widens
+// agent_output, which adds a coupling. The confirmation says so, shows the
+// new conflict and the server's values as the proposal was computed from
+// them, and confirming sends that proposal's token, which the daemon binds
+// to them.
+func TestSyncResolveMergeConfirmsTheServerAsProposed(t *testing.T) {
+	held, cur := heldPortUser()
+	now := withMembers(cur, map[string]any{"agent_output": "full", "item_version": "5"})
+	fresh := &daemon.Proposal{N: 7, Choice: daemon.ChoiceKeepMineMerge, Action: merge.ActionPut, ItemID: model.ID{1}.String(), Type: model.TypeHost,
+		Seen: now, Want: withMembers(now, map[string]any{"port": 2222, "user": "deploy", "agent_output": nil}), Confirm: tokenKM,
+		Current: now,
+		Hold: &store.HoldInfo{
+			Cause: merge.CauseGuardedConflict, Local: []string{"port"}, Remote: []string{"agent_output", "user"},
+			Conflicts: []merge.Conflict{
+				{Kind: merge.ConflictUnit, Name: merge.UnitConnection, Local: []string{"port"}, Remote: []string{"user"}},
+				{Kind: merge.ConflictCoupling, Name: merge.CouplingAgentWidening, Trigger: merge.TriggerRemote,
+					Local: []string{"port"}, Remote: []string{"agent_access", "agent_output"}},
+			},
+		},
+	}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpSyncHeld, held)
+	proposeFrom(t, f, map[string]*daemon.Proposal{daemon.ChoiceKeepMineMerge: fresh})
+	f.reply(daemon.OpSyncResolve, daemon.SyncResolveResult{Status: &daemon.SyncStatusResult{State: daemon.SyncOnline}})
+	terminal := func(e *cli.Env) { e.StdinTTY, e.StdoutTTY = true, true }
+
+	f.stdin = "y\n"
+	code, out, errOut := f.hopWith(t, terminal, "sync", "resolve", "7", "--keep-mine", "--merge")
+	if code != 0 {
+		t.Fatalf("exit %d: %s %s", code, out, errOut)
+	}
+	// The proposal comes after what changed, and the question after both.
+	moved := strings.Index(out, "changed since it was listed")
+	table := strings.Index(out, "keep mine --merge writes")
+	if moved < 0 || table < moved {
+		t.Fatalf("no notice before the proposal:\n%s", out)
+	}
+	for _, re := range []string{
+		`(?m)^  conflict: coupling agent-widening: the server widened what agents may do on it \(agent_access, agent_output\) while this device changed how it connects \(port\)`,
+		`(?m)^  FIELD +LISTED +SERVER NOW$`,
+		`(?m)^  agent_output +- +full$`,
+		// The proposal beside the server as it is now, not as listed.
+		`(?m)^  agent_output +- +full +\(changes\)$`,
+		`(?m)^  user +deploy +root +\(changes\)$`,
+		`(?m)^  agent_access +allow +allow$`,
+	} {
+		if !regexp.MustCompile(re).MatchString(out[moved:]) {
+			t.Errorf("no %s in:\n%s", re, out)
+		}
+	}
+	calls := f.called(daemon.OpSyncResolve)
+	if len(calls) != 1 {
+		t.Fatalf("sync.resolve called %d times", len(calls))
+	}
+	if p := resolveParams(t, calls[0]); p.Choice != daemon.ChoiceKeepMineMerge || p.Confirm != tokenKM {
+		t.Errorf("params %+v", p)
+	}
+
+	// Without a terminal the proposal prints the same way, with its token.
+	_, out, _ = f.hop(t, "sync", "resolve")
+	if i := strings.Index(out, "changed since it was listed"); i < 0 || !regexp.MustCompile(`(?m)^  agent_output +- +full +\(changes\)$`).MatchString(out[i:]) ||
+		!strings.Contains(out, "hop sync resolve 7 --keep-mine --merge --confirm "+tokenKM) {
+		t.Errorf("listing:\n%s", out)
+	}
+
+	// A proposal computed from the listed server says nothing of a change.
+	same := *fresh
+	same.Current, same.Hold, same.Seen = cur, held.Held[0].Hold, cur
+	same.Want = withMembers(cur, map[string]any{"port": 2222, "user": "deploy"})
+	proposeFrom(t, f, map[string]*daemon.Proposal{daemon.ChoiceKeepMineMerge: &same})
+	f.stdin = "y\n"
+	if _, out, _ := f.hopWith(t, terminal, "sync", "resolve", "7", "--keep-mine", "--merge"); strings.Contains(out, "changed since it was listed") ||
+		!strings.Contains(out, "keep mine --merge writes") {
+		t.Errorf("an unchanged server:\n%s", out)
+	}
+}
+
+// A class conflict's strings come from the three versions: the listing
+// carries none.
+func TestSyncResolveSpellsAClassConflict(t *testing.T) {
+	held, _ := heldPortUser()
+	h := &held.Held[0]
+	h.Seen = withMembers(h.Seen, map[string]any{"tags": []string{"prod"}})
+	h.Want = withMembers(h.Want, map[string]any{"tags": []string{"PROD"}})
+	h.Current = withMembers(h.Current, map[string]any{"tags": []string{"Prod"}})
+	h.Hold.Conflicts = append(h.Hold.Conflicts, merge.Conflict{Kind: merge.ConflictClass, Name: "tags", Local: []string{"tags"}, Remote: []string{"tags"}})
+	h.Choices, h.KeepMine = []string{daemon.ChoiceTakeTheirs}, nil
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpSyncHeld, held)
+	_, out, _ := f.hop(t, "sync", "resolve")
+	if !strings.Contains(out, `conflict: tags: the same tag was changed differently on each side (["PROD","Prod","prod"])`) {
+		t.Errorf("listing:\n%s", out)
 	}
 }

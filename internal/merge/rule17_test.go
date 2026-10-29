@@ -402,6 +402,58 @@ func TestClassMerge(t *testing.T) {
 	}
 }
 
+// A conflict carries no values; ConflictSpellings derives the strings a
+// class conflict or a selector-added coupling is about from the three
+// versions, whichever side fired it.
+func TestConflictSpellings(t *testing.T) {
+	const k2 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey2"
+	type mods []hostMod
+	for _, tc := range []struct {
+		id            string
+		seen, want, s mods
+		// conflict kind:name -> its spellings
+		spellings map[string][]string
+	}{
+		{id: "class", want: mods{tags("PROD", "old")}, s: mods{tags("Prod", "old")},
+			spellings: map[string][]string{"class:tags": {"PROD", "Prod", "prod"}}},
+		{id: "local selector-added", want: mods{aliases("test-db")}, s: mods{addrs("new.example")},
+			spellings: map[string][]string{"coupling:selector-added": {"test-db"}}},
+		{id: "remote selector-added", want: mods{hostKeys(k2), tags("prod")}, s: mods{addrs("new.example"), tags("prod", "old", "DB", "db")},
+			spellings: map[string][]string{"coupling:selector-added": {"DB", "db"}, "unit:connection": nil}},
+		{id: "unit", want: mods{port(2222)}, s: mods{user("root")},
+			spellings: map[string][]string{"unit:connection": nil}},
+		{id: "agent widening", want: mods{port(2222)}, s: mods{output("full")},
+			spellings: map[string][]string{"coupling:agent-widening": nil}},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			seen, want, s := h17(t, 3, tc.seen...), h17(t, 3, append(tc.seen, tc.want...)...), h17(t, 4, append(tc.seen, tc.s...)...)
+			res := Rebuild(put(seen, want), s, true, false)
+			if res.Kind != KindHold || len(res.Conflicts) != len(tc.spellings) {
+				t.Fatalf("got %s/%s %v", res.Kind, res.Cause, conflictIDs(res.Conflicts))
+			}
+			for _, c := range res.Conflicts {
+				exp, ok := tc.spellings[string(c.Kind)+":"+c.Name]
+				if !ok {
+					t.Fatalf("unexpected conflict %s:%s", c.Kind, c.Name)
+				}
+				if got := ConflictSpellings(model.TypeHost, seen, want, s, c); !slices.Equal(got, exp) {
+					t.Errorf("%s:%s spellings %q, want %q", c.Kind, c.Name, got, exp)
+				}
+			}
+		})
+	}
+	// Once the versions no longer show the conflict, there is nothing to
+	// spell, and a missing version is not an error.
+	seen, s := h17(t, 3), h17(t, 4, tags("Prod", "old"))
+	c := Conflict{Kind: ConflictClass, Name: "tags", Local: []string{"tags"}, Remote: []string{"tags"}}
+	if got := ConflictSpellings(model.TypeHost, seen, seen, s, c); got != nil {
+		t.Errorf("no race: %q", got)
+	}
+	if got := ConflictSpellings(model.TypeHost, seen, nil, s, c); got != nil {
+		t.Errorf("no want: %q", got)
+	}
+}
+
 func memberJSON(t testing.TB, it *Item, m string) string {
 	t.Helper()
 	raw, ok := it.Member(m)

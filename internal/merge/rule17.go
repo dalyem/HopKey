@@ -42,10 +42,9 @@ type Conflict struct {
 	// coupled group's on the other.
 	Local  []string `json:"local"`
 	Remote []string `json:"remote"`
-	// Spellings, for a class conflict, are the strings of the raced
-	// classes in seen, want and S, sorted. For a coupling fired by an added
-	// alias or tag class, they are the added spellings.
-	Spellings []string `json:"spellings,omitempty"`
+	// A conflict names members, never values: a class conflict's raced
+	// strings can be the whole of a large set member, more than once over.
+	// ConflictSpellings derives them from the three versions.
 }
 
 // Coupling triggers.
@@ -303,10 +302,7 @@ func analyze(t model.Type, seen, want, s *Item) analysis {
 				a.merged[m] = res
 				if len(raced) > 0 {
 					a.c.addClasses(m, raced...)
-					a.conflicts = append(a.conflicts, Conflict{
-						Kind: ConflictClass, Name: m, Local: []string{m}, Remote: []string{m},
-						Spellings: racedSpellings(a.cl.sets[m], raced, seen, want, s, m),
-					})
+					a.conflicts = append(a.conflicts, Conflict{Kind: ConflictClass, Name: m, Local: []string{m}, Remote: []string{m}})
 				}
 			default: // atomic: the unit check decides
 				a.merged[m] = want.members[m]
@@ -345,7 +341,7 @@ func (a *analysis) addCoupling(name, trigger string, p triggerParts, group, loca
 		a.c.addClasses(m, ks...)
 	}
 	a.conflicts = append(a.conflicts, Conflict{
-		Kind: ConflictCoupling, Name: name, Trigger: trigger, Local: local, Remote: remote, Spellings: p.spell,
+		Kind: ConflictCoupling, Name: name, Trigger: trigger, Local: local, Remote: remote,
 	})
 }
 
@@ -440,18 +436,75 @@ func sortByClass(key func(string) string, list []string) {
 	})
 }
 
+// racedSpellings are the strings of the raced classes in seen, want and
+// S, sorted.
 func racedSpellings(key func(string) string, raced []string, seen, want, s *Item, m string) []string {
+	rk := map[string]bool{}
+	for _, k := range raced {
+		rk[k] = true
+	}
+	found := map[string]bool{}
 	var out []string
 	for _, it := range []*Item{seen, want, s} {
 		list, _ := stringList(it, m)
 		for _, x := range list {
-			if slices.Contains(raced, key(x)) && !slices.Contains(out, x) {
+			if rk[key(x)] && !found[x] {
+				found[x] = true
 				out = append(out, x)
 			}
 		}
 	}
 	slices.Sort(out)
 	return out
+}
+
+// ConflictSpellings are the strings a conflict of a held put of type t is
+// about, derived from the held intent's seen and want and the server's
+// version s, sorted: for a class conflict, the strings of the raced
+// classes in all three; for a selector-added coupling fired by an added
+// alias or tag class, the added spellings. Anything else has none, as has
+// a conflict the three versions no longer show (nil).
+func ConflictSpellings(t model.Type, seen, want, s *Item, c Conflict) []string {
+	cl := classifications[t]
+	if cl == nil || seen == nil || want == nil || s == nil {
+		return nil
+	}
+	switch c.Kind {
+	case ConflictClass:
+		key := cl.sets[c.Name]
+		if key == nil {
+			return nil
+		}
+		b, ok1 := stringList(seen, c.Name)
+		mine, ok2 := stringList(want, c.Name)
+		theirs, ok3 := stringList(s, c.Name)
+		if !ok1 || !ok2 || !ok3 {
+			return nil
+		}
+		_, raced := classMerge(key, b, mine, theirs)
+		if len(raced) == 0 {
+			return nil
+		}
+		return racedSpellings(key, raced, seen, want, s, c.Name)
+	case ConflictCoupling:
+		if c.Name != CouplingSelectorAdded {
+			return nil
+		}
+		views := [3]*hostView{}
+		for i, it := range []*Item{seen, want, s} {
+			v, ok := viewOf(it)
+			if !ok {
+				return nil
+			}
+			views[i] = v
+		}
+		x, y := views[1], views[2]
+		if c.Trigger == TriggerRemote {
+			x, y = y, x
+		}
+		return selectorAdded(x, y, views[0]).spell
+	}
+	return nil
 }
 
 // rebuildPutRev17 is §2.5 from step 2, for an item that is live in S.
