@@ -195,6 +195,36 @@ Safety rules:
 
 `agent_access: deny` and `hop mcp --tag` are guardrails for well-behaved agents, not a security boundary. An agent runs as you and can use your agent socket and unlocked daemon directly. For a real boundary, run the agent in a container or VM.
 
+## Running hop-server
+
+The `Dockerfile` describes the deployment: the image runs `hop-server serve` behind a TLS proxy, with its database in the `/data` volume. Every other `hop-server` command opens that database file directly, while `serve` keeps running:
+
+```
+docker exec -it hop hop-server accounts ls --data /data
+```
+
+There is no admin API. An admin is whoever can write the data directory, and the commands are local to the server host.
+
+| Command | What it does |
+| --- | --- |
+| `invite EMAIL [--ttl 7d]` | Issues a single-use registration code bound to the email and prints it, alone, on stdout. Only a hash of the code is stored, so it is never shown again. |
+| `invites ls [--all]` | Lists pending invites: ID, email, created, expires. `--all` adds used and expired ones, with the account a used invite created. |
+| `invites revoke INVITE\|EMAIL` | Ends a pending invite, given its ID (at least 8 digits of it) or an email (every pending invite for it). The running server sees it at once: the code gets the same answer as a wrong one. A used invite cannot be revoked; it stays for the signup acknowledgment. |
+| `invites reissue EMAIL [--ttl 7d]` | Revokes the email's pending invites and issues a new code, in one transaction. |
+| `accounts ls` | Every account: email, ID, created, storage used and quota, recovery reserve state, active and total devices, last seen, the vault's head seq and last checkpoint. |
+| `accounts show ACCOUNT_ID\|EMAIL` | One account in detail. Its devices, each with its name, `active`, `retired` or `revoked` (and at which seq), the seq that added it, last seen and live sessions. Also live sessions, outstanding login tokens, open enrollments and pending invites for its email. |
+| `quota ACCOUNT_ID\|EMAIL SIZE` | Sets the account's storage quota (`512MiB`, `2GiB`, ...). A quota that frees the whole recovery reserve also ends a capacity-exhausted state. |
+| `audit [--account A] [--since T]` | Reads the audit trail, oldest first. `--since` takes `7d`, `36h`, `2026-10-01` or an RFC 3339 time. |
+| `backup PATH` | Writes a consistent copy of the whole database to a new file. |
+
+Every command takes `--data DIR`; the listing commands take `--json` too. `invites revoke` and `invites reissue` show what they will change and ask on a terminal (`docker exec -it`); with `--json` they show it on stderr, so stdout holds only the result. Without a terminal they refuse unless `--yes` is given, and `--dry-run` shows the change and makes none. `invite` and `quota` change state without asking, as before.
+
+**Audit trail.** `invite`, `quota`, `invites revoke` and `invites reissue` each write one row to the `admin_audit` table: the time, the OS user running the command (`nonroot (uid 65532)` inside the image, whoever ran `docker exec`), the action, the account, the arguments and the result. The row is written in the transaction that makes the change, so a change and its record commit together. A change that fails after it was confirmed is recorded with its error code. No row holds an invite code, and `invites revoke` records an invite by its 12-digit ID however many digits it was given. The command also prints the row to stderr as one JSON line. Under `docker exec` that line stays in the exec session's output; `docker logs` does not see it. Read-only commands write nothing. The trail is accountability among honest operators, not a tamper-proof log: anyone with the data directory can edit it, or restore an older database file.
+
+**Untrusted text.** Emails and device names come from users and devices. In human output, control characters, invalid UTF-8, bidi overrides and other Unicode format characters are printed as `\xNN` or `\uNNNN` escapes, so a name cannot recolour, clear or reorder the terminal. `--json` keeps valid Unicode exact, with the same characters as JSON `\u` escapes; invalid UTF-8 becomes U+FFFD.
+
+**Upgrading.** Database schema version 3 adds the `admin_audit` table. The first time a newer `hop-server` opens a version 2 database, whether to serve or to run any command, it adds the table and records version 3. No existing row changes. A `hop-server` from before that refuses the upgraded database, so take a backup with the old binary before upgrading if you may need to go back. A database from a newer server is refused and left as it was.
+
 ## Checks
 
 Checks run on Kiln, not on the orchestrator:

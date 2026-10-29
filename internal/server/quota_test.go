@@ -272,7 +272,8 @@ func TestQuotaAndRecoveryReserve(t *testing.T) {
 
 	// Raising the quota without freeing the whole reserve keeps the state.
 	used := e.account(v).UsedBytes
-	q, err := SetQuota(context.Background(), e.st, v.email, used+2*half-1, e.srv.lim)
+	op := Operator{Actor: "test", Now: e.clock.now()}
+	q, _, err := SetQuota(context.Background(), e.st, op, v.email, used+2*half-1, e.srv.lim)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +282,7 @@ func TestQuotaAndRecoveryReserve(t *testing.T) {
 	}
 	wantCode(t, e.post(v, e.recoverToken(v), wb3), 507, "quota_exhausted", "a bootstrap before the reserve is replenished")
 	// Freeing it ends the exhausted state, by account ID as well as email.
-	if q, err = SetQuota(context.Background(), e.st, v.accountID().String(), used+2*half, e.srv.lim); err != nil {
+	if q, _, err = SetQuota(context.Background(), e.st, op, v.accountID().String(), used+2*half, e.srv.lim); err != nil {
 		t.Fatal(err)
 	}
 	if q.Reserve != ReserveIntact {
@@ -291,10 +292,10 @@ func TestQuotaAndRecoveryReserve(t *testing.T) {
 	e.mustPost(v, e.recoverToken(v), wb3)
 	state(ReserveBootstrapSpent, "after a bootstrap on the replenished reserve")
 
-	if _, err := SetQuota(context.Background(), e.st, "nobody@example.com", 1<<30, e.srv.lim); err == nil {
+	if _, _, err := SetQuota(context.Background(), e.st, op, "nobody@example.com", 1<<30, e.srv.lim); err == nil {
 		t.Error("SetQuota for an unknown account")
 	}
-	if _, err := SetQuota(context.Background(), e.st, v.email, 0, e.srv.lim); err == nil {
+	if _, _, err := SetQuota(context.Background(), e.st, op, v.email, 0, e.srv.lim); err == nil {
 		t.Error("SetQuota with a zero quota")
 	}
 }
