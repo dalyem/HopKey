@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 // accounts disable and enable, devices block and unblock, sessions
@@ -72,14 +73,18 @@ func TestAccessCommands(t *testing.T) {
 	}
 
 	stubTerminal(t, "")
-	out, stderr = mustRun(t, "accounts", "enable", acct.String(), "--yes", "--json", "--data", dir)
-	var res struct {
-		Account struct {
-			Disabled *json.RawMessage `json:"disabled"`
-		} `json:"account"`
-		Audit int64 `json:"audit_id"`
+	// --json reports the account as the change left it, and what it ended.
+	out, _ = mustRun(t, "accounts", "disable", acct.String(), "--reason", "still overdue", "--yes", "--json", "--data", dir)
+	var dis accessResultJSON
+	if err := json.Unmarshal([]byte(out), &dis); err != nil || dis.Audit == 0 || dis.Account.Disabled == nil ||
+		dis.Account.Disabled.Reason != "still overdue" || dis.Account.Disabled.At.IsZero() ||
+		dis.EndedSessions == nil || dis.EndedLoginTokens == nil || dis.Account.Sessions != 0 || dis.Account.LoginTokens != 0 {
+		t.Errorf("disable --json: %s, %v", out, err)
 	}
-	if err := json.Unmarshal([]byte(out), &res); err != nil || res.Audit == 0 {
+	out, stderr = mustRun(t, "accounts", "enable", acct.String(), "--yes", "--json", "--data", dir)
+	var res accessResultJSON
+	if err := json.Unmarshal([]byte(out), &res); err != nil || res.Audit == 0 || res.Account.Disabled != nil ||
+		res.EndedSessions == nil || *res.EndedSessions != 0 || res.EndedLoginTokens == nil || *res.EndedLoginTokens != 0 {
 		t.Errorf("enable --json: %s, %v", out, err)
 	}
 	if parseAuditLine(t, stderr).Audit.Action != "accounts.enable" {
@@ -117,6 +122,18 @@ func TestAccessCommands(t *testing.T) {
 			t.Errorf("%v: no error", args)
 		}
 	}
+	out, _ = mustRun(t, "devices", "unblock", "alice@example.com", "--all", "--yes", "--json", "--data", dir)
+	var unb accessResultJSON
+	if err := json.Unmarshal([]byte(out), &unb); err != nil || len(unb.Account.Devices) != 1 ||
+		unb.Account.Devices[0].DeviceID != dev.String() || unb.Account.Devices[0].Blocked != nil {
+		t.Errorf("devices unblock --json: %s, %v", out, err)
+	}
+	out, _ = mustRun(t, "devices", "block", "alice@example.com", dev.String(), "--reason", "again", "--yes", "--json", "--data", dir)
+	var blk accessResultJSON
+	if err := json.Unmarshal([]byte(out), &blk); err != nil || len(blk.Account.Devices) != 1 || blk.Account.Devices[0].Blocked == nil ||
+		blk.Account.Devices[0].Blocked.Reason != "again" || blk.Account.Devices[0].Sessions != 0 || blk.EndedSessions == nil {
+		t.Errorf("devices block --json: %s, %v", out, err)
+	}
 	mustRun(t, "devices", "unblock", "alice@example.com", "--all", "--yes", "--data", dir)
 
 	out, stderr = mustRun(t, "sessions", "revoke", "alice@example.com", "--yes", "--data", dir)
@@ -135,4 +152,26 @@ func TestAccessCommands(t *testing.T) {
 		}
 	}
 	assertTerminalSafe(t, "audit", out)
+}
+
+// accessResultJSON is what an access command prints under --json.
+type accessResultJSON struct {
+	Account struct {
+		Disabled *struct {
+			At     time.Time `json:"at"`
+			Reason string    `json:"reason"`
+		} `json:"disabled"`
+		Devices []struct {
+			DeviceID string `json:"device_id"`
+			Blocked  *struct {
+				Reason string `json:"reason"`
+			} `json:"blocked"`
+			Sessions int `json:"sessions"`
+		} `json:"devices"`
+		Sessions    int `json:"sessions"`
+		LoginTokens int `json:"login_tokens"`
+	} `json:"account"`
+	EndedSessions    *int  `json:"ended_sessions"`
+	EndedLoginTokens *int  `json:"ended_login_tokens"`
+	Audit            int64 `json:"audit_id"`
 }

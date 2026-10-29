@@ -71,8 +71,8 @@ type unlockCheck struct {
 	cancel   context.CancelFunc
 	accepted bool
 	// admin is the operator's refusal that locked the vault before this
-	// unlock (store.Info's AdminLock): only the server letting the device
-	// in undoes it, so a server that can't be reached keeps it.
+	// unlock (adminLock): only the server letting the device in undoes
+	// it, so a server that can't be reached keeps it.
 	admin *store.AdminRefusal
 }
 
@@ -161,8 +161,15 @@ func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphr
 	case err != nil:
 		d.logf("asking the server whether this device is still in the account: %v", err)
 	case res.Active:
+		// An answer to a question asked before the operator's refusal
+		// locked the vault (which moved the generation) is no answer to
+		// it: the refusal stays until a later question is answered.
+		current := e.st.Generation() == gen
 		e.set(func() {
 			e.checkSkipped, e.unconfirmed = "", ""
+			if current {
+				e.admin = nil
+			}
 			if e.retired != nil && e.retired.Unverified {
 				// The report was wrong.
 				e.retired = nil
@@ -203,7 +210,13 @@ func (d *Daemon) unconfirmedLocked(err error) error {
 	// session ended and that asks status at once reads the reason.
 	why := err.Error()
 	again := false
-	e.set(func() { again, e.unconfirmed, e.checkSkipped = e.unconfirmed == why, why, "" })
+	e.set(func() {
+		again, e.unconfirmed, e.checkSkipped = e.unconfirmed == why, why, ""
+		if admin != nil {
+			c := *admin
+			e.admin = &c
+		}
+	})
 	switch {
 	case admin != nil:
 		d.endSessions(whyAdmin(admin))
@@ -220,12 +233,34 @@ func (d *Daemon) unconfirmedLocked(err error) error {
 	return err
 }
 
-// whyAdmin is why the ssh sessions end on the operator's refusal.
-func whyAdmin(a *store.AdminRefusal) string {
-	if a.Code == store.AdminDeviceBlocked {
-		return whyBlocked
+// adminLock returns the operator's refusal that keeps the vault locked
+// until the server accepts the device (syncer.admin), or nil.
+func (d *Daemon) adminLock() *store.AdminRefusal {
+	if d.sync == nil {
+		return nil
 	}
-	return whyDisabled
+	var out *store.AdminRefusal
+	d.sync.set(func() {
+		if d.sync.admin != nil {
+			c := *d.sync.admin
+			out = &c
+		}
+	})
+	return out
+}
+
+// whyAdmin is why the ssh sessions end on the operator's refusal, with
+// the operator's message, escaped and bounded (store.EscapeServerText):
+// it is shown on the session's terminal and kept in status.
+func whyAdmin(a *store.AdminRefusal) string {
+	why := whyDisabled
+	if a.Code == store.AdminDeviceBlocked {
+		why = whyBlocked
+	}
+	if a.Reason != "" {
+		why += fmt.Sprintf(": \"%s\" (the server's word)", store.EscapeServerText(a.Reason))
+	}
+	return why
 }
 
 // stillUnconfirmed reports whether err, the answer to a check that the

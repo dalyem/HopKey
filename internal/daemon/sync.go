@@ -215,6 +215,13 @@ type syncer struct {
 	// unconfirmed says why the server's answer kept the vault locked
 	// (unconfirmedLocked); "" once it accepts the device.
 	unconfirmed string
+	// admin is the operator's refusal (an account disabled, a device
+	// blocked) that locked the vault (unconfirmedLocked). It outlives
+	// the lock's reason, which a later error or hop lock replaces: only
+	// the server accepting the device (checkServer) clears it, so until
+	// then no unlock loads keys unasked (checkBeforeKeysLocked). It is
+	// held in memory only: a daemon that starts again has none.
+	admin *store.AdminRefusal
 
 	// confirmKey keys the confirmation tokens of resolution proposals
 	// (confirmToken). It is random per daemon process.

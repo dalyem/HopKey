@@ -245,8 +245,8 @@ func vaultState(v *store.Info) string {
 		return "locked: the server reported this device revoked, and the record of that report here is corrupt (hop auth status)"
 	case v.ServerReport != nil:
 		return "locked: the server reports this device was revoked from the account (hop auth status)"
-	case v.ServerUnconfirmed && v.AdminLock != nil:
-		return adminLockText(v.AdminLock)
+	case v.AdminLock != nil:
+		return adminLockText(v.AdminLock, v.ServerUnconfirmed)
 	case v.ServerUnconfirmed:
 		return "locked: the server did not confirm this device is still in the account; hop unlock asks it again"
 	case v.OfflineTooLong:
@@ -255,20 +255,26 @@ func vaultState(v *store.Info) string {
 	return "locked; run hop unlock"
 }
 
-// adminLockText says why the server's operator keeps the vault locked: the
-// account disabled or this device blocked, and the operator's message, the
-// server's word, escaped again here, since the server may not have
-// stripped its control characters.
-func adminLockText(a *store.AdminRefusal) string {
+// adminLockText says why the server's operator keeps the vault locked:
+// the account disabled or this device blocked, and the operator's
+// message, the server's word, escaped again here, since the server may
+// not have stripped its control characters. auto is whether the daemon
+// unlocks it by itself once the operator lets the device in; after hop
+// lock, or an unlock that failed, only hop unlock does.
+func adminLockText(a *store.AdminRefusal, auto bool) string {
 	what, undo := "disabled this account", "enables the account"
 	if a.Code == store.AdminDeviceBlocked {
 		what, undo = "blocked this device", "unblocks this device"
 	}
+	how := "by itself, or with hop unlock if this device's key needs its passphrase"
+	if !auto {
+		how = "with hop unlock"
+	}
 	if a.Reason == "" {
 		return fmt.Sprintf("locked: the server's operator %s. Nothing was deleted. Ask the server's operator; "+
-			"the vault unlocks by itself once the operator %s (hop unlock, if this device's key needs its passphrase)", what, undo)
+			"the vault unlocks once the operator %s (%s)", what, undo, how)
 	}
 	return fmt.Sprintf("locked: the server says its operator %s. The operator's message: \"%s\". This is the server's word, not your vault's. "+
-		"Nothing was deleted. It unlocks once the operator %s (by itself, or with hop unlock if this device's key needs its passphrase)",
-		what, store.EscapeServerText(a.Reason), undo)
+		"Nothing was deleted. It unlocks once the operator %s (%s)",
+		what, store.EscapeServerText(a.Reason), undo, how)
 }

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -129,14 +130,16 @@ func TestDisableLocksTheBackgroundPull(t *testing.T) {
 	disableAccount(t, x.w, "billing \x1b[2Joverdue")
 	eventually(t, 15*time.Second, "the laptop locks", func() bool { return x.n2.agentKeys() == 0 })
 	eventually(t, 15*time.Second, "the desk locks", func() bool { return x.n1.agentKeys() == 0 })
-	session.ended(t, 5*time.Second, whyDisabled)
+	// The session's end and status carry the operator's message.
+	const why = whyDisabled + `: "billing [2Joverdue" (the server's word)`
+	session.ended(t, 5*time.Second, why)
 	for _, n := range []*node{x.n1, x.n2} {
 		adminLocked(t, n, store.AdminAccountDisabled, "billing [2Joverdue")
 	}
-	if e := endedStatus(t, x.n2); e == nil || e.Why != whyDisabled || e.TerminationRequests != 1 {
+	if e := endedStatus(t, x.n2); e == nil || e.Why != why || e.TerminationRequests != 1 {
 		t.Errorf("ended sessions in status: %+v", e)
 	}
-	watchAt(t, x.n2.d.ControlSocket(), "web2", whyDisabled)
+	watchAt(t, x.n2.d.ControlSocket(), "web2", why)
 
 	// The loop asks again: still refused, still locked.
 	if x.n2.d.retryUnconfirmed(context.Background()) {
@@ -355,6 +358,233 @@ func TestLogoutWhileDisabled(t *testing.T) {
 	}
 	if dev.Active {
 		t.Error("the server still has the laptop active")
+	}
+	if exists(t, filepath.Join(x.n2.cfg.DataDir, "device.json")) {
+		t.Error("the logout left device.json")
+	}
+}
+
+// The operator's message goes into why the ssh sessions end, attributed
+// to the server, escaped and bounded: a server need not have stripped it.
+func TestWhyAdminCarriesTheReason(t *testing.T) {
+	for _, c := range []struct {
+		refusal store.AdminRefusal
+		want    string
+	}{
+		{store.AdminRefusal{Code: store.AdminAccountDisabled}, whyDisabled},
+		{store.AdminRefusal{Code: store.AdminDeviceBlocked}, whyBlocked},
+		{store.AdminRefusal{Code: store.AdminDeviceBlocked, Reason: "lost on a train"}, whyBlocked + `: "lost on a train" (the server's word)`},
+		{store.AdminRefusal{Code: store.AdminAccountDisabled, Reason: "a\x1b[2J\u202eb\n"},
+			whyDisabled + `: "a\x1b[2J\u202eb\x0a" (the server's word)`},
+	} {
+		if got := whyAdmin(&c.refusal); got != c.want {
+			t.Errorf("whyAdmin(%+v) = %q, want %q", c.refusal, got, c.want)
+		}
+	}
+	long := whyAdmin(&store.AdminRefusal{Code: store.AdminAccountDisabled, Reason: strings.Repeat("x", 5000)})
+	if len(long) > 600 || !strings.Contains(long, "...") {
+		t.Errorf("a long reason is not bounded: %d bytes", len(long))
+	}
+}
+
+// adminHeld checks that the operator's refusal (code) still keeps n
+// locked after another lock or error replaced the store's lock reason:
+// the agent is empty, the vault locked, and status says the operator
+// locked it.
+func adminHeld(t *testing.T, n *node, code string) {
+	t.Helper()
+	if k := n.agentKeys(); k != 0 {
+		t.Errorf("%s: the agent serves %d key(s)", n.name, k)
+	}
+	if info := n.st.Info(); !info.Locked {
+		t.Errorf("%s: the vault is unlocked: %+v", n.name, info)
+	}
+	var st StatusResult
+	n.must(OpStatus, nil, &st)
+	if st.Vault == nil || st.Vault.AdminLock == nil || st.Vault.AdminLock.Code != code {
+		t.Errorf("%s: status does not say the operator locked it: %+v", n.name, st.Vault)
+	}
+}
+
+// hop unlock of a sealed device key asks the daemon first without the
+// passphrase, which fails on the device key and replaces the lock's
+// reason, and then with it. With the server unreachable, that second
+// request must not load keys: the operator's refusal still holds.
+func TestAdminLockSurvivesThePassphraseRetry(t *testing.T) {
+	x := newSyncSetup(t)
+	cfg := syncStoreConfig(t, "sealed")
+	cfg.Getenv = func(k string) string {
+		if k == store.PassphraseEnv {
+			return sealedPassphrase
+		}
+		return ""
+	}
+	n := &node{t: t, name: "sealed", cfg: cfg, st: signInSealed(t, x.w.client(t), cfg, x.kit, x.pub)}
+	x.w.start(n, n.st, SyncOptions{noPoll: true})
+	n.must(OpSyncNow, nil, nil)
+	n.cfg.Getenv = func(string) string { return "" }
+	x.w.restart(n)
+	if err := n.call(OpUnlock, UnlockParams{DevicePassphrase: sealedPassphrase}, nil); err != nil {
+		t.Fatalf("setup: hop unlock with the passphrase: %v", err)
+	}
+
+	disableAccount(t, x.w, "audit")
+	if err := n.call(OpSyncNow, nil, nil); err == nil {
+		t.Fatal("hop sync of a disabled account worked")
+	}
+	adminLocked(t, n, store.AdminAccountDisabled, "audit")
+
+	x.w.down.Store(true)
+	if err := n.call(OpUnlock, nil, nil); err == nil {
+		t.Fatal("hop unlock without the passphrase unlocked a sealed device key")
+	}
+	if info := n.st.Info(); info.AdminLock != nil {
+		t.Fatalf("setup: the device-key error did not replace the store's lock reason: %+v", info)
+	}
+	adminHeld(t, n, store.AdminAccountDisabled)
+	err := n.call(OpUnlock, UnlockParams{DevicePassphrase: sealedPassphrase}, nil)
+	if err == nil || !strings.Contains(err.Error(), "operator disabled this account") || !strings.Contains(err.Error(), "could not be asked again") {
+		t.Errorf("hop unlock with the passphrase and the server unreachable: %v", err)
+	}
+	adminLocked(t, n, store.AdminAccountDisabled, "audit")
+
+	x.w.down.Store(false)
+	enableAccount(t, x.w)
+	if err := n.call(OpUnlock, UnlockParams{DevicePassphrase: sealedPassphrase}, nil); err != nil {
+		t.Fatalf("hop unlock after the enable: %v", err)
+	}
+	if k := n.agentKeys(); k != 1 {
+		t.Errorf("after the enable, the agent serves %d key(s)", k)
+	}
+}
+
+// A later answer that is not the operator's (here a plain 401) replaces
+// the lock's reason, but not the operator's refusal: an unlock with the
+// server unreachable after it still loads no key.
+func TestAdminLockSurvivesAGenericRefusal(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n2, x.n2.st, SyncOptions{noPoll: true})
+	x.n2.must(OpSyncNow, nil, nil)
+	disableAccount(t, x.w, "")
+	if err := x.n2.call(OpSyncNow, nil, nil); err == nil {
+		t.Fatal("hop sync of a disabled account worked")
+	}
+	adminLocked(t, x.n2, store.AdminAccountDisabled, "")
+
+	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool { return unauthorized(rw) })
+	if err := x.n2.call(OpUnlock, nil, nil); err == nil {
+		t.Fatal("hop unlock against a refusing server unlocked")
+	}
+	if info := x.n2.st.Info(); !info.ServerUnconfirmed || info.AdminLock != nil {
+		t.Fatalf("setup: the 401 did not replace the store's lock reason: %+v", info)
+	}
+	adminHeld(t, x.n2, store.AdminAccountDisabled)
+
+	x.w.setIntercept(func(http.ResponseWriter, *http.Request, http.Handler) bool { return false })
+	x.w.down.Store(true)
+	if x.n2.d.retryUnconfirmed(context.Background()) {
+		t.Error("the retry unlocked with the server unreachable")
+	}
+	if err := x.n2.call(OpUnlock, nil, nil); err == nil || !strings.Contains(err.Error(), "could not be asked again") {
+		t.Errorf("hop unlock with the server unreachable: %v", err)
+	}
+	adminLocked(t, x.n2, store.AdminAccountDisabled, "")
+}
+
+// hop lock over the operator's lock is a lock of its own, and does not
+// end the refusal: hop unlock with the server unreachable loads no key.
+// Once the server accepts the device again, the refusal is over: a later
+// unlock offline loads keys as for any device offline.
+func TestHopLockKeepsAnAdminLock(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n2, x.n2.st, SyncOptions{noPoll: true})
+	laptop := laptopID(t, x.n2)
+	x.n2.must(OpSyncNow, nil, nil)
+	blockDevice(t, x.w, laptop, "")
+	if err := x.n2.call(OpSyncNow, nil, nil); err == nil {
+		t.Fatal("hop sync of a blocked device worked")
+	}
+	adminLocked(t, x.n2, store.AdminDeviceBlocked, "")
+
+	x.n2.must(OpLock, nil, nil)
+	adminHeld(t, x.n2, store.AdminDeviceBlocked)
+	x.w.down.Store(true)
+	if err := x.n2.call(OpUnlock, nil, nil); err == nil || !strings.Contains(err.Error(), "operator blocked this device") {
+		t.Errorf("hop unlock after hop lock, with the server unreachable: %v", err)
+	}
+	adminLocked(t, x.n2, store.AdminDeviceBlocked, "")
+
+	// The server accepts the device: the refusal is cleared.
+	x.w.down.Store(false)
+	unblockDevice(t, x.w, laptop)
+	x.n2.must(OpLock, nil, nil)
+	x.n2.must(OpUnlock, nil, nil)
+	if k := x.n2.agentKeys(); k != 1 {
+		t.Fatalf("after the unblock, the agent serves %d key(s)", k)
+	}
+	x.n2.must(OpLock, nil, nil)
+	var st StatusResult
+	x.n2.must(OpStatus, nil, &st)
+	if st.Vault == nil || st.Vault.AdminLock != nil {
+		t.Errorf("status after the server accepted the device: %+v", st.Vault)
+	}
+	x.w.down.Store(true)
+	x.n2.must(OpUnlock, nil, nil)
+	if k := x.n2.agentKeys(); k != 1 {
+		t.Errorf("an unlock offline after the unblock: the agent serves %d key(s)", k)
+	}
+}
+
+// A logout of a disabled account's device whose verified head is behind
+// the server's (another device committed since) can't catch up without a
+// session: it stays pending, asked again as often as it is run, and posts
+// nothing, neither to the log nor to retire-post; the device and its
+// vault stay. Once the account is enabled, the logout goes through.
+func TestLogoutWhileDisabledBehindTheServer(t *testing.T) {
+	x := newSyncSetup(t)
+	ctx := context.Background()
+	laptop := laptopID(t, x.n2)
+	x.w.start(x.n1, x.n1.st, SyncOptions{noPoll: true})
+	x.n1.putHost(webHost("web3", x.keyID, "203.0.113.18"))
+	x.n1.must(OpSyncNow, nil, nil)
+	disableAccount(t, x.w, "")
+
+	var posts atomic.Int32
+	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		if req.Method == http.MethodPost && (req.URL.Path == "/v1/retire-status/post" || strings.HasSuffix(req.URL.Path, "/log")) {
+			posts.Add(1)
+		}
+		return false
+	})
+	retirer := x.w.client(t).Retirer(x.pub.VaultID)
+	for range 2 {
+		res, err := x.n2.st.Logout(ctx, retirer, store.LogoutOptions{})
+		if !errors.Is(err, store.ErrLogoutPending) || res.Done || res.State != store.StateRetiring ||
+			!strings.Contains(err.Error(), "operator refused this device a session") {
+			t.Fatalf("logout behind the server's head: %+v, %v", res, err)
+		}
+	}
+	if n := posts.Load(); n != 0 {
+		t.Errorf("the pending logout posted %d time(s)", n)
+	}
+	var dev *server.Device
+	if err := x.w.st.View(ctx, func(tx server.Tx) (err error) {
+		dev, err = tx.Device(x.pub.AccountID, laptop)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !dev.Active {
+		t.Error("the server has the laptop retired")
+	}
+	if !exists(t, filepath.Join(x.n2.cfg.DataDir, "device.json")) {
+		t.Fatal("the pending logout removed device.json")
+	}
+
+	enableAccount(t, x.w)
+	res, err := x.n2.st.Logout(ctx, retirer, store.LogoutOptions{})
+	if err != nil || !res.Done {
+		t.Fatalf("logout after the enable: %+v, %v", res, err)
 	}
 	if exists(t, filepath.Join(x.n2.cfg.DataDir, "device.json")) {
 		t.Error("the logout left device.json")

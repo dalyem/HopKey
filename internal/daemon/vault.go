@@ -255,7 +255,7 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 		pass = []byte(p.DevicePassphrase)
 		defer clear(pass)
 	}
-	chk := &unlockCheck{parent: ctx, admin: v.Info().AdminLock}
+	chk := &unlockCheck{parent: ctx, admin: d.adminLock()}
 	defer chk.done()
 	if v.Info().ServerReport != nil {
 		if err := d.recheckReportLocked(chk, pass); err != nil {
@@ -318,13 +318,17 @@ func vaultError(err error) *Error {
 }
 
 // vaultStatus describes the vault for OpStatus, or nil for a store that is
-// not a Vault.
+// not a Vault. A locked vault the operator's refusal still holds says so
+// (adminLock), whatever locked it last.
 func (d *Daemon) vaultStatus() *store.Info {
 	v, ok := d.store.(Vault)
 	if !ok {
 		return nil
 	}
 	info := v.Info()
+	if a := d.adminLock(); a != nil && info.Locked {
+		info.AdminLock = a
+	}
 	return &info
 }
 

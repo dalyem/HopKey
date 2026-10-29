@@ -38,4 +38,15 @@ func TestVaultStateOfAnAdminLock(t *testing.T) {
 	if got := vaultState(&store.Info{Locked: true, ServerUnconfirmed: true}); strings.Contains(got, "operator") {
 		t.Errorf("a plain unconfirmed lock: %q", got)
 	}
+	// The daemon still holds the operator's refusal after another lock
+	// replaced the reason (hop lock, an unlock that failed): status says
+	// so, and that hop unlock opens it.
+	lock := &store.AdminRefusal{Code: store.AdminDeviceBlocked, Reason: "lost"}
+	got := vaultState(&store.Info{Locked: true, AdminLock: lock})
+	if !strings.Contains(got, "operator blocked this device") || !strings.Contains(got, "(with hop unlock)") || strings.Contains(got, "by itself") {
+		t.Errorf("an admin lock under hop lock: %q", got)
+	}
+	if got := vaultState(&store.Info{Locked: true, ServerUnconfirmed: true, AdminLock: lock}); !strings.Contains(got, "by itself") {
+		t.Errorf("an admin lock the daemon retries: %q", got)
+	}
 }

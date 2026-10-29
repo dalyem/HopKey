@@ -206,7 +206,9 @@ type Info struct {
 	ServerUnconfirmed bool `json:"server_unconfirmed,omitempty"`
 	// AdminLock is set when that answer was the server's operator
 	// refusing this device (an AdminRefusal): the account disabled or the
-	// device blocked, and the operator's reason, unescaped.
+	// device blocked, and the operator's reason, unescaped. The daemon's
+	// status also sets it on any lock while it still holds that refusal
+	// (the server has not accepted the device since).
 	AdminLock *AdminRefusal `json:"admin_lock,omitempty"`
 	// Warnings are for the user, one sentence each.
 	Warnings []string `json:"warnings,omitempty"`

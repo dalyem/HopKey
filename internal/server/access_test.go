@@ -88,8 +88,10 @@ func TestDisableAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Sessions != 4 || got.LoginTokens != 1 {
-		t.Errorf("result %+v", got)
+	// The result is the account after the disable, and what it ended.
+	if got.EndedSessions != 4 || got.EndedLoginTokens != 1 || got.Sessions != 0 || got.LoginTokens != 0 ||
+		got.Disabled == nil || got.Disabled.Reason != "billing overdue" || !got.Disabled.At.Equal(e.clock.now().Truncate(time.Second)) {
+		t.Errorf("result %+v, disabled %+v", got, got.Disabled)
 	}
 	if entry == nil || entry.Action != ActionDisable || entry.Result != "ok" || entry.AccountID == nil || *entry.AccountID != acct ||
 		!strings.Contains(string(entry.Params), `"reason":"billing overdue"`) || !strings.Contains(string(entry.Params), `"sessions":4`) ||
@@ -169,8 +171,12 @@ func TestDisableAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, entry, err = EnableAccount(ctx, e.st, e.op(), v.email, plan); err != nil || entry.Action != ActionEnable {
+	en, entry, err := EnableAccount(ctx, e.st, e.op(), v.email, plan)
+	if err != nil || entry.Action != ActionEnable {
 		t.Fatalf("enable: %+v, %v", entry, err)
+	}
+	if en.Disabled != nil || en.EndedSessions != 0 || en.EndedLoginTokens != 0 {
+		t.Errorf("enable result %+v, disabled %+v", en, en.Disabled)
 	}
 	r, _ = e.readLog(v, e.session(v, A), "")
 	wantStatus(t, r, 200, "reading the log after the enable")
@@ -238,9 +244,14 @@ func TestBlockDevices(t *testing.T) {
 	if len(plan.Devices) != 1 || plan.Devices[0].ID != B || plan.Sessions != 1 {
 		t.Fatalf("plan %+v", plan)
 	}
-	_, entry, err := BlockDevices(ctx, e.st, e.op(), v.email, sel, "lost on a train", plan)
+	got, entry, err := BlockDevices(ctx, e.st, e.op(), v.email, sel, "lost on a train", plan)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The result is the device as it is now: blocked, with no session.
+	if got.EndedSessions != 1 || len(got.Devices) != 1 || got.Devices[0].ID != B || got.Devices[0].Sessions != 0 ||
+		got.Devices[0].Blocked == nil || got.Devices[0].Blocked.Reason != "lost on a train" || got.Sessions != 3 {
+		t.Errorf("block result %+v, devices %+v", got, got.Devices)
 	}
 	if entry.Action != ActionDeviceBlock || !strings.Contains(string(entry.Params), B.String()) ||
 		!strings.Contains(string(entry.Params), `"reason":"lost on a train"`) {
@@ -310,8 +321,17 @@ func TestBlockDevices(t *testing.T) {
 	if err != nil || len(plan.Devices) != 2 {
 		t.Fatalf("unblock --all plan %+v, %v", plan, err)
 	}
-	if _, entry, err = UnblockDevices(ctx, e.st, e.op(), v.email, all, plan); err != nil || entry.Action != ActionDeviceUnblock {
+	un, entry, err := UnblockDevices(ctx, e.st, e.op(), v.email, all, plan)
+	if err != nil || entry.Action != ActionDeviceUnblock {
 		t.Fatalf("unblock: %+v, %v", entry, err)
+	}
+	if len(un.Devices) != 2 || un.EndedSessions != 0 {
+		t.Errorf("unblock result %+v", un)
+	}
+	for _, d := range un.Devices {
+		if d.Blocked != nil {
+			t.Errorf("unblock result: device %v still blocked", d.ID)
+		}
 	}
 	for _, dev := range []model.ID{A, B} {
 		wantStatus(t, e.sessionAttempt(v, dev), 200, "a session after the unblock")
@@ -376,9 +396,13 @@ func TestRevokeSessions(t *testing.T) {
 	if err != nil || plan.Sessions != 1 || len(plan.Devices) != 1 {
 		t.Fatalf("plan %+v, %v", plan, err)
 	}
-	if _, entry, err := RevokeSessions(ctx, e.st, e.op(), v.email, B.String(), plan); err != nil ||
-		!strings.Contains(string(entry.Params), `"device":"`+B.String()+`"`) {
+	got, entry, err := RevokeSessions(ctx, e.st, e.op(), v.email, B.String(), plan)
+	if err != nil || !strings.Contains(string(entry.Params), `"device":"`+B.String()+`"`) {
 		t.Fatalf("revoke one device's: %+v, %v", entry, err)
+	}
+	if got.EndedSessions != 1 || got.EndedLoginTokens != 0 || len(got.Devices) != 1 || got.Devices[0].Sessions != 0 ||
+		got.Sessions != 2 || got.LoginTokens != 1 {
+		t.Errorf("revoke result %+v, devices %+v", got, got.Devices)
 	}
 	if s := liveSessions(t, e, acct); s[B] != 0 || s[A] != 2 {
 		t.Errorf("sessions: %v", s)

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -191,12 +192,27 @@ func view(ctx context.Context, st Store, fn func(Tx) (*AccessPlan, error)) (*Acc
 	return out, err
 }
 
+// AccessResult is what an access change did: the account as it stands
+// once the change is made, and what the change deleted.
+type AccessResult struct {
+	// AccessPlan is the account after the change, read in its
+	// transaction: its disable, and the devices the change acted on with
+	// their blocks as they are now. Sessions and LoginTokens are the live
+	// ones left on the account.
+	AccessPlan
+	// EndedSessions and EndedLoginTokens are the ones the change deleted.
+	EndedSessions    int
+	EndedLoginTokens int
+}
+
 // apply runs an access change and its audit row in one write
 // transaction: it plans again, refuses with "changed" when the plan is
-// not the one the operator confirmed (want), and then runs fn on it.
+// not the one the operator confirmed (want), runs fn on it, and reads
+// the account again for the result. fn records in ended what it
+// deleted.
 func (op Operator) apply(ctx context.Context, st Store, action string, params any, want *AccessPlan,
-	plan func(Tx) (*AccessPlan, error), fn func(Tx, *AccessPlan) error) (*AccessPlan, *AuditEntry, error) {
-	var out *AccessPlan
+	plan func(Tx) (*AccessPlan, error), fn func(tx Tx, p *AccessPlan, ended *AccessResult) error) (*AccessResult, *AuditEntry, error) {
+	var out *AccessResult
 	entry, err := op.change(ctx, st, action, &want.AccountID, params, func(tx Tx) (*model.ID, error) {
 		got, err := plan(tx)
 		var ae *AdminError
@@ -209,13 +225,40 @@ func (op Operator) apply(ctx context.Context, st Store, action string, params an
 		if !samePlan(got, want) {
 			return nil, adminErr("changed", "the account changed since it was shown; run the command again")
 		}
-		if err := fn(tx, got); err != nil {
+		res := &AccessResult{}
+		if err := fn(tx, got, res); err != nil {
 			return nil, err
 		}
-		out = got
+		after, err := accessAfter(tx, got, op)
+		if err != nil {
+			return nil, err
+		}
+		res.AccessPlan = *after
+		out = res
 		return &got.AccountID, nil
 	})
 	return out, entry, err
+}
+
+// accessAfter reads the account of p again, with p's devices in p's
+// order, as they stand now.
+func accessAfter(tx Tx, p *AccessPlan, op Operator) (*AccessPlan, error) {
+	after, a, err := accessPlan(tx, p.AccountID.String(), op)
+	if err != nil || len(p.Devices) == 0 {
+		return after, err
+	}
+	devs, err := accountDevices(tx, a, op.Now)
+	if err != nil {
+		return nil, err
+	}
+	for _, want := range p.Devices {
+		i := slices.IndexFunc(devs, func(d *DeviceDetail) bool { return d.ID == want.ID })
+		if i < 0 {
+			return nil, fmt.Errorf("server: device %s is gone from its account", want.ID)
+		}
+		after.Devices = append(after.Devices, devs[i])
+	}
+	return after, nil
 }
 
 // planDisable is what disabling who does: it ends every session and login
@@ -245,13 +288,14 @@ type disableParams struct {
 // sessions, login and recovery (account_disabled, with reason). reason
 // must be sanitized (SanitizeReason). It refuses with "changed" when the
 // account is not as planned.
-func DisableAccount(ctx context.Context, st Store, op Operator, who, reason string, want *AccessPlan) (*AccessPlan, *AuditEntry, error) {
+func DisableAccount(ctx context.Context, st Store, op Operator, who, reason string, want *AccessPlan) (*AccessResult, *AuditEntry, error) {
 	if r, err := SanitizeReason(reason); err != nil || r != reason {
 		return nil, nil, adminErr("invalid", "the reason is not sanitized")
 	}
 	params := &disableParams{Reason: reason, WasDisabled: want.Disabled != nil}
-	return op.apply(ctx, st, ActionDisable, params, want, planDisable(who, op), func(tx Tx, p *AccessPlan) error {
+	return op.apply(ctx, st, ActionDisable, params, want, planDisable(who, op), func(tx Tx, p *AccessPlan, ended *AccessResult) error {
 		params.Sessions, params.LoginTokens = p.Sessions, p.LoginTokens
+		ended.EndedSessions, ended.EndedLoginTokens = p.Sessions, p.LoginTokens
 		b := &AdminBlock{At: op.Now, Reason: reason}
 		if p.Disabled != nil {
 			b.At = p.Disabled.At
@@ -288,12 +332,12 @@ type enableParams struct {
 
 // EnableAccount ends the disable PlanEnable showed as want. Devices get
 // sessions again; nothing else changes.
-func EnableAccount(ctx context.Context, st Store, op Operator, who string, want *AccessPlan) (*AccessPlan, *AuditEntry, error) {
+func EnableAccount(ctx context.Context, st Store, op Operator, who string, want *AccessPlan) (*AccessResult, *AuditEntry, error) {
 	params := &enableParams{}
 	if want.Disabled != nil {
 		params.DisabledAt = want.Disabled.At.Unix()
 	}
-	return op.apply(ctx, st, ActionEnable, params, want, planEnable(who, op), func(tx Tx, p *AccessPlan) error {
+	return op.apply(ctx, st, ActionEnable, params, want, planEnable(who, op), func(tx Tx, p *AccessPlan, ended *AccessResult) error {
 		return tx.SetAccountDisabled(p.AccountID, nil)
 	})
 }
@@ -416,13 +460,13 @@ func deviceIDs(devs []*DeviceDetail) []model.ID {
 // (device_blocked, with reason). devices.active does not change, and the
 // account's other devices keep working. It does not keep the password
 // holder from signing in as a new device; only disable does.
-func BlockDevices(ctx context.Context, st Store, op Operator, who string, sel DeviceSelection, reason string, want *AccessPlan) (*AccessPlan, *AuditEntry, error) {
+func BlockDevices(ctx context.Context, st Store, op Operator, who string, sel DeviceSelection, reason string, want *AccessPlan) (*AccessResult, *AuditEntry, error) {
 	if r, err := SanitizeReason(reason); err != nil || r != reason {
 		return nil, nil, adminErr("invalid", "the reason is not sanitized")
 	}
 	params := &deviceParams{Devices: deviceIDs(want.Devices), All: sel.All, Reason: reason}
-	return op.apply(ctx, st, ActionDeviceBlock, params, want, planDevices(who, sel, op, true), func(tx Tx, p *AccessPlan) error {
-		params.Sessions = p.Sessions
+	return op.apply(ctx, st, ActionDeviceBlock, params, want, planDevices(who, sel, op, true), func(tx Tx, p *AccessPlan, ended *AccessResult) error {
+		params.Sessions, ended.EndedSessions = p.Sessions, p.Sessions
 		for _, d := range p.Devices {
 			if err := tx.SetDeviceBlock(p.AccountID, d.ID, &AdminBlock{At: op.Now, Reason: reason}); err != nil {
 				return err
@@ -441,9 +485,9 @@ func PlanUnblockDevices(ctx context.Context, st Store, who string, sel DeviceSel
 }
 
 // UnblockDevices ends the blocks PlanUnblockDevices showed as want.
-func UnblockDevices(ctx context.Context, st Store, op Operator, who string, sel DeviceSelection, want *AccessPlan) (*AccessPlan, *AuditEntry, error) {
+func UnblockDevices(ctx context.Context, st Store, op Operator, who string, sel DeviceSelection, want *AccessPlan) (*AccessResult, *AuditEntry, error) {
 	params := &deviceParams{Devices: deviceIDs(want.Devices), All: sel.All}
-	return op.apply(ctx, st, ActionDeviceUnblock, params, want, planDevices(who, sel, op, false), func(tx Tx, p *AccessPlan) error {
+	return op.apply(ctx, st, ActionDeviceUnblock, params, want, planDevices(who, sel, op, false), func(tx Tx, p *AccessPlan, ended *AccessResult) error {
 		for _, d := range p.Devices {
 			if err := tx.SetDeviceBlock(p.AccountID, d.ID, nil); err != nil {
 				return err
@@ -484,13 +528,14 @@ type sessionsParams struct {
 // active device signs a new challenge and goes on. It is for a bearer
 // token that may have leaked; a half-finished password login must start
 // again.
-func RevokeSessions(ctx context.Context, st Store, op Operator, who, device string, want *AccessPlan) (*AccessPlan, *AuditEntry, error) {
+func RevokeSessions(ctx context.Context, st Store, op Operator, who, device string, want *AccessPlan) (*AccessResult, *AuditEntry, error) {
 	params := &sessionsParams{}
 	if device != "" && len(want.Devices) == 1 {
 		params.Device = &want.Devices[0].ID
 	}
-	return op.apply(ctx, st, ActionSessionsRevoke, params, want, planSessions(who, device, op), func(tx Tx, p *AccessPlan) error {
+	return op.apply(ctx, st, ActionSessionsRevoke, params, want, planSessions(who, device, op), func(tx Tx, p *AccessPlan, ended *AccessResult) error {
 		params.Sessions, params.LoginTokens = p.Sessions, p.LoginTokens
+		ended.EndedSessions, ended.EndedLoginTokens = p.Sessions, p.LoginTokens
 		if device != "" {
 			return tx.DeleteSessions(p.AccountID, &p.Devices[0].ID)
 		}

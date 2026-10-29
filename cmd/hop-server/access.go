@@ -100,14 +100,15 @@ func printAccess(w io.Writer, p *server.AccessPlan) {
 }
 
 // accessChange is the shape every access command shares: plan, show,
-// confirm, change, report. what describes the change; done the result.
+// confirm, change, report. what describes the change; done the result,
+// the account as the change left it.
 type accessChange struct {
 	f      changeFlags
 	plan   func(ctx context.Context, st *server.SQLite, op server.Operator) (*server.AccessPlan, error)
 	what   func(p *server.AccessPlan) string // "would ..." lines, after the plan
 	ask    func(p *server.AccessPlan) string
-	change func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessPlan, *server.AuditEntry, error)
-	done   func(w io.Writer, p *server.AccessPlan)
+	change func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessResult, *server.AuditEntry, error)
+	done   func(w io.Writer, r *server.AccessResult)
 }
 
 func (a accessChange) run(stdout, stderr io.Writer) error {
@@ -145,10 +146,14 @@ func (a accessChange) run(stdout, stderr io.Writer) error {
 		return err
 	}
 	if *a.f.asJSON {
+		// account is the state after the change; the counts are what it
+		// ended.
 		return writeJSON(stdout, struct {
-			Account accessJSON `json:"account"`
-			Audit   int64      `json:"audit_id"`
-		}{accessOf(res), entry.ID})
+			Account          accessJSON `json:"account"`
+			EndedSessions    int        `json:"ended_sessions"`
+			EndedLoginTokens int        `json:"ended_login_tokens"`
+			Audit            int64      `json:"audit_id"`
+		}{accessOf(&res.AccessPlan), res.EndedSessions, res.EndedLoginTokens, entry.ID})
 	}
 	a.done(stdout, res)
 	return nil
@@ -198,12 +203,12 @@ func accountsDisable(args []string, stdout, stderr io.Writer) error {
 			return s + " " + disableHelp
 		},
 		ask: func(p *server.AccessPlan) string { return fmt.Sprintf("Disable %s?", esc(p.Email)) },
-		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessPlan, *server.AuditEntry, error) {
+		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessResult, *server.AuditEntry, error) {
 			return server.DisableAccount(ctx, st, op, who, r, want)
 		},
-		done: func(w io.Writer, p *server.AccessPlan) {
+		done: func(w io.Writer, r *server.AccessResult) {
 			fmt.Fprintf(w, "disabled %s; ended %s and %s. hop-server accounts enable %s undoes it.\n",
-				esc(p.Email), plural(p.Sessions, "session", "sessions"), plural(p.LoginTokens, "login token", "login tokens"), p.AccountID)
+				esc(r.Email), plural(r.EndedSessions, "session", "sessions"), plural(r.EndedLoginTokens, "login token", "login tokens"), r.AccountID)
 		},
 	}.run(stdout, stderr)
 }
@@ -229,10 +234,10 @@ func accountsEnable(args []string, stdout, stderr io.Writer) error {
 				"a device whose key is sealed with a device passphrase needs hop unlock. Blocked devices stay blocked."
 		},
 		ask: func(p *server.AccessPlan) string { return fmt.Sprintf("Enable %s?", esc(p.Email)) },
-		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessPlan, *server.AuditEntry, error) {
+		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessResult, *server.AuditEntry, error) {
 			return server.EnableAccount(ctx, st, op, who, want)
 		},
-		done: func(w io.Writer, p *server.AccessPlan) { fmt.Fprintf(w, "enabled %s\n", esc(p.Email)) },
+		done: func(w io.Writer, r *server.AccessResult) { fmt.Fprintf(w, "enabled %s\n", esc(r.Email)) },
 	}.run(stdout, stderr)
 }
 
@@ -297,18 +302,18 @@ func devicesBlock(args []string, stdout, stderr io.Writer, block bool) error {
 			return fmt.Sprintf("%s %s of %s?", map[bool]string{true: "Block", false: "Unblock"}[block],
 				plural(len(p.Devices), "device", "devices"), esc(p.Email))
 		},
-		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessPlan, *server.AuditEntry, error) {
+		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessResult, *server.AuditEntry, error) {
 			if block {
 				return server.BlockDevices(ctx, st, op, who, sel, r, want)
 			}
 			return server.UnblockDevices(ctx, st, op, who, sel, want)
 		},
-		done: func(w io.Writer, p *server.AccessPlan) {
+		done: func(w io.Writer, r *server.AccessResult) {
 			if block {
-				fmt.Fprintf(w, "blocked %s; ended %s. %s\n", plural(len(p.Devices), "device", "devices"), plural(p.Sessions, "session", "sessions"), stolenHint)
+				fmt.Fprintf(w, "blocked %s; ended %s. %s\n", plural(len(r.Devices), "device", "devices"), plural(r.EndedSessions, "session", "sessions"), stolenHint)
 				return
 			}
-			fmt.Fprintf(w, "unblocked %s\n", plural(len(p.Devices), "device", "devices"))
+			fmt.Fprintf(w, "unblocked %s\n", plural(len(r.Devices), "device", "devices"))
 		},
 	}.run(stdout, stderr)
 }
@@ -345,11 +350,11 @@ func sessions(args []string, stdout, stderr io.Writer) error {
 				plural(p.Sessions, "live session", "live sessions"), plural(p.LoginTokens, "login token", "login tokens"), signsNobodyOut)
 		},
 		ask: func(p *server.AccessPlan) string { return fmt.Sprintf("End these sessions of %s?", esc(p.Email)) },
-		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessPlan, *server.AuditEntry, error) {
+		change: func(ctx context.Context, st *server.SQLite, op server.Operator, want *server.AccessPlan) (*server.AccessResult, *server.AuditEntry, error) {
 			return server.RevokeSessions(ctx, st, op, who, *device, want)
 		},
-		done: func(w io.Writer, p *server.AccessPlan) {
-			fmt.Fprintf(w, "ended %s and %s\n", plural(p.Sessions, "session", "sessions"), plural(p.LoginTokens, "login token", "login tokens"))
+		done: func(w io.Writer, r *server.AccessResult) {
+			fmt.Fprintf(w, "ended %s and %s\n", plural(r.EndedSessions, "session", "sessions"), plural(r.EndedLoginTokens, "login token", "login tokens"))
 		},
 	}.run(stdout, stderr)
 }
