@@ -56,12 +56,15 @@ type WatchResult struct {
 }
 
 // EndedSessions is what status shows of the sessions the daemon told to
-// end: those told for the last reason that ended any.
+// end: those told for the last reason that ended any. Each is a
+// termination request sent to the hop process that runs the session; the
+// daemon does not learn whether, or when, that process ended its ssh (a
+// suspended hop <target> acts on it once it is resumed).
 type EndedSessions struct {
-	Count    int            `json:"count"`
-	Why      string         `json:"why"` // follows "when": "this device was revoked"
-	At       time.Time      `json:"at"`
-	Sessions []EndedSession `json:"sessions"` // the last maxEndedShown
+	TerminationRequests int            `json:"termination_requests"`
+	Why                 string         `json:"why"` // follows "when": "this device was revoked"
+	At                  time.Time      `json:"at"`
+	Sessions            []EndedSession `json:"sessions"` // the last maxEndedShown
 }
 
 // EndedSession is one hop process the daemon told to end its ssh, as that
@@ -147,7 +150,7 @@ func (s *sessions) noteLocked(why string, told []EndedSession) {
 		s.ended = &EndedSessions{Why: why}
 	}
 	s.ended.At = time.Now()
-	s.ended.Count += len(told)
+	s.ended.TerminationRequests += len(told)
 	s.ended.Sessions = append(s.ended.Sessions, told...)
 	if n := len(s.ended.Sessions); n > maxEndedShown {
 		s.ended.Sessions = slices.Clone(s.ended.Sessions[n-maxEndedShown:])

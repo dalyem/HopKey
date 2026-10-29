@@ -98,7 +98,7 @@ func TestRevocationEndsWatchedSessions(t *testing.T) {
 
 	watchAt(t, sock, "web3", whyRevoked)
 	e := endedStatus(t, x.n2)
-	if e == nil || e.Count != 3 || e.Why != whyRevoked || len(e.Sessions) != 3 {
+	if e == nil || e.TerminationRequests != 3 || e.Why != whyRevoked || len(e.Sessions) != 3 {
 		t.Fatalf("status: ended sessions %+v", e)
 	}
 	got := map[string]bool{}
@@ -179,7 +179,7 @@ func TestMaxOfflineLockEndsWatchedSessions(t *testing.T) {
 		t.Errorf("the vault did not lock for the policy: %+v", s)
 	}
 	watchAt(t, sock, "web2", whyOffline)
-	if e := endedStatus(t, x.n2); e == nil || e.Count != 2 || e.Why != whyOffline {
+	if e := endedStatus(t, x.n2); e == nil || e.TerminationRequests != 2 || e.Why != whyOffline {
 		t.Errorf("status: ended sessions %+v", e)
 	}
 
@@ -212,7 +212,7 @@ func TestLockEndsWatchedSessionsOnlyWhenAsked(t *testing.T) {
 	if len(res.EndedSessions) != 1 || res.EndedSessions[0] != (EndedSession{PID: 4242, Alias: "web1"}) {
 		t.Errorf("hop lock --end-sessions returned %+v", res.EndedSessions)
 	}
-	if e := endedStatus(t, x.n2); e == nil || e.Count != 1 || e.Why != whyLock {
+	if e := endedStatus(t, x.n2); e == nil || e.TerminationRequests != 1 || e.Why != whyLock {
 		t.Errorf("status: ended sessions %+v", e)
 	}
 	watchAt(t, sock, "web2", "").running(t, "the earlier hop lock --end-sessions")

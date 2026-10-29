@@ -29,10 +29,12 @@ import (
 //     group of its own put in the foreground, and appends to the file
 //     JobShellVar names a line for each thing that happens to the job:
 //     "pid N", "stopped SIG", "exit N" or "signal SIG". The job is this
-//     binary again, run as hop (HopMainVar).
+//     binary again, run as hop (HopMainVar). With JobNoHupVar set too, the
+//     job starts with SIGHUP ignored, as under nohup.
 const (
 	HopMainVar  = "HOPKEY_TEST_HOP_MAIN"
 	JobShellVar = "HOPKEY_TEST_JOBSHELL"
+	JobNoHupVar = "HOPKEY_TEST_JOBSHELL_NOHUP"
 )
 
 // HopMainPaths is HopMainVar's JSON value.
@@ -49,8 +51,8 @@ func runTerminalModes() {
 	}
 }
 
-// hopMain is cmd/hop's main for a test machine: the same signal handling,
-// the machine's paths.
+// hopMain is cmd/hop's main for a test machine: the same signal handling
+// (a SIGHUP ignored at the start stays ignored), the machine's paths.
 func hopMain(paths string, args []string) {
 	var p HopMainPaths
 	if err := json.Unmarshal([]byte(paths), &p); err != nil {
@@ -60,7 +62,11 @@ func hopMain(paths string, args []string) {
 	exe, _ := os.Executable()
 	ctx, cancel := context.WithCancelCause(context.Background())
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	stop := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !signal.Ignored(syscall.SIGHUP) {
+		stop = append(stop, syscall.SIGHUP)
+	}
+	signal.Notify(sigs, stop...)
 	go func() {
 		<-sigs
 		signal.Stop(sigs)
@@ -90,10 +96,13 @@ func jobShell(logFile string, args []string) {
 	// The shell itself is not stopped or ended by what the terminal sends
 	// its job. Handled, not ignored: the job gets the defaults back.
 	signal.Notify(make(chan os.Signal, 1), syscall.SIGTSTP, syscall.SIGTTIN, syscall.SIGTTOU, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGHUP)
+	if os.Getenv(JobNoHupVar) != "" {
+		signal.Ignore(syscall.SIGHUP) // the job inherits it ignored
+	}
 	exe, _ := os.Executable()
 	cmd := exec.Command(exe, args...)
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, JobShellVar+"=") {
+		if !strings.HasPrefix(kv, JobShellVar+"=") && !strings.HasPrefix(kv, JobNoHupVar+"=") {
 			cmd.Env = append(cmd.Env, kv)
 		}
 	}

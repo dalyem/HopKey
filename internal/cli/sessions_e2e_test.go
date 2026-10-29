@@ -195,6 +195,13 @@ func (h *termHop) output() string {
 // startTerminalHop runs hop args for m on a new 80x24 terminal.
 func startTerminalHop(t *testing.T, m *machine, args ...string) *termHop {
 	t.Helper()
+	return startTerminalHopEnv(t, m, nil, args...)
+}
+
+// startTerminalHopEnv is startTerminalHop with env added to the job
+// shell's environment.
+func startTerminalHopEnv(t *testing.T, m *machine, env []string, args ...string) *termHop {
+	t.Helper()
 	master, slave := openPTY(t)
 	setSize(t, master, 80, 24)
 	exe, err := os.Executable()
@@ -210,6 +217,7 @@ func startTerminalHop(t *testing.T, m *machine, args ...string) *termHop {
 		}
 	}
 	h.shell.Env = append(h.shell.Env, "HOME="+m.home, "TERM=xterm", cli.HopMainVar+"="+string(paths), cli.JobShellVar+"="+h.log)
+	h.shell.Env = append(h.shell.Env, env...)
 	h.shell.Stdin, h.shell.Stdout, h.shell.Stderr = slave, slave, slave
 	h.shell.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := h.shell.Start(); err != nil {
@@ -397,12 +405,41 @@ func TestTerminalSessionBehavesAsPlainSSH(t *testing.T) {
 	h.event(t, "exit 255")
 }
 
+// A hop <target> started with SIGHUP ignored (under nohup, say) leaves it
+// ignored for its ssh too: a hangup sent to the whole job, as when the
+// terminal goes away, ends neither, and the session goes on.
+func TestTerminalSessionKeepsAnIgnoredHangup(t *testing.T) {
+	requireSSH(t)
+	m, _ := localWeb(t)
+
+	h := startTerminalHopEnv(t, m, []string{cli.JobNoHupVar + "=1"}, "web-1")
+	h.expect(t, "remote$ ")
+	pid, ok := h.jobPID()
+	if !ok {
+		t.Fatal("the job shell logged no pid")
+	}
+	if err := syscall.Kill(-pid, syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	h.send("still here\r")
+	h.expect(t, "remote saw: still here")
+	h.send("exit 0\r")
+	if code := h.wait(t, 15*time.Second); code != 0 {
+		t.Errorf("hop exited %d, want 0", code)
+	}
+	h.event(t, "exit 0")
+}
+
 // A device revoked while it is online ends the ssh sessions hop started,
 // each ended by the hop process that runs it: hop exec, an MCP exec, and
 // hop <target> on a terminal, which says why. A plain ssh through hop's
 // config is not hop's to end, and runs to its end (README, What
 // revocation does: a documented limit). hop's ssh config has no hook for
-// sessions. A hop exec on the revoked device does not reach the server.
+// sessions. A hop <target> suspended (Ctrl-Z) when the revocation comes
+// ends its session as soon as it is resumed; status counts the
+// termination requests sent, its own included. A hop exec on the revoked
+// device does not reach the server.
 func TestRevokeEndsTheSessionsHopStarted(t *testing.T) {
 	requireSSH(t)
 	w := newAuthWorld(t)
@@ -447,6 +484,10 @@ func TestRevokeEndsTheSessionsHopStarted(t *testing.T) {
 	}()
 	term := startTerminalHop(t, m2, "web-1")
 	term.expect(t, "remote$ ")
+	held := startTerminalHop(t, m2, "web-1")
+	held.expect(t, "remote$ ")
+	held.send("\r~\x1a")
+	held.event(t, fmt.Sprintf("stopped %d", int(syscall.SIGTSTP)))
 	plain := startPlainSSH(t, "ssh -F hop's config", "-F", hopCfg, "web-1", "sleep")
 	waitSleeps(t, srv, 3)
 
@@ -498,9 +539,16 @@ func TestRevokeEndsTheSessionsHopStarted(t *testing.T) {
 		t.Errorf("%s was ended: %v\n%s", plain.name, err, plain.stderr.String())
 	}
 
+	// The suspended hop got the request too, and acts on it once resumed.
+	select {
+	case <-held.done:
+		t.Fatalf("the suspended hop web-1 exited (%d) before it was resumed:\n%s", held.code, held.output())
+	default:
+	}
+
 	var st struct {
 		EndedSessions *struct {
-			Count    int    `json:"count"`
+			Requests int    `json:"termination_requests"`
 			Why      string `json:"why"`
 			Sessions []struct {
 				PID   int    `json:"pid"`
@@ -509,8 +557,8 @@ func TestRevokeEndsTheSessionsHopStarted(t *testing.T) {
 		} `json:"ended_sessions"`
 	}
 	decodeJSON(t, m2.must(t, nil, "status", "--json"), &st)
-	if st.EndedSessions == nil || st.EndedSessions.Count != 3 || st.EndedSessions.Why != why {
-		t.Fatalf("hop status --json: ended sessions %+v, want 3", st.EndedSessions)
+	if st.EndedSessions == nil || st.EndedSessions.Requests != 4 || st.EndedSessions.Why != why {
+		t.Fatalf("hop status --json: ended sessions %+v, want 4 termination requests", st.EndedSessions)
 	}
 	for _, s := range st.EndedSessions.Sessions {
 		if s.Alias != "web-1" || s.PID <= 0 {
@@ -518,11 +566,29 @@ func TestRevokeEndsTheSessionsHopStarted(t *testing.T) {
 		}
 	}
 	out := m2.must(t, nil, "status")
-	if !strings.Contains(out, "sessions:     ended 3 ssh sessions hop started, when "+why) || !strings.Contains(out, "web-1 (hop pid ") {
-		t.Errorf("hop status does not say the sessions ended:\n%s", out)
+	if !strings.Contains(out, "sessions:     4 termination requests sent to ssh sessions hop started, when "+why) || !strings.Contains(out, "web-1 (hop pid ") {
+		t.Errorf("hop status does not say the sessions were told to end:\n%s", out)
 	}
-	if out := m2.must(t, nil, "auth", "status"); !strings.Contains(out, "ended 3 ssh sessions hop started, when "+why) {
-		t.Errorf("hop auth status does not say the sessions ended:\n%s", out)
+	if out := m2.must(t, nil, "auth", "status"); !strings.Contains(out, "4 termination requests sent to ssh sessions hop started, when "+why) {
+		t.Errorf("hop auth status does not say the sessions were told to end:\n%s", out)
+	}
+
+	pid, ok := held.jobPID()
+	if !ok {
+		t.Fatal("the job shell logged no pid")
+	}
+	if err := syscall.Kill(-pid, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	resumed := time.Now()
+	if code := held.wait(t, 15*time.Second); code != 255 {
+		t.Errorf("the resumed hop web-1 exited %d, want ssh's 255", code)
+	}
+	if d := time.Since(resumed); d > 3*time.Second {
+		t.Errorf("the resumed hop web-1 ended %v after it was resumed", d)
+	}
+	if out := held.output(); !strings.Contains(out, "hop: the hop daemon ended this ssh session when "+why+"\n") {
+		t.Errorf("the resumed hop web-1 does not say why its session ended:\n%s", out)
 	}
 
 	// A new hop exec: refused before ssh runs, or ended at once.
@@ -576,10 +642,10 @@ func TestLockEndsSessionsOnlyWhenAsked(t *testing.T) {
 	if d := e.at.Sub(locked); d > 8*time.Second {
 		t.Errorf("the session ended %v after hop lock --end-sessions", d)
 	}
-	if !strings.Contains(out, "ended 1 ssh session hop started") {
+	if !strings.Contains(out, "sent a termination request to 1 ssh session hop started") {
 		t.Errorf("hop lock --end-sessions says:\n%s", out)
 	}
-	if out := m.must(t, nil, "status"); !strings.Contains(out, "ended 1 ssh session hop started, when hop lock --end-sessions ran") {
+	if out := m.must(t, nil, "status"); !strings.Contains(out, "1 termination request sent to an ssh session hop started, when hop lock --end-sessions ran") {
 		t.Errorf("hop status:\n%s", out)
 	}
 }

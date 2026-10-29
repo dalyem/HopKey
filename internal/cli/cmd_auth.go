@@ -731,8 +731,8 @@ type AuthStatus struct {
 	SecretKeyStale bool                     `json:"secret_key_stale,omitempty"`
 	KitPending     bool                     `json:"kit_pending,omitempty"`
 	Sync           *daemon.SyncStatusResult `json:"sync,omitempty"`
-	// EndedSessions is the ssh sessions the daemon ended, on a revocation
-	// say.
+	// EndedSessions is the ssh sessions the daemon told to end, on a
+	// revocation say: termination requests sent, not ends confirmed.
 	EndedSessions *daemon.EndedSessions `json:"ended_sessions,omitempty"`
 	Warnings      []string              `json:"warnings,omitempty"`
 }

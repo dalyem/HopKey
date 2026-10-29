@@ -51,9 +51,9 @@ func runLock(ctx context.Context, e *Env, args []string) error {
 		case 0:
 			e.printf("no ssh sessions to end\n")
 		case 1:
-			e.printf("ended 1 ssh session hop started\n")
+			e.printf("sent a termination request to 1 ssh session hop started\n")
 		default:
-			e.printf("ended %d ssh sessions hop started\n", n)
+			e.printf("sent termination requests to %d ssh sessions hop started\n", n)
 		}
 	}
 	return nil

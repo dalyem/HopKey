@@ -423,23 +423,20 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 		runCtx, cancel = context.WithTimeout(ctx, r.timeout)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(runCtx, e.sshBinary(), sshArgs...)
-	cmd.Env = e.sshEnviron()
-	cmd.Stdin = r.stdin
-	cmd.WaitDelay = time.Second
+	sc := &sshCmd{path: e.sshBinary(), args: append([]string{e.sshBinary()}, sshArgs...), env: e.sshEnviron(), stdin: r.stdin, waitDelay: time.Second}
 	outTail, errTail := &tailBuffer{max: tailLimit}, &tailBuffer{max: tailLimit}
-	cmd.Stdout, cmd.Stderr = r.stdout, r.stderr
+	sc.stdout, sc.stderr = r.stdout, r.stderr
 	if r.stdout == nil {
-		cmd.Stdout = outTail
+		sc.stdout = outTail
 	}
 	if r.stderr == nil {
-		cmd.Stderr = errTail
+		sc.stderr = errTail
 	}
 
 	start := time.Now()
-	endedWhy, runErr := e.runSSH(cmd, t.alias)
+	endedWhy, runErr := e.runSSH(runCtx, sc, t.alias)
 	res := ExecResult{Host: t.rr.Result.HostName, DurationMS: time.Since(start).Milliseconds()}
-	var ee *exec.ExitError
+	var ee *sshExitError
 	switch {
 	case runErr == nil:
 	case errors.Is(runErr, errEndedFirst):
@@ -454,7 +451,7 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 		res.Error = fmt.Sprintf("timed out after %s", r.timeout)
 	case errors.As(runErr, &ee):
 		var exited bool
-		res.ExitCode, exited = exitCode(ee)
+		res.ExitCode, exited = ee.exited()
 		if !exited {
 			res.Error = "ssh was stopped (" + ee.Error() + ")"
 		}

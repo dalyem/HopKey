@@ -5,9 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/daemon"
@@ -25,7 +23,7 @@ const (
 	// again while ssh runs.
 	watchRetry = 5 * time.Second
 	// endTerm and endKill are when an ended ssh that still runs gets
-	// SIGTERM and SIGKILL, after its SIGHUP.
+	// SIGTERM and SIGKILL, after its SIGHUP (child.supervise).
 	endTerm = 2 * time.Second
 	endKill = 5 * time.Second
 )
@@ -111,76 +109,32 @@ func (sw *sessionWatch) close() {
 	<-sw.done
 }
 
-// endChild ends an ssh child the daemon said to end: SIGHUP, then SIGTERM
-// at endTerm and SIGKILL at endKill if it has not exited by then. send
-// signals the child, and must refuse once it is reaped, so no signal can
-// reach another process that took its PID.
-func endChild(send func(os.Signal) error, exited <-chan struct{}) {
-	if err := send(syscall.SIGHUP); err != nil {
-		if !errors.Is(err, os.ErrProcessDone) {
-			send(os.Kill) // a system without SIGHUP
-		}
-		return
-	}
-	select {
-	case <-exited:
-		return
-	case <-time.After(endTerm):
-	}
-	send(syscall.SIGTERM)
-	select {
-	case <-exited:
-		return
-	case <-time.After(endKill - endTerm):
-	}
-	send(os.Kill)
-}
-
-// runSSH is cmd.Run for an ssh hop starts, watched by the daemon
+// runSSH runs an ssh hop starts (runChild), watched by the daemon
 // (watchSession). endedWhy says why the daemon ended it; then ssh was
 // sent SIGHUP (it exits 255), or was not started at all (errEndedFirst).
-// cmd.Wait reaps the child; until then, cmd.Process signals only it.
-func (e *Env) runSSH(cmd *exec.Cmd, alias string) (endedWhy string, err error) {
+func (e *Env) runSSH(ctx context.Context, sc *sshCmd, alias string) (endedWhy string, err error) {
 	sw := e.watchSession(alias)
 	defer sw.close()
 	if sw.atOnce != "" {
 		return sw.atOnce, errEndedFirst
 	}
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-	exited, ender := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(ender)
-		select {
-		case endedWhy = <-sw.ended:
-			endChild(cmd.Process.Signal, exited)
-		case <-exited:
-		}
-	}()
-	err = cmd.Wait()
-	close(exited)
-	<-ender
-	return endedWhy, err
+	return runChild(ctx, sc, sw.ended)
 }
 
 // runPipedSSH runs hop <target>'s ssh on streams that are not all files
-// (runTerminalSSH): with cmd.Wait, and no job control.
+// (runTerminalSSH): with no job control.
 func (e *Env) runPipedSSH(path string, argv, environ []string, alias string) (code int, endedWhy string, err error) {
-	cmd := exec.Command(path, argv[1:]...)
-	cmd.Args[0] = argv[0]
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = e.Stdin, e.Stdout, e.Stderr
-	cmd.Env = environ
+	sc := &sshCmd{path: path, args: argv, env: environ, stdin: e.Stdin, stdout: e.Stdout, stderr: e.Stderr}
 	e.sshRan.Store(true)
-	endedWhy, err = e.runSSH(cmd, alias)
-	var ee *exec.ExitError
+	endedWhy, err = e.runSSH(context.Background(), sc, alias)
+	var ee *sshExitError
 	switch {
 	case err == nil:
 		return 0, endedWhy, nil
 	case errors.Is(err, errEndedFirst):
 		return 255, endedWhy, nil
 	case errors.As(err, &ee):
-		code, _ = exitCode(ee)
+		code, _ = ee.exited()
 		return code, endedWhy, nil
 	}
 	return 0, "", err
@@ -199,15 +153,16 @@ func (e *Env) debugf(format string, args ...any) {
 	}
 }
 
-// endedLine describes the sessions the daemon ended, for hop status and
-// hop auth status; "" when it ended none.
+// endedLine describes the sessions the daemon told to end, for hop status
+// and hop auth status; "" when it told none. Each is a termination request
+// sent to a hop process, not an end hop saw happen.
 func (e *Env) endedLine(es *daemon.EndedSessions) string {
-	if es == nil || es.Count == 0 {
+	if es == nil || es.TerminationRequests == 0 {
 		return ""
 	}
-	what := "ssh sessions"
-	if es.Count == 1 {
-		what = "ssh session"
+	what := "termination requests sent to ssh sessions"
+	if es.TerminationRequests == 1 {
+		what = "termination request sent to an ssh session"
 	}
 	var list []string
 	for i, s := range es.Sessions {
@@ -226,7 +181,7 @@ func (e *Env) endedLine(es *daemon.EndedSessions) string {
 			list = append(list, strings.Join(d, " "))
 		}
 	}
-	line := fmt.Sprintf("ended %d %s hop started, when %s, %s", es.Count, what, es.Why, e.when(es.At))
+	line := fmt.Sprintf("%d %s hop started, when %s, %s", es.TerminationRequests, what, es.Why, e.when(es.At))
 	if len(list) > 0 {
 		line += ": " + strings.Join(list, ", ")
 	}
