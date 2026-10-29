@@ -456,8 +456,10 @@ func TestLateRetireStatusAnswerAfterLockAndUnlockDoesNothing(t *testing.T) {
 	}
 }
 
-// A retire-status receipt acts only if it names this device and says
-// retired or revoked.
+// A retire-status receipt is recorded only if it names this device and
+// says retired or revoked. Any other is not recorded, but the session was
+// refused, so the vault locks in memory until the server accepts the
+// device again.
 func TestServerRetirementChecksTheReceipt(t *testing.T) {
 	x := newSyncSetup(t)
 	x.w.start(x.n2, x.n2.st, SyncOptions{noPoll: true})
@@ -482,11 +484,20 @@ func TestServerRetirementChecksTheReceipt(t *testing.T) {
 		"an unknown how": retireStatusBody(t, laptop, "suspended", 7),
 	} {
 		rc.Store(&body)
-		if e.sessionEnded(context.Background()) {
-			t.Errorf("%s: acted on the receipt", name)
+		if !e.sessionEnded(context.Background()) {
+			t.Errorf("%s: sync went on after a refused session", name)
 		}
-		if x.n2.st.Info().Locked || x.n2.agentKeys() != 1 || e.status().ServerRetirement != nil {
-			t.Fatalf("%s: a bad receipt had an effect", name)
+		if info := x.n2.st.Info(); !info.Locked || !info.ServerUnconfirmed || x.n2.agentKeys() != 0 {
+			t.Errorf("%s: the vault did not lock, or the agent kept its key", name)
+		}
+		if rep, _ := x.n2.st.Report(); rep != nil || e.status().ServerRetirement != nil {
+			t.Fatalf("%s: a bad receipt was recorded: %+v", name, rep)
+		}
+		refuse.Store(false)
+		x.n2.must(OpUnlock, nil, nil)
+		refuse.Store(true)
+		if x.n2.agentKeys() != 1 {
+			t.Fatalf("%s: the key is not back once the server accepts the device", name)
 		}
 	}
 	good := retireStatusBody(t, laptop, "revoked", 7)

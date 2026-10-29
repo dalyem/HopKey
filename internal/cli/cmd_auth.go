@@ -642,10 +642,12 @@ type AuthStatus struct {
 	// Revoked means the account revoked this device (SignedIn is false):
 	// the server reports it (RevokedUnverified while that is not proven,
 	// and the vault stays locked), or the log proved it and the vault was
-	// wiped here (Wiped, and Revocation says when).
+	// wiped here (Wiped, and Revocation says when). WipePending means it is
+	// proven, but the wipe has not finished.
 	Revoked           bool                    `json:"revoked,omitempty"`
 	RevokedUnverified bool                    `json:"revoked_unverified,omitempty"`
 	Wiped             bool                    `json:"wiped,omitempty"`
+	WipePending       bool                    `json:"wipe_pending,omitempty"`
 	Revocation        *store.RevocationRecord `json:"revocation,omitempty"`
 	// Vault is false when this device has no vault at all.
 	Vault          bool                     `json:"vault"`
@@ -712,7 +714,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	if s := st.Sync; s != nil && s.State != daemon.SyncOff {
 		a.Revoked = s.State == daemon.SyncRevoked
 		if r := s.ServerRetirement; a.Revoked && r != nil {
-			a.Wiped, a.RevokedUnverified = r.Wiped, !r.Wiped
+			a.Wiped, a.RevokedUnverified, a.WipePending = r.Wiped, r.Unverified, !r.Unverified && !r.Wiped
 		}
 		if a.Wiped {
 			a.Vault = false
@@ -749,6 +751,13 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		e.printf("signed in:    no; this device was revoked from the account, the revocation verified, and this device's copy of the vault, " +
 			"its device key and the ssh files hop wrote were wiped (hop auth login signs in again)\n")
 		return nil
+	case a.WipePending:
+		r := a.Sync.ServerRetirement
+		e.printf("signed in:    no; this device was %s from the account at seq %d, and the revocation verified, so the vault stays locked for good; "+
+			"wiping this device's copy has not finished (%s)\n", oneLine(r.How), r.Seq, oneLine(r.WipeError))
+	case a.RevokedUnverified && a.Sync.ServerRetirement.ReportCorrupt:
+		e.printf("signed in:    no; the server reported that this device left the account, but the record of that report here is corrupt, " +
+			"so the vault stays locked and nothing syncs (hop auth logout wipes this device, then hop auth login signs in again)\n")
 	case a.RevokedUnverified:
 		r := a.Sync.ServerRetirement
 		e.printf("signed in:    no; the server reports that this device was %s from the account at seq %d, so the vault stays locked "+

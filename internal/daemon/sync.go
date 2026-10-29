@@ -148,6 +148,11 @@ type syncer struct {
 	wakeCh chan struct{}
 	// pause stops the loop from pulling or pushing (tests).
 	pause atomic.Bool
+	// held counts the server checks in progress (holdPolls): while any
+	// is, the loop starts no step, so no long-poll holds the store's sync
+	// lock for them to wait on. parked says the loop waits for them.
+	held   atomic.Int32
+	parked atomic.Bool
 
 	mu        sync.Mutex
 	pollStop  context.CancelFunc // ends the long-poll in flight
@@ -191,6 +196,9 @@ type syncer struct {
 	maxOffline  time.Duration
 	lastContact time.Time
 	offline     string
+	// unconfirmed says why the server's answer kept the vault locked
+	// (unconfirmedLocked); "" once it accepts the device.
+	unconfirmed string
 
 	// confirmKey keys the confirmation tokens of resolution proposals
 	// (confirmToken). It is random per daemon process.
@@ -272,6 +280,37 @@ func (e *syncer) wake() {
 	}
 }
 
+// holdPolls ends the long-poll in flight and keeps the loop from taking
+// the store's sync lock again until the func it returns is called, so a
+// server check (checkServer) gets it at once. A loop that waited for it
+// resumes then. It does not wake the loop otherwise: the loop's own checks
+// (sessionEnded, retryUnconfirmed) hold it too.
+func (e *syncer) holdPolls() func() {
+	e.held.Add(1)
+	e.mu.Lock()
+	stop := e.pollStop
+	e.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	return func() {
+		if e.held.Add(-1) == 0 && e.parked.Swap(false) {
+			e.wake()
+		}
+	}
+}
+
+// parkForCheck reports whether a server check holds the loop
+// (holdPolls); the loop then waits for it to end.
+func (e *syncer) parkForCheck() bool {
+	if e.held.Load() == 0 {
+		return false
+	}
+	e.parked.Store(true)
+	// Released meanwhile: then nothing wakes the loop, so it goes on.
+	return e.held.Load() > 0 || !e.parked.Swap(false)
+}
+
 func (e *syncer) run(ctx context.Context) {
 	defer func() {
 		e.mu.Lock()
@@ -333,7 +372,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 	if e.terminal() {
 		return stepStop
 	}
-	if e.pause.Load() {
+	if e.pause.Load() || e.parkForCheck() {
 		return stepIdle
 	}
 	if e.status().Halted != "" {
@@ -363,12 +402,19 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 			}
 		})
 		return stepIdle
+	case info.Locked && info.ServerUnconfirmed:
+		// The server answered without confirming this device: ask again.
+		e.setPhase(SyncLocked)
+		if e.d.retryUnconfirmed(ctx) {
+			return stepNow
+		}
+		return stepIdle
 	case info.Locked:
 		e.setPhase(SyncLocked)
 		return stepIdle
 	}
 	e.set(func() {
-		if e.phase == SyncLocked || e.phase == SyncOff || (e.phase == SyncRevoked && e.retired != nil && !e.retired.Wiped) {
+		if e.phase == SyncLocked || e.phase == SyncOff || (e.phase == SyncRevoked && e.retired != nil && e.retired.Unverified) {
 			e.phase, e.retired = SyncStarting, nil
 		}
 	})
@@ -416,6 +462,10 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		cancel()
 	default:
 	}
+	if e.held.Load() > 0 {
+		// A server check began since the step did: it goes first.
+		cancel()
+	}
 	// Only once the server has answered does a pull wait for news: until
 	// then, at start and after a failure, status would say starting or
 	// retrying for as long as the long-poll lasts.
@@ -447,7 +497,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 func (e *syncer) terminal() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return (e.phase == SyncRevoked && (e.retired == nil || e.retired.Wiped)) || e.phase == SyncLoggedOut
+	return (e.phase == SyncRevoked && (e.retired == nil || !e.retired.Unverified)) || e.phase == SyncLoggedOut
 }
 
 // pushHead pushes the outbox's head record under the per-push deadline,
@@ -633,15 +683,27 @@ func (e *syncer) revoked(err error) {
 // entries are not served to it any more, so the revocation can't be
 // verified from the log; CheckServer asks again and, if the server says it
 // left, records the report and locks the vault (reportedLocked), and the
-// proof is asked for. It reports whether sync stopped.
+// proof is asked for. An answer that does not confirm the device locks the
+// vault until one does (unconfirmedLocked). It reports whether sync
+// stopped.
 func (e *syncer) sessionEnded(ctx context.Context) bool {
+	gen := e.st.Generation()
 	res, err := e.d.checkServer(ctx, sessionCheckTimeout, nil)
-	if err != nil || res.Report == nil {
+	switch {
+	case err == nil && res.Report != nil:
+		e.d.mu.Lock()
+		defer e.d.mu.Unlock()
+		e.d.reportedLocked(res.Report, nil)
+		return true
+	case err == nil, unreachable(err):
 		return false
 	}
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
-	e.d.reportedLocked(res.Report, nil)
+	if !e.d.stillUnconfirmed(err, gen) {
+		return false
+	}
+	e.d.unconfirmedLocked(err)
 	return true
 }
 
@@ -976,7 +1038,8 @@ func (e *syncer) status() SyncStatusResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := SyncStatusResult{State: e.phase, LastError: e.lastErr, Halted: e.halted, Equivocation: e.equivoc,
-		CheckSkipped: e.checkSkipped, MaxOffline: int64(e.maxOffline / time.Second), OfflineLocked: e.offline}
+		CheckSkipped: e.checkSkipped, MaxOffline: int64(e.maxOffline / time.Second), OfflineLocked: e.offline,
+		ServerUnconfirmed: e.unconfirmed}
 	if e.retired != nil {
 		r := *e.retired
 		out.ServerRetirement = &r

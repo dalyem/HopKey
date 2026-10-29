@@ -88,8 +88,10 @@ type Options struct {
 	writeConfig func(sshconfig.Options, []sshconfig.Host) error
 	wipeConfig  func(o sshconfig.Options, done func() error) error
 	configRetry time.Duration
-	// offlineEvery replaces offlineEvery (revocation.go).
+	// offlineEvery replaces offlineEvery (revocation.go), and now
+	// time.Now for the max-offline policy.
 	offlineEvery time.Duration
+	now          func() time.Time
 }
 
 // Daemon is a running daemon.

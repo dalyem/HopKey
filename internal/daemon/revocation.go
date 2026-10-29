@@ -15,14 +15,21 @@ import (
 //
 // Before the daemon puts a key in the agent, at start and at each hop
 // unlock, it asks the server whether this device is still in the account,
-// for at most checkTimeout. A refusal records the server's report: the
-// vault stays locked, the agent empty and the ssh config emptied, after a
-// restart too, and the daemon asks the server for the proof (prove). A
+// for at most checkTimeout in all, waiting for a sync in progress included
+// (a long-poll is cut short for it). A refusal with a report records it:
+// the vault stays locked, the agent empty and the ssh config emptied, after
+// a restart too, and the daemon asks the server for the proof (prove). A
 // proof that verifies wipes this device's copy of the vault as a logout
-// does. A server that does not answer in time is no reason to refuse: the
-// keys load, and status says the check was skipped. A report clears only
-// when the server authenticates this device again: at the next start, or
-// the next hop unlock.
+// does. A report clears only when the server authenticates this device
+// again: at the next start, or the next hop unlock.
+//
+// Only a server that can't be reached (unreachable: DNS, dial, a reset, a
+// timeout, TLS, a 5xx or 429 from what stands in front of it) is no reason
+// to refuse: the keys load, and status says the check was skipped. Any
+// other answer that does not confirm the device, a session refused without
+// a valid report or a response the client can't use, keeps the vault
+// locked in memory (unconfirmedLocked), deletes and records nothing, and
+// the next unlock or sync asks again.
 //
 // Then the account's max-offline policy (model.Policy): a device that has
 // not had an authenticated answer from the server for longer locks, and
@@ -40,9 +47,43 @@ const (
 	// checked.
 	offlineEvery = time.Minute
 	// clockSlack is how far in the future the last contact may be before
-	// the clock counts as set back.
+	// the clock counts as set back: the clock skew the policy allows.
 	clockSlack = 5 * time.Minute
 )
+
+// unreachable reports whether err means the server could not be asked:
+// the request failed below HTTP (DNS, dial, a refused or reset
+// connection, a TLS handshake), the certificate did not verify (a captive
+// portal or a proxy in the way, which could block the traffic anyway), the
+// deadline passed (waiting for a sync in progress included), or what
+// answered is a proxy or server that is down or busy (5xx, 429). Only
+// these let keys load without an answer.
+func unreachable(err error) bool {
+	return syncclient.Retryable(err) || errors.Is(err, syncclient.ErrTLS) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// unlockCheck is the server check of one unlock (unlockVault): one
+// deadline, checkTimeout from the first question, for every question it
+// asks, and whether the server accepted the device already.
+type unlockCheck struct {
+	parent   context.Context
+	ctx      context.Context
+	cancel   context.CancelFunc
+	accepted bool
+}
+
+func (c *unlockCheck) context() context.Context {
+	if c.ctx == nil {
+		c.ctx, c.cancel = context.WithTimeout(c.parent, checkTimeout)
+	}
+	return c.ctx
+}
+
+func (c *unlockCheck) done() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+}
 
 // revocationStore is the revocation side of the encrypted store
 // (*store.Store).
@@ -84,8 +125,12 @@ func (e *syncer) checker() (store.ServerChecker, error) {
 
 // checkServer asks the server, within timeout, whether this device is
 // still in the account (store.CheckServer), and records the answer for
-// status. An unanswered question is returned as the error. It does not take
-// d.mu, but a report found is acted on by the caller (reportedLocked).
+// status. A long-poll in flight is ended first, and none starts until the
+// answer is in, so the question does not wait for one. An unanswered
+// question is returned as the error; unreachable says whether that lets
+// keys load. It does not take d.mu, but a report found, or an answer that
+// does not confirm the device, is acted on by the caller (reportedLocked,
+// unconfirmedLocked).
 func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphrase []byte) (store.ServerCheck, error) {
 	rs, e, ok := d.revocations()
 	if !ok {
@@ -97,9 +142,10 @@ func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphr
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	defer e.holdPolls()()
 	res, err := rs.CheckServer(ctx, r, passphrase)
 	switch {
-	case err != nil && (syncclient.Retryable(err) || errors.Is(err, context.DeadlineExceeded)):
+	case err != nil && unreachable(err):
 		why := err.Error()
 		e.set(func() { e.checkSkipped = why })
 		d.logf("the server could not be asked whether this device is still in the account: %v", err)
@@ -107,8 +153,8 @@ func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphr
 		d.logf("asking the server whether this device is still in the account: %v", err)
 	case res.Active:
 		e.set(func() {
-			e.checkSkipped = ""
-			if e.retired != nil && !e.retired.Wiped {
+			e.checkSkipped, e.unconfirmed = "", ""
+			if e.retired != nil && e.retired.Unverified {
 				// The report was wrong.
 				e.retired = nil
 				if e.phase == SyncRevoked {
@@ -118,6 +164,79 @@ func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphr
 		})
 	}
 	return res, err
+}
+
+// unconfirmedLocked keeps the keys out after the server answered without
+// confirming this device (err): the vault is locked in memory, nothing is
+// recorded or deleted, and status says why. The next unlock asks again,
+// and so does the sync loop (retryUnconfirmed). It returns the error,
+// which matches store.ErrServerUnconfirmed. The caller holds d.mu.
+func (d *Daemon) unconfirmedLocked(err error) error {
+	rs, e, ok := d.revocations()
+	if !ok {
+		return err
+	}
+	if !errors.Is(err, store.ErrServerUnconfirmed) {
+		err = fmt.Errorf("%w (%v)", store.ErrServerUnconfirmed, err)
+	}
+	rs.LockFor(err)
+	d.dropKeysLocked(false)
+	why := err.Error()
+	e.set(func() { e.unconfirmed, e.checkSkipped = why, "" })
+	d.logf("the vault stays locked: %v", err)
+	return err
+}
+
+// stillUnconfirmed reports whether err, the answer to a check that the
+// sync loop started in generation gen, is still to be acted on by
+// unconfirmedLocked: the store locked itself for it (CheckServer), or, for
+// any other answer, nothing locked or unlocked the vault meanwhile (hop
+// lock, say, whose cancellation is no answer). The caller holds d.mu.
+func (d *Daemon) stillUnconfirmed(err error, gen uint64) bool {
+	if errors.Is(err, store.ErrServerUnconfirmed) {
+		info := d.sync.st.Info()
+		return info.Locked && info.ServerUnconfirmed
+	}
+	return d.sync.st.Generation() == gen
+}
+
+// retryUnconfirmed asks the server again about a vault unconfirmedLocked
+// locked, and once it accepts the device, unlocks the vault with the
+// device key and loads the agent, as hop unlock would. It reports whether
+// the vault unlocked.
+func (d *Daemon) retryUnconfirmed(ctx context.Context) bool {
+	v, ok := d.store.(Vault)
+	if !ok || d.sync == nil {
+		return false
+	}
+	gen := d.sync.st.Generation()
+	res, err := d.checkServer(ctx, sessionCheckTimeout, nil)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case err == nil && res.Report != nil:
+		d.reportedLocked(res.Report, nil)
+		return false
+	case err != nil && !unreachable(err) && d.stillUnconfirmed(err, gen):
+		d.unconfirmedLocked(err)
+		return false
+	case err != nil || d.sync.st.Generation() != gen:
+		// Unanswered, or the vault was locked or unlocked meanwhile.
+		return false
+	}
+	if err := v.Unlock(ctx); err != nil {
+		d.logf("the server accepts this device again, but the vault did not unlock: %v", err)
+		return false
+	}
+	if err := d.checkBeforeKeysLocked(&unlockCheck{parent: ctx, accepted: true}, nil); err != nil {
+		return false
+	}
+	d.sync.set(func() { d.sync.offline, d.sync.unconfirmed = "", "" })
+	d.logf("the server accepts this device again: the vault is unlocked")
+	if _, err := d.reloadLocked(ctx); err != nil {
+		d.logf("loading the agent: %v", err)
+	}
+	return true
 }
 
 // reportedLocked takes the daemon to the reported state: sync stopped, the
@@ -177,15 +296,20 @@ func (d *Daemon) prove(passphrase []byte) {
 	}()
 }
 
-// wiped follows a wipe of this device's copy of the vault (why wraps
-// store.ErrDeviceRevoked): sync stops for good, and the ssh config is
+// wiped follows a proven revocation (why wraps store.ErrDeviceRevoked) and
+// the wipe of this device's copy of the vault it started, finished or not
+// (store.ErrWipeIncomplete): sync stops for good, and the ssh config is
 // emptied and its files removed, which clears the store's mark that it was
-// owed.
+// owed. Status calls the device wiped only once both are done (syncStatus).
 func (d *Daemon) wiped(why error) {
 	e := d.sync
+	wipeErr := ""
+	if errors.Is(why, store.ErrWipeIncomplete) {
+		wipeErr = why.Error()
+	}
 	e.set(func() {
 		e.phase, e.lastErr, e.lastErrAt = SyncRevoked, why.Error(), time.Now()
-		r := &ServerRetirement{How: "revoked", Wiped: true}
+		r := &ServerRetirement{How: "revoked", WipeError: wipeErr}
 		if e.retired != nil {
 			r.How, r.Seq = e.retired.How, e.retired.Seq
 		}
@@ -193,8 +317,16 @@ func (d *Daemon) wiped(why error) {
 	})
 	d.mu.Lock()
 	d.dropKeysLocked(true)
+	pending := d.pendingClear()
 	d.mu.Unlock()
-	d.logf("this device was revoked from the account, verified: its copy of the vault, its device key and the ssh files hop wrote were wiped (%v)", why)
+	switch {
+	case wipeErr != "":
+		d.logf("this device was revoked from the account, verified; wiping its copy of the vault did not finish, and finishes at the next start: %v", why)
+	case pending != "":
+		d.logf("this device was revoked from the account, verified: its copy of the vault and its device key were wiped; the ssh files hop wrote are not removed yet (%s), and the daemon tries again (%v)", pending, why)
+	default:
+		d.logf("this device was revoked from the account, verified: its copy of the vault, its device key and the ssh files hop wrote were wiped (%v)", why)
+	}
 }
 
 // wipeVerified wipes the store after a verified revocation (a pull met the
@@ -218,8 +350,9 @@ func (d *Daemon) wipeVerified() bool {
 // preflight runs at start, before anything is loaded into the agent. A
 // verified revocation wipes. A signed-in device asks the server; a report
 // keeps the vault locked, and a device whose report the server now
-// contradicts unlocks with its own device key. Then the max-offline
-// policy.
+// contradicts unlocks with its own device key. An answer that does not
+// confirm the device keeps it locked too; only a server that can't be
+// reached lets the keys load unasked. Then the max-offline policy.
 func (d *Daemon) preflight(ctx context.Context) {
 	_, e, ok := d.revocations()
 	if !ok {
@@ -252,6 +385,9 @@ func (d *Daemon) preflight(ctx context.Context) {
 			e.retired = &ServerRetirement{How: info.ServerReport.How, Seq: info.ServerReport.Seq, Unverified: true}
 		})
 		return
+	case err != nil && !unreachable(err):
+		d.unconfirmedLocked(err)
+		return
 	}
 	d.enforceOfflineLocked(ctx)
 }
@@ -280,7 +416,7 @@ func (d *Daemon) enforceOfflineLocked(ctx context.Context) error {
 	if max == 0 {
 		return nil
 	}
-	now := time.Now()
+	now := d.now()
 	var why string
 	switch {
 	case cerr != nil:
@@ -301,6 +437,14 @@ func (d *Daemon) enforceOfflineLocked(ctx context.Context) error {
 	d.sync.wake()
 	d.logf("the vault locked itself: %v", err)
 	return err
+}
+
+// now is the time the max-offline policy is checked at.
+func (d *Daemon) now() time.Time {
+	if d.opts.now != nil {
+		return d.opts.now()
+	}
+	return time.Now()
 }
 
 // watchOffline checks the max-offline policy of an unlocked vault every
@@ -334,32 +478,46 @@ func (d *Daemon) watchOffline() {
 }
 
 // checkBeforeKeysLocked is what an unlock does once the store is unlocked
-// and before the agent gets a key: the server is asked, and the
-// max-offline policy applied. The caller holds d.mu.
-func (d *Daemon) checkBeforeKeysLocked(ctx context.Context, passphrase []byte) error {
+// and before the agent gets a key: the server is asked, unless it accepted
+// the device already in c, and the max-offline policy applied. A report,
+// or an answer that does not confirm the device, locks the vault again;
+// only an unreachable server lets it through unasked. The caller holds
+// d.mu.
+func (d *Daemon) checkBeforeKeysLocked(c *unlockCheck, passphrase []byte) error {
 	if _, _, ok := d.revocations(); !ok {
 		return nil
 	}
-	res, err := d.checkServer(ctx, checkTimeout, nil)
-	if err == nil && res.Report != nil {
-		d.reportedLocked(res.Report, passphrase)
-		return store.ErrServerRevoked
+	if !c.accepted {
+		res, err := d.checkServer(c.context(), checkTimeout, nil)
+		switch {
+		case err == nil && res.Report != nil:
+			d.reportedLocked(res.Report, passphrase)
+			return store.ErrServerRevoked
+		case err != nil && !unreachable(err):
+			return d.unconfirmedLocked(err)
+		}
+		c.accepted = err == nil
 	}
-	return d.enforceOfflineLocked(ctx)
+	return d.enforceOfflineLocked(c.parent)
 }
 
 // recheckReportLocked runs before an unlock of a vault the server reported
-// revoked: only the server's authentication of this device clears it. The
-// caller holds d.mu.
-func (d *Daemon) recheckReportLocked(ctx context.Context, passphrase []byte) error {
-	res, err := d.checkServer(ctx, checkTimeout, passphrase)
+// revoked: only the server's authentication of this device clears it. A
+// device key this daemon can't open without the device passphrase is
+// returned as is (store.ErrDeviceKey), so hop unlock asks for it and tries
+// again. The caller holds d.mu.
+func (d *Daemon) recheckReportLocked(c *unlockCheck, passphrase []byte) error {
+	res, err := d.checkServer(c.context(), checkTimeout, passphrase)
 	switch {
+	case errors.Is(err, store.ErrDeviceKey):
+		return fmt.Errorf("the server must accept this device again before the vault unlocks, and asking it needs the device key: %w", err)
 	case err != nil:
 		return fmt.Errorf("%w (the server could not be asked again: %v)", store.ErrServerRevoked, err)
 	case res.Report != nil:
 		d.reportedLocked(res.Report, passphrase)
 		return store.ErrServerRevoked
 	}
+	c.accepted = true
 	d.logf("the server accepts this device again: its report that the device left the account is cleared")
 	return nil
 }

@@ -213,7 +213,9 @@ func (d *Daemon) watchRevoked() {
 // its passphrase, or the password. On a signed-in device the server is
 // asked first whether the device is still in the account, and the
 // max-offline policy applied (revocation.go): a vault the server reported
-// revoked unlocks only once the server authenticates the device again.
+// revoked unlocks only once the server authenticates the device again. The
+// questions share one deadline (unlockCheck), which bounds how long d.mu
+// is held for them.
 func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -222,8 +224,10 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 		pass = []byte(p.DevicePassphrase)
 		defer clear(pass)
 	}
+	chk := &unlockCheck{parent: ctx}
+	defer chk.done()
 	if v.Info().ServerReport != nil {
-		if err := d.recheckReportLocked(ctx, pass); err != nil {
+		if err := d.recheckReportLocked(chk, pass); err != nil {
 			return err
 		}
 	}
@@ -239,12 +243,12 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 	if err != nil {
 		return err
 	}
-	if err := d.checkBeforeKeysLocked(ctx, pass); err != nil {
+	if err := d.checkBeforeKeysLocked(chk, pass); err != nil {
 		d.sync.wake()
 		return err
 	}
 	if d.sync != nil {
-		d.sync.set(func() { d.sync.offline = "" })
+		d.sync.set(func() { d.sync.offline, d.sync.unconfirmed = "", "" })
 	}
 	_, err = d.reloadLocked(ctx)
 	// Sync resumes from the last verified head (§11.2).

@@ -188,9 +188,17 @@ type Info struct {
 	// account: the vault stays locked until the server authenticates the
 	// device again (ErrServerRevoked).
 	ServerReport *ServerReport `json:"server_report,omitempty"`
+	// ServerReportCorrupt means the record of that report does not parse,
+	// or its MAC does not verify: it still keeps the vault locked, but its
+	// metadata (ServerReport is then empty) is not shown as the server's.
+	ServerReportCorrupt bool `json:"server_report_corrupt,omitempty"`
 	// OfflineTooLong means the account's max-offline policy locked the
 	// vault (ErrOfflineTooLong); LockReason says more.
 	OfflineTooLong bool `json:"offline_too_long,omitempty"`
+	// ServerUnconfirmed means the server answered without confirming that
+	// this device is still in the account, so the vault is locked until
+	// it does (ErrServerUnconfirmed); LockReason says more.
+	ServerUnconfirmed bool `json:"server_unconfirmed,omitempty"`
 	// Warnings are for the user, one sentence each.
 	Warnings []string `json:"warnings,omitempty"`
 }
@@ -217,8 +225,13 @@ type Store struct {
 	rec     *deviceRecord
 	devCfg  deviceConfig
 	lockErr error
-	kit     *Kit   // a committed password change whose kit is not confirmed
-	kitSeq  uint64 // the seq of kit's journal
+	// contactAt is the last authenticated contact with the server this
+	// Store saw (noteContact); reportVerdict what verifyReport found of
+	// server-revoked.json.
+	contactAt     time.Time
+	reportVerdict *reportVerdict
+	kit           *Kit   // a committed password change whose kit is not confirmed
+	kitSeq        uint64 // the seq of kit's journal
 	// kitServer means kit is a server-backed checkpoint's, journaled in
 	// vault/checkpoint.json (checkpoint.go), of kind kitKind.
 	kitServer bool
@@ -239,8 +252,8 @@ type Store struct {
 	// server says the vault is server-backed (vault/server.json).
 	server bool
 	// syncMu serializes Pull and PushHead. Neither holds mu while it waits
-	// on the server. Take it with lockSync.
-	syncMu sync.Mutex
+	// on the server. Take it with lockSync, or lockSyncCtx.
+	syncMu ctxMutex
 	// closing is set, under mu, once Close begins: lockSync refuses from
 	// then on, and trackRequest returns contexts already cancelled.
 	closing bool
@@ -428,6 +441,7 @@ func (s *Store) Close() error {
 	if s.owner == nil {
 		return nil
 	}
+	s.saveContact()
 	err := s.owner.Close()
 	s.owner = nil
 	return err
@@ -436,7 +450,15 @@ func (s *Store) Close() error {
 // lockSync takes syncMu, or returns ErrClosed (without it) once Close has
 // begun. The caller releases syncMu.
 func (s *Store) lockSync() error {
-	s.syncMu.Lock()
+	return s.lockSyncCtx(context.Background())
+}
+
+// lockSyncCtx is lockSync that gives up when ctx ends first, with an error
+// that wraps ctx's: no request was made.
+func (s *Store) lockSyncCtx(ctx context.Context) error {
+	if err := s.syncMu.LockContext(ctx); err != nil {
+		return fmt.Errorf("store: waiting for the sync in progress: %w", err)
+	}
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
@@ -996,7 +1018,7 @@ func (s *Store) lockedErr() error {
 	if s.refuseReported() != nil {
 		return ErrServerRevoked
 	}
-	if errors.Is(s.lockErr, ErrOfflineTooLong) {
+	if errors.Is(s.lockErr, ErrOfflineTooLong) || errors.Is(s.lockErr, ErrServerUnconfirmed) {
 		return s.lockErr
 	}
 	return errLocked
@@ -1203,6 +1225,7 @@ func (s *Store) Info() Info {
 	if s.lockErr != nil {
 		info.LockReason = s.lockErr.Error()
 		info.OfflineTooLong = s.state == nil && errors.Is(s.lockErr, ErrOfflineTooLong)
+		info.ServerUnconfirmed = s.state == nil && errors.Is(s.lockErr, ErrServerUnconfirmed)
 	}
 	if s.state != nil {
 		info.Head = &Head{Seq: s.state.Head.Seq, H: s.state.Head.H.String()}
@@ -1263,8 +1286,8 @@ func (s *Store) Info() Info {
 	if j, err := s.readRetireFile(); err == nil && j != nil {
 		info.Logout = j.State
 	}
-	if r, err := s.readReport(); err == nil && r != nil {
-		info.ServerReport = r
+	if r, corrupt, err := s.readReport(); err == nil && r != nil {
+		info.ServerReport, info.ServerReportCorrupt = r, corrupt
 	}
 	if exists, _ := s.l.mergeExists(); exists {
 		info.Merge = "present"
@@ -1592,4 +1615,39 @@ func (s *Store) Delete(_ context.Context, id model.ID) error {
 		}
 		return nil
 	})
+}
+
+// ctxMutex is a mutex that a waiter can stop waiting for (LockContext).
+// The zero value is unlocked.
+type ctxMutex struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (m *ctxMutex) c() chan struct{} {
+	m.once.Do(func() { m.ch = make(chan struct{}, 1) })
+	return m.ch
+}
+
+func (m *ctxMutex) Lock() { m.c() <- struct{}{} }
+
+// LockContext takes the mutex, or returns ctx's error when ctx ends first.
+func (m *ctxMutex) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.c() <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *ctxMutex) Unlock() {
+	select {
+	case <-m.c():
+	default:
+		panic("store: unlock of an unlocked ctxMutex")
+	}
 }

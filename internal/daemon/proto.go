@@ -272,6 +272,10 @@ type SyncStatusResult struct {
 	MaxOffline    int64      `json:"max_offline,omitempty"`
 	LastContact   *time.Time `json:"last_contact,omitempty"`
 	OfflineLocked string     `json:"offline_locked,omitempty"`
+	// ServerUnconfirmed says why the server's answer kept the vault
+	// locked: it did not confirm this device is still in the account
+	// (store.ErrServerUnconfirmed). The next unlock or sync asks again.
+	ServerUnconfirmed string `json:"server_unconfirmed,omitempty"`
 	// What still needs the user, each also a sentence in Warnings.
 	LostIntents        uint64                  `json:"lost_intents,omitempty"`
 	LostJournals       *store.LostJournals     `json:"lost_journals,omitempty"`
@@ -291,11 +295,18 @@ type ServerRetirement struct {
 	How        string `json:"how"`        // "retired" or "revoked"
 	Seq        uint64 `json:"seq"`        // the entry the server says removed it
 	Unverified bool   `json:"unverified"` // the proof has not verified (yet): nothing was deleted
-	// Wiped means the proof verified and this device's copy of the vault,
-	// its device key and the ssh files hop wrote are gone.
+	// Wiped means the revocation is proven (not Unverified) and the wipe
+	// is done: this device's copy of the vault, its device key and the
+	// ssh files hop wrote are gone.
 	Wiped bool `json:"wiped,omitempty"`
+	// WipeError says why a proven revocation's wipe has not finished yet.
+	WipeError string `json:"wipe_error,omitempty"`
 	// ProofError says why the proof did not verify, or could not be had.
 	ProofError string `json:"proof_error,omitempty"`
+	// ReportCorrupt means the record of the server's report here does not
+	// parse or its MAC does not verify: it keeps the vault locked, but How
+	// and Seq are not shown as the server's.
+	ReportCorrupt bool `json:"report_corrupt,omitempty"`
 }
 
 // SyncBackoff is the retry schedule after a failure.

@@ -219,8 +219,12 @@ func vaultState(v *store.Info) string {
 		return "unlocked"
 	case v.Revoked:
 		return "locked for good: this device was revoked from the account (hop auth status)"
+	case v.ServerReport != nil && v.ServerReportCorrupt:
+		return "locked: the server reported this device revoked, and the record of that report here is corrupt (hop auth status)"
 	case v.ServerReport != nil:
 		return "locked: the server reports this device was revoked from the account (hop auth status)"
+	case v.ServerUnconfirmed:
+		return "locked: the server did not confirm this device is still in the account; hop unlock asks it again"
 	case v.OfflineTooLong:
 		return "locked: offline too long; connect to the server, then run hop unlock"
 	}

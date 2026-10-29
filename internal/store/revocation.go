@@ -25,6 +25,13 @@ import (
 //	<data>/revocation.json    = JCS({"v":1, "account_id":id, "device_id":id, "how":str, "seq":u64s, "h":h,
 //	                                 "at":ts, "server":str, "email":str})
 //
+// The server's other answers decide less. A session refused without a
+// receipt that names this device's departure, or any answer the client
+// can't use, locks the vault in memory only (ErrServerUnconfirmed): nothing
+// is recorded, and the next unlock or sync asks again. Only a server that
+// can't be reached lets the keys load without an answer; the daemon decides
+// that (internal/daemon/revocation.go).
+//
 // A device that left the account is refused a session, and the log can't
 // show it the entry that removed it: its entries are no longer served to
 // it. retire-status says how it left (§9). That answer is the server's
@@ -32,13 +39,23 @@ import (
 // (its mac is HMAC-SHA256 under local_key over "hopkey/v1/server-revoked"
 // and the JCS of the other members), and while it is there every unlock
 // refuses, the device key's and the password's alike (ErrServerRevoked).
+// The mac is verified whenever the device key is loaded to ask the server
+// (CheckServer, ProveRevocation). One that does not verify, or a file that
+// does not parse, still refuses every unlock, but Info calls it corrupt and
+// does not show its members as the server's. The mac protects nothing
+// else: whoever controls the device can delete the file, as they can the
+// whole vault; it only keeps tampered metadata from being displayed as
+// authentic.
 // Only CheckServer removes it, once the server authenticates this device
 // again: the report was wrong. A server that lies can lock a device out,
 // which it can do anyway by refusing it, but it can't delete anything, and
 // it can't unlock a device that really was revoked, since an honest
 // server never authenticates one.
 //
-// The proof is the entries from this device's verified head up to the one
+// The proof is an authenticated departure authorization: the signatures
+// and the membership changes of every entry are verified, but not the
+// vault contents those entries carry. It is the entries from this device's
+// verified head up to the one
 // that removed it, as the server's retire-status/proof endpoint serves them
 // to a departed device: wires without their objects, checked by the public
 // stage without objects (vaultlog.CheckHeader). Each must chain from the
@@ -51,8 +68,12 @@ import (
 // keeping only revocation.json for hop auth status.
 //
 // contact.json is the time of the last request the server authenticated
-// this device for: a session granted, or a pull. The daemon locks a device
-// that has had none for longer than the account's max-offline policy
+// this device for: a session granted, or a pull. The store keeps the time
+// of every contact in memory, and LastContact returns it; the file is
+// written at most once a minute (contactEvery), on every contact while the
+// account's max-offline policy is under ten minutes (shortPolicy), and at
+// Close. After a restart the file is a lower bound. The daemon locks a
+// device that has had none for longer than the policy allows
 // (model.Policy). Someone who controls the device can edit the file or the
 // clock; only rotating the keys helps against that.
 
@@ -62,6 +83,18 @@ var (
 	// device again. It matches model.ErrLocked.
 	ErrServerRevoked = fmt.Errorf("%w: the server reports that this device was revoked from the account, so the vault stays locked here; "+
 		"hop auth logout wipes this device, and hop auth login signs in again", model.ErrLocked)
+	// ErrServerUnconfirmed means the server answered, but did not confirm
+	// that this device is still in the account: it refused it a session
+	// without a valid report of its departure, or answered in a way the
+	// client can't use. The vault is locked in memory only, and nothing is
+	// recorded, until the server accepts the device again. It matches
+	// model.ErrLocked.
+	ErrServerUnconfirmed = fmt.Errorf("%w: the server did not confirm that this device is still in the account; "+
+		"it stays locked until the server accepts it again (hop unlock asks)", model.ErrLocked)
+	// ErrWipeIncomplete means a revocation was proven (ErrDeviceRevoked
+	// matches too) but wiping this device's copy of the vault did not
+	// finish; the next start finishes it.
+	ErrWipeIncomplete = errors.New("store: wiping this device's copy of the vault did not finish; it finishes at the next start")
 	// ErrOfflineTooLong means the account's max-offline policy locked the
 	// vault. It matches model.ErrLocked.
 	ErrOfflineTooLong = fmt.Errorf("%w: offline too long; connect to the server", model.ErrLocked)
@@ -78,8 +111,12 @@ const (
 	revocationName    = "revocation.json"
 	labelServerReport = "hopkey/v1/server-revoked"
 	// contactEvery is how often a contact is written: once a minute at
-	// most, unless the stored one is in the future.
+	// most, unless the stored one is in the future, or the policy is
+	// shorter than shortPolicy.
 	contactEvery = time.Minute
+	// shortPolicy is the max-offline policy under which every contact is
+	// written.
+	shortPolicy = 10 * time.Minute
 	// maxProofEntries bounds the entries a proof may take, from this
 	// device's head to the one that removed it.
 	maxProofEntries = 1 << 20
@@ -127,20 +164,48 @@ func reportMAC(rec *deviceRecord, r ServerReport) ([]byte, error) {
 
 // readReport reads server-revoked.json, or returns nil when there is none.
 // Any file there counts as a report (only hop writes it), so one that does
-// not parse is returned empty. The caller holds s.mu.
-func (s *Store) readReport() (*ServerReport, error) {
+// not parse is returned empty and corrupt, and so is one whose mac the last
+// verifyReport of these very bytes refused. One not verified yet (the
+// device key was not loaded since) is returned as it reads. The caller
+// holds s.mu.
+func (s *Store) readReport() (rep *ServerReport, corrupt bool, err error) {
 	b, err := os.ReadFile(s.l.serverRevokedFile())
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var f serverReportFile
 	if canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
-		return &ServerReport{}, nil
+		return &ServerReport{}, true, nil
 	}
-	return &f.ServerReport, nil
+	if v := s.reportVerdict; v != nil && v.sum == sha256.Sum256(b) && !v.ok {
+		return &ServerReport{}, true, nil
+	}
+	return &f.ServerReport, false, nil
+}
+
+// reportVerdict is what verifyReport found of server-revoked.json.
+type reportVerdict struct {
+	sum [sha256.Size]byte // of the bytes verified
+	ok  bool
+}
+
+// verifyReport checks server-revoked.json's mac under rec's local_key, and
+// keeps the verdict for readReport. The caller holds s.mu.
+func (s *Store) verifyReport(rec *deviceRecord) {
+	b, err := os.ReadFile(s.l.serverRevokedFile())
+	if err != nil {
+		return
+	}
+	v := &reportVerdict{sum: sha256.Sum256(b)}
+	var f serverReportFile
+	if canonjson.Unmarshal(b, &f) == nil && f.V == 1 {
+		mac, err := reportMAC(rec, f.ServerReport)
+		v.ok = err == nil && hmac.Equal(mac, f.MAC)
+	}
+	s.reportVerdict = v
 }
 
 // refuseReported fails with ErrServerRevoked while server-revoked.json is
@@ -186,7 +251,8 @@ func (s *Store) clearReport() error {
 func (s *Store) Report() (*ServerReport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.readReport()
+	rep, _, err := s.readReport()
+	return rep, err
 }
 
 type contactFile struct {
@@ -195,13 +261,18 @@ type contactFile struct {
 }
 
 // LastContact returns when the server last authenticated this device, and
-// false when it never has (or the record is gone).
+// false when it never has (or the record is gone): the last contact this
+// Store saw, or else contact.json.
 func (s *Store) LastContact() (time.Time, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.contactAt.IsZero() {
+		return s.contactAt, true, nil
+	}
 	return s.lastContact()
 }
 
+// lastContact reads contact.json.
 func (s *Store) lastContact() (time.Time, bool, error) {
 	b, err := os.ReadFile(s.l.contactFile())
 	if errors.Is(err, os.ErrNotExist) {
@@ -217,21 +288,64 @@ func (s *Store) lastContact() (time.Time, bool, error) {
 	return f.At.Time(), true, nil
 }
 
-// noteContact records that the server authenticated this device now: at
-// most once a minute, but always when the stored time is in the future (a
-// clock that was set back). It is best effort; the caller holds s.mu.
+// noteContact records that the server authenticated this device now: in
+// memory always, and in contact.json at most once a minute, but always when
+// the stored time is in the future (a clock that was set back), when the
+// account's max-offline policy is short (shortPolicy), or when the vault is
+// locked, so the policy is not known. Writing is best effort; the caller
+// holds s.mu.
 func (s *Store) noteContact() {
 	now := time.Now()
 	if s.cfg.Now != nil {
 		now = s.cfg.Now()
 	}
-	if at, ok, err := s.lastContact(); err == nil && ok && !at.After(now) && now.Sub(at) < contactEvery {
+	s.contactAt = now
+	if at, ok, err := s.lastContact(); err == nil && ok && !at.After(now) && now.Sub(at) < contactEvery &&
+		s.sec != nil && !s.shortPolicyLocked() {
 		return
 	}
-	b, err := canonjson.Marshal(contactFile{V: 1, At: model.TimestampOf(now)})
+	s.writeContact(now)
+}
+
+// writeContact writes contact.json. The caller holds s.mu.
+func (s *Store) writeContact(at time.Time) {
+	b, err := canonjson.Marshal(contactFile{V: 1, At: model.TimestampOf(at)})
 	if err == nil {
 		writeFileAtomic(s.l.contactFile(), b)
 	}
+}
+
+// saveContact writes the last contact this Store saw, unless contact.json
+// has it or a later one, as Close does. A vault that is gone, or going (a
+// logout or a revocation wipes it), gets nothing. The caller holds s.mu.
+func (s *Store) saveContact() {
+	if s.contactAt.IsZero() || s.revoked != nil {
+		return
+	}
+	if _, err := os.Lstat(s.l.stateFile()); err != nil {
+		return
+	}
+	if j, err := s.readRetireFile(); err != nil || j != nil {
+		return
+	}
+	if at, ok, err := s.lastContact(); err == nil && ok && !at.Before(s.contactAt) {
+		return
+	}
+	s.writeContact(s.contactAt)
+}
+
+// shortPolicyLocked reports whether the verified vault's max-offline policy
+// is set and under shortPolicy. The caller holds s.mu; the vault is
+// unlocked.
+func (s *Store) shortPolicyLocked() bool {
+	var ps []model.Policy
+	for _, p := range s.sec.Items {
+		if v, ok := p.Item.(*model.Policy); ok {
+			ps = append(ps, *v)
+		}
+	}
+	max := time.Duration(model.EffectiveMaxOffline(ps)) * time.Second
+	return max > 0 && max < shortPolicy
 }
 
 // RevocationRecord is what a wiped device keeps of its revocation, beside
@@ -354,12 +468,19 @@ func (s *Store) checkKeyLocked(passphrase []byte) (*checkKey, error) {
 // account, locked or not, and acts on the answer: a session granted
 // records the contact and clears a report that it left (the report was
 // wrong); a refusal asks retire-status how it left, records that
-// (server-revoked.json) and locks the vault. It deletes nothing. Any other
-// failure (the server unreachable, say) changes nothing and is returned.
-// A lock or Close cancels it. passphrase is for a locked vault's sealed
-// device key file (checkKeyLocked); nil uses HOP_DEVICE_PASSPHRASE.
+// (server-revoked.json) and locks the vault. A refusal whose retire-status
+// fails, or names no departure of this device, locks the vault in memory
+// only and returns ErrServerUnconfirmed. It deletes nothing. Any other
+// failure (the server unreachable, a response that does not parse)
+// changes nothing and is returned; the caller decides what it means.
+//
+// It waits for a sync in progress (syncMu) only until ctx ends, and then
+// returns an error wrapping ctx's, without asking. A lock or Close cancels
+// it. passphrase is for a locked vault's sealed device key file
+// (checkKeyLocked); nil uses HOP_DEVICE_PASSPHRASE, and without one the
+// error matches ErrDeviceKey.
 func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []byte) (ServerCheck, error) {
-	if err := s.lockSync(); err != nil {
+	if err := s.lockSyncCtx(ctx); err != nil {
 		return ServerCheck{}, err
 	}
 	defer s.syncMu.Unlock()
@@ -370,6 +491,7 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 		return ServerCheck{}, err
 	}
 	defer k.close()
+	s.verifyReport(k.rec)
 	ctx, gen, untrack := s.trackRequest(ctx)
 	unlocked := s.state != nil
 	s.mu.Unlock()
@@ -385,18 +507,34 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.noteContact()
+		if s.state == nil && errors.Is(s.lockErr, ErrServerUnconfirmed) {
+			// Confirmed now: an unlock opens it again.
+			s.lockErr = nil
+		}
 		return ServerCheck{Active: true}, s.clearReport()
 	}
 	if !errors.Is(err, ErrSessionEnded) {
 		return ServerCheck{}, err
 	}
 	rs, err := r.RetireStatus(ctx, auth, crypto.Hash{})
-	if err != nil {
-		return ServerCheck{}, err
-	}
 	rc := rs.Receipt
-	if rc == nil || rc.DeviceID != k.deviceID || (rc.How != "revoked" && rc.How != "retired") {
-		return ServerCheck{}, fmt.Errorf("%w, but reports no departure of this device", ErrSessionEnded)
+	if err == nil && (rc == nil || rc.DeviceID != k.deviceID || (rc.How != "revoked" && rc.How != "retired")) {
+		err = errors.New("its retire-status names no departure of this device")
+	}
+	if err != nil {
+		// The server's answer, but no report to record: locked in memory,
+		// until it accepts the device again.
+		why := fmt.Errorf("%w (the server refused this device a session; %v)", ErrServerUnconfirmed, err)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.gen.Load() == gen {
+			if s.state != nil {
+				s.dropLocked(why)
+			} else {
+				s.lockErr = why
+			}
+		}
+		return ServerCheck{}, why
 	}
 	rep := ServerReport{AccountID: k.accountID, DeviceID: k.deviceID, How: rc.How, Seq: rc.Seq, H: rc.H, At: s.now()}
 	s.mu.Lock()
@@ -409,6 +547,7 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 		return ServerCheck{Report: &rep}, fmt.Errorf("store: the server's report could not be recorded on disk: %w", werr)
 	}
 	s.lockErr = ErrServerRevoked
+	s.verifyReport(k.rec)
 	return ServerCheck{Report: &rep}, nil
 }
 
@@ -417,15 +556,18 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 // verified head. If it verifies, this device's copy of the vault is wiped
 // (wipeRevoked) and ErrDeviceRevoked is returned; if it does not, nothing
 // changes and the error says why (ErrProofRefused, or the server's error).
-// ErrNoReport means there is nothing to prove. A lock or Close cancels it.
-// passphrase is CheckServer's.
+// A proof that verified, followed by a wipe that did not finish, returns
+// an error that matches both ErrDeviceRevoked and ErrWipeIncomplete: the
+// revocation is proven, and the next start finishes the wipe. ErrNoReport
+// means there is nothing to prove. A lock or Close cancels it. passphrase
+// is CheckServer's.
 func (s *Store) ProveRevocation(ctx context.Context, r ServerChecker, passphrase []byte) error {
-	if err := s.lockSync(); err != nil {
+	if err := s.lockSyncCtx(ctx); err != nil {
 		return err
 	}
 	defer s.syncMu.Unlock()
 	s.mu.Lock()
-	rep, err := s.readReport()
+	rep, _, err := s.readReport()
 	if err == nil && rep == nil {
 		err = ErrNoReport
 	}
@@ -439,6 +581,7 @@ func (s *Store) ProveRevocation(ctx context.Context, r ServerChecker, passphrase
 		return err
 	}
 	defer k.close()
+	s.verifyReport(k.rec)
 	ctx, _, untrack := s.trackRequest(ctx)
 	s.mu.Unlock()
 	defer func() {
@@ -451,17 +594,24 @@ func (s *Store) ProveRevocation(ctx context.Context, r ServerChecker, passphrase
 	if err != nil {
 		return err
 	}
+	proven := fmt.Errorf("%w (device %v, %s by the entry at seq %d, verified)", ErrDeviceRevoked, k.deviceID, rc.How, rc.Seq)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owner == nil || s.closing {
-		return ErrClosed
+		return incompleteWipe(proven, ErrClosed)
 	}
 	if s.state != nil {
 		s.dropLocked(ErrServerRevoked)
 	}
 	return s.wipeRevoked(RevocationRecord{
 		V: 1, AccountID: k.accountID, DeviceID: k.deviceID, How: rc.How, Seq: rc.Seq, H: rc.H, At: s.now(),
-	}, fmt.Errorf("%w (device %v, %s by the entry at seq %d, verified)", ErrDeviceRevoked, k.deviceID, rc.How, rc.Seq))
+	}, proven)
+}
+
+// incompleteWipe is the error of a proven revocation (proven matches
+// ErrDeviceRevoked) whose wipe failed with err.
+func incompleteWipe(proven, err error) error {
+	return fmt.Errorf("%w; %w (%w)", proven, ErrWipeIncomplete, err)
 }
 
 // verifyRevocation fetches the proof page by page and checks it from st,
@@ -561,12 +711,23 @@ func (s *Store) WipeRevoked() error {
 // outcome departed, and runs the logout's cleanup (cleanupRetired): the
 // outbox, the cache, every device record and device.json go, and the mark
 // that the daemon owes the ssh config is left (LogoutCleanupPending). The
-// store is revoked with why from then on. The caller holds s.mu and
-// syncMu; the store is locked.
+// store is revoked with why from then on. It returns why once all of that
+// is done, and otherwise an error that matches why and ErrWipeIncomplete:
+// a crash or a failure before the journal leaves the report, so the next
+// start proves the revocation again, and one after it leaves the journal,
+// whose cleanup the next Open finishes. The caller holds s.mu and syncMu;
+// the store is locked.
 func (s *Store) wipeRevoked(rec RevocationRecord, why error) error {
+	if err := s.wipeRevokedSteps(rec, why); err != nil {
+		return incompleteWipe(why, err)
+	}
+	return why
+}
+
+func (s *Store) wipeRevokedSteps(rec RevocationRecord, why error) error {
 	cfg, err := s.readDeviceConfig()
 	if err != nil {
-		return fmt.Errorf("store: wiping the revoked device: %w", err)
+		return err
 	}
 	if rec.AccountID.IsZero() {
 		rec.AccountID = cfg.AccountID
@@ -612,8 +773,5 @@ func (s *Store) wipeRevoked(rec RevocationRecord, why error) error {
 		s.dropLocked(why)
 	}
 	s.lockErr = why
-	if err := s.cleanupRetired(); err != nil {
-		return fmt.Errorf("store: wiping the revoked device: %w", err)
-	}
-	return why
+	return s.cleanupRetired()
 }
