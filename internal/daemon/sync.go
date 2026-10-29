@@ -62,13 +62,13 @@ const (
 	// idleRecheck is how often an idle loop looks at the store again, in
 	// case something changed that did not wake it (a publication, say).
 	idleRecheck = 30 * time.Second
-	// syncNowStepTimeout bounds each pull or push of an explicit hop sync,
-	// so one against a server that has stopped answering fails in seconds
-	// and says so, not after a request timeout or the HTTP/2 health check.
-	// It bounds a step, not the whole sync (the control request's own
-	// deadline still bounds that). The background loop keeps its own
-	// deadlines and backoff.
-	syncNowStepTimeout = 5 * time.Second
+	// syncNowTimeout bounds an explicit hop sync from the moment the daemon
+	// receives it: any wait for the loop, the pull and every push. One
+	// against a server that has stopped answering fails in seconds and says
+	// so, not after a background push's deadline, a request timeout or the
+	// HTTP/2 health check. The background loop keeps its own deadlines and
+	// backoff.
+	syncNowTimeout = 8 * time.Second
 	// maxSyncNowPushes bounds the records one sync.now pushes.
 	maxSyncNowPushes = 64
 	// maxReplacedNotes bounds the notes noteReplaced keeps.
@@ -140,9 +140,17 @@ const (
 )
 
 type syncReq struct {
-	ctx  context.Context
-	kind int
-	done chan error
+	// ctx is the request's own context, a sync.now's budget included, and
+	// caller the context it was asked in: the caller giving up is not the
+	// server failing to answer.
+	ctx    context.Context
+	caller context.Context
+	kind   int
+	done   chan error
+	// answer is the error serve got from the server, sent before serve
+	// acts on it: the check after a refusal may outlast the budget, and
+	// the refusal is still the answer.
+	answer chan error
 }
 
 // syncer is the sync engine.
@@ -163,6 +171,7 @@ type syncer struct {
 
 	mu        sync.Mutex
 	pollStop  context.CancelFunc // ends the long-poll in flight
+	pushStop  context.CancelFunc // ends the background push in flight (sync.now)
 	reqs      []*syncReq
 	stopped   bool
 	clients   map[string]*syncclient.Client
@@ -449,7 +458,23 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		return stepIdle
 	}
 	if st.Held == 0 && st.Pending > 0 {
-		res, err := e.pushHead(ctx, r)
+		// A sync.now ends the push (request), so it does not wait out the
+		// push's deadline behind a server that stopped answering. A request
+		// already queued goes first instead: it may push this record itself.
+		pctx, cancel := context.WithCancel(ctx)
+		e.mu.Lock()
+		queued := len(e.reqs) > 0
+		if !queued {
+			e.pushStop = cancel
+		}
+		e.mu.Unlock()
+		if queued {
+			cancel()
+			return stepNow
+		}
+		res, err := e.pushHead(pctx, r)
+		e.set(func() { e.pushStop = nil })
+		cancel()
 		if err != nil {
 			e.reconcile(ctx, gen, &st)
 			return e.fail(ctx, gen, err)
@@ -579,7 +604,8 @@ func (e *syncer) fail(ctx context.Context, gen uint64, err error) time.Duration 
 	}
 	if errors.Is(err, context.Canceled) {
 		// Not by the daemon: a lock or a close cancelled the request
-		// (§11.2), and the next step sees which.
+		// (§11.2), and the next step sees which, or a sync.now ended a
+		// background push to run first.
 		return stepNow
 	}
 	var eq *vaultlog.EquivocationError
@@ -931,23 +957,52 @@ func (e *syncer) devicesSeen(ctx context.Context) map[model.ID]time.Time {
 	return seen
 }
 
-// request asks the loop to run kind and waits for it, or for ctx.
+// request asks the loop to run kind and waits for it, or for ctx. A
+// sync.now has syncNowTimeout from here, whatever the loop is doing, and
+// ends the background push or long-poll in flight rather than wait for it.
 func (e *syncer) request(ctx context.Context, kind int) error {
-	r := &syncReq{ctx: ctx, kind: kind, done: make(chan error, 1)}
+	r := &syncReq{ctx: ctx, caller: ctx, kind: kind, done: make(chan error, 1), answer: make(chan error, 1)}
+	if kind == reqSyncNow {
+		var cancel context.CancelFunc
+		r.ctx, cancel = context.WithTimeout(ctx, syncNowTimeout)
+		defer cancel()
+	}
 	e.mu.Lock()
 	if e.stopped {
 		e.mu.Unlock()
 		return store.ErrClosed
 	}
 	e.reqs = append(e.reqs, r)
+	var stopPush context.CancelFunc
+	if kind == reqSyncNow {
+		stopPush = e.pushStop
+	}
 	e.mu.Unlock()
+	if stopPush != nil {
+		stopPush()
+	}
 	e.wake()
 	select {
 	case err := <-r.done:
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-r.ctx.Done():
 	}
+	// The loop's answer, if it came at the same moment, goes first: it may
+	// be the server's. So does one the loop still acts on.
+	select {
+	case err := <-r.done:
+		return err
+	default:
+	}
+	select {
+	case err := <-r.answer:
+		return err
+	default:
+	}
+	if kind == reqSyncNow {
+		return syncNowError(r.ctx.Err(), r.ctx, r.caller)
+	}
+	return r.ctx.Err()
 }
 
 func (e *syncer) serveRequests(ctx context.Context) {
@@ -996,19 +1051,11 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 	if st, err := e.st.Status(); err == nil {
 		before = &st
 	}
-	step := func(f func(context.Context) error) error { return f(rctx) }
-	if req.kind == reqSyncNow {
-		step = func(f func(context.Context) error) error {
-			sctx, cancel := context.WithTimeout(rctx, syncNowStepTimeout)
-			defer cancel()
-			return syncNowStepError(f(sctx), sctx, rctx)
-		}
-	}
-	err = step(func(c context.Context) error { return e.st.Pull(c, r) })
+	err = e.st.Pull(rctx, r)
 	if err == nil && req.kind == reqSyncNow {
 		for range maxSyncNowPushes {
 			var res store.PushResult
-			err = step(func(c context.Context) (err error) { res, err = e.pushHead(c, r); return })
+			res, err = e.pushHead(rctx, r)
 			if err != nil {
 				break
 			}
@@ -1020,7 +1067,11 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 			}
 		}
 	}
+	if req.kind == reqSyncNow {
+		err = syncNowError(err, req.ctx, req.caller)
+	}
 	if err != nil {
+		req.answer <- err
 		e.reconcile(ctx, gen, before)
 		var eq *vaultlog.EquivocationError
 		switch {
@@ -1095,17 +1146,17 @@ func (e *syncer) status() SyncStatusResult {
 	return out
 }
 
-// syncNowStepError is the error of one step of an explicit sync whose own
-// deadline (sctx) has passed while the caller (rctx) still waits: one the
+// syncNowError is the error of an explicit sync whose budget (budget, the
+// request's context) has run out while the caller still waits: one the
 // deadline caused says the server did not answer. Any other error is the
 // server's answer, a session refusal or a revocation say, and is kept as
 // it is, or the refusal handling that follows would never see it.
-func syncNowStepError(err error, sctx, rctx context.Context) error {
-	if err == nil || sctx.Err() != context.DeadlineExceeded || rctx.Err() != nil {
+func syncNowError(err error, budget, caller context.Context) error {
+	if err == nil || budget.Err() != context.DeadlineExceeded || caller.Err() != nil {
 		return err
 	}
 	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, syncclient.ErrUnreachable) {
 		return err
 	}
-	return fmt.Errorf("%w: the server did not answer within %s", syncclient.ErrUnreachable, syncNowStepTimeout)
+	return fmt.Errorf("%w: the server did not answer within %s", syncclient.ErrUnreachable, syncNowTimeout)
 }

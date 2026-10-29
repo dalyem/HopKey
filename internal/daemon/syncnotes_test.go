@@ -77,12 +77,12 @@ func TestExplicitSyncToAServerThatStoppedAnsweringFailsFast(t *testing.T) {
 	if !IsCode(err, CodeUnreachable) || !strings.Contains(err.Error(), "unreachable") {
 		t.Errorf("sync.now error = %v, want an unreachable error that says so", err)
 	}
-	if took > 8*time.Second {
-		t.Errorf("sync.now took %s to fail, want about 5s", took)
+	if took > syncNowTimeout+2*time.Second {
+		t.Errorf("sync.now took %s to fail, want about %s", took, syncNowTimeout)
 	}
 }
 
-// A session refusal that comes back just after an explicit sync's step
+// A session refusal that comes back just after an explicit sync's
 // deadline is still a refusal: only an error the deadline caused becomes
 // "the server did not answer", so sessionEnded still sees the refusal.
 func TestSyncNowStepErrorKeepsTheServersAnswer(t *testing.T) {
@@ -91,24 +91,24 @@ func TestSyncNowStepErrorKeepsTheServersAnswer(t *testing.T) {
 	<-expired.Done()
 	caller := context.Background()
 	for _, err := range []error{store.ErrSessionEnded, fmt.Errorf("pull: %w", store.ErrSessionEnded), store.ErrDeviceRevoked, context.Canceled} {
-		if got := syncNowStepError(err, expired, caller); got != err {
+		if got := syncNowError(err, expired, caller); got != err {
 			t.Errorf("%v became %v", err, got)
 		}
 	}
 	for _, err := range []error{context.DeadlineExceeded, fmt.Errorf("get: %w", context.DeadlineExceeded), syncclient.ErrUnreachable} {
-		if got := syncNowStepError(err, expired, caller); !errors.Is(got, syncclient.ErrUnreachable) || !strings.Contains(got.Error(), "did not answer") {
+		if got := syncNowError(err, expired, caller); !errors.Is(got, syncclient.ErrUnreachable) || !strings.Contains(got.Error(), "did not answer") {
 			t.Errorf("%v became %v, want the server did not answer", err, got)
 		}
 	}
 	// Before the deadline, or once the caller gave up, nothing changes.
 	live, cancelLive := context.WithCancel(context.Background())
 	defer cancelLive()
-	if got := syncNowStepError(context.DeadlineExceeded, live, caller); got != context.DeadlineExceeded {
+	if got := syncNowError(context.DeadlineExceeded, live, caller); got != context.DeadlineExceeded {
 		t.Errorf("before the deadline: %v", got)
 	}
 	gone, cancelGone := context.WithCancel(context.Background())
 	cancelGone()
-	if got := syncNowStepError(context.DeadlineExceeded, expired, gone); got != context.DeadlineExceeded {
+	if got := syncNowError(context.DeadlineExceeded, expired, gone); got != context.DeadlineExceeded {
 		t.Errorf("caller gone: %v", got)
 	}
 }
