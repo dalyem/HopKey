@@ -755,6 +755,10 @@ type echo struct {
 	// stderr, after login; a server's handshake error) as it came, before
 	// hop puts it into a step's detail.
 	remote func(text string) string
+	// loginTail is how much of ssh's stderr from the login is kept for
+	// login and remote; 0 means tailLimit. hop mcp keeps more, so that
+	// remote checks the bytes before its own cut too.
+	loginTail int
 }
 
 var plainEcho = echo{quote: strconv.Quote}
@@ -871,7 +875,7 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		// runRemote bounds it: stdin closed, output capped, and WaitDelay,
 		// so a ProxyJump child that keeps stderr open cannot hold it past
 		// the timeout.
-		res, err := e.runRemote(ctx, t, addr, remoteRun{command: "true", timeout: authCheckTimeout})
+		res, err := e.runRemote(ctx, t, addr, remoteRun{command: "true", timeout: authCheckTimeout, tail: ec.loginTail})
 		if err != nil {
 			return stepFail, err.Error() // composed by failf: already display-safe
 		}

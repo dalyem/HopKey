@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -268,7 +269,8 @@ func (s *mcpServer) redact(text string) string {
 const keyRedacted = "[private key " + redacted + "]"
 
 // span is a piece of a message: hop's own text, text the agent typed
-// (typed), or a marker redaction put in.
+// (typed), a marker redaction put in, or a server's message that the
+// message held quoted, as the server sent it (quotedSpans).
 type span struct {
 	text string
 	kind spanKind
@@ -281,6 +283,7 @@ const (
 	hopText spanKind = iota
 	typedText
 	markerText
+	quotedText
 )
 
 // redactSpans redacts the text of ss as one string. Every key block, every
@@ -353,16 +356,24 @@ func applyHits(ss []span, hits []redact.Hit) []span {
 // keepTail cuts ss, whose hits findHits found, to its last n bytes, and
 // says whether it cut. The cut never falls inside a hit: it moves on past
 // one it would split, so what is kept holds no part of a secret, only
-// whole markers. hits come back as offsets into what is kept.
+// whole markers. Nor does it split a character (runeEnd). hits come back
+// as offsets into what is kept.
 func keepTail(ss []span, hits []redact.Hit, n int) ([]span, []redact.Hit, bool) {
-	size := len(joinSpans(ss))
+	t := joinSpans(ss)
+	size := len(t)
 	if size <= n {
 		return ss, hits, false
 	}
 	cut := size - n
-	for _, h := range hits {
-		if h.Lo < cut && cut < h.Hi {
-			cut = h.Hi
+	for moved := true; moved; {
+		moved = false
+		for _, h := range hits {
+			if h.Lo < cut && cut < h.Hi {
+				cut, moved = h.Hi, true
+			}
+		}
+		if c := runeEnd(t, cut); c != cut {
+			cut, moved = c, true
 		}
 	}
 	var kept []redact.Hit
@@ -372,6 +383,55 @@ func keepTail(ss []span, hits []redact.Hit, n int) ([]span, []redact.Hit, bool) 
 		}
 	}
 	return cutSpans(nil, ss, cut, size), kept, true
+}
+
+// capSpans keeps the last n bytes of the text of ss, which redaction and
+// masking have made, and says whether it cut. The cut moves on past what
+// it would split: a marker, a hidden host's placeholder, a character. So
+// what is kept is whole markers and whole runes, and at most n bytes.
+func capSpans(ss []span, n int) ([]span, bool) {
+	size := len(joinSpans(ss))
+	if size <= n {
+		return ss, false
+	}
+	cut, at := size-n, 0
+	for i, sp := range ss {
+		lo := at
+		at += len(sp.text)
+		switch {
+		case at <= cut:
+			continue
+		case lo == cut:
+			return ss[i:], true
+		case sp.kind == markerText:
+			return ss[i+1:], true
+		}
+		k := cut - lo
+		if sp.kind == hopText {
+			from := max(0, k-len(hiddenHost)+1)
+			if j := strings.Index(sp.text[from:min(len(sp.text), k+len(hiddenHost)-1)], hiddenHost); j >= 0 {
+				k = from + j + len(hiddenHost)
+			}
+		}
+		k = runeEnd(sp.text, k)
+		return append([]span{{text: sp.text[k:], kind: sp.kind}}, ss[i+1:]...), true
+	}
+	return nil, true
+}
+
+// runeEnd is i, or, where i falls inside a character of t, the end of
+// that character. Bytes that are not UTF-8 are cut where they stand.
+func runeEnd(t string, i int) int {
+	for s := i - 1; s >= 0 && s > i-utf8.UTFMax; s-- {
+		if !utf8.RuneStart(t[s]) {
+			continue
+		}
+		if _, n := utf8.DecodeRuneInString(t[s:]); n > 1 && s+n > i {
+			return s + n
+		}
+		return i
+	}
+	return i
 }
 
 // markerFor is what stands where a secret of kind was: hop's own values
@@ -673,17 +733,19 @@ func (m masker) hide(text string) string {
 
 // hideSpans joins ss, the spans of a text redactSpans has redacted, with
 // each hidden name replaced in hop's own text, as hide does.
-func (m masker) hideSpans(ss []span) string {
-	var b strings.Builder
-	for _, sp := range ss {
+func (m masker) hideSpans(ss []span) string { return joinSpans(m.maskSpans(ss)) }
+
+// maskSpans is ss with each hidden name replaced in hop's own text.
+func (m masker) maskSpans(ss []span) []span {
+	out := slices.Clone(ss)
+	for i, sp := range out {
 		if sp.kind == hopText {
 			for _, n := range m.names {
-				sp.text = replaceWord(sp.text, n, hiddenHost)
+				out[i].text = replaceWord(out[i].text, n, hiddenHost)
 			}
 		}
-		b.WriteString(sp.text)
 	}
-	return b.String()
+	return out
 }
 
 // The marks around text the agent typed. Only hop puts them in a message
@@ -704,7 +766,7 @@ func typed(s string) string { return markOpen + unmark.Replace(s) + markClose }
 // typedQ is typed for s quoted as %q quotes it.
 func typedQ(s string) string { return typed(strconv.Quote(s)) }
 
-var mcpEcho = echo{quote: typedQ, login: markSSHUser}
+var mcpEcho = echo{quote: typedQ, login: markSSHUser, loginTail: mcpTail}
 
 // markSSHUser removes any marks from stderr, ssh's on a login to t at
 // addr, and marks the user the agent gave where ssh names it on that login
@@ -1023,10 +1085,12 @@ func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mc
 // remoteText is what check_host shows of text the network supplied, as
 // it came, under a host's agent_output policy: under none, a note that it
 // is withheld; otherwise the text redacted as exec's output is
-// (agentView), checked as a whole before hop cuts it to its last lines or
-// puts it on one line, so a secret's line goes whole. Text that cannot be
-// checked is withheld. What comes back is marked (typed) where it is not
-// hop's own, the markers included, so hide leaves it be.
+// (agentView), checked as a whole before hop cuts it to its last 64 KiB
+// (keepTail, capSpans), its last lines or one line, so a secret's line
+// goes whole. A server's message the text quotes is checked as the server
+// sent it (quotedSpans). Text that cannot be checked is withheld. What
+// comes back is marked (typed) where it is not hop's own, the markers
+// included, so hide leaves it be.
 func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) func(string) string {
 	return func(text string) string {
 		if strings.TrimSpace(unmark.Replace(text)) == "" {
@@ -1035,21 +1099,83 @@ func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) fun
 		if policy == model.AgentOutputNone {
 			return "(withheld: the host's agent_output policy is none)"
 		}
-		ss := typedSpans(text)
+		ss := quotedSpans(typedSpans(text))
 		found, err := s.findSecrets(ctx, []string{joinSpans(ss)}, policy == model.AgentOutputRedacted)
 		if err != nil {
 			return "(withheld: hop could not check it for the vault's secrets: " + m.hide(err.Error()) + ")"
 		}
+		ss, hits, _ := keepTail(ss, findHits(joinSpans(ss), m.secrets, found[0]), tailLimit)
+		ss, _ = capSpans(applyHits(ss, hits), tailLimit)
 		var b strings.Builder
-		for _, sp := range redactSpans(ss, m.secrets, found[0]) {
-			if sp.kind == hopText {
+		for _, sp := range ss {
+			switch sp.kind {
+			case hopText:
 				b.WriteString(sp.text)
-			} else {
+			case quotedText:
+				// Quoted again as it was: each piece as %q would have it.
+				q := strconv.Quote(sp.text)
+				b.WriteString(q[1 : len(q)-1])
+			default:
 				b.WriteString(typed(sp.text))
 			}
 		}
 		return b.String()
 	}
+}
+
+// disconnectQuote begins where x/crypto's ssh writes a server's disconnect
+// message into its error: "ssh: disconnect, reason %d: %q".
+const disconnectQuote = "ssh: disconnect, reason "
+
+// quotedSpans finds, in the hop text of ss, each server message that a
+// disconnect error quotes (disconnectQuote), and makes the message, as
+// the server sent it, a span of its own (quotedText): quoted, a secret
+// with a " or a \ in it does not stand as it is. A message that does not
+// unquote is withheld, and so is the rest of its span: hop cannot tell
+// where the server's text ends.
+func quotedSpans(ss []span) []span {
+	var out []span
+	for _, sp := range ss {
+		if sp.kind != hopText {
+			out = append(out, sp)
+			continue
+		}
+		text := sp.text
+		for {
+			i := strings.Index(text, disconnectQuote)
+			if i < 0 {
+				break
+			}
+			j := i + len(disconnectQuote)
+			for j < len(text) && '0' <= text[j] && text[j] <= '9' {
+				j++
+			}
+			if !strings.HasPrefix(text[j:], ": ") {
+				out = append(out, span{text: text[:j]})
+				text = text[j:]
+				continue
+			}
+			j += len(": ")
+			q, err := strconv.QuotedPrefix(text[j:])
+			var raw string
+			if err == nil && q[0] == '"' {
+				raw, err = strconv.Unquote(q)
+			} else if err == nil {
+				err = errors.New("not quoted as %q quotes")
+			}
+			if err != nil {
+				out = append(out, span{text: text[:j] + "(withheld: hop could not read the server's message)"})
+				text = ""
+				break
+			}
+			out = append(out, span{text: text[:j] + `"`}, span{text: raw, kind: quotedText}, span{text: `"`})
+			text = text[j+len(q):]
+		}
+		if text != "" {
+			out = append(out, span{text: text})
+		}
+	}
+	return out
 }
 
 // MCPSSHCommand answers ssh_command.
@@ -1141,8 +1267,8 @@ type MCPExecResult struct {
 	// AgentOutput is the policy that applied: redacted, full or none.
 	// It is empty for a host the command did not run on.
 	AgentOutput string `json:"agent_output,omitempty"`
-	// Redactions counts the secrets replaced in stdout and stderr, by
-	// kind (redact.Hit).
+	// Redactions counts the markers in the stdout and stderr returned, by
+	// kind (redact.Hit): one the tail limit cut off is not counted.
 	Redactions map[string]int `json:"redactions,omitempty"`
 	// Withheld is set when no output is returned: the policy is none, or
 	// hop could not check the output for the vault's secrets.
@@ -1429,8 +1555,14 @@ func (s *mcpServer) agentView(ctx context.Context, h model.Host, r ExecResult, m
 		out.Truncated = out.Truncated || cut
 		return applyHits(ss, hits)
 	}
-	so, se := tail(stdout, s.secrets, more[0]), tail(stderr, m.secrets, more[1])
-	out.Stdout, out.Stderr = joinSpans(so), m.hideSpans(se)
+	so, se := tail(stdout, s.secrets, more[0]), m.maskSpans(tail(stderr, m.secrets, more[1]))
+	// A marker can be longer than what it stands for, and so can a hidden
+	// host's placeholder: the limit holds for what is returned, and the
+	// counts are of the markers in it.
+	so, cutOut := capSpans(so, tailLimit)
+	se, cutErr := capSpans(se, tailLimit)
+	out.Truncated = out.Truncated || cutOut || cutErr
+	out.Stdout, out.Stderr = joinSpans(so), joinSpans(se)
 	counts := map[string]int{}
 	countMarkers(counts, so)
 	countMarkers(counts, se)

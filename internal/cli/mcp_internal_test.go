@@ -4,9 +4,12 @@ import (
 	"context"
 	"io"
 	"maps"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -292,5 +295,70 @@ func TestRedactSpansBreaksRankTiesByKind(t *testing.T) {
 		if len(out) != 1 || out[0].what != redact.KindAWSAccessKeyID {
 			t.Errorf("hits %v: %+v, want one %s marker", hits, out, redact.KindAWSAccessKeyID)
 		}
+	}
+}
+
+// capSpans keeps the last n bytes, moving its cut past a marker, a hidden
+// host's placeholder or a character it would split.
+func TestCapSpansCutsOnlyBetweenWholes(t *testing.T) {
+	mk := span{text: "[redacted by hop: x]", kind: markerText, what: "x"}
+	ss := []span{{text: "aé"}, mk, {text: "éé"}} // 3 + 20 + 4 bytes
+	for _, c := range []struct {
+		n    int
+		want string
+		cut  bool
+	}{
+		{27, "aé[redacted by hop: x]éé", false},
+		{24, "[redacted by hop: x]éé", true}, // the cut falls on the marker's start
+		{25, "[redacted by hop: x]éé", true}, // inside the é before it
+		{5, "éé", true},                      // inside the marker
+		{3, "é", true},                       // inside the first é of the last two
+	} {
+		got, cut := capSpans(ss, c.n)
+		if s := joinSpans(got); s != c.want || cut != c.cut || len(s) > c.n || !utf8.ValidString(s) {
+			t.Errorf("n %d: %q cut %v, want %q cut %v", c.n, s, cut, c.want, c.cut)
+		}
+	}
+	got, _ := capSpans([]span{{text: "x " + hiddenHost + " y"}}, 8)
+	if s := joinSpans(got); s != " y" {
+		t.Errorf("hidden host: %q, want the text after it", s)
+	}
+	counts := map[string]int{}
+	got, _ = capSpans(ss, 5)
+	if countMarkers(counts, got); len(counts) != 0 {
+		t.Errorf("a marker cut off is counted: %v", counts)
+	}
+}
+
+// keepTail's cut, past any hit, lands on a character's start.
+func TestKeepTailKeepsWholeRunes(t *testing.T) {
+	text := strings.Repeat("é", 10) + "!" // 21 bytes: the last 6 begin inside an é
+	ss, _, cut := keepTail([]span{{text: text}}, nil, 6)
+	if got := joinSpans(ss); got != "éé!" || !cut {
+		t.Errorf("%q cut %v, want %q", got, cut, "éé!")
+	}
+}
+
+// A disconnect's message, quoted by x/crypto, is checked as the server
+// sent it and quoted again on the way out; one that does not unquote is
+// withheld with the rest of its text.
+func TestQuotedSpans(t *testing.T) {
+	msg := `ab"cd\ef`
+	text := "ssh: handshake failed: ssh: disconnect, reason 2: " + strconv.Quote(msg) + " (more)"
+	ss := quotedSpans([]span{{text: text}})
+	if got := joinSpans(ss); got != `ssh: handshake failed: ssh: disconnect, reason 2: "`+msg+`" (more)` {
+		t.Errorf("joined: %q", got)
+	}
+	if !slices.ContainsFunc(ss, func(sp span) bool { return sp.kind == quotedText && sp.text == msg }) {
+		t.Errorf("no span of the server's text: %+v", ss)
+	}
+	for _, bad := range []string{`"unterminated \"`, `'x' and more`, "no quote"} {
+		ss := quotedSpans([]span{{text: "x: ssh: disconnect, reason 2: " + bad}})
+		if got, want := joinSpans(ss), "x: ssh: disconnect, reason 2: (withheld: hop could not read the server's message)"; got != want {
+			t.Errorf("%q: %q, want %q", bad, got, want)
+		}
+	}
+	if got := joinSpans(quotedSpans([]span{{text: "ssh: disconnect, reason x"}})); got != "ssh: disconnect, reason x" {
+		t.Errorf("not the format: %q", got)
 	}
 }

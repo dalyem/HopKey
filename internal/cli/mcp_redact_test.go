@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zalando/go-keyring"
 	"golang.org/x/crypto/ssh"
@@ -576,5 +577,125 @@ func TestMCPWithholdsOutputPastTheRedactionBudget(t *testing.T) {
 	}
 	if withheld == 0 {
 		t.Errorf("16 hosts of 240 KiB each never ran out of the daemon's 1 MiB burst: %d results", len(out.Results))
+	}
+}
+
+// x/crypto writes a server's disconnect message into its error quoted
+// (%q), so a password with a " or a \ in it stands there escaped. hop
+// checks the message as the server sent it, under redacted and full, in
+// read-only hop mcp too: no form of the password reaches the agent.
+func TestMCPCheckFindsSecretsInAQuotedDisconnect(t *testing.T) {
+	const password = `ab"cd\ef-quoted-vault-secret`
+	e, _, _ := redactWorld(t)
+	if _, err := e.store.PutCredential(context.Background(), model.Credential{Name: "quoted", Username: "admin", Password: password}); err != nil {
+		t.Fatal(err)
+	}
+	port := startDisconnectServer(t, "go away: db password "+password+" token "+githubToken)
+	e.addHost(t, "gate", func(h *model.Host) { h.Port = uint32(port) })
+	for _, args := range [][]string{nil, {"--read-only"}} {
+		m := e.startMCP(t, args...)
+		for _, policy := range []string{"redacted", "full"} {
+			if code, _, stderr := e.hop(t, "edit", "gate", "--agent-output", policy); code != 0 {
+				t.Fatalf("hop edit --agent-output %s: exit %d: %s", policy, code, stderr)
+			}
+			name := strings.TrimSpace(strings.Join(args, " ") + " " + policy)
+			c := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "gate"})
+			status, detail := c.step(t, "host_key_matches")
+			if status != "fail" || !strings.Contains(detail, "go away: db password [redacted by hop: vault-password] token ") {
+				t.Errorf("%s: host_key_matches %s %q, want the server's message with the password replaced", name, status, detail)
+			}
+			for _, s := range []string{password, strconv.Quote(password), `ab\"cd\\ef`, "quoted-vault-secret"} {
+				if strings.Contains(detail, s) {
+					t.Errorf("%s: the agent got %q: %q", name, s, detail)
+				}
+			}
+			// full leaves token formats be; redacted replaces them.
+			if got, want := strings.Contains(detail, githubToken), policy == "full"; got != want {
+				t.Errorf("%s: token shown %v, want %v: %q", name, got, want, detail)
+			}
+		}
+	}
+}
+
+// hop mcp's check keeps twice the tail of ssh's stderr from its login,
+// checks all of it, and only then cuts to the last 64 KiB, as exec does:
+// a password the cut would split goes whole. A person's hop check is
+// unchanged.
+func TestMCPCheckScansLoginStderrBeforeTheTailCut(t *testing.T) {
+	e, _, _ := redactWorld(t)
+	// The last 64 KiB begin 5 bytes before the password's end.
+	pad := strings.Repeat("x", 65531)
+	e.server.mu.Lock()
+	e.server.trueErr = vaultPassword + pad
+	e.server.mu.Unlock()
+	tail := vaultPassword[len(vaultPassword)-5:]
+	if _, stdout, _ := e.hop(t, "check", "web-1"); !strings.Contains(stdout, tail+"xxxx") {
+		t.Errorf("hop check: no %q before the padding in %.200q", tail, stdout)
+	}
+	m := e.startMCP(t)
+	c := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "web-1"})
+	status, detail := c.step(t, "auth_ok")
+	if status != "fail" || !strings.HasSuffix(detail, "xxxxxxxx") {
+		t.Fatalf("auth_ok: %s %.200q, want ssh's stderr", status, detail)
+	}
+	if rest := strings.TrimRight(detail, "x"); !strings.HasSuffix(rest, "ssh did not log in: ") || strings.Contains(detail, tail) {
+		t.Errorf("the agent got part of the password: %.200q", rest)
+	}
+}
+
+// The 64 KiB limit holds for what an agent gets, after the markers are in:
+// a one-character password repeated 65,536 times is 2 MiB of markers, cut
+// to whole ones, and the counts are of the markers returned.
+func TestMCPOutputLimitHoldsAfterRedaction(t *testing.T) {
+	e := newE2E(t)
+	if _, err := e.store.PutCredential(context.Background(), model.Credential{Name: "short", Username: "admin", Password: "Q"}); err != nil {
+		t.Fatal(err)
+	}
+	leak := strings.Repeat("Q", 64<<10)
+	e.server.mu.Lock()
+	e.server.leak = leak
+	e.server.mu.Unlock()
+	if code, stdout, _ := e.hop(t, "exec", "web-1", "--", "leak"); code != 0 || stdout != leak {
+		t.Errorf("hop exec: exit %d, %d bytes, want the remote's %d unchanged", code, len(stdout), len(leak))
+	}
+	m := e.startMCP(t)
+	const marker = "[redacted by hop: vault-password]"
+	for _, cmd := range []string{"leak", "leakerr"} {
+		r := mcpCall[agentExec](m, "exec", map[string]any{"hosts": "web-1", "command": cmd}).Results[0]
+		got := r.Stdout
+		if cmd == "leakerr" {
+			got = r.Stderr
+		}
+		if len(got) > 64<<10 || len(got) < 60<<10 || !r.Truncated || !utf8.ValidString(got) {
+			t.Errorf("%s: %d bytes, truncated %v, valid UTF-8 %v; want at most 64 KiB, cut", cmd, len(got), r.Truncated, utf8.ValidString(got))
+		}
+		if rest := strings.ReplaceAll(got, marker, ""); rest != "" {
+			t.Errorf("%s: %d bytes that are not whole markers: %.40q", cmd, len(rest), rest)
+		}
+		if n := strings.Count(got, marker); r.Redactions["vault-password"] != n {
+			t.Errorf("%s: redactions %v, but %d markers returned", cmd, r.Redactions, n)
+		}
+	}
+}
+
+// The tail cut never splits a character: the agent gets whole runes, not
+// a stray byte the JSON encoding turns into U+FFFD.
+func TestMCPTailCutKeepsWholeRunes(t *testing.T) {
+	e := newE2E(t)
+	// 80,001 bytes: the last 64 KiB begin inside an é.
+	leak := strings.Repeat("é", 40000) + "\n"
+	e.server.mu.Lock()
+	e.server.leak = leak
+	e.server.mu.Unlock()
+	m := e.startMCP(t)
+	for _, cmd := range []string{"leak", "leakerr"} {
+		r := mcpCall[agentExec](m, "exec", map[string]any{"hosts": "web-1", "command": cmd}).Results[0]
+		got := r.Stdout
+		if cmd == "leakerr" {
+			got = r.Stderr
+		}
+		if want := strings.Repeat("é", 32767) + "\n"; got != want || !r.Truncated {
+			t.Errorf("%s: %d bytes beginning %.8q, truncated %v; want the last %d bytes, whole runes", cmd, len(got), got, r.Truncated, len(want))
+		}
 	}
 }
