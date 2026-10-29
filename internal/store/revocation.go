@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -94,6 +97,9 @@ var (
 	// ErrSessionRefused is in an ErrServerUnconfirmed that follows the
 	// server refusing this device a session, as it refuses a revoked one.
 	ErrSessionRefused = errors.New("the server refused this device a session")
+	// ErrAdminRefused matches an *AdminRefusal: the server's operator
+	// disabled the account or blocked this device.
+	ErrAdminRefused = errors.New("the server's operator refused this device")
 	// ErrWipeIncomplete means a revocation was proven (ErrDeviceRevoked
 	// matches too) but wiping this device's copy of the vault did not
 	// finish; the next start finishes it.
@@ -107,6 +113,89 @@ var (
 	// did not verify. Nothing was deleted.
 	ErrProofRefused = errors.New("store: the server's proof that this device was revoked did not verify")
 )
+
+// Admin refusal codes (R11): the server's operator disabled the account,
+// or blocked this device. The server sends them with 403, only to a
+// caller that proved the device's key or the account's secret.
+const (
+	AdminAccountDisabled = "account_disabled"
+	AdminDeviceBlocked   = "device_blocked"
+)
+
+// AdminRefusal is the server refusing this device because its operator
+// disabled the account or blocked the device (Code), with the operator's
+// Reason ("" when none was given). It is the server's word, not the
+// account's: the vault locks in memory, as for any answer that does not
+// confirm the device (ErrServerUnconfirmed), and nothing is recorded or
+// deleted. It matches ErrAdminRefused. Reason comes from the server
+// unchecked; Error escapes it, and so must anything else that shows it.
+type AdminRefusal struct {
+	Code   string `json:"code"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func (e *AdminRefusal) Error() string {
+	what := "the server's operator disabled this account"
+	if e.Code == AdminDeviceBlocked {
+		what = "the server's operator blocked this device"
+	}
+	if e.Reason != "" {
+		what += fmt.Sprintf("; the operator's message: \"%s\" (the server's word, not your vault's)", EscapeServerText(e.Reason))
+	}
+	return what
+}
+
+func (e *AdminRefusal) Is(target error) bool { return target == ErrAdminRefused }
+
+// maxServerText bounds server text shown on a device, in bytes.
+const maxServerText = 400
+
+// EscapeServerText makes text the server sent safe to show on a terminal:
+// invalid UTF-8, control characters (C0, DEL, C1), the line and paragraph
+// separators and Unicode format characters such as bidi overrides become
+// \xNN or \uNNNN, a backslash is doubled, and it is cut at maxServerText
+// bytes.
+func EscapeServerText(s string) string {
+	const cut = "..."
+	var frags []string
+	total := 0
+	for i := 0; i < len(s); {
+		c, n := utf8.DecodeRuneInString(s[i:])
+		var frag string
+		switch {
+		case c == utf8.RuneError && n == 1:
+			frag = fmt.Sprintf(`\x%02x`, s[i])
+		case c == '\\':
+			frag = `\\`
+		case c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0):
+			frag = fmt.Sprintf(`\x%02x`, c)
+		case c == '\u2028' || c == '\u2029' || unicode.Is(unicode.Cf, c):
+			frag = fmt.Sprintf(`\u%04x`, c)
+		default:
+			frag = string(c)
+		}
+		i += n
+		frags = append(frags, frag)
+		total += len(frag)
+		if total > maxServerText {
+			break
+		}
+	}
+	if total <= maxServerText {
+		return strings.Join(frags, "")
+	}
+	// Too long: whole fragments up to the limit less the cut mark, so an
+	// escape is never split and the result never passes maxServerText.
+	var b strings.Builder
+	for _, f := range frags {
+		if b.Len()+len(f) > maxServerText-len(cut) {
+			break
+		}
+		b.WriteString(f)
+	}
+	b.WriteString(cut)
+	return b.String()
+}
 
 const (
 	serverRevokedRel  = "server-revoked.json"

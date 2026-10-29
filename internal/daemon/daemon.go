@@ -96,11 +96,13 @@ type Options struct {
 	now          func() time.Time
 	// unconfirmedRead runs once retryUnconfirmed has read that the vault
 	// is locked as unconfirmed, and beforeCheck just before checkServer
-	// asks the store (CheckServer). sessionRefused runs once a request
+	// asks the store (CheckServer), afterCheck once it has answered that
+	// the device is active and before that answer is acted on. sessionRefused runs once a request
 	// the server refused a session has returned, before sessionEnded
 	// acts on it.
 	unconfirmedRead func()
 	beforeCheck     func()
+	afterCheck      func()
 	sessionRefused  func()
 }
 

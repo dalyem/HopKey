@@ -160,6 +160,7 @@ type AccountSummary struct {
 	ActiveDevices  int
 	AllDevices     int       // every device the account has had
 	LastSeen       time.Time // the latest of its devices; zero when none was seen
+	Disabled       *AdminBlock
 }
 
 // ListAccounts returns every account, oldest first.
@@ -195,6 +196,7 @@ type DeviceDetail struct {
 	DepartedSeq uint64
 	LastSeen    time.Time // zero when never seen
 	Sessions    int
+	Blocked     *AdminBlock // the operator's block; nil when not blocked
 }
 
 // ShowAccount returns the account who names (an ID or an email), its
@@ -254,6 +256,10 @@ func accountDevices(tx Tx, a *Account, now time.Time) ([]*DeviceDetail, error) {
 	if err != nil {
 		return nil, err
 	}
+	blocks, err := tx.DeviceBlocks(a.ID)
+	if err != nil {
+		return nil, err
+	}
 	var ps *vaultlog.PublicState
 	if v, err := tx.Vault(a.VaultID); err == nil {
 		ps, _ = vaultlog.ParsePublicState(v.PublicState)
@@ -264,7 +270,7 @@ func accountDevices(tx Tx, a *Account, now time.Time) ([]*DeviceDetail, error) {
 	for _, dev := range devs {
 		d := &DeviceDetail{
 			ID: dev.DeviceID, Active: dev.Active, AddedSeq: dev.AddedSeq,
-			LastSeen: seen[dev.DeviceID], Sessions: sessions[dev.DeviceID],
+			LastSeen: seen[dev.DeviceID], Sessions: sessions[dev.DeviceID], Blocked: blocks[dev.DeviceID],
 		}
 		if d.Name, err = deviceName(tx, a.VaultID, ps, dev); err != nil {
 			return nil, err

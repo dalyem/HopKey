@@ -609,20 +609,31 @@ func schemaVersionOf(t *testing.T, db *sql.DB) string {
 // frozen version 2 schema.
 func v2DB(t *testing.T, e *env) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "v2.db")
+	return oldDB(t, e, "2", `DROP TABLE account_admin`, `DROP TABLE device_blocks`,
+		`DROP INDEX admin_audit_account`, `DROP TABLE admin_audit`)
+}
+
+// v3DB is v2DB for version 3.
+func v3DB(t *testing.T, e *env) string {
+	t.Helper()
+	return oldDB(t, e, "3", `DROP TABLE account_admin`, `DROP TABLE device_blocks`)
+}
+
+// oldDB copies e's database, runs drop on the copy and records version,
+// and checks that its schema is the frozen one of that version.
+func oldDB(t *testing.T, e *env, version string, drop ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "v"+version+".db")
 	if err := e.st.Backup(context.Background(), path); err != nil {
 		t.Fatal(err)
 	}
 	db := openRaw(t, path)
-	for _, q := range []string{
-		`DROP INDEX admin_audit_account`, `DROP TABLE admin_audit`,
-		`UPDATE meta SET v = CAST('2' AS BLOB) WHERE k = 'schema_version'`,
-	} {
+	for _, q := range append(drop, `UPDATE meta SET v = CAST('`+version+`' AS BLOB) WHERE k = 'schema_version'`) {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
 	}
-	frozen, err := os.ReadFile(filepath.Join("testdata", "schema-v2.sql"))
+	frozen, err := os.ReadFile(filepath.Join("testdata", "schema-v"+version+".sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,16 +642,16 @@ func v2DB(t *testing.T, e *env) string {
 		t.Fatal(err)
 	}
 	if got, want := schemaOf(t, db), schemaOf(t, ref); !slices.Equal(got, want) {
-		t.Fatalf("the downgraded schema is not version 2:\n%v\nwant\n%v", got, want)
+		t.Fatalf("the downgraded schema is not version %s:\n%v\nwant\n%v", version, got, want)
 	}
 	db.Close()
 	return path
 }
 
-// A populated version 2 database moves to version 3 on open: admin_audit
-// appears, every existing row is kept, and the server and the admin
-// commands work on it.
-func TestMigrateV2ToV3(t *testing.T) {
+// A populated version 2 database moves to version 4 on open: admin_audit
+// and the access tables appear, every existing row is kept, and the server
+// and the admin commands work on it.
+func TestMigrateV2ToV4(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	v, A, _, _, _ := adminVault(e)
@@ -656,14 +667,16 @@ func TestMigrateV2ToV3(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := openRaw(t, path)
-	if v := schemaVersionOf(t, raw); v != "3" {
+	if v := schemaVersionOf(t, raw); v != "4" {
 		t.Errorf("schema version %q after the migration", v)
 	}
 	after := tableCounts(t, raw)
-	if after["admin_audit"] != 0 {
-		t.Errorf("admin_audit has %d rows", after["admin_audit"])
+	for _, tbl := range []string{"admin_audit", "account_admin", "device_blocks"} {
+		if n, ok := after[tbl]; !ok || n != 0 {
+			t.Errorf("%s: %d rows (there: %v)", tbl, n, ok)
+		}
+		delete(after, tbl)
 	}
-	delete(after, "admin_audit")
 	if !mapsEqual(before, after) {
 		t.Errorf("rows changed: %v, then %v", before, after)
 	}
@@ -683,21 +696,66 @@ func TestMigrateV2ToV3(t *testing.T) {
 
 	// Opening again changes nothing; a database from a newer server is
 	// refused, and the refusal creates nothing.
-	if v := schemaVersionOf(t, raw); v != "3" {
+	if v := schemaVersionOf(t, raw); v != "4" {
 		t.Errorf("schema version %q after reopening", v)
 	}
-	for _, q := range []string{`UPDATE meta SET v = CAST('4' AS BLOB) WHERE k = 'schema_version'`, `DROP TABLE device_seen`} {
+	for _, q := range []string{`UPDATE meta SET v = CAST('5' AS BLOB) WHERE k = 'schema_version'`, `DROP TABLE device_seen`} {
 		if _, err := raw.Exec(q); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if st3, err := OpenSQLite(path); err == nil {
 		st3.Close()
-		t.Error("opened a version 4 database")
+		t.Error("opened a version 5 database")
 	}
 	if slices.ContainsFunc(schemaOf(t, raw), func(o sqlObject) bool { return o.Name == "device_seen" }) {
 		t.Error("refusing a newer database created a table")
 	}
+}
+
+// A populated version 3 database, with audit rows, moves to version 4 on
+// open: account_admin and device_blocks appear empty, every existing row
+// is kept, and an access change and the server's refusal work on it.
+func TestMigrateV3ToV4(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	v, A, _, _, _ := adminVault(e)
+	if _, _, err := IssueInvite(ctx, e.st, e.op(), "pending@example.com", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	path := v3DB(t, e)
+	before := tableCounts(t, openRaw(t, path))
+	if before["accounts"] != 1 || before["devices"] != 4 || before["admin_audit"] != 1 || before["log"] != 6 {
+		t.Fatalf("the version 3 database is not populated: %v", before)
+	}
+	st, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := openRaw(t, path)
+	if v := schemaVersionOf(t, raw); v != "4" {
+		t.Errorf("schema version %q after the migration", v)
+	}
+	after := tableCounts(t, raw)
+	for _, tbl := range []string{"account_admin", "device_blocks"} {
+		if n, ok := after[tbl]; !ok || n != 0 {
+			t.Errorf("%s: %d rows (there: %v)", tbl, n, ok)
+		}
+		delete(after, tbl)
+	}
+	if !mapsEqual(before, after) {
+		t.Errorf("rows changed: %v, then %v", before, after)
+	}
+	plan, err := PlanDisable(ctx, st, v.email, e.op())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DisableAccount(ctx, st, e.op(), v.email, "migrated", plan); err != nil {
+		t.Errorf("a disable after the migration: %v", err)
+	}
+	st.Close()
+	e2 := newEnvAt(t, path)
+	wantCode(t, e2.sessionAttempt(v, A), 403, CodeAccountDisabled, "a session after the migration and a disable")
 }
 
 // A version 2 database from before device_seen existed gains it too.
@@ -715,7 +773,7 @@ func TestMigrateV2WithoutDeviceSeen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if v := schemaVersionOf(t, raw); v != "3" {
+	if v := schemaVersionOf(t, raw); v != "4" {
 		t.Errorf("schema version %q", v)
 	}
 	if _, err := ShowAccount(context.Background(), st, v.email, e.clock.now()); err != nil {
@@ -782,7 +840,7 @@ func TestOpenWhileAnotherWriterHoldsTheLock(t *testing.T) {
 				t.Fatalf("opening once the writer is done: %v", err)
 			}
 			st.Close()
-			if v := schemaVersionOf(t, raw); v != "3" {
+			if v := schemaVersionOf(t, raw); v != "4" {
 				t.Errorf("schema version %q after the writer finished", v)
 			}
 		})

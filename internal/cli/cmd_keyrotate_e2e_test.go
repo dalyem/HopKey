@@ -59,6 +59,8 @@ type akServer struct {
 	// onAuth, if set, sees each key a client offers before the server
 	// decides on it.
 	onAuth func(c ssh.ConnMetadata, k ssh.PublicKey)
+	// path, if set, is the PATH commands run with.
+	path string
 }
 
 func startAKServer(t *testing.T, home string) *akServer {
@@ -105,9 +107,16 @@ func (s *akServer) setOnAuth(f func(c ssh.ConnMetadata, k ssh.PublicKey)) {
 	s.onAuth = f
 }
 
+func (s *akServer) setPath(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.path = path
+}
+
 // isAKWrite reports whether a command hop runs is one of its
-// authorized_keys edits: the script that writes a temp file and renames it.
-func isAKWrite(command string) bool { return strings.Contains(command, "authorized_keys.hop-") }
+// authorized_keys edits: the script that writes a temp file in a session
+// directory and renames it.
+func isAKWrite(command string) bool { return strings.Contains(command, ".hop-s.") }
 
 func (s *akServer) authorize(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
 	s.mu.Lock()
@@ -209,12 +218,15 @@ func (s *akServer) session(conn ssh.Conn, ch ssh.Channel, reqs <-chan *ssh.Reque
 		}
 		req.Reply(true, nil)
 		s.mu.Lock()
-		hook := s.onExec
+		hook, path := s.onExec, s.path
 		s.mu.Unlock()
+		if path == "" {
+			path = os.Getenv("PATH")
+		}
 		drop := hook != nil && hook(p.Command)
 		cmd := exec.Command("sh", "-c", p.Command)
 		cmd.Dir = s.home
-		cmd.Env = []string{"HOME=" + s.home, "PATH=" + os.Getenv("PATH")}
+		cmd.Env = []string{"HOME=" + s.home, "PATH=" + path}
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = ch, ch, ch.Stderr()
 		cmd.WaitDelay = 2 * time.Second
 		status := uint32(0)

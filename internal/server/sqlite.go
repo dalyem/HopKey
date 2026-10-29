@@ -21,7 +21,7 @@ import (
 
 // schemaVersion is stored in meta; Open refuses a database from a newer
 // server and moves an older one forward (migrate).
-const schemaVersion = "3"
+const schemaVersion = "4"
 
 // schema is the multi-tenant SQLite schema. IDs and digests are BLOBs of
 // their raw bytes; times are Unix seconds.
@@ -171,7 +171,7 @@ CREATE TABLE IF NOT EXISTS enroll_messages (
 	body      BLOB NOT NULL,
 	PRIMARY KEY (enroll_id, n)
 ) STRICT;
-` + schemaV3
+` + schemaV3 + schemaV4
 
 // schemaV3 is what version 3 added: the admin audit trail. account_id is
 // not a foreign key, so a row outlives its account.
@@ -186,6 +186,27 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 	result     TEXT NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS admin_audit_account ON admin_audit (account_id, at);
+`
+
+// schemaV4 is what version 4 added: the operator's access controls. An
+// account is disabled while its account_admin row has a disabled_at; a
+// device is blocked while it has a device_blocks row. Neither is a foreign
+// key, and neither changes devices.active, which mirrors the signed log.
+// A reason is "" when the operator gave none.
+const schemaV4 = `
+CREATE TABLE IF NOT EXISTS account_admin (
+	account_id      BLOB PRIMARY KEY,
+	disabled_at     INTEGER,
+	disabled_reason TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS device_blocks (
+	account_id BLOB NOT NULL,
+	device_id  BLOB NOT NULL,
+	blocked_at INTEGER NOT NULL,
+	reason     TEXT NOT NULL,
+	PRIMARY KEY (account_id, device_id)
+) STRICT;
 `
 
 // SQLite is the Store backed by one SQLite database in WAL mode. Writes go
@@ -233,9 +254,10 @@ func OpenSQLite(path string) (*SQLite, error) {
 // migrate creates any missing table and records or checks the schema
 // version, in one write transaction, so two processes opening the same file
 // cannot both migrate it. Every table is CREATE IF NOT EXISTS: a version 2
-// database gains admin_audit and moves to version 3, and no existing row
-// changes. A database from a newer server is refused before anything is
-// created. An older server refuses a migrated file; a hop-server backup
+// database gains admin_audit and the version 4 tables and moves to version
+// 4, and no existing row changes. A database from a newer server is refused before anything is
+// created. A version 3 database gains account_admin and device_blocks the
+// same way. An older server refuses a migrated file; a hop-server backup
 // taken before upgrading is the way back.
 func (s *SQLite) migrate() error {
 	tx, err := s.w.Begin() // BEGIN IMMEDIATE (_txlock)
@@ -252,7 +274,7 @@ func (s *SQLite) migrate() error {
 	case errors.Is(err, sql.ErrNoRows):
 		_, err = tx.Exec(`INSERT INTO meta (k, v) VALUES ('schema_version', ?)`, []byte(schemaVersion))
 	case err != nil:
-	case string(v) == "2":
+	case string(v) == "2", string(v) == "3":
 		_, err = tx.Exec(`UPDATE meta SET v = ? WHERE k = 'schema_version'`, []byte(schemaVersion))
 	case string(v) != schemaVersion:
 		err = fmt.Errorf("server: database schema version %q is not %q", v, schemaVersion)
@@ -822,8 +844,10 @@ func (t *sqliteTx) AccountSummaries(only *model.ID) ([]*AccountSummary, error) {
 		coalesce(v.head_seq, 0), coalesce(v.last_bootstrap, -1), coalesce(v.last_checkpoint, -1),
 		(SELECT COUNT(*) FROM devices d WHERE d.account_id = a.account_id AND d.active = 1),
 		(SELECT COUNT(*) FROM devices d WHERE d.account_id = a.account_id),
-		(SELECT MAX(seen_at) FROM device_seen s WHERE s.account_id = a.account_id)
-		FROM accounts a LEFT JOIN vaults v ON v.vault_id = a.vault_id `+where+`
+		(SELECT MAX(seen_at) FROM device_seen s WHERE s.account_id = a.account_id),
+		x.disabled_at, coalesce(x.disabled_reason, '')
+		FROM accounts a LEFT JOIN vaults v ON v.vault_id = a.vault_id
+		LEFT JOIN account_admin x ON x.account_id = a.account_id `+where+`
 		ORDER BY a.created_at, a.email`, args...)
 	if err != nil {
 		return nil, err
@@ -834,10 +858,14 @@ func (t *sqliteTx) AccountSummaries(only *model.ID) ([]*AccountSummary, error) {
 		var a AccountSummary
 		var id, vid []byte
 		var created int64
-		var seen sql.NullInt64
+		var seen, disabled sql.NullInt64
+		var reason string
 		if err := rows.Scan(&id, &a.Email, &vid, &a.UsedBytes, &a.QuotaBytes, &a.Reserve, &created,
-			&a.HeadSeq, &a.LastBootstrap, &a.LastCheckpoint, &a.ActiveDevices, &a.AllDevices, &seen); err != nil {
+			&a.HeadSeq, &a.LastBootstrap, &a.LastCheckpoint, &a.ActiveDevices, &a.AllDevices, &seen, &disabled, &reason); err != nil {
 			return nil, err
+		}
+		if disabled.Valid {
+			a.Disabled = &AdminBlock{At: fromUnix(disabled.Int64), Reason: reason}
 		}
 		if err := errors.Join(scanID(id, &a.ID), scanID(vid, &a.VaultID)); err != nil {
 			return nil, err
@@ -1007,4 +1035,64 @@ func (t *sqliteTx) AuditEntries(f AuditFilter) ([]*AuditEntry, error) {
 		out = append(out, &e)
 	}
 	return out, rows.Err()
+}
+
+// --- access controls (hop-server accounts disable, devices block) ---
+
+func (t *sqliteTx) AccountDisabled(accountID model.ID) (*AdminBlock, error) {
+	var at sql.NullInt64
+	var reason string
+	err := t.row(`SELECT disabled_at, disabled_reason FROM account_admin WHERE account_id = ?`, accountID[:]).Scan(&at, &reason)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !at.Valid) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &AdminBlock{At: fromUnix(at.Int64), Reason: reason}, nil
+}
+
+func (t *sqliteTx) SetAccountDisabled(accountID model.ID, b *AdminBlock) error {
+	if b == nil {
+		return t.exec(`UPDATE account_admin SET disabled_at = NULL, disabled_reason = '' WHERE account_id = ?`, accountID[:])
+	}
+	return t.exec(`INSERT INTO account_admin (account_id, disabled_at, disabled_reason) VALUES (?, ?, ?)
+		ON CONFLICT (account_id) DO UPDATE SET disabled_at = excluded.disabled_at, disabled_reason = excluded.disabled_reason`,
+		accountID[:], unix(b.At), b.Reason)
+}
+
+func (t *sqliteTx) DeviceBlocks(accountID model.ID) (map[model.ID]*AdminBlock, error) {
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT device_id, blocked_at, reason FROM device_blocks WHERE account_id = ?`, accountID[:])
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[model.ID]*AdminBlock{}
+	for rows.Next() {
+		var b []byte
+		var at int64
+		var reason string
+		if err := rows.Scan(&b, &at, &reason); err != nil {
+			return nil, err
+		}
+		var id model.ID
+		if err := scanID(b, &id); err != nil {
+			return nil, err
+		}
+		out[id] = &AdminBlock{At: fromUnix(at), Reason: reason}
+	}
+	return out, rows.Err()
+}
+
+func (t *sqliteTx) SetDeviceBlock(accountID, deviceID model.ID, b *AdminBlock) error {
+	if b == nil {
+		return t.exec(`DELETE FROM device_blocks WHERE account_id = ? AND device_id = ?`, accountID[:], deviceID[:])
+	}
+	return t.exec(`INSERT INTO device_blocks (account_id, device_id, blocked_at, reason) VALUES (?, ?, ?, ?)
+		ON CONFLICT (account_id, device_id) DO UPDATE SET blocked_at = excluded.blocked_at, reason = excluded.reason`,
+		accountID[:], deviceID[:], unix(b.At), b.Reason)
+}
+
+func (t *sqliteTx) DeleteLoginTokens(accountID model.ID) error {
+	return t.exec(`DELETE FROM login_tokens WHERE account_id = ?`, accountID[:])
 }

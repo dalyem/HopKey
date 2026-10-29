@@ -79,7 +79,10 @@ const (
 	whyRevoked = "this device was revoked"
 	whyRefused = "the server refused this device a session"
 	whyOffline = "the max-offline policy locked the vault"
-	whyLock    = "hop lock --end-sessions ran"
+	// The server's operator refused this device (unconfirmedLocked).
+	whyDisabled = "the server's operator disabled this account"
+	whyBlocked  = "the server's operator blocked this device"
+	whyLock     = "hop lock --end-sessions ran"
 )
 
 const (

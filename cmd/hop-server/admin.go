@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/user"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -235,15 +236,19 @@ func table(w io.Writer) *tabwriter.Writer { return tabwriter.NewWriter(w, 0, 0, 
 
 // --- accounts ---
 
-func accounts(args []string, stdout io.Writer) error {
+func accounts(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: hop-server accounts ls|show")
+		return errors.New("usage: hop-server accounts ls|show|disable|enable")
 	}
 	switch args[0] {
 	case "ls":
 		return accountsLs(args[1:], stdout)
 	case "show":
 		return accountsShow(args[1:], stdout)
+	case "disable":
+		return accountsDisable(args[1:], stdout, stderr)
+	case "enable":
+		return accountsEnable(args[1:], stdout, stderr)
 	}
 	return fmt.Errorf("unknown accounts command %q", args[0])
 }
@@ -262,6 +267,7 @@ type accountJSON struct {
 	HeadSeq           uint64     `json:"head_seq"`
 	LastBootstrapSeq  *int64     `json:"last_bootstrap_seq"`
 	LastCheckpointSeq *int64     `json:"last_checkpoint_seq"`
+	Disabled          *blockJSON `json:"disabled"`
 }
 
 func accountOf(a *server.AccountSummary) accountJSON {
@@ -270,6 +276,7 @@ func accountOf(a *server.AccountSummary) accountJSON {
 		QuotaBytes: a.QuotaBytes, Reserve: a.Reserve.String(), ActiveDevices: a.ActiveDevices, Devices: a.AllDevices,
 		LastSeen: timeOrNil(a.LastSeen), HeadSeq: a.HeadSeq,
 		LastBootstrapSeq: seqOrNil(a.LastBootstrap), LastCheckpointSeq: seqOrNil(a.LastCheckpoint),
+		Disabled: blockOf(a.Disabled),
 	}
 }
 
@@ -277,12 +284,13 @@ func accountsLs(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("accounts ls", flag.ContinueOnError)
 	data := fs.String("data", "", "data directory")
 	asJSON := fs.Bool("json", false, "print JSON")
+	onlyDisabled := fs.Bool("disabled", false, "only disabled accounts")
 	pos, err := parse(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 0 {
-		return errors.New("usage: hop-server accounts ls [--json] --data DIR")
+		return errors.New("usage: hop-server accounts ls [--disabled] [--json] --data DIR")
 	}
 	st, err := openStore(*data)
 	if err != nil {
@@ -292,6 +300,9 @@ func accountsLs(args []string, stdout io.Writer) error {
 	list, err := server.ListAccounts(context.Background(), st)
 	if err != nil {
 		return err
+	}
+	if *onlyDisabled {
+		list = slices.DeleteFunc(list, func(a *server.AccountSummary) bool { return a.Disabled == nil })
 	}
 	if *asJSON {
 		out := struct {
@@ -303,13 +314,21 @@ func accountsLs(args []string, stdout io.Writer) error {
 		return writeJSON(stdout, out)
 	}
 	if len(list) == 0 {
-		fmt.Fprintln(stdout, "no accounts")
+		if *onlyDisabled {
+			fmt.Fprintln(stdout, "no disabled accounts")
+		} else {
+			fmt.Fprintln(stdout, "no accounts")
+		}
 		return nil
 	}
 	tw := table(stdout)
-	fmt.Fprintln(tw, "ACCOUNT\tEMAIL\tCREATED\tUSED\tQUOTA\tRESERVE\tDEVICES\tLAST SEEN\tHEAD\tCHECKPOINT")
+	fmt.Fprintln(tw, "ACCOUNT\tEMAIL\tSTATE\tCREATED\tUSED\tQUOTA\tRESERVE\tDEVICES\tLAST SEEN\tHEAD\tCHECKPOINT")
 	for _, a := range list {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d/%d\t%s\t%d\t%s\n", a.ID, esc(a.Email), when(a.CreatedAt),
+		state := "enabled"
+		if a.Disabled != nil {
+			state = "disabled"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d/%d\t%s\t%d\t%s\n", a.ID, esc(a.Email), state, when(a.CreatedAt),
 			size(a.UsedBytes), quotaText(a.QuotaBytes), a.Reserve, a.ActiveDevices, a.AllDevices, when(a.LastSeen),
 			a.HeadSeq, seqText(a.LastCheckpoint))
 	}
@@ -329,6 +348,7 @@ type deviceJSON struct {
 	DepartedSeq *uint64    `json:"departed_seq,omitempty"`
 	LastSeen    *time.Time `json:"last_seen"`
 	Sessions    int        `json:"sessions"`
+	Blocked     *blockJSON `json:"blocked"`
 }
 
 type accountDetailJSON struct {
@@ -342,13 +362,17 @@ type accountDetailJSON struct {
 }
 
 func deviceState(d *server.DeviceDetail) string {
+	s := "departed"
 	switch {
 	case d.Active:
-		return "active"
+		s = "active"
 	case d.DepartedHow != "":
-		return fmt.Sprintf("%s at seq %d", d.DepartedHow, d.DepartedSeq)
+		s = fmt.Sprintf("%s at seq %d", d.DepartedHow, d.DepartedSeq)
 	}
-	return "departed"
+	if d.Blocked != nil {
+		s += ", blocked"
+	}
+	return s
 }
 
 func accountsShow(args []string, stdout io.Writer) error {
@@ -381,6 +405,7 @@ func accountsShow(args []string, stdout io.Writer) error {
 			j := deviceJSON{
 				DeviceID: dev.ID, Name: dev.Name, Active: dev.Active, AddedSeq: dev.AddedSeq,
 				DepartedHow: string(dev.DepartedHow), LastSeen: timeOrNil(dev.LastSeen), Sessions: dev.Sessions,
+				Blocked: blockOf(dev.Blocked),
 			}
 			if dev.DepartedHow != "" {
 				j.DepartedSeq = &dev.DepartedSeq
@@ -399,6 +424,7 @@ func accountsShow(args []string, stdout io.Writer) error {
 	fmt.Fprintf(tw, "email\t%s\n", esc(d.Email))
 	fmt.Fprintf(tw, "vault\t%s\n", d.VaultID)
 	fmt.Fprintf(tw, "created\t%s\n", when(d.CreatedAt))
+	fmt.Fprintf(tw, "access\t%s\n", disabledText(d.Disabled))
 	quota := quotaText(d.QuotaBytes)
 	if d.QuotaBytes == 0 {
 		quota = "the server default (--quota-mib)"

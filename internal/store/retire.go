@@ -780,8 +780,10 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 			return err
 		})
 		switch {
-		case errors.Is(err, ErrSessionEnded):
-			outcome, err := s.retireStatus(ctx, r, auth, j, outside)
+		case errors.Is(err, ErrSessionEnded), errors.Is(err, ErrAdminRefused):
+			// No session (the operator's refusal included): retire-status
+			// and retire-post stay open to a device that signs.
+			outcome, err := s.retireStatus(ctx, r, auth, j, outside, v, errors.Is(err, ErrAdminRefused))
 			if err != nil {
 				return pending, err
 			}
@@ -813,12 +815,12 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 				return err
 			}
 			_, err := r.Post(ctx, auth, w)
-			if errors.Is(err, ErrSessionEnded) {
+			if errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrAdminRefused) {
 				_, err = r.RetirePost(ctx, auth, w)
 			}
 			return err
 		})
-		if err != nil && !errors.Is(err, ErrHeadConflict) && !errors.Is(err, ErrSessionEnded) {
+		if err != nil && !errors.Is(err, ErrHeadConflict) && !errors.Is(err, ErrSessionEnded) && !errors.Is(err, ErrAdminRefused) {
 			return pending, fmt.Errorf("%w: %w", ErrLogoutPending, err)
 		}
 	}
@@ -909,7 +911,16 @@ func (s *Store) retireVerified(v *loaded, j *retireJournal, entries []Committed,
 // its prev) or reauthenticating (the head moved, so verified history decides
 // next). The answers are not verified: they only decide local cleanup. The
 // caller holds s.mu.
-func (s *Store) retireStatus(ctx context.Context, r Retirer, auth DeviceAuth, j *retireJournal, outside func(func() error) error) (string, error) {
+//
+// admin means the server's operator refused this device a session (the
+// account disabled, or the device blocked): the device is still active,
+// but no session reads history or posts. When the server's head is this
+// device's verified head, the retirement is built on it, journaled, and
+// posted through retire-post, which stays open; the next round's
+// retire-status settles it. A head this device has not verified leaves
+// the logout pending: history can't be read without a session.
+func (s *Store) retireStatus(ctx context.Context, r Retirer, auth DeviceAuth, j *retireJournal, outside func(func() error) error,
+	v *loaded, admin bool) (string, error) {
 	var h crypto.Hash
 	c := j.live()
 	if c != nil {
@@ -938,6 +949,25 @@ func (s *Store) retireStatus(ctx context.Context, r Retirer, auth DeviceAuth, j 
 		w, err := j.wire(c.H)
 		if err != nil {
 			return "", err
+		}
+		err = outside(func() error {
+			_, err := r.RetirePost(ctx, auth, w)
+			return err
+		})
+		if err != nil && !errors.Is(err, ErrHeadConflict) {
+			return "", fmt.Errorf("%w: %w", ErrLogoutPending, err)
+		}
+		return "", nil
+	}
+	if admin {
+		if st.Head.Seq != v.st.Head.Seq || !st.Head.H.Equal(v.st.Head.H) {
+			return "", fmt.Errorf("%w: the server's operator refused this device a session, and the server's head (seq %d) is not "+
+				"this device's verified head (seq %d), which a logout needs a session to catch up to; once the operator lets the "+
+				"device in again, run hop auth logout again, or hop auth logout --local-only to give up on it", ErrLogoutPending, st.Head.Seq, v.st.Head.Seq)
+		}
+		outcome, w, err := s.retireVerified(v, j, nil, st.Head)
+		if err != nil || outcome != "" || w == nil {
+			return outcome, err
 		}
 		err = outside(func() error {
 			_, err := r.RetirePost(ctx, auth, w)

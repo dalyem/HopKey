@@ -155,6 +155,30 @@ type Tx interface {
 	InsertAudit(e *AuditEntry) error
 	// AuditEntries returns the audit rows the filter selects, oldest first.
 	AuditEntries(f AuditFilter) ([]*AuditEntry, error)
+
+	// The operator's access controls (hop-server accounts disable, devices
+	// block, sessions revoke).
+
+	// AccountDisabled returns the account's disable, or nil when it is
+	// not disabled.
+	AccountDisabled(accountID model.ID) (*AdminBlock, error)
+	// SetAccountDisabled disables the account, or enables it when b is
+	// nil.
+	SetAccountDisabled(accountID model.ID, b *AdminBlock) error
+	// DeviceBlocks returns the account's blocked devices.
+	DeviceBlocks(accountID model.ID) (map[model.ID]*AdminBlock, error)
+	// SetDeviceBlock blocks a device, or unblocks it when b is nil.
+	SetDeviceBlock(accountID, deviceID model.ID, b *AdminBlock) error
+	// DeleteLoginTokens deletes the account's login and recovery tokens.
+	DeleteLoginTokens(accountID model.ID) error
+}
+
+// AdminBlock is an operator's disable of an account or block of a device:
+// when, and the reason given ("" for none), already sanitized
+// (SanitizeReason).
+type AdminBlock struct {
+	At     time.Time
+	Reason string
 }
 
 // Account is one account and the values the server derives from the latest
