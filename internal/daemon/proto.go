@@ -137,6 +137,11 @@ type ResolveResult struct {
 	// CaughtUp means the target first matched nothing and a catch-up pull
 	// ran before this answer.
 	CaughtUp bool `json:"caught_up,omitempty"`
+	// AgentTagsApplied says the daemon narrowed the resolution to the
+	// request's AgentTags. A daemon from before agent_tags ignores the field
+	// and leaves this out, so hop mcp --tag can tell an unscoped answer from
+	// a scoped one and refuse to use it.
+	AgentTagsApplied bool `json:"agent_tags_applied,omitempty"`
 }
 
 // PutHostParams is the request for OpPutHost. A zero ItemID creates the host.

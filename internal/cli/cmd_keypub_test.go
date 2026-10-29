@@ -1,6 +1,7 @@
 package cli_test
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -189,5 +190,61 @@ func TestKeyPubCommentIsOneWord(t *testing.T) {
 	want := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))) + " my_laptop_[2J_x\n"
 	if stdout != want {
 		t.Errorf("key pub = %q, want %q", stdout, want)
+	}
+}
+
+// A key whose public half in the vault is empty or not a key gets an error,
+// not a line made of whatever was stored, and nothing on stdout.
+func TestKeyPubRefusesAStoredPublicKeyThatIsNotOne(t *testing.T) {
+	e := newE2E(t)
+	ctx := context.Background()
+	snap, err := e.store.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := snap.Keys[0]
+	for _, stored := range []string{"   ", "not a key", "ssh-ed25519", "ssh-ed25519 !!!notbase64 comment", "ssh-ed25519 AAAA"} {
+		key.PublicKey = stored
+		if key, err = e.store.PutKey(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"key", "pub", key.Name}, {"key", "pub", key.Name, "--fingerprint"}, {"key", "pub", key.Name, "--json"}} {
+			code, stdout, stderr := e.hop(t, args...)
+			if code != 255 || stdout != "" || !strings.Contains(stderr, "has no usable public key") {
+				t.Errorf("hop %v with stored public key %q: %d stdout %q stderr %q", args, stored, code, stdout, stderr)
+			}
+		}
+	}
+}
+
+// Characters that end a line or reorder text in some displays are not
+// printable, or are white space: each becomes one underscore.
+func TestKeyPubCommentReplacesLineSeparatorsAndInvisibles(t *testing.T) {
+	e := newE2E(t)
+	ctx := context.Background()
+	snap, err := e.store.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := snap.Keys[0]
+	for name, want := range map[string]string{
+		"a\u2028b":             "a_b",
+		"a\u2029b":             "a_b",
+		"\ufeffname":           "_name",
+		"a\u202eb":             "a_b",
+		"a\u2028\u202e\ufeffb": "a___b",
+	} {
+		key.Name = name
+		if key, err = e.store.PutKey(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+		code, stdout, stderr := e.hop(t, "key", "pub", key.ItemID.String())
+		if code != 0 {
+			t.Fatalf("key pub %q: %d %s", name, code, stderr)
+		}
+		f := strings.Split(strings.TrimSuffix(stdout, "\n"), " ")
+		if len(f) != 3 || f[2] != want || strings.ContainsAny(stdout[:len(stdout)-1], "\n\u2028\u2029\ufeff\u202e") {
+			t.Errorf("key pub for the name %q = %q, want the comment %q", name, stdout, want)
+		}
 	}
 }

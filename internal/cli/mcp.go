@@ -162,13 +162,14 @@ func writeCloser(w io.Writer) io.WriteCloser {
 	return nopWriteCloser{w}
 }
 
-// parseAgentTags checks the --tag values of hop mcp: none may be empty. A
-// tag that no host carries is allowed; the agent then sees no host.
+// parseAgentTags checks the --tag values of hop mcp: none may be empty or
+// only white space. A tag is kept exactly as given, because host tags are
+// stored and compared (case-insensitively) without trimming. A tag that no
+// host carries is allowed; the agent then sees no host.
 func parseAgentTags(tags []string) ([]string, error) {
 	var out []string
 	for _, t := range tags {
-		t = strings.TrimSpace(t)
-		if t == "" {
+		if strings.TrimSpace(t) == "" {
 			return nil, failf("hop mcp --tag needs a tag")
 		}
 		if !slices.ContainsFunc(out, func(o string) bool { return strings.EqualFold(o, t) }) {
@@ -897,6 +898,12 @@ func (s *mcpServer) resolve(ctx context.Context, target string, l *daemon.ListRe
 	var rr daemon.ResolveResult
 	if err := call(ctx, s.e, daemon.OpResolve, daemon.ResolveParams{Target: target, AgentOnly: true, AgentTags: s.tags}, &rr); err != nil {
 		return nil, s.daemonError(configStale(s.e, err))
+	}
+	if len(s.tags) > 0 && !rr.AgentTagsApplied {
+		// A daemon from before --tag ignores agent_tags and answers among
+		// every host agents may use; a hidden host among its candidates
+		// could change the answer, so none of it is used.
+		return nil, failf("the running hop daemon does not support hop mcp --tag; run hop daemon stop (it starts again on next use), then try again")
 	}
 	if rr.Result == nil {
 		return nil, failf("the daemon did not resolve %q", target)

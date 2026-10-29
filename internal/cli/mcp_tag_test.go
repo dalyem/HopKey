@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/dalyem/hopkey/internal/cli"
+	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/resolve"
 )
 
 // retag changes a host's tags and agent_access in the vault.
@@ -230,5 +234,115 @@ func TestMCPInstallPassesTagsThrough(t *testing.T) {
 	}
 	if code, _, stderr, ran := run("--tag", ""); code != 255 || !strings.Contains(stderr, "needs a tag") || len(ran) != 0 {
 		t.Errorf("empty tag: %d %q %v", code, stderr, ran)
+	}
+}
+
+// A tag is kept as typed: host tags are stored and compared without
+// trimming, so " work " and "work" are different tags, and only the case of
+// a tag is ignored.
+func TestMCPTagKeepsTheTagAsTyped(t *testing.T) {
+	e := newE2E(t)
+	e.retag(t, "web-1", []string{"work"}, "allow")
+	e.retag(t, "web-2", []string{" work "}, "allow")
+	names := func(args ...string) []string {
+		t.Helper()
+		return hostNames(mcpCall[cli.MCPHosts](e.startMCP(t, args...), "list_hosts", nil).Hosts)
+	}
+	if got := names("--tag", "work"); !slices.Equal(got, []string{"web-1"}) {
+		t.Errorf("--tag work lists %v, want only web-1", got)
+	}
+	if got := names("--tag", " work "); !slices.Equal(got, []string{"web-2"}) {
+		t.Errorf("--tag ' work ' lists %v, want only web-2", got)
+	}
+	if got := names("--tag", "work", "--tag", " work "); !slices.Equal(got, []string{"web-1", "web-2"}) {
+		t.Errorf("--tag work --tag ' work ' lists %v, want both", got)
+	}
+	// What hop mcp install registers is what hop mcp then reads.
+	var so, se bytes.Buffer
+	env := &cli.Env{Stdout: &so, Stderr: &se, Getenv: func(string) string { return "" }, Executable: filepath.Join(t.TempDir(), "hop")}
+	args := []string{"mcp", "install", "--json", "--tag", "work", "--tag", " work ", "--tag", "WORK", "--tag", " WORK "}
+	if code := cli.Run(context.Background(), args, env); code != 0 {
+		t.Fatalf("install: %d %s", code, se.String())
+	}
+	var rep struct{ Server struct{ Args []string } }
+	if err := json.Unmarshal(so.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"mcp", "--tag", "work", "--tag", " work "}; !slices.Equal(rep.Server.Args, want) {
+		t.Errorf("install registers %q, want %q", rep.Server.Args, want)
+	}
+}
+
+// A daemon from before --tag ignores agent_tags and answers among every host
+// agents may use, so a host out of scope can be among the candidates and
+// change the answer. hop mcp --tag never uses such an answer: it says to
+// restart the daemon. Without --tag the same answer is fine.
+func TestMCPTagRefusesADaemonThatIgnoresTheScope(t *testing.T) {
+	const addr = "192.0.2.9"
+	inScope := model.Host{Header: model.Header{ItemID: model.ID{1}}, Name: "work-box", Tags: []string{"work"}, AgentAccess: "allow", Addresses: []string{addr}}
+	outOfScope := model.Host{Header: model.Header{ItemID: model.ID{2}}, Name: "home-box", Tags: []string{"personal"}, AgentAccess: "allow", Addresses: []string{addr}}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: []model.Host{inScope, outOfScope}, Snippets: []model.Snippet{{Header: model.Header{ItemID: model.ID{9}}, Name: "up", Command: "uptime"}}})
+	f.on(daemon.OpResolve, func(params json.RawMessage) (any, error) {
+		// What an old daemon answers: no agent_tags_applied, and both hosts
+		// offered, because it did not read agent_tags.
+		var p daemon.ResolveParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		return daemon.ResolveResult{Result: &resolve.Result{
+			Target: p.Target, Status: resolve.StatusAmbiguous, Rule: resolve.RuleAddress, Matched: "2 hosts match",
+			Candidates: []resolve.Candidate{
+				{HostID: inScope.ItemID.String(), Name: inScope.Name, Addresses: inScope.Addresses},
+				{HostID: outOfScope.ItemID.String(), Name: outOfScope.Name, Addresses: outOfScope.Addresses},
+			},
+		}}, nil
+	})
+
+	scoped := startMCP(t, f.env(t, nil, nil, nil), "--tag", "work")
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"resolve_host", map[string]any{"target": addr}},
+		{"check_host", map[string]any{"host": addr}},
+		{"ssh_command", map[string]any{"host": addr}},
+		{"exec", map[string]any{"hosts": addr, "command": "true"}},
+		{"run_snippet", map[string]any{"name": "up", "hosts": addr}},
+	} {
+		msg := scoped.mcpError(c.tool, c.args)
+		if !strings.Contains(msg, "does not support hop mcp --tag") || !strings.Contains(msg, "hop daemon stop") {
+			t.Errorf("%s under --tag work with an old daemon: %s", c.tool, msg)
+		}
+		if strings.Contains(msg, outOfScope.Name) || strings.Contains(msg, "ambiguous") {
+			t.Errorf("%s under --tag work answered from the unscoped result: %s", c.tool, msg)
+		}
+	}
+	if got := f.called(daemon.OpResolve); len(got) == 0 || !strings.Contains(string(got[0]), `"agent_tags":["work"]`) {
+		t.Errorf("hop mcp --tag work asked the daemon %s", got)
+	}
+
+	// The same daemon answer, to a server with no --tag, is used as before.
+	plain := startMCP(t, f.env(t, nil, nil, nil))
+	if r := mcpCall[cli.MCPResolution](plain, "resolve_host", map[string]any{"target": addr}); r.Status != resolve.StatusAmbiguous || len(r.Candidates) != 2 {
+		t.Errorf("resolve_host without --tag = %+v", r)
+	}
+}
+
+// When the client's CLI is missing and --json prints no config, the command
+// the error points to registers the same server: with the same --read-only
+// and --tag.
+func TestMCPInstallMissingClientPointsToTheSameServer(t *testing.T) {
+	var so, se bytes.Buffer
+	env := &cli.Env{
+		Stdout: &so, Stderr: &se, Getenv: func(string) string { return "" }, Executable: filepath.Join(t.TempDir(), "hop"),
+		RunCommand: func(_ context.Context, name string, _ ...string) ([]byte, error) {
+			return nil, errors.Join(errors.New("lookup "+name), exec.ErrNotFound)
+		},
+	}
+	code := cli.Run(context.Background(), []string{"mcp", "install", "--client", "claude", "--json", "--read-only", "--tag", "work", "--tag", "a b"}, env)
+	want := "config from: hop mcp install --client print --json --read-only --tag work --tag 'a b'"
+	if code != 255 || so.Len() != 0 || !strings.Contains(se.String(), want) {
+		t.Errorf("missing claude, --json: %d stdout %q stderr %q, want stderr to contain %q", code, so.String(), se.String(), want)
 	}
 }

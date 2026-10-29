@@ -380,7 +380,7 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 			return nil, invalidf("%v", err)
 		}
 	}
-	out := &ResolveResult{Result: res, CaughtUp: caughtUp}
+	out := &ResolveResult{Result: res, CaughtUp: caughtUp, AgentTagsApplied: p.AgentOnly && len(p.AgentTags) > 0}
 	if res.Host != nil {
 		h := *res.Host
 		out.Host = &h

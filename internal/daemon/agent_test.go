@@ -338,3 +338,39 @@ func TestResolveRouteHintIsNotForAgents(t *testing.T) {
 		t.Errorf("jump host: host %v, hint %q; want the host and no hint", rr.Host, rr.RouteHint)
 	}
 }
+
+// A scoped resolution (agent_only with agent_tags) says so in its answer, so
+// hop mcp --tag can tell it from the answer of a daemon that ignored the tags.
+func TestResolveAgentTagsAreReportedApplied(t *testing.T) {
+	f := newFixture(t, nil)
+	f.put(f.host("work-box", func(h *model.Host) { h.Tags = []string{"Work"}; h.Addresses = []string{"203.0.113.7"} }))
+	f.put(f.host("home-box", func(h *model.Host) { h.Tags = []string{"personal"}; h.Addresses = []string{"203.0.113.7"} }))
+	c := f.client()
+	resolveWith := func(p ResolveParams) ResolveResult {
+		t.Helper()
+		var rr ResolveResult
+		if err := c.Call(context.Background(), OpResolve, p, &rr); err != nil {
+			t.Fatal(err)
+		}
+		return rr
+	}
+	rr := resolveWith(ResolveParams{Target: "203.0.113.7", AgentOnly: true, AgentTags: []string{"work"}})
+	if !rr.AgentTagsApplied || rr.Host == nil || rr.Host.Name != "work-box" {
+		t.Errorf("scoped resolve = applied %v, %+v", rr.AgentTagsApplied, rr.Result)
+	}
+	// Nothing was scoped: the field stays off the wire.
+	for _, p := range []ResolveParams{
+		{Target: "203.0.113.7", AgentOnly: true},
+		{Target: "203.0.113.7", AgentTags: []string{"work"}}, // not agent_only: tags narrow nothing
+		{Target: "203.0.113.7"},
+	} {
+		if rr := resolveWith(p); rr.AgentTagsApplied {
+			t.Errorf("resolve %+v reports the tags applied", p)
+		}
+	}
+	// And a result without the field is how an old daemon looks.
+	b, _ := json.Marshal(resolveWith(ResolveParams{Target: "203.0.113.7", AgentOnly: true}))
+	if strings.Contains(string(b), "agent_tags_applied") {
+		t.Errorf("unscoped answer carries the field: %s", b)
+	}
+}
