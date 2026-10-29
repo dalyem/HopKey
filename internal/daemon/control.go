@@ -257,6 +257,9 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 	if result, ok, err := d.dispatchVault(ctx, req, decode); ok {
 		return result, err
 	}
+	if result, ok, err := d.dispatchRedact(ctx, req, decode); ok {
+		return result, err
+	}
 	if result, ok, err := d.dispatchSync(ctx, req); ok {
 		return result, err
 	}
@@ -499,6 +502,13 @@ func checkHostInput(h model.Host, all []model.Host) (model.Host, error) {
 	}
 	if h.AgentAccess != "allow" && h.AgentAccess != "deny" {
 		return h, invalidf("agent_access must be allow or deny, not %q", h.AgentAccess)
+	}
+	switch h.AgentOutput {
+	case model.AgentOutputRedacted:
+		h.AgentOutput = "" // the default, stored as no member at all
+	case "", model.AgentOutputFull, model.AgentOutputNone:
+	default:
+		return h, invalidf("agent_output must be redacted, full or none, not %q", h.AgentOutput)
 	}
 	for _, line := range h.HostKeys {
 		if _, err := sshkeys.ParsePublic(line); err != nil {

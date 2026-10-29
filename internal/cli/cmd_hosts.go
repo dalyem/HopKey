@@ -45,18 +45,21 @@ type tsView struct {
 
 // HostView is the --json shape of hop ls (a list of them) and hop info.
 type HostView struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Aliases     []string  `json:"aliases"`
-	Addresses   []string  `json:"addresses"`
-	Port        uint32    `json:"port"`
-	User        string    `json:"user"`
-	Key         *keyRef   `json:"key"`
-	JumpHost    string    `json:"jump_host,omitempty"`
-	Tags        []string  `json:"tags"`
-	Description string    `json:"description"`
-	Route       string    `json:"route"`
-	AgentAccess string    `json:"agent_access"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Aliases     []string `json:"aliases"`
+	Addresses   []string `json:"addresses"`
+	Port        uint32   `json:"port"`
+	User        string   `json:"user"`
+	Key         *keyRef  `json:"key"`
+	JumpHost    string   `json:"jump_host,omitempty"`
+	Tags        []string `json:"tags"`
+	Description string   `json:"description"`
+	Route       string   `json:"route"`
+	AgentAccess string   `json:"agent_access"`
+	// AgentOutput is what of a command's output hop mcp returns to an
+	// agent: redacted, full or none. Nothing a person runs is filtered.
+	AgentOutput string    `json:"agent_output"`
 	Tailscale   *tsView   `json:"tailscale"`
 	HostKeys    []pinView `json:"host_keys"`
 	SSHAlias    string    `json:"ssh_alias,omitempty"`
@@ -83,7 +86,7 @@ func hostView(h model.Host, l *daemon.ListResult) HostView {
 	v := HostView{
 		ID: h.ItemID.String(), Name: h.Name, Aliases: nonNil(h.Aliases), Addresses: nonNil(h.Addresses),
 		Port: h.Port, User: h.User, Tags: nonNil(h.Tags), Description: h.Description,
-		Route: h.Route, AgentAccess: h.AgentAccess, HostKeys: []pinView{},
+		Route: h.Route, AgentAccess: h.AgentAccess, AgentOutput: model.AgentOutputPolicy(h), HostKeys: []pinView{},
 	}
 	if !h.KeyID.IsZero() {
 		for _, k := range l.Keys {
@@ -283,6 +286,7 @@ func runInfo(ctx context.Context, e *Env, args []string) error {
 		e.printf("hint:         %s\n", oneLine(rr.RouteHint))
 	}
 	e.printf("agent access: %s\n", oneLine(string(v.AgentAccess)))
+	e.printf("agent output: %s\n", oneLine(v.AgentOutput))
 	if t := v.Tailscale; t != nil {
 		state := "unknown"
 		if t.Online != nil {
@@ -319,6 +323,7 @@ type hostFlags struct {
 	description *string
 	route       *string
 	agentAccess *string
+	agentOutput *string
 	port        *int
 	addresses   stringList
 	aliases     stringList
@@ -337,6 +342,8 @@ func newHostFlags(fs *flag.FlagSet, withName bool) *hostFlags {
 	hf.description = fs.String("description", "", "free-text description")
 	hf.route = fs.String("route", "", "auto, tailnet or direct")
 	hf.agentAccess = fs.String("agent-access", "", "allow or deny; deny keeps the host out of agent tool results")
+	hf.agentOutput = fs.String("agent-output", "", "redacted, full or none: what of a command's output hop mcp returns to agents "+
+		"(redacted removes secrets, full removes only hop's and the vault's, none returns sizes only); your own commands are never filtered")
 	hf.port = fs.Int("port", 0, "ssh port")
 	fs.Var(&hf.addresses, "address", "hostname or IP (repeatable; replaces the list on edit)")
 	fs.Var(&hf.aliases, "alias", "another name for the host (repeatable)")
@@ -362,6 +369,14 @@ func (hf *hostFlags) apply(ctx context.Context, e *Env, h *model.Host, l *daemon
 	}
 	if set("agent-access") {
 		h.AgentAccess = *hf.agentAccess
+	}
+	if set("agent-output") {
+		switch *hf.agentOutput {
+		case model.AgentOutputRedacted, model.AgentOutputFull, model.AgentOutputNone:
+			h.AgentOutput = *hf.agentOutput
+		default:
+			return failf("--agent-output must be redacted, full or none, not %q", *hf.agentOutput)
+		}
 	}
 	if set("port") {
 		if *hf.port < 1 || *hf.port > 65535 {

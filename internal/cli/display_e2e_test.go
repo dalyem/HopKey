@@ -45,7 +45,7 @@ func assertDisplaySafe(t *testing.T, what, out string) {
 func lines(s string) []string { return strings.Split(strings.TrimRight(s, "\n"), "\n") }
 
 // infoLabel is every label hop info prints at the start of a line.
-var infoLabel = regexp.MustCompile(`^(name|id|aliases|addresses|port|user|key|jump host|tags|description|route|would use|agent access|tailscale|host keys|host key|ssh): `)
+var infoLabel = regexp.MustCompile(`^(name|id|aliases|addresses|port|user|key|jump host|tags|description|route|would use|agent access|agent output|tailscale|host keys|host key|ssh): `)
 
 // Vault text reaches ls, info and which. Whatever a host's fields hold, the
 // table has one line per host, info has one line per field, and nothing in

@@ -109,6 +109,33 @@ type Host struct {
 	Route        string     `json:"route"`     // "auto" | "tailnet" | "direct"
 	HostKeys     []string   `json:"host_keys"` // OpenSSH public-key lines
 	AgentAccess  string     `json:"agent_access"`
+	// AgentOutput is what of a command's output hop mcp hands an agent:
+	// "" (redacted: hop's and the vault's secrets and well-known token
+	// formats removed), "full" (only hop's and the vault's secrets
+	// removed) or "none" (sizes and the exit code only). It is absent from
+	// the plaintext when "", so a host written before it existed reads as
+	// redacted. What a person runs is never filtered.
+	AgentOutput string `json:"agent_output,optional"`
+}
+
+// Agent output policies (Host.AgentOutput). AgentOutputRedacted is
+// stored as "".
+const (
+	AgentOutputRedacted = "redacted"
+	AgentOutputFull     = "full"
+	AgentOutputNone     = "none"
+)
+
+// AgentOutputPolicy is h's policy by name. A value this build does not
+// know, from a newer one, withholds the output.
+func AgentOutputPolicy(h Host) string {
+	switch h.AgentOutput {
+	case "", AgentOutputRedacted:
+		return AgentOutputRedacted
+	case AgentOutputFull:
+		return AgentOutputFull
+	}
+	return AgentOutputNone
 }
 
 // Key is an SSH key pair. PrivateKey is unencrypted OpenSSH PEM.

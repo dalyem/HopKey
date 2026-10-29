@@ -254,25 +254,47 @@ type ExecResult struct {
 	Error string `json:"error,omitempty"`
 	// Warning is set when the command ran but its output may be incomplete.
 	Warning string `json:"warning,omitempty"`
+
+	// The size of the whole of stdout and stderr, kept or not, for hop
+	// mcp to report when it withholds them. They are not in the JSON.
+	stdoutBytes, stdoutLines int64
+	stderrBytes, stderrLines int64
 }
 
 // tailLimit is how much of each output stream --json keeps: the last 64 KB.
 const tailLimit = 64 << 10
 
-// tailBuffer keeps the last max bytes written to it.
+// tailBuffer keeps the last max bytes written to it, and counts them all.
 type tailBuffer struct {
 	max     int
 	buf     []byte
 	dropped bool
+
+	total, newlines int64
+	last            byte
 }
 
 func (t *tailBuffer) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		t.total += int64(len(p))
+		t.newlines += int64(bytes.Count(p, []byte{'\n'}))
+		t.last = p[len(p)-1]
+	}
 	t.buf = append(t.buf, p...)
 	if len(t.buf) > 2*t.max {
 		t.buf = append([]byte(nil), t.buf[len(t.buf)-t.max:]...)
 		t.dropped = true
 	}
 	return len(p), nil
+}
+
+// lines is how many lines were written: one more than the line breaks
+// when the last line has none.
+func (t *tailBuffer) lines() int64 {
+	if t.total > 0 && t.last != '\n' {
+		return t.newlines + 1
+	}
+	return t.newlines
 }
 
 func (t *tailBuffer) Bytes() []byte {
@@ -388,8 +410,10 @@ type remoteRun struct {
 	// a remote prompt reads end-of-file instead of waiting.
 	stdin io.Reader
 	// stdout and stderr receive the output as it comes. Nil keeps the last
-	// tailLimit bytes of that stream in the result instead.
+	// tail bytes of that stream in the result instead.
 	stdout, stderr io.Writer
+	// tail is how much of a stream the result keeps; 0 means tailLimit.
+	tail int
 }
 
 // runRemote runs one command on t at addr with ssh: no PTY, and BatchMode,
@@ -417,7 +441,11 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	cmd.Env = e.sshEnviron()
 	cmd.Stdin = r.stdin
 	cmd.WaitDelay = time.Second
-	outTail, errTail := &tailBuffer{max: tailLimit}, &tailBuffer{max: tailLimit}
+	keep := tailLimit
+	if r.tail > 0 {
+		keep = r.tail
+	}
+	outTail, errTail := &tailBuffer{max: keep}, &tailBuffer{max: keep}
 	cmd.Stdout, cmd.Stderr = r.stdout, r.stderr
 	if r.stdout == nil {
 		cmd.Stdout = outTail
@@ -451,9 +479,11 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	}
 	if r.stdout == nil {
 		res.Stdout = string(outTail.Bytes())
+		res.stdoutBytes, res.stdoutLines = outTail.total, outTail.lines()
 	}
 	if r.stderr == nil {
 		res.Stderr = string(errTail.Bytes())
+		res.stderrBytes, res.stderrLines = errTail.total, errTail.lines()
 	}
 	res.Truncated = outTail.dropped || errTail.dropped || res.Warning != ""
 	return res, nil
@@ -721,9 +751,24 @@ type echo struct {
 	quote func(string) string
 	// login, if set, is applied to ssh's stderr from a login to t at addr.
 	login func(t *target, addr, stderr string) string
+	// remote, if set, makes a step's detail of text the network supplied
+	// (ssh's stderr, after login; a server's handshake error), as it came,
+	// and lead, hop's own words before it. lines, if not 0, shows only the
+	// last lines of text, joined into one line as lastLines does. fromGo
+	// says text is an error from hop's own ssh client (fetchHostKey),
+	// which quotes a server's disconnect message as %q does.
+	remote func(lead, text string, lines int, fromGo bool) string
+	// loginTail is how much of ssh's stderr from the login is kept for
+	// login and remote; 0 means tailLimit. hop mcp keeps more, so that
+	// remote checks the bytes before its own cut too.
+	loginTail int
 }
 
 var plainEcho = echo{quote: strconv.Quote}
+
+// cutNote follows a step's lead when echo.remote kept only the end of the
+// text it quotes.
+const cutNote = "(earlier output cut) "
 
 // authCheckTimeout bounds hop check's login, ssh's own start included.
 const authCheckTimeout = 20 * time.Second
@@ -810,7 +855,12 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 	probe("host_key_matches", []string{"tcp_reachable", "host_key_pinned"}, func() (string, string) {
 		key, err := fetchHostKey(ctx, addr, port, algorithmsFor(pins), e.dialTimeout())
 		if err != nil {
-			return stepFail, safef("could not read the server's host key: %v", err)
+			// The error can quote the server: a disconnect's message.
+			const lead = "could not read the server's host key: "
+			if ec.remote != nil {
+				return stepFail, ec.remote(lead, err.Error(), 0, true)
+			}
+			return stepFail, lead + oneLine(err.Error())
 		}
 		for _, p := range pins {
 			if bytes.Equal(p.Marshal(), key.Marshal()) {
@@ -832,15 +882,19 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		// runRemote bounds it: stdin closed, output capped, and WaitDelay,
 		// so a ProxyJump child that keeps stderr open cannot hold it past
 		// the timeout.
-		res, err := e.runRemote(ctx, t, addr, remoteRun{command: "true", timeout: authCheckTimeout})
+		res, err := e.runRemote(ctx, t, addr, remoteRun{command: "true", timeout: authCheckTimeout, tail: ec.loginTail})
 		if err != nil {
 			return stepFail, err.Error() // composed by failf: already display-safe
 		}
 		if res.ExitCode != 0 || res.Error != "" {
 			// ssh's stderr is remote text; lastLines makes each line safe.
+			const lead = "ssh did not log in: "
 			stderr := res.Stderr
 			if ec.login != nil {
 				stderr = ec.login(t, addr, stderr)
+			}
+			if ec.remote != nil && strings.TrimSpace(unmark.Replace(stderr)) != "" {
+				return stepFail, ec.remote(lead, stderr, 3, false)
 			}
 			msg := strings.TrimSpace(stderr)
 			if msg == "" {
@@ -849,7 +903,7 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 			if msg == "" {
 				msg = fmt.Sprintf("exit status %d", res.ExitCode)
 			}
-			return stepFail, "ssh did not log in: " + lastLines(msg, 3)
+			return stepFail, lead + lastLines(msg, 3)
 		}
 		return stepPass, safef("logged in with ssh %s", t.alias)
 	})

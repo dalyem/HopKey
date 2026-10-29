@@ -67,6 +67,8 @@ func TestHostSchemaRejects(t *testing.T) {
 		"description 1025":   func(h *model.Host) { h.Description = strings.Repeat("a", 1025) },
 		"route":              func(h *model.Host) { h.Route = "magic" },
 		"agent_access":       func(h *model.Host) { h.AgentAccess = "maybe" },
+		"agent_output":       func(h *model.Host) { h.AgentOutput = "some" },
+		"agent_output named": func(h *model.Host) { h.AgentOutput = model.AgentOutputRedacted }, // stored as ""
 		"tailscale ssh":      func(h *model.Host) { h.Tailscale = &model.Tailscale{SSH: "sometimes"} },
 		"tailscale dns_name": func(h *model.Host) { h.Tailscale = &model.Tailscale{DNSName: strings.Repeat("a", 256), SSH: "no"} },
 		"host key too long":  func(h *model.Host) { h.HostKeys = []string{strings.Repeat("a", 8193)} },
@@ -250,5 +252,34 @@ func TestParseItemClosedSchema(t *testing.T) {
 	}
 	if _, err := ParseItem("note", b); err == nil {
 		t.Error("unknown type accepted")
+	}
+}
+
+// A host written before agent_output existed has no such member, and reads
+// as the default; a host with a policy carries it, and only then.
+func TestHostAgentOutputMember(t *testing.T) {
+	h := testHost(fixedID(1), 1)
+	old, err := MarshalItem(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(old), "agent_output") {
+		t.Fatalf("a default host carries agent_output: %s", old)
+	}
+	it, err := ParseItem(model.TypeHost, old)
+	if err != nil || it.(*model.Host).AgentOutput != "" {
+		t.Fatalf("the old host: %v %+v", err, it)
+	}
+	h.AgentOutput = model.AgentOutputNone
+	b, err := MarshalItem(h)
+	if err != nil || !strings.Contains(string(b), `"agent_output":"none"`) {
+		t.Fatalf("%s %v", b, err)
+	}
+	if it, err := ParseItem(model.TypeHost, b); err != nil || it.(*model.Host).AgentOutput != model.AgentOutputNone {
+		t.Errorf("round trip: %v %+v", err, it)
+	}
+	empty := strings.Replace(string(old), `"agent_access":"allow"`, `"agent_access":"allow","agent_output":""`, 1)
+	if _, err := ParseItem(model.TypeHost, []byte(empty)); err == nil {
+		t.Error("a present but empty agent_output was accepted")
 	}
 }

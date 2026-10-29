@@ -12,7 +12,10 @@
 //
 //   - struct: an object with one member per exported field, named by its
 //     json tag. Anonymous struct fields without a name are flattened. Every
-//     member is required; omitempty and omitzero are refused.
+//     member is required; omitempty and omitzero are refused. The one
+//     exception is a string field tagged ",optional": it is written only
+//     when it is not "", and an absent member decodes as "". A member that
+//     is present must not be "", so that a value has one encoding.
 //   - pointer: null when nil (a "|null" field in the spec); null is accepted
 //     only for pointer fields.
 //   - slice and array: an array; a nil slice encodes as []. []byte is the
@@ -108,6 +111,7 @@ type field struct {
 	name     string
 	index    []int
 	asString bool // the ",string" option: an integer written as a decimal string
+	optional bool // the ",optional" option: a string member absent when ""
 }
 
 var fieldCache sync.Map // reflect.Type -> fieldsResult
@@ -175,6 +179,11 @@ func collectFields(t reflect.Type, prefix []int, out *[]field) error {
 				default:
 					return fmt.Errorf("canonjson: ,string on non-integer field %s in %v", sf.Name, t)
 				}
+			case "optional":
+				if sf.Type.Kind() != reflect.String {
+					return fmt.Errorf("canonjson: ,optional on non-string field %s in %v", sf.Name, t)
+				}
+				f.optional = true
 			default:
 				return fmt.Errorf("canonjson: unsupported tag option %q on %s in %v (every member is required)", opt, sf.Name, t)
 			}
@@ -338,9 +347,13 @@ func (e *encoder) structValue(v reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	ms := make([]encMember, len(fields))
-	for i, f := range fields {
-		ms[i] = encMember{key: f.name, utf16: utf16.Encode([]rune(f.name)), value: v.FieldByIndex(f.index), asStr: f.asString}
+	ms := make([]encMember, 0, len(fields))
+	for _, f := range fields {
+		fv := v.FieldByIndex(f.index)
+		if f.optional && fv.String() == "" {
+			continue
+		}
+		ms = append(ms, encMember{key: f.name, utf16: utf16.Encode([]rune(f.name)), value: fv, asStr: f.asString})
 	}
 	return e.members(ms)
 }
@@ -577,12 +590,19 @@ func decode(n *node, v reflect.Value, path string, asString bool) error {
 		}
 		for _, f := range fields {
 			c, ok := byName[f.name]
+			if !ok && f.optional {
+				v.FieldByIndex(f.index).SetString("")
+				continue
+			}
 			if !ok {
 				return fmt.Errorf("canonjson: %s: missing member %q", path, f.name)
 			}
 			delete(byName, f.name)
 			if err := decode(c, v.FieldByIndex(f.index), path+"."+f.name, f.asString); err != nil {
 				return err
+			}
+			if f.optional && v.FieldByIndex(f.index).String() == "" {
+				return fmt.Errorf("canonjson: %s: optional member %q is present but empty", path, f.name)
 			}
 		}
 		for _, mem := range n.members {

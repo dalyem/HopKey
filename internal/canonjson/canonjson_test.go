@@ -277,3 +277,37 @@ func TestUnmarshalNeedsPointer(t *testing.T) {
 		t.Fatal("non-pointer accepted")
 	}
 }
+
+// An ,optional string member is absent when "", so a record written before
+// it existed still decodes, and present only with a value.
+func TestOptionalMember(t *testing.T) {
+	type rec struct {
+		A string `json:"a"`
+		B string `json:"b,optional"`
+	}
+	for _, c := range []struct {
+		in   rec
+		want string
+	}{{rec{A: "x"}, `{"a":"x"}`}, {rec{A: "x", B: "y"}, `{"a":"x","b":"y"}`}} {
+		got, err := Marshal(c.in)
+		if err != nil || string(got) != c.want {
+			t.Errorf("Marshal(%+v) = %s, %v; want %s", c.in, got, err, c.want)
+		}
+		back := rec{B: "stale"}
+		if err := Unmarshal(got, &back); err != nil || back != c.in {
+			t.Errorf("Unmarshal(%s) = %+v, %v", got, back, err)
+		}
+	}
+	if err := Unmarshal([]byte(`{"a":"x","b":""}`), new(rec)); err == nil {
+		t.Error("a present but empty optional member was accepted")
+	}
+	if err := Unmarshal([]byte(`{"b":"y"}`), new(rec)); err == nil {
+		t.Error("a missing required member was accepted")
+	}
+	type bad struct {
+		N int `json:"n,optional"`
+	}
+	if _, err := Marshal(bad{}); err == nil {
+		t.Error(",optional accepted on an integer")
+	}
+}
