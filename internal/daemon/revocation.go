@@ -70,6 +70,10 @@ type unlockCheck struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	accepted bool
+	// admin is the operator's refusal that locked the vault before this
+	// unlock (adminLock): only the server letting the device in undoes
+	// it, so a server that can't be reached keeps it.
+	admin *store.AdminRefusal
 }
 
 func (c *unlockCheck) context() context.Context {
@@ -157,8 +161,21 @@ func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphr
 	case err != nil:
 		d.logf("asking the server whether this device is still in the account: %v", err)
 	case res.Active:
+		if d.opts.afterCheck != nil {
+			d.opts.afterCheck()
+		}
 		e.set(func() {
 			e.checkSkipped, e.unconfirmed = "", ""
+			// An answer to a question asked before the operator's
+			// refusal locked the vault (which moved the generation) is
+			// no answer to it: the refusal stays until a later question
+			// is answered. The generation is read under e.mu, where the
+			// refusal is installed after the store moved it, so a
+			// refusal that lands while this answer is in flight is
+			// never cleared by it.
+			if e.st.Generation() == gen {
+				e.admin = nil
+			}
 			if e.retired != nil && e.retired.Unverified {
 				// The report was wrong.
 				e.retired = nil
@@ -182,21 +199,74 @@ func (d *Daemon) unconfirmedLocked(err error) error {
 		return err
 	}
 	refused := errors.Is(err, store.ErrSessionRefused)
-	if !errors.Is(err, store.ErrServerUnconfirmed) {
+	// The operator's refusal (an account disabled, a device blocked) is
+	// kept in the lock's reason, so status can say so (store.Info's
+	// AdminLock); nothing else of err is.
+	var admin *store.AdminRefusal
+	errors.As(err, &admin)
+	switch {
+	case errors.Is(err, store.ErrServerUnconfirmed):
+	case admin != nil:
+		err = fmt.Errorf("%w (%w)", store.ErrServerUnconfirmed, admin)
+	default:
 		err = fmt.Errorf("%w (%v)", store.ErrServerUnconfirmed, err)
 	}
 	rs.LockFor(err)
 	// Status says why before any session ends, so a hop process whose
 	// session ended and that asks status at once reads the reason.
 	why := err.Error()
-	e.set(func() { e.unconfirmed, e.checkSkipped = why, "" })
-	if refused {
+	again := false
+	e.set(func() {
+		again, e.unconfirmed, e.checkSkipped = e.unconfirmed == why, why, ""
+		if admin != nil {
+			c := *admin
+			e.admin = &c
+		}
+	})
+	switch {
+	case admin != nil:
+		d.endSessions(whyAdmin(admin))
+	case refused:
 		// The server's refusal is how a revoked device learns it.
 		d.endSessions(whyRefused)
 	}
 	d.dropKeysLocked(false)
-	d.logf("the vault stays locked: %v", err)
+	if !again {
+		// The sync loop asks again every idleRecheck; the same answer is
+		// logged once.
+		d.logf("the vault stays locked: %v", err)
+	}
 	return err
+}
+
+// adminLock returns the operator's refusal that keeps the vault locked
+// until the server accepts the device (syncer.admin), or nil.
+func (d *Daemon) adminLock() *store.AdminRefusal {
+	if d.sync == nil {
+		return nil
+	}
+	var out *store.AdminRefusal
+	d.sync.set(func() {
+		if d.sync.admin != nil {
+			c := *d.sync.admin
+			out = &c
+		}
+	})
+	return out
+}
+
+// whyAdmin is why the ssh sessions end on the operator's refusal, with
+// the operator's message, escaped and bounded (store.EscapeServerText):
+// it is shown on the session's terminal and kept in status.
+func whyAdmin(a *store.AdminRefusal) string {
+	why := whyDisabled
+	if a.Code == store.AdminDeviceBlocked {
+		why = whyBlocked
+	}
+	if a.Reason != "" {
+		why += fmt.Sprintf(": \"%s\" (the server's word)", store.EscapeServerText(a.Reason))
+	}
+	return why
 }
 
 // stillUnconfirmed reports whether err, the answer to a check that the
@@ -243,6 +313,12 @@ func (d *Daemon) retryUnconfirmed(ctx context.Context) bool {
 	switch {
 	case err == nil && res.Report != nil:
 		d.reportedLocked(res.Report, nil)
+		return false
+	case errors.Is(err, store.ErrDeviceKey):
+		// The device key is sealed with a passphrase this daemon does not
+		// have, so it can't ask: that is no answer from the server, and
+		// the lock and its reason stay. hop unlock asks for the
+		// passphrase.
 		return false
 	case err != nil && !unreachable(err) && d.stillUnconfirmed(err, gen):
 		d.unconfirmedLocked(err)
@@ -535,6 +611,12 @@ func (d *Daemon) checkBeforeKeysLocked(c *unlockCheck, passphrase []byte) error 
 			return store.ErrServerRevoked
 		case err != nil && !unreachable(err):
 			return d.unconfirmedLocked(err)
+		case err != nil && c.admin != nil:
+			// Offline, the keys would load; but this vault was locked by
+			// the operator's refusal, which an unreachable server does not
+			// undo. (A daemon that starts offline has no such lock: it is
+			// held in memory only.)
+			return fmt.Errorf("%w; the server could not be asked again: %v", d.unconfirmedLocked(c.admin), err)
 		}
 		c.accepted = err == nil
 	}

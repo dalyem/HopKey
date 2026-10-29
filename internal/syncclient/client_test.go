@@ -257,9 +257,12 @@ type fakeAuth struct {
 	sessions   int
 	logs       int
 	tokens     map[string]bool
-	inactive   bool // session challenges get 401
-	refuse     int  // this many session requests get 401
-	logRefuse  bool // every log request gets 401
+	inactive   bool   // session challenges get 401
+	refuse     int    // this many session requests get 401
+	refuse403  int    // this many session requests get 403 without an admin code
+	admin      string // session requests get 403 with this admin code
+	reason     string // and this operator's reason
+	logRefuse  bool   // every log request gets 401
 	ttl        time.Duration
 	vault      model.ID // the vault the sessions are bound to
 	noVault    bool     // session responses have no vault_id, as an older server's
@@ -270,7 +273,7 @@ func newFakeAuth() *fakeAuth {
 }
 
 func (f *fakeAuth) unauthorized(w http.ResponseWriter) {
-	writeCanon(w, http.StatusUnauthorized, errorResponse{errorBody{"unauthorized", "authentication failed"}})
+	writeCanon(w, http.StatusUnauthorized, errorResponse{errorBody{Code: "unauthorized", Message: "authentication failed"}})
 }
 
 func (f *fakeAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -291,6 +294,15 @@ func (f *fakeAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.refuse > 0 {
 			f.refuse--
 			f.unauthorized(w)
+			return
+		}
+		if f.refuse403 > 0 {
+			f.refuse403--
+			writeCanon(w, http.StatusForbidden, errorResponse{errorBody{Code: "forbidden", Message: "forbidden"}})
+			return
+		}
+		if f.admin != "" {
+			writeCanon(w, http.StatusForbidden, errorResponse{errorBody{Code: f.admin, Message: "refused by the operator", Reason: f.reason}})
 			return
 		}
 		tok := "tok-" + strconv.Itoa(f.sessions)
@@ -433,8 +445,10 @@ func TestSessionEnded(t *testing.T) {
 	}
 }
 
-// A refused session is tried once more with a fresh challenge; a second
-// refusal is an authentication failure, not a session the server ended.
+// A refused session is tried once more with a fresh challenge; refused
+// again, 401 or 403 without an admin code, the server will not let the
+// device in: the session ended, so the caller asks retire-status, as for
+// a refused challenge.
 func TestSessionRefusedRetriedOnce(t *testing.T) {
 	f, r, _, _, _ := sessionFixture(t)
 	f.set(func(f *fakeAuth) { f.refuse = 1 })
@@ -444,10 +458,44 @@ func TestSessionRefusedRetriedOnce(t *testing.T) {
 	f, r, _, _, _ = sessionFixture(t)
 	f.set(func(f *fakeAuth) { f.refuse = 2 })
 	_, _, err := r.Since(bg, 0)
-	if !errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrSessionEnded) {
+	if !errors.Is(err, ErrUnauthorized) || !errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrAdminRefused) {
 		t.Errorf("refused twice: %v", err)
 	}
 	wantCounts(t, f, 2, 2, 0)
+
+	f, r, _, _, _ = sessionFixture(t)
+	f.set(func(f *fakeAuth) { f.refuse403 = 1 })
+	since(t, r)
+	f, r, _, _, _ = sessionFixture(t)
+	f.set(func(f *fakeAuth) { f.refuse403 = 2 })
+	if _, _, err := r.Since(bg, 0); !errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrAdminRefused) || Retryable(err) {
+		t.Errorf("a 403 without an admin code, twice: %v", err)
+	}
+	wantCounts(t, f, 2, 2, 0)
+}
+
+// A session refused with an admin code is the operator's refusal at once:
+// not retried, not a session ending, not retryable, with the code and the
+// reason; and the reason is escaped in the error text.
+func TestSessionAdminRefused(t *testing.T) {
+	for _, code := range []string{store.AdminAccountDisabled, store.AdminDeviceBlocked} {
+		t.Run(code, func(t *testing.T) {
+			f, r, _, _, _ := sessionFixture(t)
+			f.set(func(f *fakeAuth) { f.admin, f.reason = code, "bill\x1b[2J overdue" })
+			_, _, err := r.Since(bg, 0)
+			var ar *store.AdminRefusal
+			if !errors.Is(err, ErrAdminRefused) || !errors.As(err, &ar) || ar.Code != code || ar.Reason != "bill\x1b[2J overdue" {
+				t.Fatalf("admin refusal: %v (%+v)", err, ar)
+			}
+			if errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrUnauthorized) || Retryable(err) {
+				t.Errorf("admin refusal matches more: %v", err)
+			}
+			if strings.ContainsRune(err.Error(), 0x1b) || !strings.Contains(err.Error(), `bill\x1b[2J overdue`) {
+				t.Errorf("the reason is not escaped: %q", err.Error())
+			}
+			wantCounts(t, f, 1, 1, 0)
+		})
+	}
 }
 
 // A session response without a vault_id (an older server), or with a zero
@@ -618,6 +666,19 @@ func TestErrorMapping(t *testing.T) {
 		{409, env("conflict"), []check{is(ErrConflict), not(ErrAlreadyClaimed), not(store.ErrHeadConflict)}},
 		{400, env("bad_request"), []check{is(ErrBadRequest), retry(false)}},
 		{401, env("unauthorized"), []check{is(ErrUnauthorized), not(ErrSessionEnded), retry(false), code("unauthorized")}},
+		// The operator's refusals: 403 with an admin code, the reason optional.
+		{403, `{"error":{"code":"account_disabled","message":"m","reason":"overdue"}}`,
+			[]check{is(ErrAdminRefused), not(ErrUnauthorized), retry(false), code("account_disabled"), func(err error) bool {
+				var ar *store.AdminRefusal
+				return errors.As(err, &ar) && ar.Code == store.AdminAccountDisabled && ar.Reason == "overdue"
+			}}},
+		{403, env("device_blocked"), []check{is(ErrAdminRefused), retry(false), func(err error) bool {
+			var ar *store.AdminRefusal
+			return errors.As(err, &ar) && ar.Code == store.AdminDeviceBlocked && ar.Reason == ""
+		}}},
+		{403, env("forbidden"), []check{not(ErrAdminRefused), retry(false), code("forbidden")}},
+		{401, env("account_disabled"), []check{not(ErrAdminRefused), is(ErrUnauthorized)}},
+		{403, `{"error":{"code":"account_disabled","message":"m","reason":""}}`, []check{not(ErrAdminRefused), code("")}},
 		{404, env("not_found"), []check{is(ErrNotFound), retry(false)}},
 		{413, env("too_large"), []check{is(ErrTooLarge), retry(false)}},
 		{429, env("rate_limited"), []check{is(ErrRateLimited), retry(true)}},

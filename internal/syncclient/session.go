@@ -243,9 +243,13 @@ type granted struct {
 // authenticate gets a new session (§9): a "session" challenge, the device's
 // signature over the device-auth object, and POST /v1/auth/session. A
 // refused challenge means the device is not active: ErrSessionEnded. A
-// refused session (the device left between the two calls, say) is tried
-// once more with a fresh challenge, which then tells. A response without a
-// vault_id (an older server) is malformed. It returns the session granted.
+// session refused with an admin code (the operator disabled the account
+// or blocked the device) is ErrAdminRefused at once. A session refused
+// otherwise, 401 or 403 (the device left between the two calls, say), is
+// tried once more with a fresh challenge, and refused again it is
+// ErrSessionEnded: the server will not let this device in. A response
+// without a vault_id (an older server) is malformed. It returns the
+// session granted.
 func (c *Client) authenticate(ctx context.Context, dev Device) (granted, error) {
 	for attempt := 0; ; attempt++ {
 		ch, err := c.challenge(ctx, dev, crypto.OperationSession)
@@ -269,8 +273,12 @@ func (c *Client) authenticate(ctx context.Context, dev Device) (granted, error) 
 		}
 		var resp sessionResponse
 		err = r.decode(&resp)
-		if errors.Is(err, ErrUnauthorized) && attempt == 0 {
-			continue
+		var ae *APIError
+		if errors.As(err, &ae) && ae.Admin == nil && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden) {
+			if attempt == 0 {
+				continue
+			}
+			return granted{}, fmt.Errorf("%w: %w", ErrSessionEnded, err)
 		}
 		if err != nil {
 			return granted{}, err

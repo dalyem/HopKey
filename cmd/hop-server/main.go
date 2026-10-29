@@ -6,8 +6,13 @@
 //	hop-server invites ls [--all] [--json] --data DIR
 //	hop-server invites revoke INVITE|EMAIL [--dry-run] [--yes] [--json] --data DIR
 //	hop-server invites reissue EMAIL [--ttl 7d] [--dry-run] [--yes] [--json] --data DIR
-//	hop-server accounts ls [--json] --data DIR
+//	hop-server accounts ls [--disabled] [--json] --data DIR
 //	hop-server accounts show ACCOUNT_ID|EMAIL [--json] --data DIR
+//	hop-server accounts disable ACCOUNT_ID|EMAIL [--reason TEXT] [--dry-run] [--yes] [--json] --data DIR
+//	hop-server accounts enable ACCOUNT_ID|EMAIL [--dry-run] [--yes] [--json] --data DIR
+//	hop-server devices block ACCOUNT_ID|EMAIL DEVICE_ID...|--all [--reason TEXT] [--dry-run] [--yes] [--json] --data DIR
+//	hop-server devices unblock ACCOUNT_ID|EMAIL DEVICE_ID...|--all [--dry-run] [--yes] [--json] --data DIR
+//	hop-server sessions revoke ACCOUNT_ID|EMAIL [--device DEVICE_ID] [--dry-run] [--yes] [--json] --data DIR
 //	hop-server quota ACCOUNT_ID|EMAIL SIZE --data DIR
 //	hop-server audit [--account ACCOUNT_ID|EMAIL] [--since T] [--json] --data DIR
 //	hop-server backup PATH --data DIR
@@ -15,7 +20,8 @@
 //
 // Every command but serve and version opens the database file directly,
 // while serve may be running: an admin is whoever can write the data
-// directory. invite, quota, invites revoke and invites reissue write a row
+// directory. invite, quota, invites revoke and reissue, accounts disable
+// and enable, devices block and unblock, and sessions revoke write a row
 // to the admin audit trail; audit reads it.
 package main
 
@@ -53,7 +59,7 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: hop-server serve|invite|invites|accounts|quota|audit|backup|version")
+		return errors.New("usage: hop-server serve|invite|invites|accounts|devices|sessions|quota|audit|backup|version")
 	}
 	switch args[0] {
 	case "serve":
@@ -63,7 +69,11 @@ func run(args []string, stdout, stderr io.Writer) error {
 	case "invites":
 		return invites(args[1:], stdout, stderr)
 	case "accounts":
-		return accounts(args[1:], stdout)
+		return accounts(args[1:], stdout, stderr)
+	case "devices":
+		return devices(args[1:], stdout, stderr)
+	case "sessions":
+		return sessions(args[1:], stdout, stderr)
 	case "quota":
 		return quota(args[1:], stdout, stderr)
 	case "audit":

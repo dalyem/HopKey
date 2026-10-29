@@ -52,9 +52,16 @@ var (
 )
 
 // ErrSessionEnded is store.ErrSessionEnded: the server refused a session
-// challenge for the device (it is no longer active), or ended the session
-// it had just issued.
+// challenge for the device (it is no longer active), refused the session
+// itself twice without an admin code, or ended the session it had just
+// issued.
 var ErrSessionEnded = store.ErrSessionEnded
+
+// ErrAdminRefused is store.ErrAdminRefused: a 403 with the code
+// account_disabled or device_blocked, the server's operator refusing the
+// account or this device. The error is also a *store.AdminRefusal, which
+// carries the code and the operator's reason.
+var ErrAdminRefused = store.ErrAdminRefused
 
 // APIError is an error response from the server: the R11 envelope
 // {"error":{"code","message"}}, or only the status when the body is not
@@ -64,13 +71,27 @@ type APIError struct {
 	Status  int
 	Code    string // the R11 code; empty when the body was not an R11 error
 	Message string
+	// Admin is set for a 403 account_disabled or device_blocked, with the
+	// operator's reason: the error then matches ErrAdminRefused.
+	Admin *store.AdminRefusal
 }
 
 func (e *APIError) Error() string {
+	if e.Admin != nil {
+		return fmt.Sprintf("syncclient: server answered %d %s: %v", e.Status, e.Code, e.Admin)
+	}
 	if e.Code == "" {
 		return fmt.Sprintf("syncclient: server answered %d %s", e.Status, http.StatusText(e.Status))
 	}
 	return fmt.Sprintf("syncclient: server answered %d %s: %s", e.Status, e.Code, e.Message)
+}
+
+// Unwrap is the admin refusal, if this is one.
+func (e *APIError) Unwrap() error {
+	if e.Admin == nil {
+		return nil
+	}
+	return e.Admin
 }
 
 func (e *APIError) Is(target error) bool {
@@ -117,6 +138,8 @@ func Retryable(err error) bool {
 type errorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Reason is the operator's, for an admin refusal; absent otherwise.
+	Reason string `json:"reason,optional"`
 }
 
 type errorResponse struct {
@@ -146,7 +169,11 @@ func responseError(status int, body []byte) error {
 	if er.Error.Code == "head_conflict" {
 		return fmt.Errorf("%w: a head_conflict error without a head", ErrMalformedResponse)
 	}
-	return &APIError{Status: status, Code: er.Error.Code, Message: er.Error.Message}
+	e := &APIError{Status: status, Code: er.Error.Code, Message: er.Error.Message}
+	if status == http.StatusForbidden && (e.Code == store.AdminAccountDisabled || e.Code == store.AdminDeviceBlocked) {
+		e.Admin = &store.AdminRefusal{Code: e.Code, Reason: er.Error.Reason}
+	}
+	return e
 }
 
 // transportError classifies an error of http.Client.Do.
