@@ -1,24 +1,28 @@
+//go:build linux
+
 package cli_test
 
 import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
-	"net"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 
 	"github.com/dalyem/hopkey/internal/cli"
 )
@@ -44,6 +48,24 @@ func sessionKey(t *testing.T) (string, ssh.Signer) {
 		t.Fatal(err)
 	}
 	return f, signer
+}
+
+// localWeb is a machine with a local vault and a host web-1 on an
+// in-process ssh server.
+func localWeb(t *testing.T) (*machine, *sshServer) {
+	t.Helper()
+	w := newAuthWorld(t)
+	m := newMachine(t, w, "m")
+	initS := &session{secrets: map[string]string{"Master password: ": resolvePassword, "Repeat it: ": resolvePassword}}
+	if code := m.hop(t, initS, "init"); code != 0 {
+		t.Fatalf("init: exit %d: %s", code, initS.stderr.String())
+	}
+	keyFile, signer := sessionKey(t)
+	srv := startSSHServer(t, signer.PublicKey())
+	m.must(t, nil, "key", "add", keyFile, "--name", "deploy-key")
+	m.must(t, nil, "add", "web-1", "--address", "127.0.0.1", "--port", strconv.Itoa(srv.port),
+		"--user", "deploy", "--key", "deploy-key", "--host-key", authorizedKeysLine(srv.hostKey))
+	return m, srv
 }
 
 // longExec runs hop exec web-1 -- sleep on m in the background: the
@@ -91,8 +113,8 @@ func waitSleeps(t *testing.T, srv *sshServer, n int) {
 	}
 }
 
-// stopped says the daemon ended the session (ssh exits 255 on its SIGHUP),
-// long before the server would end the command, and hop exec says why.
+// stopped says hop ended the session (ssh exits 255 on its SIGHUP), long
+// before the server would end the command, and hop exec says why.
 func stopped(e execEnd, why string) bool {
 	return e.code == 255 && e.res.ExitCode == 255 && e.res.DurationMS < 25_000 &&
 		e.res.Error == "the hop daemon ended this ssh session when "+why
@@ -108,9 +130,7 @@ type plainSSH struct {
 	at     time.Time
 }
 
-// startPlainSSH runs ssh with args, with env added to this process's
-// environment (which loses its own SSH_AUTH_SOCK).
-func startPlainSSH(t *testing.T, name string, env []string, args ...string) *plainSSH {
+func startPlainSSH(t *testing.T, name string, args ...string) *plainSSH {
 	t.Helper()
 	p := &plainSSH{name: name, done: make(chan struct{})}
 	p.cmd = exec.Command("ssh", append([]string{"-o", "BatchMode=yes"}, args...)...)
@@ -119,7 +139,6 @@ func startPlainSSH(t *testing.T, name string, env []string, args ...string) *pla
 			p.cmd.Env = append(p.cmd.Env, kv)
 		}
 	}
-	p.cmd.Env = append(p.cmd.Env, env...)
 	p.cmd.Stderr = &p.stderr
 	p.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := p.cmd.Start(); err != nil {
@@ -148,61 +167,246 @@ func (p *plainSSH) wait(t *testing.T, within time.Duration) error {
 	}
 }
 
-func writeFile(t *testing.T, path, body string) string {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
+// termHop is hop on a pseudo-terminal of its own, as a job of a minimal
+// job-control shell (cli.JobShellVar): this test binary twice.
+type termHop struct {
+	master *os.File
+	shell  *exec.Cmd
+	log    string
+	mu     sync.Mutex
+	out    bytes.Buffer
+	pos    int
+	done   chan struct{}
+	code   int
 }
 
-// sshG is ssh -G with args: the configuration ssh would use, lower-cased
-// keywords one per line.
-func sshG(t *testing.T, args ...string) string {
-	t.Helper()
-	out, err := exec.Command("ssh", append([]string{"-G"}, args...)...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("ssh -G %v: %v\n%s", args, err, out)
-	}
-	return string(out)
+func (h *termHop) Write(b []byte) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.out.Write(b)
 }
 
-// timeSSH is how long ssh with args takes to run true on the server, the
-// best of three.
-func timeSSH(t *testing.T, args ...string) time.Duration {
-	t.Helper()
-	best := time.Duration(1 << 62)
-	for range 3 {
-		start := time.Now()
-		cmd := exec.Command("ssh", append(append([]string{"-o", "BatchMode=yes"}, args...), "true")...)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("ssh %v: %v\n%s", args, err, out)
-		}
-		best = min(best, time.Since(start))
-	}
-	return best
+func (h *termHop) output() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return strings.ReplaceAll(h.out.String(), "\r", "")
 }
 
-// A device revoked while it is online ends the ssh sessions that took
-// hop's config, and only those. Ended: hop exec, an MCP exec, ssh -F with
-// hop's config, and ssh with a config that includes it first. Not ended,
-// though each reaches the same host under the same alias: ssh with the
-// user's own config, before or after the destination, an ssh with no -F
-// whose ~/.ssh/config has no Include, one where a block above the
-// Include turns LocalCommand off or sets its own, one with IdentityAgent
-// none and hop's agent in SSH_AUTH_SOCK, and one whose own config points
-// IdentityAgent at hop's agent.
-func TestRevokeEndsTheSessionsThroughHopsConfig(t *testing.T) {
-	requireSSH(t)
-	w := newAuthWorld(t)
-	m1, m2 := newMachine(t, w, "m1"), newMachine(t, w, "m2")
+// startTerminalHop runs hop args for m on a new 80x24 terminal.
+func startTerminalHop(t *testing.T, m *machine, args ...string) *termHop {
+	t.Helper()
+	master, slave := openPTY(t)
+	setSize(t, master, 80, 24)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	m2.hopBin = exe
-	// hop's config is ~/.ssh/hop/config of this home.
-	t.Setenv("HOME", m2.home)
+	paths, _ := json.Marshal(cli.HopMainPaths{Home: m.home, Data: m.data, Run: m.paths.RunDir, Config: m.paths.ConfigDir, State: m.paths.StateDir})
+	h := &termHop{master: master, log: filepath.Join(shortTemp(t), "job.log"), done: make(chan struct{})}
+	h.shell = exec.Command(exe, args...)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "SSH_AUTH_SOCK=") && !strings.HasPrefix(kv, "HOME=") && !strings.HasPrefix(kv, "TERM=") {
+			h.shell.Env = append(h.shell.Env, kv)
+		}
+	}
+	h.shell.Env = append(h.shell.Env, "HOME="+m.home, "TERM=xterm", cli.HopMainVar+"="+string(paths), cli.JobShellVar+"="+h.log)
+	h.shell.Stdin, h.shell.Stdout, h.shell.Stderr = slave, slave, slave
+	h.shell.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	if err := h.shell.Start(); err != nil {
+		t.Fatal(err)
+	}
+	slave.Close()
+	go io.Copy(h, master) // ends (EIO) once every process on the terminal has exited
+	go func() {
+		err := h.shell.Wait()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			h.code = ee.ExitCode()
+		} else if err != nil {
+			h.code = -1
+		}
+		close(h.done)
+	}()
+	t.Cleanup(func() {
+		if pid, ok := h.jobPID(); ok {
+			syscall.Kill(-pid, syscall.SIGKILL)
+		}
+		h.shell.Process.Kill()
+		<-h.done
+		master.Close()
+		t.Logf("hop %s on a terminal:\n%s\njob: %q", strings.Join(args, " "), h.output(), h.events())
+	})
+	return h
+}
+
+func (h *termHop) send(s string) { h.master.Write([]byte(s)) }
+
+// expect waits for s in what the terminal shows after the last expect.
+func (h *termHop) expect(t *testing.T, s string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		out := h.output()
+		if i := strings.Index(out[h.pos:], s); i >= 0 {
+			h.pos += i + len(s)
+			return
+		}
+		select {
+		case <-h.done:
+			t.Fatalf("hop exited (%d) before the terminal showed %q:\n%s", h.code, s, out)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the terminal never showed %q:\n%s", s, out)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// events is what the job shell logged about hop.
+func (h *termHop) events() []string {
+	b, _ := os.ReadFile(h.log)
+	return strings.Fields(strings.ReplaceAll(string(b), " ", "_"))
+}
+
+func (h *termHop) jobPID() (int, bool) {
+	for _, ev := range h.events() {
+		if n, ok := strings.CutPrefix(ev, "pid_"); ok {
+			pid, err := strconv.Atoi(n)
+			return pid, err == nil
+		}
+	}
+	return 0, false
+}
+
+// event waits for the job shell to log ev ("stopped 20", "exit 3").
+func (h *termHop) event(t *testing.T, ev string) {
+	t.Helper()
+	want := strings.ReplaceAll(ev, " ", "_")
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		for _, got := range h.events() {
+			if got == want {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the job shell never logged %q: %q\n%s", ev, h.events(), h.output())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// wait waits for hop, and the shell, to exit, and returns the status.
+func (h *termHop) wait(t *testing.T, within time.Duration) int {
+	t.Helper()
+	select {
+	case <-h.done:
+		return h.code
+	case <-time.After(within):
+		t.Fatalf("hop on the terminal still runs after %v:\n%s", within, h.output())
+		return -1
+	}
+}
+
+// openPTY opens a pseudo-terminal pair.
+func openPTY(t *testing.T) (master, slave *os.File) {
+	t.Helper()
+	m, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("opening a pseudo-terminal: %v", err)
+	}
+	fd := int(m.Fd())
+	if err := unix.IoctlSetPointerInt(fd, unix.TIOCSPTLCK, 0); err != nil {
+		m.Close()
+		t.Fatalf("unlocking the pseudo-terminal: %v", err)
+	}
+	n, err := unix.IoctlGetInt(fd, unix.TIOCGPTN)
+	if err != nil {
+		m.Close()
+		t.Fatalf("naming the pseudo-terminal: %v", err)
+	}
+	s, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|syscall.O_NOCTTY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		m.Close()
+		t.Fatalf("opening the pseudo-terminal's slave: %v", err)
+	}
+	return m, s
+}
+
+func setSize(t *testing.T, master *os.File, cols, rows uint16) {
+	t.Helper()
+	if err := unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Col: cols, Row: rows}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// hop <target> runs ssh as its child on the terminal and behaves as a
+// plain ssh does: the session is interactive, Ctrl-C goes to the remote
+// side and hop keeps running, a new window size reaches the server, ~^Z
+// suspends the job (hop stops with ssh, and both go on with SIGCONT), and
+// hop exits with ssh's status. SIGTERM sent to hop alone reaches ssh, and
+// hop exits as ssh does, not as an interrupted hop.
+func TestTerminalSessionBehavesAsPlainSSH(t *testing.T) {
+	requireSSH(t)
+	m, _ := localWeb(t)
+
+	h := startTerminalHop(t, m, "web-1")
+	h.expect(t, "remote$ ")
+	h.send("\x03")
+	h.expect(t, "remote got ^C")
+	h.send("still here\r")
+	h.expect(t, "remote saw: still here")
+
+	setSize(t, h.master, 100, 30)
+	h.expect(t, "remote size 100x30")
+
+	h.send("\r~\x1a")
+	h.event(t, fmt.Sprintf("stopped %d", int(syscall.SIGTSTP)))
+	pid, ok := h.jobPID()
+	if !ok {
+		t.Fatal("the job shell logged no pid")
+	}
+	if err := syscall.Kill(-pid, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	h.send("back\r")
+	h.expect(t, "remote saw: back")
+
+	h.send("exit 3\r")
+	if code := h.wait(t, 15*time.Second); code != 3 {
+		t.Errorf("hop exited %d after the remote shell exited 3", code)
+	}
+	h.event(t, "exit 3")
+	if out := h.output(); strings.Contains(out, "hop daemon ended") {
+		t.Errorf("hop says the daemon ended a session it did not end:\n%s", out)
+	}
+
+	h = startTerminalHop(t, m, "web-1")
+	h.expect(t, "remote$ ")
+	pid, ok = h.jobPID()
+	if !ok {
+		t.Fatal("the job shell logged no pid")
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if code := h.wait(t, 15*time.Second); code != 255 {
+		t.Errorf("hop exited %d after SIGTERM, want ssh's 255", code)
+	}
+	h.event(t, "exit 255")
+}
+
+// A device revoked while it is online ends the ssh sessions hop started,
+// each ended by the hop process that runs it: hop exec, an MCP exec, and
+// hop <target> on a terminal, which says why. A plain ssh through hop's
+// config is not hop's to end, and runs to its end (README, What
+// revocation does: a documented limit). hop's ssh config has no hook for
+// sessions. A hop exec on the revoked device does not reach the server.
+func TestRevokeEndsTheSessionsHopStarted(t *testing.T) {
+	requireSSH(t)
+	w := newAuthWorld(t)
+	m1, m2 := newMachine(t, w, "m1"), newMachine(t, w, "m2")
 	initS := &session{secrets: map[string]string{"Master password: ": resolvePassword, "Repeat it: ": resolvePassword}}
 	if code := m1.hop(t, initS, "init"); code != 0 {
 		t.Fatalf("init: exit %d: %s", code, initS.stderr.String())
@@ -229,61 +433,9 @@ func TestRevokeEndsTheSessionsThroughHopsConfig(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-
 	hopCfg := filepath.Join(m2.paths.ConfigDir, "config")
-	agent := m2.paths.AgentSocket()
-	dir := shortTemp(t)
-	// The user's own definition of web-1: the same server, their own key
-	// file, no hop.
-	own := fmt.Sprintf("Host web-1\n  HostName 127.0.0.1\n  Port %d\n  User deploy\n  IdentityFile %s\n  IdentitiesOnly yes\n"+
-		"  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  GlobalKnownHostsFile /dev/null\n", srv.port, keyFile)
-	ownCfg := writeFile(t, filepath.Join(dir, "own.conf"), own)
-	// The user's config that includes hop's first, as hop setup writes it.
-	inclCfg := writeFile(t, filepath.Join(dir, "incl.conf"), "Include "+hopCfg+"\n\nHost *\n  ServerAliveInterval 30\n")
-	// Blocks above the Include: one turns LocalCommand off, one runs its
-	// own. ssh takes the first value of each keyword.
-	offCfg := writeFile(t, filepath.Join(dir, "off.conf"), "Host web-1\n  PermitLocalCommand no\n\nInclude "+hopCfg+"\n")
-	ownLCCfg := writeFile(t, filepath.Join(dir, "ownlc.conf"), "Host web-1\n  LocalCommand true\n\nInclude "+hopCfg+"\n")
-	// The user's own config with hop's agent as its IdentityAgent.
-	viaAgentCfg := writeFile(t, filepath.Join(dir, "agent.conf"), strings.Replace(own, "  IdentityFile "+keyFile+"\n  IdentitiesOnly yes\n", "  IdentityAgent "+agent+"\n", 1))
-
-	// What ssh takes from each config, as ssh -G says.
-	wantLC := fmt.Sprintf("localcommand exec '%s' session attach --control '%s' web-1\n", exe, m2.paths.ControlSocket())
-	for name, c := range map[string]struct {
-		args             []string
-		permit, hasLocal bool
-	}{
-		"hop's config":          {[]string{"-F", hopCfg, "web-1"}, true, true},
-		"the Include":           {[]string{"-F", inclCfg, "web-1"}, true, true},
-		"own config":            {[]string{"-F", ownCfg, "web-1"}, false, false},
-		"own config after":      {[]string{"web-1", "-F", ownCfg}, false, false},
-		"PermitLocalCommand no": {[]string{"-F", offCfg, "web-1"}, false, true},
-		"own LocalCommand":      {[]string{"-F", ownLCCfg, "web-1"}, true, false},
-	} {
-		g := sshG(t, c.args...)
-		if strings.Contains(g, "permitlocalcommand yes\n") != c.permit || strings.Contains(g, wantLC) != c.hasLocal {
-			t.Errorf("ssh -G %s: want permitlocalcommand %v and hop's LocalCommand %v; got:\n%s", name, c.permit, c.hasLocal, g)
-		}
-	}
-
-	// LocalCommand runs before the session starts, and ssh waits for it:
-	// how much it adds. Starting this test binary (large, and slow under
-	// the race detector) is not hop's cost, so the attach is measured
-	// against the same binary run as a LocalCommand that does nothing.
-	var noLC, noop []string
-	for _, l := range strings.SplitAfter(m2.config(t), "\n") {
-		if !strings.Contains(l, "LocalCommand") {
-			noLC = append(noLC, l)
-		}
-		noop = append(noop, strings.Replace(l, " session attach --control ", " session noop ", 1))
-	}
-	noLCCfg := writeFile(t, filepath.Join(dir, "nolc.conf"), strings.Join(noLC, ""))
-	noopCfg := writeFile(t, filepath.Join(dir, "noop.conf"), strings.Join(noop, ""))
-	with, bare, none := timeSSH(t, "-F", hopCfg, "web-1"), timeSSH(t, "-F", noopCfg, "web-1"), timeSSH(t, "-F", noLCCfg, "web-1")
-	t.Logf("ssh web-1 true: %v with hop session attach, %v with a LocalCommand that only starts the binary, %v with none",
-		with.Round(time.Millisecond), bare.Round(time.Millisecond), none.Round(time.Millisecond))
-	if with-bare > time.Second {
-		t.Errorf("hop session attach makes a session %v slower", with-bare)
+	if cfg := m2.config(t); strings.Contains(cfg, "LocalCommand") {
+		t.Errorf("hop's ssh config runs something when a session starts:\n%s", cfg)
 	}
 
 	srv.reset()
@@ -293,22 +445,10 @@ func TestRevokeEndsTheSessionsThroughHopsConfig(t *testing.T) {
 	go func() {
 		mcpDone <- mcpCall[cli.MCPExec](mcpS, "exec", map[string]any{"hosts": []string{"web-1"}, "command": "sleep", "timeout_s": 60})
 	}()
-	end := []*plainSSH{
-		startPlainSSH(t, "ssh -F hop's config", nil, "-F", hopCfg, "web-1", "sleep"),
-		startPlainSSH(t, "ssh through the Include", nil, "-F", inclCfg, "web-1", "sleep"),
-	}
-	hopAgent := []string{"SSH_AUTH_SOCK=" + agent}
-	keep := []*plainSSH{
-		startPlainSSH(t, "ssh -F own config", nil, "-F", ownCfg, "web-1", "sleep"),
-		startPlainSSH(t, "ssh web-1 -F own config", nil, "web-1", "-F", ownCfg, "sleep"),
-		startPlainSSH(t, "ssh with no -F and no Include", nil, "-o", "HostName=127.0.0.1", "-p", strconv.Itoa(srv.port), "-l", "deploy",
-			"-i", keyFile, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "web-1", "sleep"),
-		startPlainSSH(t, "ssh with PermitLocalCommand no above the Include", nil, "-F", offCfg, "web-1", "sleep"),
-		startPlainSSH(t, "ssh with its own LocalCommand above the Include", nil, "-F", ownLCCfg, "web-1", "sleep"),
-		startPlainSSH(t, "ssh -o IdentityAgent=none with hop's agent in SSH_AUTH_SOCK", hopAgent, "-F", ownCfg, "-o", "IdentityAgent=none", "web-1", "sleep"),
-		startPlainSSH(t, "ssh with hop's agent as its own IdentityAgent", nil, "-F", viaAgentCfg, "web-1", "sleep"),
-	}
-	waitSleeps(t, srv, 2+len(end)+len(keep))
+	term := startTerminalHop(t, m2, "web-1")
+	term.expect(t, "remote$ ")
+	plain := startPlainSSH(t, "ssh -F hop's config", "-F", hopCfg, "web-1", "sleep")
+	waitSleeps(t, srv, 3)
 
 	s := &session{
 		tty:     true,
@@ -327,41 +467,41 @@ func TestRevokeEndsTheSessionsThroughHopsConfig(t *testing.T) {
 		t.Fatalf("revoke: exit %d: %s", code, s.stderr.String())
 	}
 	revoked := time.Now()
+	const why = "this device was revoked"
 	var e execEnd
 	select {
 	case e = <-hopExec:
 	case <-time.After(45 * time.Second):
 		t.Fatal("hop exec on the revoked device still runs 45s after the revoke")
 	}
-	if !stopped(e, "this device was revoked") {
+	t.Logf("hop exec ended %v after the revoke", e.at.Sub(revoked).Round(time.Millisecond))
+	if !stopped(e, why) {
 		t.Errorf("hop exec ended %v after the revoke with exit %d, %+v: not stopped by the revocation", e.at.Sub(revoked), e.code, e.res)
 	}
 	select {
 	case out := <-mcpDone:
-		if r := execResults(t, out)["web-1"]; r.ExitCode != 255 || r.Error != "the hop daemon ended this ssh session when this device was revoked" {
+		if r := execResults(t, out)["web-1"]; r.ExitCode != 255 || r.Error != "the hop daemon ended this ssh session when "+why {
 			t.Errorf("MCP exec: %+v", r)
 		}
 	case <-time.After(45 * time.Second):
 		t.Fatal("the MCP exec on the revoked device still runs 45s after the revoke")
 	}
-	for _, p := range end {
-		err := p.wait(t, 45*time.Second)
-		t.Logf("%s ended %v after the revoke: %v", p.name, p.at.Sub(revoked).Round(time.Millisecond), err)
-		if err == nil || p.at.Sub(revoked) > 25*time.Second {
-			t.Errorf("%s was not ended by the revocation: %v\n%s", p.name, err, p.stderr.String())
-		}
+	if code := term.wait(t, 45*time.Second); code != 255 {
+		t.Errorf("hop web-1 on the terminal exited %d, want ssh's 255", code)
 	}
-	// The others run to the end of their command: the server ends it
+	if out := term.output(); !strings.Contains(out, "hop: the hop daemon ended this ssh session when "+why+"\n") {
+		t.Errorf("hop web-1 does not say why its session ended:\n%s", out)
+	}
+	// The plain ssh runs to the end of its command: the server ends it
 	// after 30 seconds, and ssh exits 0.
-	for _, p := range keep {
-		if err := p.wait(t, 60*time.Second); err != nil {
-			t.Errorf("%s was ended: %v\n%s", p.name, err, p.stderr.String())
-		}
+	if err := plain.wait(t, 60*time.Second); err != nil {
+		t.Errorf("%s was ended: %v\n%s", plain.name, err, plain.stderr.String())
 	}
 
 	var st struct {
 		EndedSessions *struct {
-			Count    int `json:"count"`
+			Count    int    `json:"count"`
+			Why      string `json:"why"`
 			Sessions []struct {
 				PID   int    `json:"pid"`
 				Alias string `json:"alias"`
@@ -369,32 +509,32 @@ func TestRevokeEndsTheSessionsThroughHopsConfig(t *testing.T) {
 		} `json:"ended_sessions"`
 	}
 	decodeJSON(t, m2.must(t, nil, "status", "--json"), &st)
-	if st.EndedSessions == nil || st.EndedSessions.Count != 4 {
-		t.Fatalf("hop status --json: ended sessions %+v, want 4", st.EndedSessions)
+	if st.EndedSessions == nil || st.EndedSessions.Count != 3 || st.EndedSessions.Why != why {
+		t.Fatalf("hop status --json: ended sessions %+v, want 3", st.EndedSessions)
 	}
-	var pids []int
 	for _, s := range st.EndedSessions.Sessions {
-		if s.Alias != "web-1" {
+		if s.Alias != "web-1" || s.PID <= 0 {
 			t.Errorf("ended session %+v", s)
-		}
-		pids = append(pids, s.PID)
-	}
-	for _, p := range end {
-		if !slices.Contains(pids, p.cmd.Process.Pid) {
-			t.Errorf("status does not name %s, pid %d: %v", p.name, p.cmd.Process.Pid, pids)
-		}
-	}
-	for _, p := range keep {
-		if slices.Contains(pids, p.cmd.Process.Pid) {
-			t.Errorf("status names %s, pid %d", p.name, p.cmd.Process.Pid)
 		}
 	}
 	out := m2.must(t, nil, "status")
-	if !strings.Contains(out, "sessions:     ended 4 ssh sessions when this device was revoked") || !strings.Contains(out, " web-1") {
+	if !strings.Contains(out, "sessions:     ended 3 ssh sessions hop started, when "+why) || !strings.Contains(out, "web-1 (hop pid ") {
 		t.Errorf("hop status does not say the sessions ended:\n%s", out)
 	}
-	if out := m2.must(t, nil, "auth", "status"); !strings.Contains(out, "ended 4 ssh sessions when this device was revoked") {
+	if out := m2.must(t, nil, "auth", "status"); !strings.Contains(out, "ended 3 ssh sessions hop started, when "+why) {
 		t.Errorf("hop auth status does not say the sessions ended:\n%s", out)
+	}
+
+	// A new hop exec: refused before ssh runs, or ended at once.
+	srv.reset()
+	s = &session{}
+	code := m2.hop(t, s, "exec", "web-1", "--json", "--", "sleep")
+	if code == 0 {
+		t.Errorf("hop exec on the revoked device succeeded: %s", s.stdout.String())
+	}
+	time.Sleep(time.Second)
+	if c := srv.commands(); len(c) != 0 {
+		t.Errorf("hop exec on the revoked device reached the server: %q", c)
 	}
 }
 
@@ -412,22 +552,7 @@ func (m *machine) config(t *testing.T) string {
 // ends them.
 func TestLockEndsSessionsOnlyWhenAsked(t *testing.T) {
 	requireSSH(t)
-	w := newAuthWorld(t)
-	m := newMachine(t, w, "m")
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.hopBin = exe
-	initS := &session{secrets: map[string]string{"Master password: ": resolvePassword, "Repeat it: ": resolvePassword}}
-	if code := m.hop(t, initS, "init"); code != 0 {
-		t.Fatalf("init: exit %d: %s", code, initS.stderr.String())
-	}
-	keyFile, signer := sessionKey(t)
-	srv := startSSHServer(t, signer.PublicKey())
-	m.must(t, nil, "key", "add", keyFile, "--name", "deploy-key")
-	m.must(t, nil, "add", "web-1", "--address", "127.0.0.1", "--port", strconv.Itoa(srv.port),
-		"--user", "deploy", "--key", "deploy-key", "--host-key", authorizedKeysLine(srv.hostKey))
+	m, srv := localWeb(t)
 
 	ended := longExec(t, m, srv)
 	m.must(t, nil, "lock")
@@ -451,62 +576,10 @@ func TestLockEndsSessionsOnlyWhenAsked(t *testing.T) {
 	if d := e.at.Sub(locked); d > 8*time.Second {
 		t.Errorf("the session ended %v after hop lock --end-sessions", d)
 	}
-	if !strings.Contains(out, "ended 1 ssh session") {
+	if !strings.Contains(out, "ended 1 ssh session hop started") {
 		t.Errorf("hop lock --end-sessions says:\n%s", out)
 	}
-	if out := m.must(t, nil, "status"); !strings.Contains(out, "ended 1 ssh session when hop lock --end-sessions ran") {
+	if out := m.must(t, nil, "status"); !strings.Contains(out, "ended 1 ssh session hop started, when hop lock --end-sessions ran") {
 		t.Errorf("hop status:\n%s", out)
-	}
-}
-
-// hop session attach, which ssh runs and waits for, prints nothing and
-// exits 0 at once, whatever is at the socket: no daemon, a socket where
-// nothing answers, or a daemon that refuses (its parent is not ssh). It
-// never starts a daemon.
-func TestSessionAttachIsQuietAndBounded(t *testing.T) {
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := shortTemp(t)
-	silent := filepath.Join(dir, "silent.sock")
-	ln, err := net.Listen("unix", silent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			defer c.Close() // accepted, never answered
-		}
-	}()
-	var times []string
-	for name, sock := range map[string]string{"no daemon": filepath.Join(dir, "none.sock"), "no answer": silent} {
-		// What ssh runs: no output, exit 0. Its time includes starting
-		// this test binary, which is large, so it is only logged.
-		cmd := exec.Command(exe, "session", "attach", "--control", sock, "web-1")
-		start := time.Now()
-		out, err := cmd.CombinedOutput()
-		took := time.Since(start)
-		if err != nil || len(out) != 0 {
-			t.Errorf("%s: %v, output %q", name, err, out)
-		}
-		// The attach itself.
-		start = time.Now()
-		cli.SessionAttach([]string{"--control", sock, "web-1"})
-		attach := time.Since(start)
-		times = append(times, fmt.Sprintf("%s %v (%v as a process)", name, attach.Round(time.Millisecond), took.Round(time.Millisecond)))
-		if attach > time.Second {
-			t.Errorf("%s: took %v", name, attach)
-		}
-	}
-	sort.Strings(times)
-	t.Logf("hop session attach: %s", strings.Join(times, ", "))
-	if _, err := os.Stat(filepath.Join(dir, "none.sock")); err == nil {
-		t.Error("hop session attach started a daemon")
 	}
 }

@@ -136,10 +136,6 @@ type machine struct {
 	ring  *memRing
 	// noDaemon makes the CLI's daemon starts fail, so nothing syncs.
 	noDaemon atomic.Bool
-	// hopBin, when set, is the hop binary the daemon's ssh config runs
-	// as each session's LocalCommand (daemon.Options.Hop): this test
-	// binary, which TestMain runs as hop session attach.
-	hopBin string
 
 	mu sync.Mutex
 	d  *daemon.Daemon
@@ -181,7 +177,6 @@ func (m *machine) startDaemon(t *testing.T) func() error {
 		}
 		d, err := daemon.Start(daemon.Options{
 			Paths: m.paths, Store: s, Version: "test", Tailscale: noTailscale{},
-			Hop:  m.hopBin,
 			Logf: func(format string, args ...any) { t.Logf(m.name+" daemon: "+format, args...) },
 			Sync: daemon.SyncOptions{Client: syncclient.Options{RootCAs: m.w.pool}},
 		})

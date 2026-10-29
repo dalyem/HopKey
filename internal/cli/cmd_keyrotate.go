@@ -1414,12 +1414,13 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 	if stdout == nil {
 		cmd.Stdout = io.Discard
 	}
-	// Through hop's config the session registers itself (SessionAttach);
-	// a check's own config has no LocalCommand, and its sessions are short.
-	endedWhy, runErr := r.e.runSSH(ctx, cmd)
+	// The daemon ends it on a revocation, as any ssh hop starts (runSSH).
+	endedWhy, runErr := r.e.runSSH(cmd, r.t.alias)
 	res := rotResult{ExecResult: ExecResult{Host: r.t.rr.Result.HostName}}
 	var ee *exec.ExitError
 	switch {
+	case errors.Is(runErr, errEndedFirst):
+		res.ExitCode = 255
 	case runErr == nil, errors.Is(runErr, exec.ErrWaitDelay):
 		// ssh exited 0; with ErrWaitDelay something it started still held
 		// stderr open.

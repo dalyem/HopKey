@@ -41,13 +41,14 @@ type Vault interface {
 }
 
 // LockParams is the request for OpLock. EndSessions also ends the ssh
-// sessions registered through hop's config (sessions.go), which a lock by itself
-// leaves running.
+// sessions hop started (sessions.go), which a lock by itself leaves
+// running.
 type LockParams struct {
 	EndSessions bool `json:"end_sessions,omitempty"`
 }
 
-// LockResult answers OpLock: the sessions it ended, with EndSessions.
+// LockResult answers OpLock: the sessions it told to end, with
+// EndSessions.
 type LockResult struct {
 	EndedSessions []EndedSession `json:"ended_sessions,omitempty"`
 }
@@ -113,15 +114,10 @@ func (d *Daemon) dispatchVault(ctx context.Context, req Request, decode func(any
 			}
 		}
 		ended := d.lockVault(v, p.EndSessions)
-		if ended == nil {
+		if !p.EndSessions {
 			return nil, true, nil
 		}
-		select {
-		case got := <-ended:
-			return &LockResult{EndedSessions: got}, true, nil
-		case <-ctx.Done():
-			return nil, true, ctx.Err()
-		}
+		return &LockResult{EndedSessions: ended}, true, nil
 	case OpUnlock:
 		var p UnlockParams
 		if len(req.Params) > 0 {
@@ -154,13 +150,13 @@ func (d *Daemon) dispatchVault(ctx context.Context, req Request, decode func(any
 }
 
 // lockVault drops the store's secrets, empties the agent and forgets the
-// last snapshot. With endSessions it also ends the ssh sessions hop is
-// responsible for, and the channel gets them once they are ended.
-func (d *Daemon) lockVault(v Vault, endSessions bool) <-chan []EndedSession {
+// last snapshot. With endSessions it also ends the ssh sessions hop
+// started, and returns them.
+func (d *Daemon) lockVault(v Vault, endSessions bool) []EndedSession {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	v.Lock()
-	var ended <-chan []EndedSession
+	var ended []EndedSession
 	if endSessions {
 		ended = d.endSessions(whyLock)
 	}

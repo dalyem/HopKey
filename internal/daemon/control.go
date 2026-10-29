@@ -59,7 +59,7 @@ func (d *Daemon) serveControl() {
 	}
 }
 
-func (d *Daemon) serveConn(c *net.UnixConn) {
+func (d *Daemon) serveConn(c net.Conn) {
 	defer d.control.untrack(c)
 	sc := bufio.NewScanner(c)
 	sc.Buffer(make([]byte, 0, 64<<10), maxRequest)
@@ -82,9 +82,11 @@ func (d *Daemon) serveConn(c *net.UnixConn) {
 		var resp Response
 		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
 			resp = errorResponse(invalidf("malformed request: %v", err))
-		} else if req.Op == OpSessionAttach {
-			// Who is asking is the request (sessions.go).
-			resp = d.attachResponse(c, req)
+		} else if req.Op == OpSessionWatch {
+			// The connection is the subscription, until it ends
+			// (sessions.go).
+			d.serveWatch(c, enc, req)
+			return
 		} else {
 			resp = d.handle(req)
 		}
@@ -256,9 +258,6 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 		return d.opPolicy(ctx, &p)
 	case OpShutdown:
 		return nil, nil
-	}
-	if result, ok, err := d.dispatchSessions(req, decode); ok {
-		return result, err
 	}
 	if result, ok, err := d.dispatchVault(ctx, req, decode); ok {
 		return result, err

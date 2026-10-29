@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -65,7 +66,8 @@ type Env struct {
 	StartDaemon func() error
 	// SSHBinary is the system ssh. Empty means "ssh".
 	SSHBinary string
-	// ExecSSH replaces the process with ssh (hop <target>). Tests replace it.
+	// ExecSSH, when set, runs hop <target>'s ssh in place of
+	// runTerminalSSH. Tests set it.
 	ExecSSH func(path string, argv, environ []string) error
 	// Environ is the environment hop's child processes (ssh, the daemon)
 	// start from, before the hop auth secrets are removed. Nil means
@@ -118,6 +120,11 @@ type Env struct {
 	// ends, and nil when none is (beginRotation).
 	rotMu    sync.Mutex
 	rotation chan struct{}
+
+	// sshRan is set once hop <target> has started ssh on this terminal:
+	// a signal then waits for ssh, and hop exits with ssh's status
+	// (runTerminalSSH).
+	sshRan atomic.Bool
 }
 
 // ExitInterrupted is the exit status after SIGINT or SIGTERM, as a shell
@@ -147,6 +154,12 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 		return // a deadline, not a signal
 	}
 	if ctxAware {
+		return
+	}
+	if e.sshRan.Load() {
+		// ssh got the signal from the terminal, or from hop
+		// (runTerminalSSH); the command returns when it exits.
+		<-done
 		return
 	}
 	grace := e.InterruptGrace
@@ -313,7 +326,6 @@ func init() {
 		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|policy|logout|rotate|passwd|merge|resume> [--json]"},
 		"login":   {runLogin, "hop login [flags of hop auth login]"},
 		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
-		"session": {runSession, "hop session attach --control SOCKET ALIAS (run by ssh, from hop's ssh config)"},
 	}
 }
 
@@ -348,8 +360,8 @@ func Run(ctx context.Context, args []string, e *Env) int {
 	// failure its cancelled context caused, or with success when it
 	// finished as the signal came. hop daemon keeps its own status: it
 	// stops on a signal by design, and a service manager reads 0 as a
-	// clean stop.
-	if !ctxAware && errors.Is(context.Cause(ctx), ErrInterrupted) {
+	// clean stop. So does hop <target> once ssh ran: it exits as ssh did.
+	if !ctxAware && !e.sshRan.Load() && errors.Is(context.Cause(ctx), ErrInterrupted) {
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, flag.ErrHelp) {
 			report(e, err, args)
 		}

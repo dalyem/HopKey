@@ -151,26 +151,34 @@ func runConnect(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintf(e.Stderr, "hop: %s\n", hint)
 	}
 	argv := append([]string{e.sshBinary()}, e.sshArgs(t, addr)...)
-	// ssh takes over this process's terminal (or runs as a child on the same
-	// streams). Its session is the user's own and is not sanitized, on purpose.
-	// It registers itself with the daemon through hop's config, so that a
-	// revocation ends it (SessionAttach).
-	return e.execSSH(argv)
+	// ssh runs as a child on this process's terminal. Its session is the
+	// user's own and is not sanitized, on purpose.
+	return e.connectSSH(ctx, argv, t.alias)
 }
 
-// execSSH replaces this process with ssh, falling back to a child process
-// where exec is not available.
-func (e *Env) execSSH(argv []string) error {
+// connectSSH runs hop <target>'s ssh as a child, so that this process can
+// end it when the daemon says this device was revoked (runTerminalSSH),
+// and exits with its status.
+func (e *Env) connectSSH(ctx context.Context, argv []string, alias string) error {
 	path, err := exec.LookPath(argv[0])
 	if err != nil {
 		return failf("cannot find %s: %v", argv[0], err)
 	}
-	run := e.ExecSSH
-	if run == nil {
-		run = execReplace
+	if e.ExecSSH != nil {
+		if err := e.ExecSSH(path, argv, e.sshEnviron()); err != nil {
+			return failf("cannot run %s: %v", path, err)
+		}
+		return nil
 	}
-	if err := run(path, argv, e.sshEnviron()); err != nil {
+	code, endedWhy, err := e.runTerminalSSH(ctx, path, argv, e.sshEnviron(), alias)
+	if err != nil {
 		return failf("cannot run %s: %v", path, err)
+	}
+	if endedWhy != "" {
+		fmt.Fprintf(e.Stderr, "hop: %s\n", endedError(endedWhy))
+	}
+	if code != 0 {
+		return silent(code)
 	}
 	return nil
 }
@@ -429,11 +437,13 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	}
 
 	start := time.Now()
-	endedWhy, runErr := e.runSSH(ctx, cmd)
+	endedWhy, runErr := e.runSSH(cmd, t.alias)
 	res := ExecResult{Host: t.rr.Result.HostName, DurationMS: time.Since(start).Milliseconds()}
 	var ee *exec.ExitError
 	switch {
 	case runErr == nil:
+	case errors.Is(runErr, errEndedFirst):
+		res.ExitCode = 255 // as ssh exits when it is ended
 	case errors.Is(runErr, exec.ErrWaitDelay):
 		// ssh exited 0, but something it started (a ProxyJump ssh, say)
 		// still held its output open, and WaitDelay cut that off. The exit
@@ -452,7 +462,7 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 		return res, failf("cannot run ssh: %v", runErr)
 	}
 	if endedWhy != "" && runErr != nil {
-		// ssh exits 255 on the SIGHUP, as when it can't connect.
+		// ssh exits 255 on the SIGHUP, as when it can't connect: say why.
 		res.Error = endedError(endedWhy)
 	}
 	if r.stdout == nil {

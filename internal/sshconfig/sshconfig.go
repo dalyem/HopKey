@@ -55,13 +55,6 @@ type Options struct {
 	Dir         string // absolute; receives config, known_hosts-<id> and keys/
 	AgentSocket string // absolute path of the sshagent socket
 
-	// Hop, when set, is the absolute path of the hop binary, and
-	// ControlSocket the absolute path of the daemon's control socket.
-	// Each host's block then has ssh register its session with the
-	// daemon once it has logged in, so that a revocation can end it
-	// (SessionCommand). Empty leaves the sessions unregistered.
-	Hop, ControlSocket string
-
 	// PruneGrace is how long a file that no config refers to any more is
 	// kept. Zero means DefaultPruneGrace.
 	PruneGrace time.Duration
@@ -460,14 +453,6 @@ func render(opts Options, hosts []Host) (*files, error) {
 		config.WriteString("  StrictHostKeyChecking yes\n")
 		// Keep ssh from appending host keys it learns to the pinned file.
 		config.WriteString("  UpdateHostKeys no\n")
-		if opts.Hop != "" {
-			cmd, err := SessionCommand(opts.Hop, opts.ControlSocket, h.Alias)
-			if err != nil {
-				return nil, err
-			}
-			config.WriteString("  PermitLocalCommand yes\n")
-			fmt.Fprintf(&config, "  LocalCommand %s\n", cmd)
-		}
 	}
 	return &files{
 		config:         config.Bytes(),
@@ -521,34 +506,6 @@ func quotePath(p string) (string, error) {
 	}
 	p = strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(p)
 	return `"` + p + `"`, nil
-}
-
-// SessionCommand is the LocalCommand of alias's block: hop session attach,
-// which tells the daemon at controlSocket that the ssh running it, its
-// parent, is a session through hop's config. ssh runs a LocalCommand
-// with the user's shell ($SHELL -c), after it has logged in, and waits for
-// it; exec makes hop that ssh's child and not the shell's. It holds no
-// % token: a % in a path is doubled, as ssh reads %% as one %. The paths
-// are single-quoted for the shell, so a path with a character outside a
-// plain set (a quote, $, a backslash, a control character...) is refused
-// rather than escaped for every shell a user may have.
-func SessionCommand(hop, controlSocket, alias string) (string, error) {
-	if !aliasRe.MatchString(alias) {
-		return "", fmt.Errorf("sshconfig: invalid alias %q", alias)
-	}
-	var q [2]string
-	for i, p := range []string{hop, controlSocket} {
-		if !filepath.IsAbs(p) {
-			return "", fmt.Errorf("sshconfig: path %q is not absolute", p)
-		}
-		for _, r := range p {
-			if !isBareChar(r) && r != ' ' && r != '~' {
-				return "", fmt.Errorf("sshconfig: path %q has a character a LocalCommand can't hold: %q", p, r)
-			}
-		}
-		q[i] = "'" + strings.ReplaceAll(p, "%", "%%") + "'"
-	}
-	return fmt.Sprintf("exec %s session attach --control %s %s", q[0], q[1], alias), nil
 }
 
 func isBareChar(r rune) bool {

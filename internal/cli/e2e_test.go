@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -992,9 +993,42 @@ func (s *sshServer) serve(c net.Conn, cfg *ssh.ServerConfig) {
 // (echoes stdin), "stderr" (writes to stderr, exits 1), "big" (writes more than
 // 64 KB, ending in END), "sleep" (waits), "leak" (prints s.leak). Anything else
 // is recorded and exits 0. hop mcp's mcpEnvPrefix is recorded, then ignored.
+// A shell request, after a pty-req, gets termShell.
 func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
+	// The shell and window-change both write: one write at a time, as an
+	// ssh.Channel needs.
+	var wmu sync.Mutex
+	write := func(b string) {
+		wmu.Lock()
+		defer wmu.Unlock()
+		io.WriteString(ch, b)
+	}
 	for req := range reqs {
+		switch req.Type {
+		case "pty-req", "env":
+			req.Reply(req.Type == "pty-req", nil)
+			continue
+		case "shell":
+			req.Reply(true, nil)
+			s.mu.Lock()
+			s.cmds = append(s.cmds, "shell")
+			s.mu.Unlock()
+			go func() {
+				status := termShell(ch, write)
+				wmu.Lock()
+				defer wmu.Unlock()
+				ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+				ch.Close()
+			}()
+			continue
+		case "window-change":
+			var w struct{ Cols, Rows, Width, Height uint32 }
+			if ssh.Unmarshal(req.Payload, &w) == nil {
+				write(fmt.Sprintf("\r\nremote size %dx%d\r\n", w.Cols, w.Rows))
+			}
+			continue
+		}
 		if req.Type != "exec" {
 			req.Reply(false, nil)
 			continue
@@ -1041,6 +1075,40 @@ func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 		}
 		ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
 		return
+	}
+}
+
+// termShell is the server's interactive shell: it prompts "remote$ ",
+// echoes what is typed, answers a line with "remote saw: LINE", says
+// "remote got ^C" for a Ctrl-C byte, and ends on "exit N" with status N.
+func termShell(ch io.Reader, write func(string)) uint32 {
+	write("remote$ ")
+	var line []byte
+	buf := make([]byte, 256)
+	for {
+		n, err := ch.Read(buf)
+		if err != nil {
+			return 0
+		}
+		for _, b := range buf[:n] {
+			switch b {
+			case 3:
+				write("^C\r\nremote got ^C\r\nremote$ ")
+				line = line[:0]
+			case '\r', '\n':
+				l := string(line)
+				line = line[:0]
+				if code, ok := strings.CutPrefix(l, "exit "); ok {
+					n, _ := strconv.Atoi(code)
+					write("\r\n")
+					return uint32(n)
+				}
+				write(fmt.Sprintf("\r\nremote saw: %s\r\nremote$ ", l))
+			default:
+				line = append(line, b)
+				write(string(b))
+			}
+		}
 	}
 }
 

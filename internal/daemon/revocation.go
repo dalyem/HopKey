@@ -392,7 +392,11 @@ func (d *Daemon) preflight(ctx context.Context) {
 	gen := e.st.Generation()
 	info := e.st.Info()
 	if info.Revoked {
-		d.wipeVerified()
+		if !d.wipeVerified() {
+			// Not wiped yet, but revoked all the same (wiped ends them
+			// when it is).
+			d.endSessions(whyRevoked)
+		}
 		return
 	}
 	if info.Locked && info.ServerReport == nil {

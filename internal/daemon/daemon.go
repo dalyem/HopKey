@@ -81,11 +81,6 @@ type Options struct {
 	Sync SyncOptions
 	// Logf receives log lines. Nil discards them.
 	Logf func(format string, args ...any)
-	// Hop is the absolute path of the hop binary. The ssh config the
-	// daemon writes then has each session run hop session attach, so
-	// that a revocation can end it (sessions.go). Empty, or a path a
-	// LocalCommand can't hold, leaves sessions unregistered.
-	Hop string
 
 	// Test hooks: writeConfig replaces sshconfig.Write, wipeConfig
 	// sshconfig.WipeIf with no condition, and configRetry
@@ -107,10 +102,6 @@ type Options struct {
 	unconfirmedRead func()
 	beforeCheck     func()
 	sessionRefused  func()
-	// procs replaces this machine's processes, and sessionTerm and
-	// sessionKill the waits before SIGTERM and SIGKILL (sessions.go).
-	procs                    procTable
-	sessionTerm, sessionKill time.Duration
 }
 
 // Daemon is a running daemon.
@@ -147,9 +138,9 @@ type Daemon struct {
 	// proving is set while a revocation proof is fetched (prove).
 	proving atomic.Bool
 
-	// sessions are the ssh sessions to end on a revocation (sessions.go).
+	// sessions are the hop processes running ssh that a revocation tells
+	// to end it (sessions.go).
 	sessions *sessions
-	procs    procTable
 
 	tsMu     sync.Mutex
 	tsCached *tailscale.Status
@@ -210,16 +201,7 @@ func Start(opts Options) (*Daemon, error) {
 		started: time.Now(), live: live, agent: agentSrv, control: control,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		writeConfig: opts.writeConfig, wipeConfig: opts.wipeConfig,
-		sessions: newSessions(), procs: opts.procs,
-	}
-	if d.procs == nil {
-		d.procs = sysProcs{}
-	}
-	if opts.Hop != "" {
-		if _, err := sshconfig.SessionCommand(opts.Hop, opts.Paths.ControlSocket(), "x"); err != nil {
-			logf("ssh sessions will not register, so a revocation can't end them: %v", err)
-			d.opts.Hop = ""
-		}
+		sessions: newSessions(),
 	}
 	if d.writeConfig == nil {
 		d.writeConfig = sshconfig.Write
@@ -290,7 +272,6 @@ func (d *Daemon) shutdown() {
 			err = aerr
 		}
 		d.wg.Wait()
-		d.sessions.closeAll()
 		if c, ok := d.store.(io.Closer); ok {
 			if cerr := c.Close(); err == nil {
 				err = cerr
