@@ -16,3 +16,7 @@
 
 # Binaries built by scripts/preview-server.sh
 /.bin/
+
+# End-to-end test runs (scripts/e2e/run.sh)
+/e2e-out/
+__pycache__/

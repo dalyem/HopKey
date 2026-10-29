@@ -1,0 +1,164 @@
+"""A minimal MCP stdio client (newline-delimited JSON-RPC) for hop mcp."""
+import json
+import os
+import re
+import select
+import subprocess
+import time
+
+import e2elib as L
+
+
+class MCP:
+    def __init__(self, args=(), user='tester', nopass=False, env=None, tag='mcp'):
+        argv = L.user_argv(user, ['hop', 'mcp'] + list(args), 600)
+        self.stderr_path = '%s/logs/%s.stderr' % (L.E2E, tag)
+        self.p = subprocess.Popen(argv, env=L.user_env(user, nopass, env), stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=open(self.stderr_path, 'w'),
+                                  text=True, bufsize=1, cwd='/tmp')
+        self.nid = 0
+        self.transcript = []  # every raw response line, for the secret scan
+        self.buf = b''
+        self.hung = False      # a request went unanswered past its timeout
+        self.exited = False    # hop mcp closed its stdout
+        self.answered = 0      # responses to our requests that carried a JSON-RPC result or error
+        self.init = self.rpc('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
+                                            'clientInfo': {'name': 'hk-e2e', 'version': '1'}})
+        self.send({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+
+    def send(self, msg):
+        try:
+            self.p.stdin.write(json.dumps(msg) + '\n')
+            self.p.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            self.exited = True
+
+    def _line(self, deadline):
+        """The next stdout line, '' at EOF, None at the deadline (reads the fd, so select sees all data)."""
+        fd = self.p.stdout.fileno()
+        while b'\n' not in self.buf:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            r, _, _ = select.select([fd], [], [], left)
+            if not r:
+                continue
+            d = os.read(fd, 65536)
+            if not d:
+                return ''
+            self.buf += d
+        line, self.buf = self.buf.split(b'\n', 1)
+        return line.decode(errors='replace') + '\n'
+
+    def rpc(self, method, params, timeout=120):
+        self.nid += 1
+        self.send({'jsonrpc': '2.0', 'id': self.nid, 'method': method, 'params': params})
+        deadline = time.time() + timeout
+        while True:
+            if self.exited:
+                return {'error': {'message': 'EOF from hop mcp'}, 'transport': 'eof'}
+            line = self._line(deadline)
+            if line is None:
+                self.hung = True
+                return {'error': {'message': 'timeout'}, 'transport': 'timeout'}
+            if not line:
+                self.exited = True
+                return {'error': {'message': 'EOF from hop mcp'}, 'transport': 'eof'}
+            self.transcript.append(line)
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(m, dict) and m.get('id') == self.nid:
+                if 'result' not in m and 'error' not in m:
+                    # A line with our ID but neither member is no answer: the request stays open.
+                    continue
+                self.answered += 1
+                return m
+
+    def tools(self):
+        r = self.rpc('tools/list', {})
+        return [t['name'] for t in r.get('result', {}).get('tools', [])], r
+
+    def call(self, name, args):
+        """Returns (is_error, structured or None, text); the raw response is in last_raw."""
+        r = self.rpc('tools/call', {'name': name, 'arguments': args})
+        self.last_raw = r
+        res = r.get('result')
+        if res is None:
+            return True, None, json.dumps(r.get('error'))
+        text = '\n'.join(c.get('text', '') for c in res.get('content', []) if c.get('type') == 'text')
+        L.log('MCP', name, json.dumps(args), '->', 'isError=%s' % res.get('isError'), L.cut(text, 600))
+        return bool(res.get('isError')), res.get('structuredContent'), text
+
+    @property
+    def healthy(self):
+        """Every request so far got an answer from hop mcp (no hang, no exit)."""
+        return not self.hung and not self.exited and self.answered == self.nid
+
+    def transport(self):
+        """How the session went: 'ok' while every request got a JSON-RPC result or
+        error from hop mcp; 'refused' when hop mcp exited by itself with an error
+        status and stderr carries one of hop's own refusals (REFUSAL); 'broken' for
+        everything else: a hang, a crash, a signal, or an exit that said anything
+        else. Only 'ok' and 'refused' may be judged as access denied; 'broken' is a
+        harness failure."""
+        if self.healthy:
+            return 'ok'
+        if self.hung:
+            return 'broken'
+        try:
+            rc = self.p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            return 'broken'
+        err = self.stderr()
+        crashed = 'panic:' in err or 'goroutine ' in err or 'SIGSEGV' in err
+        return 'refused' if rc and rc > 0 and not crashed and refusal(err) else 'broken'
+
+    def why(self):
+        """A masked one-line account of the transport, for evidence."""
+        return L.cut('hung %s, exited %s (rc %s), answered %d of %d; stderr: %s' % (
+            self.hung, self.exited, self.p.poll(), self.answered, self.nid, self.stderr().strip().replace('\n', ' ')), -400)
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(timeout=20)
+        except Exception:
+            self.p.kill()
+            self.p.wait()
+        return self.p.returncode
+
+    def stderr(self):
+        try:
+            return open(self.stderr_path).read()
+        except OSError:
+            return ''
+
+
+# hop's own refusals, as hop mcp words them (internal/cli/mcp.go daemonError) and as
+# the CLI does (offline too long): this device was revoked, the vault is locked
+# (also for being offline too long), or there is no vault (a proven revocation wiped
+# it), plus an authorization refusal. Any other error says nothing about access.
+REFUSAL = re.compile(r'this device was revoked from the account|the vault is locked|offline too long|'
+                     r'there is no vault on this device|not authori[sz]ed|unauthori[sz]ed')
+
+
+def refusal(text):
+    """The refusal hop gave in text, or ''."""
+    m = REFUSAL.search(text or '')
+    return m.group(0) if m else ''
+
+
+def results(struct):
+    """exec/run_snippet results by host."""
+    return {r['host']: r for r in (struct or {}).get('results', [])}
+
+
+def require_ok(m, cid, label):
+    """Record a harness failure when hop mcp stopped answering: a check judged on an
+    EOF or a hang would pass for "no access" or fail for the wrong reason."""
+    if m.transport() != 'ok':
+        L.harness(cid, label, 'hop mcp did not answer every request: ' + m.why())
+        return False
+    return True

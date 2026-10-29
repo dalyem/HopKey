@@ -184,3 +184,50 @@ kiln checks run test       # one check
 `test` also runs the packages that only exist under `-tags hopdev` (the dev store and the real `hop` binary starting its own daemon).
 
 `scripts/check.sh` defines each check. The ssh integration test needs an `ssh` binary and a passwd entry for the current uid; `scripts/with-passwd.sh` supplies the entry on Kiln. With `HOPKEY_REQUIRE_SSH=1` the test fails instead of skipping when `ssh` is missing.
+
+## End-to-end tests on Kiln
+
+`scripts/e2e/run.sh` runs the whole product on real machines. It builds `hop` and `hop-server` from the worktree with `kiln checks run`, leases two Ubuntu VMs (CLI-A, CLI-B), creates three sandboxes as SSH targets (T1-T3), runs the phases, writes a report and releases everything, also on failure. Nothing from the repository runs on the orchestrator.
+
+Prerequisites:
+
+- the `kiln` CLI, logged in;
+- for phases 3-6, a Tailscale auth key that is reusable, ephemeral and tagged `tag:hoptest`, in a file (default `~/hopkey-test/ts-authkey`, or `HOP_E2E_TS_AUTHKEY_FILE`). The tailnet policy must let `tag:hoptest` reach `tag:hoptest`, for example `{"action":"accept","src":["tag:hoptest"],"dst":["tag:hoptest:*"]}`. The script copies the file only by path. Each machine deletes it when `tailscale up` ends, whatever the outcome. The driver deletes it again at cleanup on every machine that got a copy, also with `--keep`, and checks that it is gone.
+
+```
+scripts/e2e/run.sh                    # all phases
+scripts/e2e/run.sh --phases 1,2       # local only and MCP; no Tailscale key needed
+scripts/e2e/run.sh --keep             # leave the machines up and print their IDs
+scripts/e2e/run.sh --phases 6 --source ../other-worktree   # build hop from another worktree
+```
+
+`--source <dir>` builds `hop` and `hop-server` from another checkout (a branch in review, say) and runs this checkout's suite against them. The report names that checkout's branch, commit and uncommitted files.
+
+The run's kiln identity (`kiln whoami`) is printed and kept in the ledger before anything is allocated, and the report names it. `HOP_E2E_EXPECT_IDENTITY=<name or principal ID>` refuses to run under any other. Without it, the run warns when kiln sees a plain shell but the environment is an agent's, or the reverse. An agent should start a run from its own tool call (the tool's background mode), not with a plain `&`: a process that outlives the call runs as the user's identity, and the agent can then neither see nor release its machines.
+
+The phases:
+
+1. Local use with no account, on both VMs.
+2. MCP.
+3. Sync, through a throwaway `hop-server` on CLI-A that is reachable only on the tailnet, with a CA made for the run. A description both devices edit is not held, the later push (B's) wins, and B names the item and the field, never either value, in the text of `hop status`, in `hop sync` and in its `daemon.log`.
+4. SSH over Tailscale, including a jump host.
+5. The revocation matrix, and what revocation does on the device: an online revoke leaves `hop unlock` refused and the agent empty, a proven revocation wipes the vault, `device.key` and `~/.ssh/hop` but keeps `revocation.json`, a device revoked offline keeps working while offline with the policy off (documented, so asserted as working), is cut off within 120 s after it reconnects and stays cut off across a restart, and the account's `--max-offline 1m` policy locks a device blocked from the server and never an idle healthy one (`rev2-*` checks). MCP access counts as working when `list_hosts` lists a host or `exec` ran on T1, whatever else `hop mcp` did. It counts as denied only on one of hop's own refusals (revoked, locked, offline too long, no vault), given in answer to both tool calls, or by a `hop mcp` that exits with one before answering any tool call. "No vault" counts only when the same step sees the proven revocation's wipe of that store (no vault, no `device.key`, a `revocation.json`); a store that is merely empty does not. Any other answer, or a `hop mcp` that hangs or exits, is a harness failure, as is an agent probe that gives no clear answer.
+6. `hop key rotate` against real sshd: the sandboxes' stock Ubuntu sshd (StrictModes on), T2's jump-host target and CLI-B's sshd. `--dry-run` changes nothing; rotated hosts keep every other `authorized_keys` line byte for byte and the old line's options (`restrict` and `from=`, which sshd then enforces on the new key); the old key is refused; T3, whose sshd is set to take only the lines it had before (`AuthorizedKeysCommand` on a snapshot, with a hook that logs each offered key's fingerprint and whether the live file holds it), refuses the new key and is put back, and the hook log proves the new key was installed and refused before the restore; a second record of a rotated account is `already-rotated`; B follows with nothing done there; lines appended on T1 during a rotation are kept, each exactly once, and the T1 clock is measured against A's so at least one append is shown to land inside the rotation (none is a harness failure, as are zero appends); the rotation must reach its edit, so it either ends `rotated` (`old_key_removed`) or fails on hop's own conflict check (`~/.ssh/authorized_keys changed while hop was editing it`) with the host `unchanged`, and any other failure fails the check (`rot-*` checks). T3's sshd is put back to stock and checked, also when the phase stops early: `sshd -T` must succeed and show deploy the same `AuthorizedKeysFile` and `AuthorizedKeysCommand` (`none`) as the stock config did at setup. A build without `hop key rotate` (exit 255, `unknown key subcommand "rotate"`) records a skip; a detection that gets any other answer is a harness failure. The same goes for `hop auth policy`.
+
+Every check is one JSON line in `e2e-out/<run-id>/results.jsonl`. `REPORT.md` next to it has a table per phase and the failures in detail. Assertions encode the intended behaviour, so known product gaps show up as FAIL, tagged with their bug ID. Where the product README documents a limit (no field-level merge for protected fields, secrets hop does not know pass through MCP output, open sessions survive a revoke), the check asserts the documented behaviour: status `limit` means it holds as documented, and the report lists it under Documented limits with the README reference. A limit never counts as a failure and never changes the exit code; behaviour that differs from the documentation is a FAIL. A check whose prerequisite did not hold (a session that never connected, a daemon that never started, an answer that was not valid JSON, a firewall block that did not take effect) fails as `harness`; it never passes. A full run takes about 20 minutes: about 6 to build, lease and set up the machines, then about 14 for the phases. Phases 1-2 alone should take under 10 minutes.
+
+The exit code is the verdict:
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | every check passed |
+| 1 | assertion failures (known product bugs show up here) |
+| 2 | harness failures: setup, a `harness` check, log collection or masking, or a machine that could not be released |
+| 3 | missing coverage: a selected phase that did not run to its end, a step that did not finish with exit 0, or a machine that reported no checks |
+| 128+n | interrupted by signal n, whatever the verdict; `REPORT.md` notes the signal, and its verdict covers only what ran |
+
+A run ID is used once: the run's directory is reserved with a plain `mkdir`, so a repeated `--run-id` is refused before it can touch another run's ledger.
+
+Cleanup runs on every exit, including Ctrl-C. Each allocation runs in a worker of its own under `setsid` (`scripts/e2e/alloc.sh`), which ignores INT, TERM and HUP and writes the operation ID and the machine ID to `alloc/<kind>.<who>.rec` the moment kiln returns them, so a signal to the run's whole process group cannot lose one. Cleanup waits for those workers, asks kiln about any operation still without a machine, and reports one it cannot resolve as a harness failure that names the operation. It then releases everything this run asked for and checks with `kiln vm list` and `kiln sandbox list` that it is gone. Each of these outcomes (auth key deleted, each release, the final check) is a phase 0 check in the results, and `REPORT.md` is written after them, so a release that failed shows up in the saved report. A second Ctrl-C only skips the rest of the log collection; the releases still run. Logs leave a machine only after its suite jobs are stopped and each file is masked into a separate export directory. A file that cannot be masked is withheld and counted as a harness failure. Cross-machine timings are corrected by the A-B clock offset, measured over the tailnet at the start and the end; an offset over 0.5 s is a harness failure.
+
+`--reuse e2e-out/<run>` (with machines kept by `--keep`) is for debugging. Each machine has a lock file (`$TMPDIR/hk-e2e-locks-<uid>/<id>.lock`, held with `flock` for the whole run), so two runs never share machines; a ledger whose machines were released (`machines.released`) or are no longer live is refused. It stops every job of the earlier run (they all run in `hke2e.slice`), removes only the firewall rules the suite added (tagged `hk-e2e`), and clears the completion markers, which carry the run ID.
