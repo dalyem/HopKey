@@ -83,14 +83,14 @@ const (
 	akHeldAdvice = `hop key rotate and hop access both use this lock, and hop never removes it on its own. ` +
 		`Remove it (rm -r LOCK) only when no hop key rotate and no hop access run can still be active for this account: ` +
 		`on every device you use, and on every machine that shares this home directory. ` +
-		`If you remove it while one is active, run hop access check afterwards.`
+		`If you remove it while one is active, check ~/.ssh/authorized_keys by hand afterwards.`
 	akHeldMsg    = `LOCK is held by another hop run: process $op took it at $ow, on the machine that took it. ` + akHeldAdvice
 	akNoOwnerMsg = `LOCK exists, with no owner in it: another hop run is taking it, or one was cut off. ` + akHeldAdvice
 	akProbeMsg   = `hop's temporary file can't be hard-linked into ~/.ssh, so hop can't be sure that replacing ~/.ssh/authorized_keys would be a rename; nothing changed`
 	akDirKeptMsg = `hop could not confirm that it removed its session directory ~/.ssh/.hop-s.TOKEN, so it left the lock LOCK in place. ` +
-		`Check the file with hop access check, remove ~/.ssh/.hop-s.TOKEN if it is still there, and then follow the advice for a held lock before you remove LOCK.`
+		`Check ~/.ssh/authorized_keys by hand, remove ~/.ssh/.hop-s.TOKEN if it is still there, and then follow the advice for a held lock before you remove LOCK.`
 	akLostLockMsg = `the lock LOCK was removed, replaced or unreadable when this hop run went to release it, ` +
-		`so another hop run may have edited ~/.ssh/authorized_keys at the same time. Run hop access check.`
+		`so another hop run may have edited ~/.ssh/authorized_keys at the same time. Check the file by hand.`
 	akUnlockMsg = `hop could not remove its lock LOCK. This hop run has finished; remove the lock (rm -r LOCK) once ` +
 		`no hop key rotate and no hop access run is active for this account, on any of your devices or machines that share this home directory.`
 )
@@ -112,11 +112,15 @@ func akWriteScript(from, to string) string {
 //
 // The script is one line, sent through the login shell as one quoted word
 // (sh): no newline (tcsh), no '!' (csh history), no '#', and no backslash
-// before a backslash or a quote (fish).
+// before a backslash or a quote (fish). It is tested on Linux with dash
+// and bash as sh, and under those as login shells. Other shells (busybox
+// ash, the sh of FreeBSD or macOS, mksh, ksh, and zsh, fish or tcsh as the
+// login shell) are run by the tests only where the test machine has them,
+// and are not part of what hop claims to support.
 func akTokenScript(token, from, to string) string {
 	changed := `{ echo "~/.ssh/authorized_keys changed while hop was editing it" >&2; exit 83; }; `
 	return strings.NewReplacer("TOKEN", token, "LOCK", "~/.ssh/"+akLockDir, "WAIT", strconv.Itoa(akLockWait)).Replace(
-		`umask 077; f="$HOME/.ssh/authorized_keys"; d="$HOME/.ssh/` + akLockDir + `"; s="$HOME/.ssh/.hop-s.TOKEN"; p="$HOME/.ssh/.hop-p.TOKEN"; l=; o=; m=; ` +
+		`umask 077; f="$HOME/.ssh/authorized_keys"; d="$HOME/.ssh/` + akLockDir + `"; s="$HOME/.ssh/.hop-s.TOKEN"; p="$HOME/.ssh/.hop-p.TOKEN"; l=; o=; m=; x=; ` +
 			`if [ -L "$f" ]; then echo "~/.ssh/authorized_keys is a symbolic link; hop does not edit it" >&2; exit 81; fi; ` +
 			`if [ -f "$f" ]; then :; else echo "~/.ssh/authorized_keys does not exist" >&2; exit 82; fi; ` +
 			// same FILE "CRC SIZE": the file's cksum is that.
@@ -132,14 +136,19 @@ func akTokenScript(token, from, to string) string {
 			`if rm -f "$d/owner" && rmdir "$d"; then :; else echo "` + akUnlockMsg + `" >&2; exit 89; fi; fi; ` +
 			`exit "$r"; }; ` +
 			// From here the exit status of a signal is not one of 81-85:
-			// the rename may have happened.
-			`trap 'hop_end $?' EXIT; trap 'hop_end 86' HUP INT TERM PIPE; ` +
-			`n=0; until mkdir "$d" 2>/dev/null; do n=$((n+1)); if [ $n -gt WAIT ]; then ` +
+			// the rename may have happened. While the script takes the
+			// lock and makes its session directory, a signal is only
+			// noted ($x): one that ended it between a mkdir and its flag
+			// would leave the lock, or the directory, behind. Once the
+			// flags are set the signal ends it, at once if one came.
+			`trap 'hop_end $?' EXIT; trap 'x=1' HUP INT TERM PIPE; ` +
+			`n=0; until mkdir "$d" 2>/dev/null; do [ -z "$x" ] || exit 86; n=$((n+1)); if [ $n -gt WAIT ]; then ` +
 			`if { read -r ot op ow < "$d/owner"; } 2>/dev/null; then echo "` + akHeldMsg + `" >&2; ` +
 			`else echo "` + akNoOwnerMsg + `" >&2; fi; ` +
 			`exit 85; fi; sleep 1; done; l=1; ` +
 			`if { echo "TOKEN $$ $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$d/owner"; } 2>/dev/null; then o=1; else echo "cannot write the lock LOCK" >&2; exit 84; fi; ` +
 			`if mkdir "$s" 2>/dev/null; then m=1; else echo "cannot create ~/.ssh/.hop-s.TOKEN" >&2; exit 84; fi; ` +
+			`trap 'hop_end 86' HUP INT TERM PIPE; [ -z "$x" ] || hop_end 86; ` +
 			`same "$f" "` + from + `" || ` + changed +
 			`(set -C; : > "$s/new") 2>/dev/null || { echo "cannot create a temporary file in ~/.ssh/.hop-s.TOKEN" >&2; exit 84; }; ` +
 			// The probe: if the temp file can be hard-linked into ~/.ssh,

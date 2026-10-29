@@ -133,6 +133,57 @@ func TestKeyRotateUnconfirmedCleanupKeepsTheLock(t *testing.T) {
 	}
 }
 
+// The new key does not log in, so hop puts the file back. That edit goes
+// through, but its own session can't confirm that it removed its
+// directory (89), and keeps the lock. The file reads back as it was, yet
+// the host is not as it was: it needs attention, with the script's words,
+// and both keys stay.
+func TestKeyRotateRollbackCleanupFailureNeedsAttention(t *testing.T) {
+	cli.SetAKLockWait(t, 1)
+	w := newRotWorld(t, rotWorldOpts{})
+	w.srv[0].setRefuse("hop-rotated")
+	rmdir, err := exec.LookPath("rmdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first session (adding the new key) removes its directory; the
+	// second (the rollback) can't.
+	once := filepath.Join(t.TempDir(), "first-session-removed")
+	w.srv[0].setPath(fakeServerBin(t, map[string]string{
+		"rmdir": `case "$1" in *.hop-s.*) if [ -e '` + once + `' ]; then exit 1; fi; : > '` + once + `' ;; esac; exec '` + rmdir + `' "$@"`,
+	}))
+	code, stdout, stderr := w.hop(t, "key", "rotate", "deploy-key", "--hosts", "web-1", "--yes", "--json")
+	t.Logf("hop key rotate (exit %d)\n%s\nstderr: %s", code, stdout, stderr)
+	res := decodeRotate(t, stdout)
+	h := decodeRotateHosts(t, stdout)["web-1"]
+	for _, want := range []string{
+		"the new key did not log in",
+		"~/.ssh/authorized_keys is back as it was, but an edit hop made there could not clean up after itself",
+		"could not confirm that it removed its session directory ~/.ssh/.hop-s.",
+		"the server takes the old key, as before",
+	} {
+		if !strings.Contains(h.Reason, want) {
+			t.Errorf("reason does not say %q", want)
+		}
+	}
+	if code == 0 || h.Status != "needs-attention" || h.RemoteState != "unchanged" || h.Fix == "" || strings.Contains(h.Reason, "put back as it was") {
+		t.Errorf("exit %d, web-1 %+v", code, h)
+	}
+	if got, _ := w.authorizedKeys(t, 0); got != w.orig[0] {
+		t.Errorf("authorized_keys:\n%s\nwant:\n%s", got, w.orig[0])
+	}
+	if res.Keys[0].NewKeyRemoved || w.keyNamed(t, "deploy-key") == nil || w.keyNamed(t, res.Keys[0].NewKey) == nil {
+		t.Errorf("both keys should stay: %+v", res.Keys[0])
+	}
+	if w.hostKeyID(t, "web-1") != w.keyID {
+		t.Error("web-1 moved off the old key")
+	}
+	lock := filepath.Join(w.srv[0].home, ".ssh", ".hop-authorized_keys.lock.d")
+	if b, err := os.ReadFile(filepath.Join(lock, "owner")); err != nil || len(strings.Fields(string(b))) != 3 {
+		t.Errorf("the lock was released: %q %v", b, err)
+	}
+}
+
 // A hop access line that holds the old key is not rotate's: it keeps it
 // byte for byte, never copies its options, and never calls the host done
 // while the line is there. Tombstones are kept byte for byte too.

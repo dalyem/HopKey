@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // The write script's session: its own directory, named by the run's token,
@@ -24,10 +25,18 @@ type akShell struct{ name, path string }
 // akInterpreters are the shells on this machine that hosts run as sh. Each
 // is started through a link named sh, so bash and busybox act as sh does.
 // dash and bash are in the check image and must be there under
-// HOPKEY_REQUIRE_SSH.
+// HOPKEY_REQUIRE_SSH; they are the shells hop's support claim rests on.
+// The others run only where they are installed, and the log names the ones
+// that were not.
 func akInterpreters(t *testing.T) []akShell {
 	t.Helper()
 	var out []akShell
+	var missing []string
+	defer func() {
+		if len(missing) > 0 {
+			t.Logf("NOT TESTED as sh (not installed): %s", strings.Join(missing, ", "))
+		}
+	}()
 	for _, c := range []struct {
 		name, bin string
 		required  bool
@@ -44,7 +53,7 @@ func akInterpreters(t *testing.T) []akShell {
 			if c.required && os.Getenv("HOPKEY_REQUIRE_SSH") != "" {
 				t.Fatalf("%s is not installed", c.bin)
 			}
-			t.Logf("%s is not installed; not tested", c.bin)
+			missing = append(missing, c.name)
 			continue
 		}
 		link := filepath.Join(t.TempDir(), "sh")
@@ -325,6 +334,76 @@ func akScriptCases(t *testing.T, shell string) {
 			t.Errorf("the lock is gone: %v", err)
 		}
 	})
+	// A signal that comes between a successful mkdir and the flag that
+	// says the run made it is held until the flag is set: the lock and
+	// the session directory are cleaned up all the same. The fake mkdir
+	// makes the directory, then signals the script's shell before it
+	// returns.
+	realMkdir, err := exec.LookPath("mkdir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ name, pattern string }{
+		{"the lock", "*/" + testLockDir},
+		{"the session directory", "*/.hop-s.*"},
+	} {
+		t.Run("86 TERM right after the mkdir of "+c.name, func(t *testing.T) {
+			h, f := home(t)
+			p := fakeBin(t, map[string]string{
+				"mkdir": `'` + realMkdir + `' "$@" || exit; case "$1" in ` + c.pattern + `) kill -TERM $PPID ;; esac; exit 0`,
+			})
+			code, stderr := runAKIn(t, shell, h, p, script(), next)
+			if code != akExitUncertain {
+				t.Errorf("exit %d %q, want %d", code, stderr, akExitUncertain)
+			}
+			unchanged(t, f)
+			onlyAK(t, h) // the lock released, the session directory removed
+		})
+	}
+	// A TERM sent to the script's shell alone, while mv runs in the
+	// foreground, waits for mv: nothing is cleaned up and the lock stays
+	// until mv returns, and then the script ends as for any signal.
+	t.Run("86 TERM to the shell alone waits for mv", func(t *testing.T) {
+		h, f := home(t)
+		realMv, err := exec.LookPath("mv")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		started, release := filepath.Join(dir, "mv-started"), filepath.Join(dir, "release")
+		p := fakeBin(t, map[string]string{
+			"mv": `: > '` + started + `'; until [ -e '` + release + `' ]; do sleep 0.02; done; exec '` + realMv + `' "$@"`,
+		})
+		w := startAKIn(t, shell, h, p, script())
+		w.stdin.Write(next)
+		w.stdin.Close()
+		waitFor(t, "mv to start", func() bool { _, err := os.Stat(started); return err == nil })
+		if err := syscall.Kill(w.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case code := <-w.done:
+			t.Fatalf("the shell exited %d while mv was running: %q", code, w.err.String())
+		case <-time.After(300 * time.Millisecond):
+		}
+		if !holdsTemp(h) {
+			t.Error("the session directory was cleaned up while mv was running")
+		}
+		if fields := strings.Fields(lockOwner(h)); len(fields) != 3 {
+			t.Errorf("the lock was released while mv was running: owner %q", lockOwner(h))
+		}
+		unchanged(t, f)
+		if err := os.WriteFile(release, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code := <-w.done; code != akExitUncertain {
+			t.Errorf("exit %d %q, want %d", code, w.err.String(), akExitUncertain)
+		}
+		if got, _ := os.ReadFile(f); !bytes.Equal(got, next) {
+			t.Errorf("authorized_keys %q: mv did not finish before the cleanup", got)
+		}
+		onlyAK(t, h)
+	})
 	t.Run("86 TERM past the lock", func(t *testing.T) {
 		h, f := home(t)
 		w := start(t, h, script())
@@ -339,15 +418,26 @@ func akScriptCases(t *testing.T, shell string) {
 
 // Through each login shell a host may have, the command hop sends (sh -c
 // and the quoted script) reaches sh unchanged: the write goes through, and
-// the held-lock message arrives byte for byte.
+// the held-lock message arrives byte for byte. sh, dash and bash must be
+// there under HOPKEY_REQUIRE_SSH; the others run only where installed, and
+// the log names the ones that were not.
 func TestAKWriteScriptThroughLoginShells(t *testing.T) {
 	defer func(w int) { akLockWait = w }(akLockWait)
 	akLockWait = 1
 	tested := 0
+	var missing []string
+	defer func() {
+		if len(missing) > 0 {
+			t.Logf("NOT TESTED as login shells (not installed): %s", strings.Join(missing, ", "))
+		}
+	}()
 	for _, name := range []string{"sh", "dash", "bash", "zsh", "ksh", "mksh", "fish", "tcsh", "csh"} {
 		shell, err := exec.LookPath(name)
 		if err != nil {
-			t.Logf("%s is not installed; not tested", name)
+			if (name == "sh" || name == "dash" || name == "bash") && os.Getenv("HOPKEY_REQUIRE_SSH") != "" {
+				t.Fatalf("%s is not installed", name)
+			}
+			missing = append(missing, name)
 			continue
 		}
 		tested++

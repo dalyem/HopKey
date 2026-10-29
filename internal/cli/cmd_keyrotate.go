@@ -133,6 +133,11 @@ type rotHost struct {
 	// marked says that a hop access line still authorizes the old key
 	// there. state does not count it, so the report does not use state.
 	marked bool
+	// cleanup holds why of each edit of authorized_keys that could not
+	// confirm it cleaned up after itself (akExitCleanup): it may have left
+	// its session directory and its lock on the host. Whatever the file
+	// holds, such a host needs attention. state does not count it.
+	cleanup []string
 }
 
 // rotPlan is the plan for one key.
@@ -794,11 +799,23 @@ var remText = map[string]string{
 // new one.
 func (h *rotHost) attention(k *rotKeys, why string) {
 	h.out.Status = rotAttention
+	why = h.withCleanup(why)
 	if !h.marked {
 		why += "; " + remText[h.state]
 	}
 	h.out.Reason = why + safef("; both keys stay in the vault: %s (old) and %s (new)", k.oldName, k.newName)
 	h.out.Fix = rotateFix(k, h.host.Name)
+}
+
+// withCleanup is why with the diagnostic of each edit that could not clean
+// up after itself, unless why says it already.
+func (h *rotHost) withCleanup(why string) string {
+	for _, c := range h.cleanup {
+		if !strings.Contains(why, c) {
+			why += "; " + c
+		}
+	}
+	return why
 }
 
 func rotateFix(k *rotKeys, host string) string {
@@ -836,6 +853,7 @@ func (h *rotHost) moved(k *rotKeys, m *hostMovedError) {
 	default:
 		h.out.Reason += "; the record no longer uses either key"
 	}
+	h.out.Reason = h.withCleanup(h.out.Reason)
 	h.out.Reason += safef("; both keys stay in the vault: %s (old) and %s (new)", k.oldName, k.newName)
 }
 
@@ -878,7 +896,7 @@ func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp stri
 
 	// 2. Add the new key's lines.
 	if len(ed.added) > 0 {
-		switch out, why, _ := w.old.writeAK(ctx, orig, ed.appended); out {
+		switch out, why, _ := h.writeAK(ctx, &w.old, orig, ed.appended); out {
 		case akNotDone:
 			h.fail(why + "; nothing was changed")
 			return
@@ -897,7 +915,7 @@ func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp stri
 	}
 
 	// 4. Remove the old key's lines. From here the new key is the way in.
-	switch out, why, _ := w.new.writeAK(ctx, ed.appended, ed.final); out {
+	switch out, why, _ := h.writeAK(ctx, &w.new, ed.appended, ed.final); out {
 	case akNotDone:
 		e.putBack(ctx, h, k, w, ed, why)
 		return
@@ -976,7 +994,7 @@ func (w *rotWays) removeOld(ctx context.Context, h *rotHost, k *rotKeys) string 
 	if removed == 0 {
 		return problem
 	}
-	switch out, why, _ := w.new.writeAK(ctx, cur, next); out {
+	switch out, why, _ := h.writeAK(ctx, &w.new, cur, next); out {
 	case akNotDone:
 		return "hop could not remove the old key's lines: " + why
 	case akUnknown:
@@ -1154,14 +1172,19 @@ func sshDenied(line, user, host string) bool {
 }
 
 // putBack undoes ed on the host after why, and reports the host as failed
-// if it is as it was, or as needing attention if not.
+// if it is as it was, or as needing attention if not. A host whose file is
+// as it was also needs attention when an edit there could not clean up
+// after itself: its lock may still be on the host.
 func (e *Env) putBack(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, ed *akEdit, why string) {
-	h.state = w.rollback(ctx, ed, h.state)
-	if h.state == remUnchanged {
+	w.rollback(ctx, h, ed)
+	switch {
+	case h.state == remUnchanged && len(h.cleanup) == 0:
 		h.fail(why + "; put back as it was, and it keeps the old key")
-		return
+	case h.state == remUnchanged:
+		h.attention(k, why+"; "+akFile+" is back as it was, but an edit hop made there could not clean up after itself")
+	default:
+		h.attention(k, why+"; hop could not put "+akFile+" back")
 	}
-	h.attention(k, why+"; hop could not put "+akFile+" back")
 }
 
 // repoint points the host's record at the new key once the server takes
@@ -1183,20 +1206,20 @@ func (e *Env) repoint(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, e
 			if mv.fresh != nil && mv.fresh.KeyID == k.newID {
 				undo = ed.oldLinesOnly()
 			}
-			h.state = w.rollback(ctx, undo, h.state)
+			w.rollback(ctx, h, undo)
 		}
 		h.moved(k, mv)
 	case errors.Is(err, errRepointUnknown):
 		if ed != nil {
-			h.state = w.rollback(ctx, ed.oldLinesOnly(), h.state)
+			w.rollback(ctx, h, ed.oldLinesOnly())
 		}
 		h.attention(k, safef("the new key works, but hop could not tell whether the vault points the host at it (%v)", err))
 	default:
 		why := safef("the new key works, but the vault could not point the host at it (%v)", err)
 		if ed != nil {
-			h.state = w.rollback(ctx, ed, h.state)
+			w.rollback(ctx, h, ed)
 		}
-		if h.state == remUnchanged {
+		if h.state == remUnchanged && len(h.cleanup) == 0 {
 			h.fail(why + "; put back as it was, and it keeps the old key")
 		} else {
 			h.attention(k, why)
@@ -1311,31 +1334,43 @@ func hostChain(h model.Host, hosts []model.Host) []daemon.ItemVersion {
 	}
 }
 
-// rollback undoes ed on the host as far as it can and returns where the
-// host stands then. state is where it stood as far as hop knew. It reads
-// the file over whichever key logs in, and tries again if the file changed
-// under it.
-func (w *rotWays) rollback(ctx context.Context, ed *akEdit, state string) string {
+// rollback undoes ed on the host as far as it can, and sets h.state to
+// where the host stands then; h.state on the way in is where it stood as
+// far as hop knew. It reads the file over whichever key logs in, and tries
+// again if the file changed under it. An edit of its own that cannot
+// confirm its cleanup goes to h.cleanup, even when the file read back is
+// as it was.
+func (w *rotWays) rollback(ctx context.Context, h *rotHost, ed *akEdit) {
 	for range 3 {
 		cur, way := w.readAny(ctx)
 		if way == nil {
-			return state
+			return
 		}
-		state = akState(cur, ed.oldPub, ed.newPub)
+		h.state = akState(cur, ed.oldPub, ed.newPub)
 		next, changed := rollbackAK(cur, ed)
 		if !changed {
-			return state
+			return
 		}
-		switch out, _, code := way.writeAK(ctx, cur, next); {
+		switch out, _, code := h.writeAK(ctx, way, cur, next); {
 		case out == akDone:
-			return akState(next, ed.oldPub, ed.newPub)
+			h.state = akState(next, ed.oldPub, ed.newPub)
+			return
 		case out == akUnknown:
-			state = remUnknown
+			h.state = remUnknown
 		case code != akExitChanged && code != akExitLocked:
-			return state
+			return
 		}
 	}
-	return state
+}
+
+// writeAK is way.writeAK, and notes in h.cleanup an edit that could not
+// confirm its cleanup.
+func (h *rotHost) writeAK(ctx context.Context, way *rotSSH, from, to []byte) (akOutcome, string, int) {
+	out, why, code := way.writeAK(ctx, from, to)
+	if out == akUnknown && code == akExitCleanup {
+		h.cleanup = append(h.cleanup, why)
+	}
+	return out, why, code
 }
 
 // readAny reads authorized_keys with the old key, or else with the new one.

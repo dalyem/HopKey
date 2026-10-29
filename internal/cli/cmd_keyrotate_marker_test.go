@@ -183,7 +183,7 @@ func TestAKScriptMessages(t *testing.T) {
 			"hop key rotate and hop access both use this lock",
 			"Remove it (rm -r LOCK) only when no hop key rotate and no hop access run can still be active for this account",
 			"on every device you use, and on every machine that shares this home directory",
-			"run hop access check afterwards",
+			"check ~/.ssh/authorized_keys by hand afterwards",
 		} {
 			if !strings.Contains(m, want) {
 				t.Errorf("%q does not say %q", m, want)
@@ -191,6 +191,11 @@ func TestAKScriptMessages(t *testing.T) {
 		}
 		if strings.Contains(m, "running") {
 			t.Errorf("%q judges whether a process runs", m)
+		}
+	}
+	for name, m := range msgs {
+		if strings.Contains(m, "hop access check") {
+			t.Errorf("%s message names hop access check, which does not exist yet: %s", name, m)
 		}
 	}
 	s := akWriteScript("1 2", "3 4")
