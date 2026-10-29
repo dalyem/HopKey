@@ -20,6 +20,7 @@ SIP = L.env_get('HK_SERVER_IP')
 EMAIL = L.env_get('HK_EMAIL')
 PTYLOG = '/var/e2e/logs/pty-blogin.log'
 INBOX = '/var/e2e/state/blogin.in'
+REF_FIELDS = 'README, Sync: "Two changes to different protected fields of one item are held too."'
 
 
 def block(on):
@@ -138,8 +139,10 @@ def step_a_approve_start(code):
 def step_a_approve_sas(code, sas):
     r = hop('auth', 'approve', code, '--sas', sas, timeout=120)
     c('A.approve', 'hop auth approve CODE --sas approves B headless', r.rc == 0 and 'Approved' in r.out, '', r.ev('auth approve --sas'))
-    m = re.search(r'Approved (.*?) \((.*?)\)', r.out)
-    c('A.approve-id', 'the approval message names the new device\'s ID', bool(m) and len(m.group(2)) > 8, '', r.ev('auth approve'), 'r1-P3-6')
+    # Decided: "Approved <name>." names the device by its name, with no empty parentheses.
+    m = re.search(r'Approved (\S.*?)\. ', r.out)
+    c('A.approve-id', 'the approval message is "Approved cli-b." (the device\'s name, no empty parentheses)',
+      bool(m) and m.group(1) == 'cli-b' and '()' not in r.all, 'named: %r' % (m.group(1) if m else None), r.ev('auth approve'), 'r1-P3-6')
 
 
 def step_b_received():
@@ -167,7 +170,8 @@ def step_offline_start():
     c('B.offline-queue', 'changes made offline are queued', r1.rc == 0 and r2.rc == 0 and s.get('pending', 0) >= 2,
       'pending %s, state %s' % (s.get('pending'), s.get('state')))
     r = hop('sync', timeout=70)
-    c('B.offline-sync', 'hop sync while offline fails fast', r.rc == 255 and r.secs < 10, '%.1fs' % r.secs, r.ev('hop sync'), 'r1-P3-10')
+    c('B.offline-sync', 'hop sync while offline fails fast (exit 255 within 10s)', r.rc == 255 and r.secs < 10,
+      'took %.1fs (limit 10s), exit %s' % (r.secs, r.rc), r.ev('hop sync'), 'r1-P3-10')
     root('pkill -9 -u tester -f "hop daemon"; sleep 1')
     hop('ls')
     s = sync_state()
@@ -225,11 +229,27 @@ def step_conflict_check():
     c('B.conflict-drained', 'after resolving every held change, nothing is pending or held', drained,
       'held in order: %s; pending %s, held %s after %.0fs' % (ever, st.get('pending'), st.get('held'), time.time() - t0))
     c('B.conflict-held', 'a concurrent edit of the same protected field (user) is held', 'cf1' in ever, 'held: %s' % ever)
-    # "Not held" only means something once the queue has drained.
-    c('B.conflict-fields', 'edits of different protected fields (port on A, user on B) merge without a hold', drained and 'cf2' not in ever,
-      'held: %s' % ever if drained else 'not judged: the queue did not drain', '', 'r1-P3-2')
-    c('B.conflict-unprotected', 'a concurrent edit of an unprotected field (description) is not lost silently',
-      'cf3' in ever, 'held: %s; final description %r' % (ever, hs.get('cf3', {}).get('description')), '', 'r1-P3-1')
+    # Documented limit: no field-level merge for protected fields.
+    L.limit('B.conflict-fields', 'edits of different protected fields of one item (port on A, user on B) are held, as documented',
+            'cf2' in ever, 'held: %s' % ever, '', 'r1-P3-2', REF_FIELDS)
+    # Decided: last writer wins on the description, and the device whose push replaced
+    # the other's value says so (README, Sync). A pushed first; B, offline, pushed second.
+    note, notes = None, []
+    if drained:
+        def find():
+            st2 = L.status_json() or {}
+            ws = list(st2.get('warnings') or []) + list((st2.get('sync') or {}).get('warnings') or [])
+            notes[:] = [w for w in ws if 'replaced' in w]
+            return next((w for w in notes if '"cf3"' in w and 'description' in w), None)
+        note, _ = L.wait_for(find, 60, 2)
+    desc = hs.get('cf3', {}).get('description')
+    c('B.conflict-unprotected', 'a concurrent description edit is not held, B\'s later push wins, and B\'s hop status names cf3 and the field '
+      '(never the values)', drained and 'cf3' not in ever and desc == 'fromB' and bool(note) and 'fromA' not in note and 'fromB' not in note,
+      'held: %s; final description %r; note: %s' % (ever, desc, note or ('none of %d replaced-edit notes names cf3' % len(notes) if drained
+                                                                        else 'not judged: the queue did not drain')), '', 'r1-P3-1')
+    if note:
+        r = hop('sync', timeout=40)
+        L.log('hop sync with the note', r.all)
     if 'cf1' in resolved:
         r = resolved['cf1']
         c('B.resolve-theirs', 'hop sync resolve --take-theirs keeps the server\'s user', r.rc == 0 and hs.get('cf1', {}).get('user') == 'uA',
@@ -293,8 +313,8 @@ def step_after_reboot(name):
 def step_service_setup():
     r = hop('setup', '--service', '--yes', timeout=60)
     c('B.service-setup', 'hop setup --service installs the user service', r.rc == 0, '', r.ev('hop setup --service --yes'))
-    c('B.service-warns', 'on a sealed file-store device, setup --service warns that the service has no passphrase',
-      'HOP_DEVICE_PASSPHRASE' in r.all or 'passphrase' in r.all.lower(), '', r.ev('setup --service'), 'r1-P2-3')
+    c('B.service-warns', 'on a sealed file-store device, setup --service warns that its daemon starts locked after a boot until hop unlock',
+      has(r.all, 'HOP_DEVICE_PASSPHRASE', 'starts locked', 'hop unlock'), '', r.ev('setup --service'), 'r1-P2-3')
     root('loginctl enable-linger tester')
 
 
@@ -303,26 +323,29 @@ def user_systemctl(*args):
 
 
 def step_after_reboot_service(name):
-    got, secs = L.wait_for(lambda: os.path.exists('/home/tester/.ssh/hop/config') and
-                           re.search(r'^Host %s$' % name, open('/home/tester/.ssh/hop/config').read(), re.M), 120, 1)
-    act = user_systemctl('is-active', 'hopkey.service').out.strip()
+    """Decided (README, Sync): on a sealed device key the service's daemon starts locked
+    after a boot, says so, and hop unlock (with the passphrase) is all it takes for
+    the change made during the reboot to arrive."""
+    def config_has():
+        try:
+            return re.search(r'^Host %s$' % name, open('/home/tester/.ssh/hop/config').read(), re.M)
+        except OSError:
+            return None
+    act, _ = L.wait_for(lambda: user_systemctl('is-active', 'hopkey.service').out.strip() == 'active', 60, 2)
     st = L.status_json() or {}
-    c('B.service-reboot', 'with hop setup --service, a change made during the reboot arrives with no hop command run',
-      bool(got), 'service %s, vault locked: %s' % (act, (st.get('vault') or {}).get('locked')), '', 'r1-P2-3')
-    if not got:
-        # Workaround from round 1: give the unit the passphrase, then restart it.
-        root('install -d -o tester -g tester -m 700 /home/tester/.config/systemd/user/hopkey.service.d; '
-             'printf "HOP_DEVICE_PASSPHRASE=%s\\n" "$(cat /root/e2e/sec/devpass)" > /home/tester/.config/hk-e2e-pass.env; '
-             'chown tester: /home/tester/.config/hk-e2e-pass.env; chmod 600 /home/tester/.config/hk-e2e-pass.env; '
-             'printf "[Service]\\nEnvironmentFile=%%h/.config/hk-e2e-pass.env\\n" > /home/tester/.config/systemd/user/hopkey.service.d/pass.conf; '
-             'chown -R tester: /home/tester/.config/systemd/user/hopkey.service.d')
-        user_systemctl('daemon-reload')
-        user_systemctl('restart', 'hopkey.service')
-        got, secs = L.wait_for(lambda: re.search(r'^Host %s$' % name, open('/home/tester/.ssh/hop/config').read(), re.M), 90, 1)
-        c('B.service-dropin', 'with the passphrase drop-in (workaround), the service daemon unlocks and syncs', bool(got), '%.1fs' % secs)
+    v, sy = st.get('vault') or {}, st.get('sync') or {}
+    txt = hop('status').all
+    c('B.service-locked', 'after the reboot the service daemon runs, locked, and hop status says to run hop unlock (sync paused)',
+      bool(act) and v.get('locked') is True and sy.get('state') == 'locked' and 'hop unlock' in txt,
+      'service active: %s; vault locked %s, sync %s' % (bool(act), v.get('locked'), sy.get('state')), L.cut(txt, 600), 'r1-P2-3')
+    r = hop('unlock', timeout=60)
+    t0 = time.time()
+    got, secs = L.wait_for(config_has, 120, 1)
+    c('B.service-reboot', 'after hop unlock (with the passphrase), the change made during the reboot arrives with no other command',
+      r.rc == 0 and bool(got), 'hop unlock rc %d; %s %s' % (r.rc, name, 'in the ssh config %.1fs after the unlock' % (time.time() - t0) if got
+                                                               else 'not in the ssh config after 120s'), r.ev('hop unlock'), 'r1-P2-3')
     # Back to command-started daemons for the rest of the run.
     user_systemctl('disable', '--now', 'hopkey.service')
-    root('rm -rf /home/tester/.config/systemd/user/hopkey.service.d /home/tester/.config/hk-e2e-pass.env')
     user_systemctl('daemon-reload')
     hop('ls')
 

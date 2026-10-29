@@ -27,22 +27,31 @@ def step_a_add():
     L.ensure_include()
     L.ensure_testkey()
     hs = L.hosts() or {}
+    # Decided (README, The hop CLI): a short MagicDNS name stays a direct address, and
+    # hop add, which and check print the hint that links it, naming the node by its stable ID.
+    hint = 'hop ts link t1 %s' % (E('HK_T1_ID') or '')
     for name, addr in (('t1', T1S), ('t2', T2F), ('t3', T3IP)):
         if name not in hs:
             r = hop('add', name, '--address', addr, '--user', 'deploy', '--key', 'testkey', '--tag', 'ts')
             c('A.add-' + name, 'hop add %s by %s' % (name, {'t1': 'short MagicDNS name', 't2': 'MagicDNS FQDN', 't3': 'tailnet IP'}[name]),
               r.rc == 0, '', r.ev('hop add %s --address %s' % (name, addr)))
+            if name == 't1':
+                c('A.add-hint', 'hop add t1 (a short MagicDNS name) prints the hint "%s"' % hint, bool(E('HK_T1_ID')) and hint in r.err,
+                  '' if E('HK_T1_ID') else 'T1\'s node ID is unknown', r.ev('hop add t1'), 'r2-P3-1')
     r = hop('which', 't1', '--json')
     j = r.json() or {}
-    c('A.which-short', 'a short MagicDNS name is recognised as a tailnet address', (j.get('route') or {}).get('chosen') == 'tailnet',
-      'route %s' % L.cut(json.dumps(j.get('route')), 200), r.ev('which t1'), 'r2-P3-1')
+    r2 = hop('which', 't1')
+    c('A.which-short', 'a short MagicDNS name routes direct, and hop which names the link command (%s)' % hint,
+      (j.get('route') or {}).get('chosen') == 'direct' and bool(E('HK_T1_ID')) and hint in (j.get('route_hint') or '') and hint in r2.out,
+      'route %s; route_hint %r' % (L.cut(json.dumps(j.get('route')), 200), j.get('route_hint')), r.ev('which t1 --json') + '\n' + r2.ev('which t1'), 'r2-P3-1')
     for h in ('t2', 't3'):
         r = hop('which', h, '--json')
         j = r.json() or {}
         c('A.which-' + h, 'hop which %s routes via the tailnet' % h, (j.get('route') or {}).get('chosen') == 'tailnet', L.cut(json.dumps(j.get('route')), 200))
     r = hop('check', 't1')
-    c('A.check-unpinned', 'hop check before trust: TCP reaches T1 over the tailnet, the pin step fails and names hop trust',
+    c('A.check-unpinned', 'hop check before trust: TCP reaches T1, the pin step fails and names hop trust',
       r.rc == 255 and has(r.out, '[pass] tcp_reachable', '[fail] host_key_pinned', 'hop trust t1'), '', r.ev('check t1'))
+    c('A.check-hint', 'hop check t1 prints the link hint (%s)' % hint, bool(E('HK_T1_ID')) and hint in r.all, '', r.ev('check t1'), 'r2-P3-1')
     for h in TARGETS:
         hop('trust', h, '--yes', timeout=60)
     bad = []

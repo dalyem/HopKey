@@ -2,14 +2,24 @@
 """Phase 5: the revocation matrix (REPORT-r2 part B).
 
 The intended behaviour, per the user: "If I revoke one of the synced devices
-... it should stop working." Every check below asserts that, so the known
-gaps (P1-1 hop unlock restores access, P2-1 offline keeps access, P2-2 the
-start-up window) show up as FAIL.
+... it should stop working." A device that can reach the server must be cut
+off, so the known gaps (P1-1 hop unlock restores access, P2-2 the start-up
+window) show up as FAIL.
+
+What the README ("What revocation does") documents is asserted as documented:
+- Offline: a revoked device that cannot reach the server keeps working until it
+  does, across a daemon restart too (the keys load after a skipped check), with
+  the max-offline policy off, its default. That is a documented limit, not a
+  failure: s3 asserts that it works while offline, and is cut off within 120 s
+  after it reconnects, for good.
+- Open sessions keep running after a revoke: a documented limit (r2-gap4),
+  recorded with status limit.
 
 Steps: localb-setup | ensure-t1 | revoke <device> <n> | access <tag> <work|cut> |
-       watch <tag> <secs> | cutoff <tag> <t0> <limit> | unlock-after <tag> |
-       sessions-start | sessions-end <tag> | block <0|1> | daemon-restart <tag> |
-       stopped <tag> | start-window <tag> | inventory <tag> | relogin <name> | b-wait-t1
+       watch <tag> <secs> | cutoff <tag> <t0> <limit> <offset> <revoke|reconnect> |
+       unlock-after <tag> | sessions-start | sessions-end <tag> | block <0|1> |
+       daemon-restart <tag> <work|cut> | stopped <tag> | start-window <tag> |
+       inventory <tag> | relogin <name> | b-wait-t1 | policy-off | policy* (s6)
 """
 import glob
 import json
@@ -21,11 +31,13 @@ import time
 
 import e2elib as L
 from e2elib import check as c, hop, has, root, ssh, skip
-from mcpc import MCP, results
+from mcpc import MCP, refusal, results
 
 M = L.MACHINE
 URL, SIP = L.env_get('HK_SERVER_URL'), L.env_get('HK_SERVER_IP')
-BUGS = {'unlock': 'r2-P1-1', 'offline': 'r2-P2-1', 'window': 'r2-P2-2'}
+BUGS = {'unlock': 'r2-P1-1', 'window': 'r2-P2-2'}
+REF_SESSIONS = 'README, What revocation does: "Open sessions that the revoked device already had keep running"'
+
 
 
 def step_localb_setup():
@@ -124,28 +136,40 @@ def m_plain_ssh():
 
 
 def m_agent():
-    n = L.agent_keys()
-    return n > 0, 'ssh-add -L on hop\'s agent: %s keys' % n
+    st, v = L.agent_probe()
+    if st == 'error':
+        raise HarnessError('the agent probe failed: %s' % v)
+    return st == 'keys', 'ssh-add -L on hop\'s agent: %s (%s)' % (st, v)
 
 
 def m_mcp():
-    """Works when exec on t1 or list_hosts answers; denied only on a real answer from hop mcp
-    (tool errors, no hosts, or hop mcp refusing to start with a reason). An EOF, hang or crash raises."""
+    """Works when exec on t1 runs or list_hosts lists hosts. Denied only on one of hop's
+    own refusals (mcpc.REFUSAL: revoked, locked, offline too long, no vault): both tool
+    calls answer with one, or hop mcp exits with one. Any other answer, an EOF, a hang
+    or a crash raises: it says nothing about access."""
     m = MCP(tag='p5-mcp')
-    nh, st2, text = 0, None, ''
+    nh, lerr, ltext, eerr, st2, etext = 0, None, '', None, None, ''
     if m.healthy:
-        _, st, _ = m.call('list_hosts', {})
+        lerr, st, ltext = m.call('list_hosts', {})
         nh = len((st or {}).get('hosts', []))
     if m.healthy:
-        _, st2, text = m.call('exec', {'hosts': 't1', 'command': 'echo mcp-exec-ok'})
+        eerr, st2, etext = m.call('exec', {'hosts': 't1', 'command': 'echo mcp-exec-ok'})
     m.close()
     tr = m.transport()
     if tr == 'broken':
         raise HarnessError('hop mcp gave no real answer: ' + m.why())
     if tr == 'refused':
-        return False, 'hop mcp refused to start: ' + m.why()
-    ok = 'mcp-exec-ok' in json.dumps(st2)
-    return ok or nh > 0, 'list_hosts %d hosts; exec: %s' % (nh, L.cut((json.dumps(results(st2).get('t1', {}).get('error')) if st2 else text), 200))
+        return False, 'hop mcp exited with hop\'s refusal "%s": %s' % (refusal(m.stderr()), m.why())
+    host = results(st2).get('t1', {})
+    if 'mcp-exec-ok' in (host.get('stdout') or '') or nh > 0:
+        return True, 'list_hosts %d hosts; exec stdout %r' % (nh, L.cut(host.get('stdout') or '', 80))
+    # Not working: only hop's own refusal, in both answers, counts as a denial.
+    ewhy = etext if eerr and not st2 else json.dumps(host.get('error'))
+    lr, er = refusal(ltext) if lerr else '', refusal(ewhy)
+    ev = 'list_hosts isError=%s %s; exec isError=%s %s' % (lerr, L.cut(ltext, 200), eerr, L.cut(ewhy, 200))
+    if lr and er:
+        return False, 'refused: list_hosts "%s", exec "%s"' % (lr, er)
+    raise HarnessError('hop mcp answered, but neither with access nor with one of hop\'s refusals: ' + ev)
 
 
 def m_localb():
@@ -203,14 +227,21 @@ def step_watch(tag, secs):
     end = time.time() + float(secs)
     prev = None
     while time.time() < end:
-        n = L.agent_keys()
+        st, n = L.agent_probe()
+        if st == 'error':
+            # Recorded, never read as "empty": cutoff and nokeys make it a harness failure.
+            out.append({'t': time.time(), 'probe_error': n})
+            L.state_put('watch5-%s' % tag, out)
+            prev = None
+            time.sleep(0.5)
+            continue
         try:
             h = len(re.findall(r'^Host ', open('/home/tester/.ssh/hop/config').read(), re.M))
         except OSError:
             h = -1
         cur = (n, h)
         if cur != prev:
-            out.append({'t': time.time(), 'agent_keys': n, 'config_hosts': h})
+            out.append({'t': time.time(), 'agent_keys': n, 'agent': st, 'config_hosts': h})
             L.state_put('watch5-%s' % tag, out)
             prev = cur
         time.sleep(0.1)
@@ -222,14 +253,19 @@ def first_cut(tl, after):
     for e in tl:
         if e.get('end'):
             break
-        if e['t'] >= after and e['agent_keys'] <= 0:
+        if 'agent_keys' in e and e['t'] >= after and e['agent_keys'] <= 0:
             return e['t']
     return None
 
 
-def step_cutoff(tag, t0, limit, offset='0'):
+def probe_errors(tl):
+    return [e for e in tl if isinstance(e, dict) and 'probe_error' in e]
+
+
+def step_cutoff(tag, t0, limit, offset='0', what='revoke'):
     """t0 is on the clock of the machine that started the change; offset is
-    B's clock minus that clock (measured by the driver), so B's times map back."""
+    B's clock minus that clock (measured by the driver), so B's times map back.
+    what names the moment t0 marks: the revoke, or B's reconnect to the server."""
     t0, limit = float(t0) + float(offset), float(limit)
     name = 'watch5-%s' % tag
 
@@ -240,9 +276,13 @@ def step_cutoff(tag, t0, limit, offset='0'):
         return w if st == 'ok' and (first_cut(w, t0) or (w and w[-1].get('end'))) else None
     got, secs = L.wait_for(ready, limit + 10, 0.5)
     st, tl = L.state_read(name)
-    cid, label = 'B.%s.cutoff' % tag, '%s: hop\'s agent is empty within %ds of the revoke' % (tag, limit)
+    cid, label = 'B.%s.cutoff' % tag, ('%s: hop\'s agent is empty within %ds of the revoke' % (tag, limit) if what == 'revoke' else
+                                       '%s: hop\'s agent is empty within %ds after B reconnects to the server' % (tag, limit))
     if st != 'ok':
         return L.harness(cid, label, 'watch state %s' % st, L.cut(str(tl), 200))
+    pe = probe_errors(tl)
+    if pe:
+        return L.harness(cid, label, '%d agent probes failed during the watch' % len(pe), L.cut(json.dumps(pe[:3]), 600))
     before = [e for e in tl if not e.get('end') and e['t'] < t0]
     if not before or before[-1]['agent_keys'] <= 0:
         # The agent must hold keys before the change, or "empty" proves nothing.
@@ -258,6 +298,7 @@ def step_cutoff(tag, t0, limit, offset='0'):
 def step_unlock_after(tag):
     r = hop('unlock', timeout=40)
     # Sample the agent right after the unlock: a key served even briefly is access.
+    # A probe error raises ProbeError: a harness failure, never "empty".
     samples = []
     end = time.time() + 6
     while time.time() < end:
@@ -315,31 +356,85 @@ def step_nokeys(tag):
     cid, label = 'B.%s.rev2-nokeys' % tag, '%s: the revoked device serves no key at any point, across a daemon restart' % tag
     if st != 'ok' or not tl or not tl[-1].get('end'):
         return L.harness(cid, label, 'watch state %s' % st, L.cut(str(tl), 200))
+    pe = probe_errors(tl)
+    if pe:
+        return L.harness(cid, label, '%d agent probes failed during the watch' % len(pe), L.cut(json.dumps(pe[:3]), 600))
     served = [e for e in tl if not e.get('end') and e['agent_keys'] > 0]
     c(cid, label, not served, '%d samples with keys, first at %s' % (len(served), served[0]['t'] if served else '-'),
-      L.cut(json.dumps(tl[:12]), 600), BUGS['offline'])
+      L.cut(json.dumps(tl[:12]), 600))
 
 
-# ---- max-offline policy (scenario s6)
+# ---- max-offline policy (scenario s6, and off before s3)
 
-def policy_supported():
-    return L.state_get('policy-supported', '') == 'yes'
+def policy_capability():
+    """('yes'|'no'|'error', R): yes when hop auth policy --json answers with max_offline;
+    no only on the exact refusal of a build without the command (exit 255,
+    unknown auth subcommand "policy"); anything else is a failed detection."""
+    r = hop('auth', 'policy', '--json', timeout=30)
+    j = r.json()
+    if r.rc == 0 and isinstance(j, dict) and isinstance(j.get('max_offline'), int):
+        return 'yes', r
+    if r.rc == 255 and 'unknown auth subcommand "policy"' in r.err:
+        return 'no', r
+    return 'error', r
+
+
+def policy_state():
+    """What policy-seen found on B: yes, no (confirmed absent), or error/missing."""
+    return L.state_get('policy-supported', '') or 'missing'
+
+
+def policy_gate(cid, label, extra=()):
+    """True when the policy checks can run; else records a skip (confirmed absent)
+    or a harness failure (detection failed) for cid and every id in extra."""
+    st = policy_state()
+    if st == 'yes':
+        return True
+    for i in (cid,) + tuple(extra):
+        if st == 'no':
+            skip(i, label, 'confirmed absent: this build has no hop auth policy')
+        else:
+            L.harness(i, label, 'not judged: the policy detection failed (%s)' % st)
+    return False
 
 
 def step_policy(val):
     """On A: hop auth policy --max-offline <val>."""
+    cap, rd = policy_capability()
+    cid = 'A.rev2-policy-set-%s' % val
+    if cap == 'no':
+        return skip(cid, 'hop auth policy --max-offline %s' % val, 'confirmed absent: ' + L.cut(rd.all.strip(), 200))
+    if cap == 'error':
+        return L.harness(cid, 'hop auth policy --max-offline %s' % val, 'detection failed: hop auth policy --json gave no valid answer',
+                         rd.ev('auth policy --json'))
     r = hop('auth', 'policy', '--max-offline', val, '--json', timeout=60)
-    if r.rc != 0 and 'unknown' in r.all.lower():
-        return skip('A.rev2-policy-set-%s' % val, 'hop auth policy --max-offline %s' % val, 'not in this build: ' + L.cut(r.all.strip(), 200))
-    c('A.rev2-policy-set-%s' % val, 'hop auth policy --max-offline %s on A' % val, r.rc == 0, '', r.ev('auth policy'))
+    c(cid, 'hop auth policy --max-offline %s on A' % val, r.rc == 0, '', r.ev('auth policy'))
+
+
+def step_policy_off():
+    """On B before s3: the policy explicitly off (max_offline 0), so the offline
+    scenario runs under the documented default."""
+    cid, label = 'B.policy-off', 'before s3, B reads the max-offline policy as off (max_offline 0)'
+    cap, rd = policy_capability()
+    if cap == 'no':
+        return skip(cid, label, 'confirmed absent: no hop auth policy in this build, so nothing can lock an offline device')
+    if cap == 'error':
+        return L.harness(cid, label, 'detection failed: hop auth policy --json gave no valid answer', rd.ev('auth policy --json'))
+    r = hop('auth', 'policy', '--max-offline', 'off', '--json', timeout=60)
+    got, t = L.wait_for(lambda: (hop('auth', 'policy', '--json', timeout=30).json() or {}).get('max_offline') == 0, 30, 2)
+    if r.rc != 0 or not got:
+        return L.harness(cid, label, 'prerequisite of s3: the policy did not read 0 on B after %.0fs' % t, r.ev('auth policy --max-offline off'))
+    c(cid, label, True, 'set on B; read back 0 after %.0fs' % t)
 
 
 def step_policy_seen(want):
-    r = hop('auth', 'policy', '--json', timeout=30)
-    if r.rc != 0 and 'unknown' in r.all.lower():
-        L.state_put('policy-supported', 'no')
-        return skip('B.rev2-policy-seen', 'the max-offline policy syncs to B', 'not in this build: ' + L.cut(r.all.strip(), 200))
-    L.state_put('policy-supported', 'yes')
+    cap, rd = policy_capability()
+    L.state_put('policy-supported', cap)
+    if cap == 'no':
+        return skip('B.rev2-policy-seen', 'the max-offline policy syncs to B', 'confirmed absent: ' + L.cut(rd.all.strip(), 200))
+    if cap == 'error':
+        return L.harness('B.rev2-policy-seen', 'the max-offline policy syncs to B', 'detection failed: hop auth policy --json gave no valid answer',
+                         rd.ev('auth policy --json'))
     want = int(want)
 
     def seen():
@@ -358,8 +453,8 @@ def vault_locked():
 
 def step_policy_idle(secs):
     """A healthy, idle B (server reachable) with a 1m policy never locks: sample for secs."""
-    if not policy_supported():
-        return skip('B.rev2-policy-idle', 'a healthy idle device with a 1m policy does not lock', 'no max-offline policy in this build')
+    if not policy_gate('B.rev2-policy-idle', 'a healthy idle device with a 1m policy does not lock'):
+        return
     if not L.server_reachable(URL, 3):
         return L.harness('B.rev2-policy-idle', 'a healthy idle device with a 1m policy does not lock', 'B does not reach the server')
     hop('unlock', timeout=40)
@@ -383,8 +478,8 @@ def step_policy_idle(secs):
 
 def step_policy_offline(secs):
     """B is blocked from the server: within secs it locks, empties the agent, and refuses hop unlock."""
-    if not policy_supported():
-        return skip('B.rev2-policy-lock', 'a device offline longer than the policy locks', 'no max-offline policy in this build')
+    if not policy_gate('B.rev2-policy-lock', 'a device offline longer than the policy locks', ('B.rev2-policy-unlock',)):
+        return
     t0 = time.time()
 
     def locked():
@@ -401,8 +496,8 @@ def step_policy_offline(secs):
 
 def step_policy_clear(secs):
     """B reaches the server again: a contact clears the lock (hop unlock works, keys back)."""
-    if not policy_supported():
-        return skip('B.rev2-policy-clear', 'a contact clears the max-offline lock', 'no max-offline policy in this build')
+    if not policy_gate('B.rev2-policy-clear', 'a contact clears the max-offline lock'):
+        return
     t0, last = time.time(), None
     while time.time() - t0 < float(secs):
         last = hop('unlock', timeout=40)
@@ -440,15 +535,15 @@ def step_sessions_start():
 def step_sessions_end(tag):
     L.wait_for(lambda: not root('pgrep -u tester -f "seq 1 45"').out.strip(), 70, 2)
     o = {n: open('/var/e2e/state/%s.out' % n).read() for n in SESSIONS}
-    cid, label = 'B.%s.open-sessions' % tag, '%s: sessions open at the revoke are ended (hop exec and plain ssh)' % tag
+    cid, label = 'B.%s.open-sessions' % tag, '%s: sessions open at the revoke keep running to their end (hop exec and plain ssh), as documented' % tag
     _, pre = L.state_read('sessions-start')
     connected = (pre or {}).get('connected') or []
     if sorted(connected) != sorted(SESSIONS):
         return L.harness(cid, label, 'prerequisite: not every session was running before the revoke (connected: %s)' % connected,
                          '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items()))
     survived = [n for n, s in o.items() if 'tick 45' in s]
-    c(cid, label, not survived,
-      'ran to the end: %s' % survived, '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items()), 'r2-gap4')
+    L.limit(cid, label, sorted(survived) == sorted(SESSIONS), 'ran to the end: %s' % survived,
+            '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items()), 'r2-gap4', REF_SESSIONS)
 
 
 def step_block(on):
@@ -466,15 +561,24 @@ def step_block(on):
                   'rules that failed: %s; server reachable: %s' % (bad, reach))
 
 
-def step_daemon_restart(tag):
+def step_daemon_restart(tag, expect='cut'):
+    """expect work: B is offline, and the README says the keys load after the check
+    with the server is skipped (about 3 s), and hop status says it was skipped.
+    expect cut: B has reconnected and was cut off; a restart must not undo that."""
     hop('daemon', 'stop')
     time.sleep(1)
     hop('ls')
     if not cut_prereq('B.%s.restart' % tag, tag):
         return
     works = working(METHODS[:3])
-    c('B.%s.restart' % tag, '%s: after a daemon restart, the revoked device has no access' % tag, not works,
-      'working: %s' % works, '', BUGS['offline'])
+    if expect == 'work':
+        c('B.%s.restart' % tag, '%s: after a daemon restart while offline, hop exec, hop <target> and plain ssh still work (documented offline behaviour)' % tag,
+          len(works) == 3, 'working: %s' % works)
+        sync = (L.status_json() or {}).get('sync') or {}
+        c('B.%s.check-skipped' % tag, '%s: hop status says the check with the server was skipped at the start' % tag,
+          bool(sync.get('check_skipped')), 'check_skipped %r' % sync.get('check_skipped'), L.cut(json.dumps(sync), 400))
+    else:
+        c('B.%s.restart' % tag, '%s: after a daemon restart, the revoked device has no access' % tag, not works, 'working: %s' % works)
 
 
 def step_stopped(tag):
@@ -585,7 +689,7 @@ STEPS = {'localb-setup': step_localb_setup, 'ensure-t1': step_ensure_t1, 'b-wait
          'daemon-restart': step_daemon_restart, 'stopped': step_stopped, 'start-window': step_start_window,
          'inventory': step_inventory, 'relogin': step_relogin, 'device-id': step_device_id, 'wiped': step_wiped,
          'nokeys': step_nokeys, 'policy': step_policy, 'policy-seen': step_policy_seen, 'policy-idle': step_policy_idle,
-         'policy-offline': step_policy_offline, 'policy-clear': step_policy_clear}
+         'policy-offline': step_policy_offline, 'policy-clear': step_policy_clear, 'policy-off': step_policy_off}
 
 if __name__ == '__main__':
     name = sys.argv[1]

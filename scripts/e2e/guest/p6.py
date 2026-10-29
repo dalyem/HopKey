@@ -8,14 +8,20 @@ One key, rotkey, is used by six host records:
   r-t2   T2 deploy                                    rotated
   r-t2in deploy2 on T2's loopback sshd, jump host t2  rotated
   r-t3   T3 deploy; T3's sshd takes only the lines    failed and put back
-         it had before the rotation (AuthorizedKeysCommand on a snapshot)
+         it had before the rotation (AuthorizedKeysCommand on a snapshot; the hook logs
+         each offered key's fingerprint and whether the live file holds it, so the
+         rollback is proven: new key installed, offered, refused, file put back)
   rb     CLI-B user rot, line 'from="<A>" <key>'      rotated; from= carried over, so B is refused
-A second key, rotkey2, is on r-cc (T1 deploy2) for the concurrent-edit check.
+A second key, rotkey2, is on r-cc (T1 deploy2) for the concurrent-edit check:
+T1 appends tagged lines on a coordinated start while A rotates, and judge-cc
+proves on one clock (T1's, mapped to A's with a measured offset) that appends
+landed inside the rotation, then compares the exact tagged lines.
 
 Steps: supported | keys | b-target <a-ip> | hosts | b-wait | dry-run | rotate |
-       judge <before-suffix> <after-suffix> <label> | after-a | after-b | cc | judge-cc <manual-lines>
-The driver copies the targets' authorized_keys (public data) to
-/var/e2e/state/ak/<target>.<suffix> before each judge step.
+       judge <before-suffix> <after-suffix> <label> | judge-rollback | after-a | after-b |
+       cc <round> <start-epoch> | judge-cc <round> <appended> <interval>
+The driver copies the targets' authorized_keys (public data), T3's hook log and
+T1's append log to /var/e2e/state/ak/ before each judge step.
 """
 import json
 import os
@@ -25,7 +31,7 @@ import sys
 import time
 
 import e2elib as L
-from e2elib import check as c, hop, root, ssh, skip
+from e2elib import check as c, has, hop, root, ssh, skip
 
 M = L.MACHINE
 E = L.env_get
@@ -106,11 +112,20 @@ def refused(r):
 
 
 def step_supported():
+    """rot-supported: yes (the help of hop key rotate), no (only the exact refusal of a
+    build without it: exit 255, unknown key subcommand "rotate"), or error: anything
+    else is a failed detection, a harness failure, never a skip."""
     r = hop('key', 'rotate', '--help', timeout=20)
-    ok = 'dry-run' in r.all and 'unknown key subcommand' not in r.all
-    L.state_put('rot-supported', 'yes' if ok else 'no')
-    if not ok:
-        skip('A.rot-supported', 'this build has hop key rotate', 'not in this build: ' + L.cut(r.all.strip(), 200))
+    label = 'this build has hop key rotate'
+    if r.rc == 0 and has(r.all, 'usage: hop key rotate', '-dry-run', '-new-key'):
+        L.state_put('rot-supported', 'yes')
+    elif r.rc == 255 and 'unknown key subcommand "rotate"' in r.err:
+        L.state_put('rot-supported', 'no')
+        skip('A.rot-supported', label, 'confirmed absent: ' + L.cut(r.all.strip(), 200))
+    else:
+        L.state_put('rot-supported', 'error')
+        L.harness('A.rot-supported', label, 'detection failed: neither the help of hop key rotate nor the refusal of a build without it',
+                  r.ev('hop key rotate --help'))
 
 
 def step_keys():
@@ -239,6 +254,9 @@ def step_rotate():
     c('A.rot-rollback-status', 'r-t3, whose sshd refuses the new key, fails and is put back (remote_state unchanged)',
       t3.get('status') == 'failed' and t3.get('remote_state') == 'unchanged', 'status %s, remote_state %s: %s' % (
           t3.get('status'), t3.get('remote_state'), t3.get('reason', '')))
+    reason = t3.get('reason') or ''
+    c('A.rot-rollback-stage', 'r-t3 fails at the login with the new key (README step 3), and the report says it was put back',
+      'the new key did not log in' in reason and 'Permission denied' in reason and 'put back' in reason, 'reason: %s' % reason)
     c('A.rot-exit', 'hop key rotate exits non-zero because a host failed', r.rc != 0 and j.get('ok') is False, 'rc %d, ok %s' % (r.rc, j.get('ok')))
     hs = L.hosts() or {}
     point = {n: key_of(hs, n) for n in HOSTS}
@@ -345,7 +363,11 @@ def step_after_b():
     c('B.rot-records', 'B\'s records of the rotated hosts point at the new key, with nothing done on B', bool(newname) and bool(got),
       'after %.0fs: %s' % (secs, {n: key_of(L.hosts(), n) for n in ROTATED}))
     agent = L.run_as('tester', ['ssh-add', '-L'], 15, env={'SSH_AUTH_SOCK': '/run/user/%d/hop/agent.sock' % pwd.getpwnam('tester').pw_uid})
-    c('B.rot-agent', 'B\'s agent serves the new key', bool(newb) and newb in agent.out, '%d keys' % agent.out.count('ssh-'))
+    pst, pv = L.agent_probe()
+    if pst == 'error':
+        L.harness('B.rot-agent', 'B\'s agent serves the new key', 'the agent probe failed: %s' % pv)
+    else:
+        c('B.rot-agent', 'B\'s agent serves the new key', bool(newb) and newb in agent.out, '%s, %s keys' % (pst, pv))
     bad = []
     for n in ('r-t1', 'r-t2', 'r-t2in'):
         r = hop('exec', n, '--', 'echo', 'b-new-ok', timeout=60)
@@ -359,50 +381,120 @@ def step_after_b():
       'b-rb-SHOULD-FAIL' not in r.out and refused(r), '', r.ev('exec rb'))
 
 
-def step_cc(rnd):
-    """Rotate whatever key r-cc uses now, while the driver appends lines on T1."""
+HOOK_RX = re.compile(r'^(?P<t>[0-9.]+) user=(?P<user>\S+) fp=(?P<fp>\S+) live_has=(?P<live>[01]) snap_has=(?P<snap>[01]) live_sum=(?P<sum>\S*)$')
+
+
+def step_judge_rollback():
+    """T3's AuthorizedKeysCommand logged every key sshd was offered for deploy, whether
+    the live authorized_keys held it then, and whether the snapshot sshd answers with
+    did. A real rollback shows the new key offered while installed in the live file,
+    refused (not in the snapshot), and the file byte-identical afterwards."""
+    cid, label = 'A.rot-rollback-proof', ('r-t3: the new key was installed, offered and refused by sshd while installed, '
+                                          'and the file was put back after that probe')
+    res = (L.state_get('rot-result.json', {}) or {}).get('json') or {}
+    k, rows = host_rows(res, KEY)
+    newfp = (k or {}).get('new_fingerprint') or ''
+    oldfp = (k or {}).get('fingerprint') or ''
+    newb = blob(L.state_get('rot-newpub', '') or '')
+    try:
+        lines = open(AK + '/t3-hook.log').read().splitlines()
+        after = open(AK + '/t3-deploy.after').read()
+    except OSError as e:
+        return L.harness(cid, label, 'no copy of the hook log or the file: %s' % e)
+    ents = [m.groupdict() for m in map(HOOK_RX.match, lines) if m]
+    if not ents or len(ents) != len([l for l in lines if l.strip()]) or not newfp or not oldfp or not newb:
+        return L.harness(cid, label, 'instrumentation: %d hook lines, %d parsed; new fingerprint %r, old %r, new key known: %s' % (
+            len(lines), len(ents), newfp, oldfp, bool(newb)), L.cut('\n'.join(lines[-10:]), 800))
+    olds = [e for e in ents if e['fp'] == oldfp]
+    if not any(e['snap'] == '1' for e in olds):
+        # The control: the hook saw the old key that logs in, and answered with it.
+        return L.harness(cid, label, 'control: the hook never saw the old key offered and accepted', L.cut('\n'.join(lines[-10:]), 800))
+    probes = [e for e in ents if e['fp'] == newfp]
+    installed = [e for e in probes if e['live'] == '1' and e['snap'] == '0']
+    restored = newb not in after
+    c(cid, label, bool(installed) and restored,
+      'new key offered %d times, %d while installed in the live file and absent from the snapshot sshd uses; after the run the file %s the new key' % (
+          len(probes), len(installed), 'lacks' if restored else 'still holds'), L.cut('\n'.join(lines[-12:]), 1000))
+
+
+def step_cc(rnd, start):
+    """Rotate whatever key r-cc uses now, starting at start + 2 s on A's clock: the
+    appender on T1 starts at start on its own, so the rotation runs among its writes."""
     hs = L.hosts() or {}
     key = key_of(hs, 'r-cc')
     old = ((keys() or {}).get(key) or {}).get('public_key', '')
+    while time.time() < float(start) + 2:
+        time.sleep(0.05)
     t0 = time.time()
     r, j = rotate(key, timeout=300)
+    t1 = time.time()
     k, rows = host_rows(j, key)
     h = rows.get('r-cc', {})
-    L.state_put('rot-cc-%s.json' % rnd, {'rc': r.rc, 't0': t0, 't1': time.time(), 'key': key, 'old': old, 'status': h.get('status'),
+    L.state_put('rot-cc-%s.json' % rnd, {'rc': r.rc, 't0': t0, 't1': t1, 'key': key, 'old': old, 'status': h.get('status'),
                                          'remote_state': h.get('remote_state'), 'reason': h.get('reason'),
                                          'new': ((keys() or {}).get((k or {}).get('new_key') or '') or {}).get('public_key', '')})
 
 
 def step_judge_cc(rnd, manual, interval):
-    manual = int(manual)
-    st = L.state_get('rot-cc-%s.json' % rnd, {}) or {}
+    """Every line T1 appended (counter n, T1's time) must be in the file exactly once,
+    at least one append must have landed inside the rotation (on A's clock, with the
+    measured T1-A offset and its uncertainty), and the host must end rotated or put back."""
     cid, label = 'A.rot-concurrent-%s' % rnd, 'lines appended every %ss during a rotation are all kept, and the host ends rotated or put back' % interval
+    st = L.state_get('rot-cc-%s.json' % rnd, {}) or {}
     try:
+        manual = int(manual)
         before = open('%s/t1-deploy2.cc-%s-before' % (AK, rnd)).read()
         after = open('%s/t1-deploy2.cc-%s-after' % (AK, rnd)).read()
-    except OSError as e:
-        return L.harness(cid, label, 'no copy of the file: %s' % e)
+        alog = open('%s/t1-append-%s.log' % (AK, rnd)).read().split()
+        bk = open(L.STATE + '/bkey.pub').read().split()
+    except (OSError, ValueError) as e:
+        return L.harness(cid, label, 'no copy of the files: %s' % e)
+    clk = L.state_get('t1clock-%s' % rnd) or {}
+    if manual <= 0:
+        return L.harness(cid, label, 'the appender on T1 wrote nothing: nothing to judge')
+    if not isinstance(clk, dict) or not isinstance(clk.get('offset'), (int, float)):
+        return L.harness(cid, label, 'no T1-A clock offset measured: %r' % clk)
+    ts = {}
+    for i in range(0, len(alog) - 1, 2):
+        try:
+            ts[int(alog[i])] = float(alog[i + 1])
+        except ValueError:
+            pass
+    if sorted(ts) != list(range(1, manual + 1)):
+        return L.harness(cid, label, 'the append log does not hold appends 1..%d: %s' % (manual, sorted(ts)[:12]))
+    if not isinstance(st.get('t0'), (int, float)) or not isinstance(st.get('t1'), (int, float)):
+        return L.harness(cid, label, 'no rotation window recorded', L.cut(json.dumps(st), 300))
+    off, unc = clk['offset'], clk.get('rtt', 0) / 2 + 0.05
+    t0, t1 = st['t0'], st['t1']
+    on_a = {n: t - off for n, t in ts.items()}  # T1 minus A: T1's times on A's clock
+    during = sorted(n for n, t in on_a.items() if t0 + unc <= t <= t1 - unc)
+    window = 'rotation %.2fs on A; appends from %+.2fs to %+.2fs of its start (T1-A offset %.3fs +- %.3fs)' % (
+        t1 - t0, min(on_a.values()) - t0, max(on_a.values()) - t0, off, unc)
+    if not during:
+        return L.harness(cid, label, 'no append landed inside the rotation, so it proves nothing: ' + window)
     lines = after.split('\n')
     tag = 'hk-e2e-manual-%s-' % rnd
-    kept = sum(1 for l in lines if tag in l)
-    others_b = [l for l in before.split('\n') if split_line(l) is None or split_line(l)[1] != blob(st.get('old'))]
+    want = ['%s %s %s%d' % (bk[0], bk[1], tag, n) for n in range(1, manual + 1)]
+    counts = {w: lines.count(w) for w in want}
+    wrong = {w.rsplit(' ', 1)[1]: n for w, n in counts.items() if n != 1}
+    extra = [l for l in lines if tag in l and l not in want]
     oldb, newb = blob(st.get('old') or ''), blob(st.get('new') or '')
+    others_b = [l for l in before.split('\n') if split_line(l) is None or split_line(l)[1] != oldb]
     has_old = any((split_line(l) or ('', ''))[1] == oldb for l in lines)
     has_new = bool(newb) and any((split_line(l) or ('', ''))[1] == newb for l in lines)
     lost = [l for l in others_b if l and l not in lines]
     status = st.get('status')
     consistent = (status == 'rotated' and has_new and not has_old) or (status == 'failed' and has_old and not has_new)
-    secs = (st.get('t1') or 0) - (st.get('t0') or 0)
-    if manual == 0:
-        return skip(cid, label, 'the appender on T1 wrote nothing')
-    c(cid, label, kept == manual and consistent and not lost, 'rotation of %s %s (%s) in %.1fs; %d of %d appended lines kept; earlier lines lost: %d; '
-      'old key line %s, new key line %s; %s' % (st.get('key'), status, st.get('remote_state'), secs, kept, manual, len(lost), has_old, has_new,
-                                                 st.get('reason') or ''), after)
+    c(cid, label, not wrong and not extra and consistent and not lost,
+      'rotation of %s %s (%s); %d appends, %d inside the rotation (#%s); tagged lines not exactly once: %s; unexpected tagged lines: %d; '
+      'earlier lines lost: %d; old key line %s, new key line %s; %s; %s' % (
+          st.get('key'), status, st.get('remote_state'), manual, len(during), ','.join(map(str, during[:10])), wrong or 'none', len(extra),
+          len(lost), has_old, has_new, window, st.get('reason') or ''), after)
 
 
 STEPS = {'supported': step_supported, 'keys': step_keys, 'b-target': step_b_target, 'hosts': step_hosts, 'b-wait': step_b_wait,
          'dry-run': step_dry_run, 'rotate': step_rotate, 'judge': step_judge, 'after-a': step_after_a, 'after-b': step_after_b,
-         'cc': step_cc, 'judge-cc': step_judge_cc}
+         'cc': step_cc, 'judge-cc': step_judge_cc, 'judge-rollback': step_judge_rollback}
 
 if __name__ == '__main__':
     os.makedirs(AK, exist_ok=True)

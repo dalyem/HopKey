@@ -15,7 +15,7 @@ apt-get install -y -q openssh-server curl ca-certificates iproute2 procps >/dev/
 command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh || { mark fail-ts; exit 1; }
 mkdir -p /run/sshd /run/tailscale /var/lib/tailscale
 # A phase 6 left by an earlier run (--reuse): put sshd_config back.
-[ -f /etc/ssh/sshd_config.hk-e2e-orig ] && mv /etc/ssh/sshd_config.hk-e2e-orig /etc/ssh/sshd_config && rm -rf /etc/ssh/hk-e2e-ak && { pgrep -x sshd >/dev/null && kill -HUP "$(cat /run/sshd.pid)"; }
+[ -f /etc/ssh/sshd_config.hk-e2e-orig ] && mv /etc/ssh/sshd_config.hk-e2e-orig /etc/ssh/sshd_config && rm -rf /etc/ssh/hk-e2e-ak /usr/local/sbin/hk-e2e-ak && { pgrep -x sshd >/dev/null && kill -HUP "$(cat /run/sshd.pid)"; }
 rm -f /var/e2e/append-*.done
 for u in deploy deploy2; do id "$u" >/dev/null 2>&1 || useradd -m -s /bin/bash "$u"; done
 # sshd refuses an account with a locked password even for keys under PAM-less setups.

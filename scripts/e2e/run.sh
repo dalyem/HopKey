@@ -20,7 +20,11 @@
 # Output: e2e-out/<run-id>/REPORT.md and results.jsonl. A run ID is used once.
 # Exit: 0 every check passed; 1 assertion failures; 2 harness failure (setup,
 # collection, masking, a release); 3 missing coverage (a selected phase or step
-# did not finish); 128+n interrupted by signal n.
+# did not finish); 128+n interrupted by signal n, whatever the verdict (the
+# report notes the signal, and its verdict covers only what ran). Checks with
+# status "limit" (a documented limit that holds as documented) never count.
+# The cleanup (auth key deletion, release, the check that every machine is
+# gone) is recorded as phase 0 checks, and REPORT.md is written after it.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -142,7 +146,7 @@ log "run $RUN, phases $PHASES, output $OUT${SOURCE:+, building from $SOURCE}"
 
 # ------------------------------------------------------------------ machines
 
-A="" B="" T1="" T2="" T3="" PUBLISHED=0
+A="" B="" T1="" T2="" T3="" PUBLISHED=0 T3_SETUP=0
 MACH=$OUT/machines.env
 save_machines() { printf 'A=%s\nB=%s\nT1=%s\nT2=%s\nT3=%s\n' "$A" "$B" "$T1" "$T2" "$T3" >"$MACH"; }
 
@@ -324,12 +328,19 @@ reconcile_allocs() {
 key_copied() { echo "key $1 $2 $3" >>"$ALLOC"; } # vm|sbx id path
 delete_keys() {
 	local kind m path st left=0
+	local i
 	while read -r _ kind m path; do
-		if [ "$kind" = vm ]; then
-			st=$(vx "$m" "rm -f $path; test -e $path && echo present || echo gone" | tr -d '[:space:]')
-		else
-			st=$(sx "$m" "rm -f $path; test -e $path && echo present || echo gone" | tr -d '[:space:]')
-		fi
+		# An empty answer is kiln's exec failing, not the machine's: ask again.
+		for i in 1 2 3; do
+			if [ "$kind" = vm ]; then
+				st=$(vx "$m" "rm -f $path; test -e $path && echo present || echo gone" </dev/null | tr -d '[:space:]')
+			else
+				st=$(sx "$m" "rm -f $path; test -e $path && echo present || echo gone" </dev/null | tr -d '[:space:]')
+			fi
+			case $st in gone | present) break ;; esac
+			log "no answer from $m about $path (try $i)"
+			sleep 3
+		done
 		if [ "$st" = gone ]; then
 			log "auth key gone from $m:$path"
 		else
@@ -341,14 +352,24 @@ delete_keys() {
 }
 RELEASE_FAIL=0
 release_all() {
-	local kind who id i
+	local kind who id i ok
 	while read -r kind who id; do
-		case $kind in
-		vm) for i in 1 2 3; do setsid -w kiln vm release "$id" >>"$DLOG" 2>&1 && break; sleep 5; done ;;
-		sbx) for i in 1 2 3; do setsid -w kiln sandbox destroy "$id" >>"$DLOG" 2>&1 && break; sleep 5; done ;;
-		*) continue ;;
-		esac
-		log "release $kind $who $id: try $i"
+		ok=0
+		for i in 1 2 3; do
+			case $kind in
+			vm) setsid -w kiln vm release "$id" >>"$DLOG" 2>&1 && { ok=1; break; } ;;
+			sbx) setsid -w kiln sandbox destroy "$id" >>"$DLOG" 2>&1 && { ok=1; break; } ;;
+			*) continue 2 ;;
+			esac
+			sleep 5
+		done
+		log "release $kind $who $id: $([ $ok = 1 ] && echo "done on try $i" || echo "failed 3 times")"
+		if [ $ok = 1 ]; then
+			dcheck 0 "cleanup.release-$who" "$kind $who ($id) is released" pass "try $i"
+		else
+			dcheck 0 "harness.release-$who" "$kind $who ($id) is released" fail "kiln refused 3 times; see driver.log" harness
+			RELEASE_FAIL=1
+		fi
 	done < <(ledger | sort -u)
 	# Released machines are no ledger for a later --reuse. Only a run that held
 	# machines marks anything: a refused --reuse never marks the ledger it was refused.
@@ -359,8 +380,9 @@ release_all() {
 }
 verify_released() { # every machine of this run is gone; warns about other live ones made since the start
 	local v s rc
-	v=$(kiln vm list --json 2>>"$DLOG") || { log "WARNING: kiln vm list failed"; RELEASE_FAIL=1; return; }
-	s=$(kiln sandbox list --json 2>>"$DLOG") || { log "WARNING: kiln sandbox list failed"; RELEASE_FAIL=1; return; }
+	local label="every machine of this run is gone (kiln vm list, kiln sandbox list)"
+	v=$(kiln vm list --json 2>>"$DLOG") || { dcheck 0 harness.verify-released "$label" fail "kiln vm list failed" harness; RELEASE_FAIL=1; return; }
+	s=$(kiln sandbox list --json 2>>"$DLOG") || { dcheck 0 harness.verify-released "$label" fail "kiln sandbox list failed" harness; RELEASE_FAIL=1; return; }
 	python3 -I - "$(ledger | awk '{print $3}' | tr '\n' ' ')" "$T_START" "$v" "$s" <<'EOF' >>"$DLOG"
 import datetime, json, sys
 t0 = int(sys.argv[2])
@@ -396,7 +418,12 @@ sys.exit(1 if ours_live or missing else 0)
 EOF
 	rc=${PIPESTATUS[0]}
 	grep -E "^(machines of this run|WARNING)" "$DLOG" | tail -2 >&2 2>/dev/null
-	[ "$rc" = 0 ] || RELEASE_FAIL=1
+	if [ "$rc" = 0 ]; then
+		dcheck 0 cleanup.verify-released "$label" pass "$(grep '^machines of this run' "$DLOG" | tail -1)"
+	else
+		dcheck 0 harness.verify-released "$label" fail "$(grep '^machines of this run' "$DLOG" | tail -1)" harness
+		RELEASE_FAIL=1
+	fi
 }
 stop_bg() { # stop setup jobs still running against the machines
 	local p
@@ -467,21 +494,28 @@ cleanup() {
 	stop_bg
 	reconcile_allocs
 	save_machines
-	delete_keys
+	# A phase 6 that stopped early, or an interrupt, can leave T3's sshd on the test hook.
+	[ "$T3_SETUP" = 1 ] && [ "$HURRY" = 0 ] && t3_restore
+	if delete_keys && grep -q '^key ' "$ALLOC"; then
+		dcheck 0 cleanup.authkeys "the Tailscale auth key is deleted from every machine it was copied to" pass "$(grep -c '^key ' "$ALLOC") copies"
+	fi
 	if [ "$SETUP_STARTED" = 1 ]; then
 		log "collecting results"
 		collect
 	fi
-	rm -f "$OUT/verdict"
-	python3 -I "$HERE/report.py" "$OUT" "$RUN" "$PHASES" "$T_START" "$(date +%s)" "$MACH" >>"$DLOG" 2>&1 || log "report.py failed"
-	code=$(cat "$OUT/verdict" 2>/dev/null || echo 2)
 	if [ "$KEEP" = 1 ]; then
 		log "--keep: machines left up: CLI-A $A, CLI-B $B, T1 $T1, T2 $T2, T3 $T3 (release with kiln vm release / kiln sandbox destroy)"
+		dcheck 0 cleanup.release "the machines of this run are released" skip "--keep: left up: CLI-A $A, CLI-B $B, T1 $T1, T2 $T2, T3 $T3"
 	else
 		release_all
 		verify_released
 	fi
 	[ "$PUBLISHED" = 1 ] && kiln unpublish --project "$REPO" >>"$DLOG" 2>&1
+	[ "$INTERRUPTED" != 0 ] && echo "$INTERRUPTED" >"$OUT/interrupted"
+	# The report comes last, so it holds every cleanup outcome.
+	rm -f "$OUT/verdict"
+	python3 -I "$HERE/report.py" "$OUT" "$RUN" "$PHASES" "$T_START" "$(date +%s)" "$MACH" >>"$DLOG" 2>&1 || log "report.py failed"
+	code=$(cat "$OUT/verdict" 2>/dev/null || echo 2)
 	rm -rf "$OUT/tmp" "$SECTMP"
 	[ "$RELEASE_FAIL" = 1 ] && [ "$code" -lt 2 ] && code=2
 	[ "$INTERRUPTED" != 0 ] && code=$((128 + INTERRUPTED))
@@ -1037,10 +1071,10 @@ try: print(json.load(sys.stdin)["t"])
 except Exception: print("")'
 	}
 	relogin() { copy_secret kit "$A" "$B" || return 1; vrun "$B" 5 relogin 300 $(py p5.py) relogin "$1"; }
-	# cutoff tag t0 limit offset: t0 empty means the change never started
+	# cutoff tag t0 limit offset [revoke|reconnect]: t0 empty means the change never started
 	cutoff() {
-		if [ -z "$2" ]; then dcheck 5 "harness.cutoff-$1" "$1: the revoke started" fail "no start time" harness; return 1; fi
-		vrun "$B" 5 cutoff 60 $(py p5.py) cutoff "$1" "$2" "$3" "$4"
+		if [ -z "$2" ]; then dcheck 5 "harness.cutoff-$1" "$1: the ${5:-revoke} has a start time" fail "no start time" harness; return 1; fi
+		vrun "$B" 5 cutoff 60 $(py p5.py) cutoff "$1" "$2" "$3" "$4" "${5:-revoke}"
 	}
 
 	# B1: online and idle.
@@ -1067,12 +1101,15 @@ except Exception: print("")'
 	vrun "$B" 5 inventory 120 $(py p5.py) inventory s2-session
 	relogin cli-r3 || return 1
 
-	# B3: offline during the revoke.
+	# B3: offline during the revoke. Documented (README, What revocation does, Offline):
+	# with the max-offline policy off, its default, a device that cannot reach the
+	# server keeps working, across a daemon restart too, and is cut off once it reconnects.
+	vrun "$B" 5 policy-off 90 $(py p5.py) policy-off
 	vrun "$B" 5 block 30 $(py p5.py) block 1
 	t0=$(revoke 3)
 	sleep 15
-	vrun "$B" 5 access 240 $(py p5.py) access s3-offline cut r2-P2-1
-	vrun "$B" 5 daemon-restart 120 $(py p5.py) daemon-restart s3-offline
+	vrun "$B" 5 access 240 $(py p5.py) access s3-offline work
+	vrun "$B" 5 daemon-restart 120 $(py p5.py) daemon-restart s3-offline work
 	tw=$(vjob "$B" 5 watch $(py p5.py) watch s3u 150)
 	sleep 2
 	vrun "$B" 5 block 30 $(py p5.py) block 0
@@ -1080,13 +1117,13 @@ except Exception: print("")'
 	t0=$(vx "$B" "cat /var/e2e/state/block-0 2>/dev/null" | python3 -I -c 'import json,sys
 try: print(json.load(sys.stdin)["t"])
 except Exception: print("")')
-	cutoff s3u "$t0" 120 0
+	cutoff s3u "$t0" 120 0 reconnect
 	vfinish "$B" "$tw" 5 watch 180
 	vrun "$B" 5 access 240 $(py p5.py) access s3-reconnected cut
 	# Cut off once it reconnects, it stays cut off across a daemon restart, never serving a key.
 	tw=$(vjob "$B" 5 watch $(py p5.py) watch rev2-s3r 40)
 	sleep 2
-	vrun "$B" 5 daemon-restart 120 $(py p5.py) daemon-restart rev2-s3-reconnected
+	vrun "$B" 5 daemon-restart 120 $(py p5.py) daemon-restart rev2-s3-reconnected cut
 	vfinish "$B" "$tw" 5 watch 90
 	vrun "$B" 5 nokeys 30 $(py p5.py) nokeys rev2-s3r
 	vrun "$B" 5 inventory 120 $(py p5.py) inventory s3-offline
@@ -1165,6 +1202,7 @@ rot_targets() { # rotkey's lines on T1-T3, other lines that must survive, and T3
 		kiln sandbox write "$T3" /var/e2e/ak-add --from-file "$OUT/tmp/ak-t3" >>"$DLOG" 2>&1 &&
 		kiln sandbox write "$T3" /var/e2e/rot-t3.sh --from-file "$HERE/guest/rot-t3.sh" >>"$DLOG" 2>&1 ||
 		{ dcheck 6 harness.rot-targets "the rotation fixtures are written to T1-T3" fail "kiln sandbox write failed" harness; return 1; }
+	T3_SETUP=1 # from here on, T3's sshd may run the test hook: phase6 and cleanup put it back
 	r=$(sx "$T1" "cat /var/e2e/ak-add >> /home/deploy/.ssh/authorized_keys && cat /var/e2e/ak-add-cc >> /home/deploy2/.ssh/authorized_keys && echo ok")
 	r="$r $(sx "$T2" "cat /var/e2e/ak-add >> /home/deploy/.ssh/authorized_keys && cat /var/e2e/ak-add-in >> /home/deploy2/.ssh/authorized_keys && echo ok")"
 	r="$r $(sx "$T3" "cat /var/e2e/ak-add >> /home/deploy/.ssh/authorized_keys && sh /var/e2e/rot-t3.sh setup 2>&1 | tail -3")"
@@ -1173,16 +1211,47 @@ rot_targets() { # rotkey's lines on T1-T3, other lines that must survive, and T3
 		{ dcheck 6 harness.rot-targets "the rotation fixtures are written to T1-T3 and T3's sshd reloads" fail "$r" harness; return 1; }
 }
 
+# T3's sshd back to stock, verified (rot-t3.sh prints "ok" last only then); a failure is a harness failure.
+t3_restore() {
+	local out
+	out=$(sx "$T3" "sh /var/e2e/rot-t3.sh restore 2>&1 | tail -3")
+	log "T3 sshd back to stock: $(echo "$out" | tr '\n' ' ')"
+	if [ "$(echo "$out" | tail -1)" = ok ]; then
+		T3_SETUP=0
+		dcheck 6 rot-t3-restored "T3's sshd is back to its stock config after the rotation tests" pass ""
+	else
+		dcheck 6 harness.rot-t3-restore "T3's sshd is back to its stock config after the rotation tests" fail "$(echo "$out" | tr '\n' ' ')" harness
+		return 1
+	fi
+}
+# sandbox-to-A copy of a public file (no secret): kiln sandbox read, then kiln vm put.
+sbx_to_a() { # sandbox path name
+	kiln sandbox read "$1" "$2" -o "$OUT/tmp/ak/$3" 2>>"$DLOG" &&
+		kiln vm put "$A" "/var/e2e/state/ak/$3" --from-file "$OUT/tmp/ak/$3" >>"$DLOG" 2>&1 ||
+		{ dcheck 6 "harness.copy-$3" "$2 is copied from the sandbox to A" fail "kiln sandbox read or vm put failed" harness; return 1; }
+}
+
 phase6() {
+	local rc
+	phase6_steps
+	rc=$?
+	# An early return leaves T3 on the hook too.
+	if [ "$T3_SETUP" = 1 ]; then t3_restore || rc=1; fi
+	return $rc
+}
+
+phase6_steps() {
 	log "=== phase 6: key rotation on real sshd"
-	local aip n i rnd cnt ivl
+	local aip n i rnd cnt ivl e t1ip
 	ensure_signed_in cli-k1 || return 1
 	vrun "$A" 6 supported 60 $(py p6.py) supported
-	if [ "$(vx "$A" "cat /var/e2e/state/rot-supported 2>/dev/null")" != yes ]; then
-		log "this build has no hop key rotate: phase 6 recorded a skip"
-		return 0
-	fi
+	case $(vx "$A" "cat /var/e2e/state/rot-supported 2>/dev/null") in
+	yes) ;;
+	no) log "this build has no hop key rotate (confirmed): phase 6 recorded a skip"; return 0 ;;
+	*) return 1 ;; # the detection failed: p6 recorded a harness failure
+	esac
 	aip=$(sed -n 's/^HK_A_IP=//p' "$OUT/tailnet.env")
+	t1ip=$(sed -n 's/^HK_T1_IP=//p' "$OUT/tailnet.env")
 	vrun "$A" 6 keys 120 $(py p6.py) keys
 	kiln vm get "$A" /var/e2e/state/rotkey.pub -o "$OUT/tmp/rotkey.pub" 2>>"$DLOG" &&
 		kiln vm get "$A" /var/e2e/state/rotkey2.pub -o "$OUT/tmp/rotkey2.pub" 2>>"$DLOG" ||
@@ -1196,32 +1265,37 @@ phase6() {
 	vrun "$A" 6 dry-run 300 $(py p6.py) dry-run
 	ak_fetch dry || return 1
 	vrun "$A" 6 judge 60 $(py p6.py) judge before dry dryrun
+	sx "$T3" ": >/var/e2e/ak-hook.log" >/dev/null # the hook log covers the rotation only
 	vrun "$A" 6 rotate 900 $(py p6.py) rotate
 	xfer "$A" /var/e2e/state/rot-newname "$B" /var/e2e/state/rot-newname && xfer "$A" /var/e2e/state/rot-newpub "$B" /var/e2e/state/rot-newpub || return 1
 	ak_fetch after || return 1
+	sbx_to_a "$T3" /var/e2e/ak-hook.log t3-hook.log || return 1
 	vrun "$A" 6 judge 60 $(py p6.py) judge before after rot
+	vrun "$A" 6 judge-rollback 60 $(py p6.py) judge-rollback
 	vrun "$A" 6 after-a 300 $(py p6.py) after-a
 	vrun "$B" 6 after-b 300 $(py p6.py) after-b
 
 	# Lines appended on T1 while r-cc's key rotates: dense (hop's edits are likely to see the file change
 	# under them, and must stop with nothing changed), then sparse (the rotation is likely to finish between two).
+	# The appender starts at e on T1's clock, the rotation at e+2 on A's; T1's clock is measured against A's
+	# first, so judge-cc can place every append against the rotation's window.
 	mkdir -p "$OUT/tmp/ak"
-	for rnd in dense:40:0.3 sparse:6:2.5; do
+	for rnd in dense:40:0.3 sparse:10:1.5; do
 		IFS=: read -r rnd cnt ivl <<<"$rnd"
 		log "rotation with lines appended during it ($rnd: $cnt every ${ivl}s)"
-		kiln sandbox read "$T1" /home/deploy2/.ssh/authorized_keys -o "$OUT/tmp/ak/cc-$rnd-before" 2>>"$DLOG" &&
-			kiln vm put "$A" "/var/e2e/state/ak/t1-deploy2.cc-$rnd-before" --from-file "$OUT/tmp/ak/cc-$rnd-before" >>"$DLOG" 2>&1 || return 1
-		kiln sandbox exec "$T1" --background --timeout-seconds 120 --command "sh /var/e2e/rot-append.sh /var/e2e/bkey.pub $cnt $ivl $rnd" >>"$DLOG" 2>&1 ||
+		vrun "$A" 6 "t1clock-$rnd" 90 $(py clockoff.py) "t1clock-$rnd" "$t1ip" deploy
+		sbx_to_a "$T1" /home/deploy2/.ssh/authorized_keys "t1-deploy2.cc-$rnd-before" || return 1
+		e=$(($(date +%s) + 20))
+		kiln sandbox exec "$T1" --background --timeout-seconds 180 --command "sh /var/e2e/rot-append.sh /var/e2e/bkey.pub $cnt $ivl $rnd $e" >>"$DLOG" 2>&1 ||
 			{ dcheck 6 "harness.rot-append-$rnd" "the appender starts on T1" fail "kiln sandbox exec failed" harness; return 1; }
-		vrun "$A" 6 cc 300 $(py p6.py) cc "$rnd"
+		vrun "$A" 6 cc 300 $(py p6.py) cc "$rnd" "$e"
 		n=""
 		for i in $(seq 1 40); do n=$(sx "$T1" "cat /var/e2e/append-$rnd.done 2>/dev/null" | tr -d '[:space:]'); [ -n "$n" ] && break; sleep 2; done
 		[ -n "$n" ] || { dcheck 6 "harness.rot-append-$rnd" "the appender on T1 finishes" fail "no append-$rnd.done" harness; return 1; }
-		kiln sandbox read "$T1" /home/deploy2/.ssh/authorized_keys -o "$OUT/tmp/ak/cc-$rnd-after" 2>>"$DLOG" &&
-			kiln vm put "$A" "/var/e2e/state/ak/t1-deploy2.cc-$rnd-after" --from-file "$OUT/tmp/ak/cc-$rnd-after" >>"$DLOG" 2>&1 || return 1
+		sbx_to_a "$T1" /home/deploy2/.ssh/authorized_keys "t1-deploy2.cc-$rnd-after" || return 1
+		sbx_to_a "$T1" "/var/e2e/append-$rnd.log" "t1-append-$rnd.log" || return 1
 		vrun "$A" 6 judge-cc 60 $(py p6.py) judge-cc "$rnd" "$n" "$ivl"
 	done
-	log "T3 sshd back to stock: $(sx "$T3" "sh /var/e2e/rot-t3.sh restore 2>&1 | tail -2" | tr '\n' ' ')"
 	return 0
 }
 

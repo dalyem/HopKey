@@ -128,7 +128,7 @@ def log(*parts):
 
 # ---------------------------------------------------------------- results
 
-_counts = {'pass': 0, 'fail': 0, 'skip': 0}
+_counts = {'pass': 0, 'fail': 0, 'skip': 0, 'limit': 0}
 
 
 def short(s, n=900):
@@ -136,8 +136,8 @@ def short(s, n=900):
     return s if len(s) <= n else s[:n // 2] + ' ... ' + s[-n // 2:]
 
 
-def check(cid, name, ok, detail='', evidence='', bug=None, status=None):
-    """Record one check. ok is a bool; status overrides it (skip)."""
+def check(cid, name, ok, detail='', evidence='', bug=None, status=None, ref=None):
+    """Record one check. ok is a bool; status overrides it (skip, limit)."""
     st = status or ('pass' if ok else 'fail')
     rec = {
         'run': RUN, 'phase': int(PHASE) if str(PHASE).isdigit() else PHASE, 'machine': MACHINE,
@@ -145,6 +145,8 @@ def check(cid, name, ok, detail='', evidence='', bug=None, status=None):
         'detail': short(detail, 600), 'evidence': short(evidence),
         'bug': bug, 'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
     }
+    if ref:
+        rec['ref'] = ref
     with open('%s/results/p%s.jsonl' % (E2E, PHASE), 'a') as f:
         f.write(json.dumps(rec) + '\n')
     _counts[st] += 1
@@ -154,6 +156,19 @@ def check(cid, name, ok, detail='', evidence='', bug=None, status=None):
 
 def skip(cid, name, why, bug=None):
     return check(cid, name, False, why, '', bug, status='skip')
+
+
+def limit(cid, name, holds, detail, evidence, bug, ref, better=None):
+    """A documented limit of the product (README section ref). When the documented
+    behaviour holds, the check is recorded as 'limit': listed in the report with
+    its reference, never counted as a failure. better: the observed behaviour is
+    stricter than the README promises (a pass). Anything else differs from the
+    documentation and fails under bug."""
+    if holds:
+        return check(cid, name, False, detail, evidence, bug, status='limit', ref=ref)
+    if better:
+        return check(cid, name, True, detail, evidence, bug, ref=ref)
+    return check(cid, name, False, 'differs from the documented behaviour: ' + detail, evidence, bug, ref=ref)
 
 
 def harness(cid, name, detail, evidence=''):
@@ -265,15 +280,38 @@ def ssh(host, cmd, user='tester', timeout=30, extra=()):
     return run_as(user, ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'] + list(extra) + [host, cmd], timeout)
 
 
-def agent_keys(user='tester'):
-    """How many identities hop's agent socket serves (-1: no agent)."""
+class ProbeError(Exception):
+    """A probe that gave no usable answer: a harness failure, never a verdict."""
+
+
+def agent_probe(user='tester'):
+    """What hop's agent socket serves, as one of:
+      ('keys', n)       n > 0 identities
+      ('empty', 0)      the agent answered that it holds no identities
+      ('absent', -1)    no agent listens: the socket is missing or refuses the connection
+      ('error', detail) anything else (a timeout, an unexpected exit or answer)
+    """
     uid = pwd.getpwnam(user).pw_uid
-    r = run_as(user, ['ssh-add', '-L'], 15, env={'SSH_AUTH_SOCK': '/run/user/%d/hop/agent.sock' % uid})
-    if 'no identities' in r.all:
-        return 0
-    if r.rc != 0:
-        return -1
-    return sum(1 for l in r.out.splitlines() if l.startswith(('ssh-', 'ecdsa-')))
+    sock = '/run/user/%d/hop/agent.sock' % uid
+    r = run_as(user, ['ssh-add', '-L'], 15, env={'SSH_AUTH_SOCK': sock})
+    keys = [l for l in r.out.splitlines() if l.startswith(('ssh-', 'ecdsa-', 'sk-'))]
+    if r.rc == 0 and keys and len(keys) == len([l for l in r.out.splitlines() if l.strip()]):
+        return 'keys', len(keys)
+    if r.rc == 1 and 'The agent has no identities' in r.all:
+        return 'empty', 0
+    if r.rc == 2 and re.search(r'(Could not open a connection to your authentication agent|Error connecting to agent: '
+                               r'(No such file or directory|Connection refused))', r.all):
+        return 'absent', -1
+    return 'error', 'ssh-add -L rc=%s: %s' % (r.rc, cut(r.all.strip(), 200))
+
+
+def agent_keys(user='tester'):
+    """How many identities hop's agent serves: n > 0, 0 when it holds none, -1 when
+    no agent listens. A probe error raises ProbeError: it proves neither."""
+    st, v = agent_probe(user)
+    if st == 'error':
+        raise ProbeError(v)
+    return v
 
 
 def daemon_pids(user='tester'):

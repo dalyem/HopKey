@@ -13,6 +13,8 @@ from mcpc import MCP, require_ok, results
 DENIED_WORDS = ('mdeny', 'md1', 'secret db')
 TOOLS7 = sorted(['check_host', 'exec', 'list_hosts', 'list_snippets', 'resolve_host', 'run_snippet', 'ssh_command'])
 AUDIT = '/home/tester/.local/state/hop/mcp-audit.jsonl'
+REF_SCRUB = ('README, Using hop with AI agents (MCP), Safety rules: "This is best effort: a secret the remote prints in another form, '
+             'or one hop does not know, passes through."')
 
 
 def fixtures():
@@ -163,9 +165,13 @@ def main():
     if pr.get('exit_code') == 0 and pr.get('stdout', '').count('---') == 3:
         c('scrub.pem', 'a private key block the remote prints is redacted', 'PRIVATE KEY' not in planted and pem not in planted, '')
         c('scrub.devpass', 'the device passphrase the remote prints is redacted', L.sec_read('devpass') not in planted, '')
+        # Documented limit: hop removes only the secrets it knows (the hop auth secrets and the
+        # passphrase in its own env); this server was started without HOP_PASSWORD or HOP_SECRET_KEY.
+        # scrub.env-secrets below checks that they are removed when hop does know them.
         leaked = [n for n, v in (('Secret Key', L.kit()[0]), ('master password', L.sec_read('masterpw'))) if v and v in planted]
-        c('scrub.unknown-secrets', 'the Secret Key and master password the remote prints are redacted (daemon knows the Secret Key)',
-          not leaked, 'passed through: %s (hop mcp was started without them in its env; README calls this best effort)' % leaked, '', 'r1-P1-rule')
+        L.limit('scrub.unknown-secrets', 'a Secret Key and master password hop mcp was not given pass through when the remote prints them, as documented',
+                bool(leaked), 'passed through: %s' % leaked, '', 'r1-P1-rule', REF_SCRUB,
+                better=not leaked)
     else:
         L.harness('scrub', 'the planted-secret command runs on m1 and prints its four parts', 'result: %s' % L.cut(json.dumps(pr), 200))
     healthy = m.healthy

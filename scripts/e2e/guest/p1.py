@@ -224,8 +224,11 @@ def step_daemon():
       r.rc == 0 and gone and 'after-restart' in r2.out and p2 and p2 != p1, 'pids %s -> %s' % (p1, p2), r2.ev('exec'))
     hop('daemon', 'stop'); time.sleep(1)
     r = hop('status')
-    c('status.starts', 'hop status with no daemon running starts it (as other commands do)', r.rc == 0,
-      'README: the first command that needs the daemon starts it', r.ev('hop status'), 'r2-P3-7')
+    time.sleep(1)
+    left = L.daemon_pids()
+    # Decided (README): hop status does not start the daemon; it says so and names what does.
+    c('status.starts', 'hop status with no daemon running says so, names hop daemon and a command that starts it (hop ls), and starts none',
+      has(r.all, 'not running', 'hop daemon', 'hop ls') and not left, 'rc %d; daemon pids after: %s' % (r.rc, left), r.ev('hop status'), 'r2-P3-7')
     hop('daemon', 'stop'); time.sleep(1)
     # A daemon started without the passphrase comes up locked; hop unlock from a terminal must fix it.
     r = hop('ls', nopass=True)

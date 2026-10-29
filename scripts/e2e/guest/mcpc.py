@@ -1,6 +1,7 @@
 """A minimal MCP stdio client (newline-delimited JSON-RPC) for hop mcp."""
 import json
 import os
+import re
 import select
 import subprocess
 import time
@@ -20,7 +21,7 @@ class MCP:
         self.buf = b''
         self.hung = False      # a request went unanswered past its timeout
         self.exited = False    # hop mcp closed its stdout
-        self.answered = 0      # responses that carried a result or an error from hop mcp
+        self.answered = 0      # responses to our requests that carried a JSON-RPC result or error
         self.init = self.rpc('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                                             'clientInfo': {'name': 'hk-e2e', 'version': '1'}})
         self.send({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
@@ -68,7 +69,10 @@ class MCP:
                 m = json.loads(line)
             except ValueError:
                 continue
-            if m.get('id') == self.nid:
+            if isinstance(m, dict) and m.get('id') == self.nid:
+                if 'result' not in m and 'error' not in m:
+                    # A line with our ID but neither member is no answer: the request stays open.
+                    continue
                 self.answered += 1
                 return m
 
@@ -93,11 +97,12 @@ class MCP:
         return not self.hung and not self.exited and self.answered == self.nid
 
     def transport(self):
-        """How the session went: 'ok' while every request got an answer from hop mcp;
-        'refused' when hop mcp exited by itself with an error status and said why on
-        stderr (a real answer: it will not serve this device); 'broken' for a hang,
-        a crash, a signal or an exit that said nothing. Only 'ok' and 'refused' may
-        be judged as access denied; 'broken' is a harness failure."""
+        """How the session went: 'ok' while every request got a JSON-RPC result or
+        error from hop mcp; 'refused' when hop mcp exited by itself with an error
+        status and stderr carries one of hop's own refusals (REFUSAL); 'broken' for
+        everything else: a hang, a crash, a signal, or an exit that said anything
+        else. Only 'ok' and 'refused' may be judged as access denied; 'broken' is a
+        harness failure."""
         if self.healthy:
             return 'ok'
         if self.hung:
@@ -108,7 +113,7 @@ class MCP:
             return 'broken'
         err = self.stderr()
         crashed = 'panic:' in err or 'goroutine ' in err or 'SIGSEGV' in err
-        return 'refused' if rc and rc > 0 and err.strip() and not crashed else 'broken'
+        return 'refused' if rc and rc > 0 and not crashed and refusal(err) else 'broken'
 
     def why(self):
         """A masked one-line account of the transport, for evidence."""
@@ -129,6 +134,20 @@ class MCP:
             return open(self.stderr_path).read()
         except OSError:
             return ''
+
+
+# hop's own refusals, as hop mcp words them (internal/cli/mcp.go daemonError) and as
+# the CLI does (offline too long): this device was revoked, the vault is locked
+# (also for being offline too long), or there is no vault (a proven revocation wiped
+# it), plus an authorization refusal. Any other error says nothing about access.
+REFUSAL = re.compile(r'this device was revoked from the account|the vault is locked|offline too long|'
+                     r'there is no vault on this device|not authori[sz]ed|unauthori[sz]ed')
+
+
+def refusal(text):
+    """The refusal hop gave in text, or ''."""
+    m = REFUSAL.search(text or '')
+    return m.group(0) if m else ''
 
 
 def results(struct):
