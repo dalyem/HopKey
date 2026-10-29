@@ -136,6 +136,10 @@ type machine struct {
 	ring  *memRing
 	// noDaemon makes the CLI's daemon starts fail, so nothing syncs.
 	noDaemon atomic.Bool
+	// hopBin, when set, is the hop binary the daemon's ssh config runs
+	// as each session's LocalCommand (daemon.Options.Hop): this test
+	// binary, which TestMain runs as hop session attach.
+	hopBin string
 
 	mu sync.Mutex
 	d  *daemon.Daemon
@@ -177,6 +181,7 @@ func (m *machine) startDaemon(t *testing.T) func() error {
 		}
 		d, err := daemon.Start(daemon.Options{
 			Paths: m.paths, Store: s, Version: "test", Tailscale: noTailscale{},
+			Hop:  m.hopBin,
 			Logf: func(format string, args ...any) { t.Logf(m.name+" daemon: "+format, args...) },
 			Sync: daemon.SyncOptions{Client: syncclient.Options{RootCAs: m.w.pool}},
 		})
@@ -262,11 +267,25 @@ func (m *machine) hop(t *testing.T, s *session, args ...string) int {
 	if s == nil {
 		s = &session{}
 	}
+	env := m.env(t, s)
+	parent := s.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
+	defer cancel()
+	code := cli.Run(ctx, args, env)
+	t.Logf("%s: hop %s: exit %d\nstdout: %s\nstderr: %s", m.name, strings.Join(args, " "), code, redactKit(s.stdout.String()), redactKit(s.stderr.String()))
+	return code
+}
+
+// env is the Env a hop command runs in on m, in session s.
+func (m *machine) env(t *testing.T, s *session) *cli.Env {
 	var stdin io.Reader = strings.NewReader("")
 	if s.tty {
 		stdin = &promptStdin{s: s}
 	}
-	env := &cli.Env{
+	return &cli.Env{
 		Stdin: stdin, Stdout: &s.stdout, Stderr: &s.stderr,
 		Getenv: func(k string) string { return s.env[k] },
 		Home:   m.home, Paths: m.paths, DataDir: m.data, Keyring: m.ring,
@@ -299,15 +318,6 @@ func (m *machine) hop(t *testing.T, s *session, args ...string) int {
 			return nil, errors.New("no answer")
 		},
 	}
-	parent := s.ctx
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(parent, 90*time.Second)
-	defer cancel()
-	code := cli.Run(ctx, args, env)
-	t.Logf("%s: hop %s: exit %d\nstdout: %s\nstderr: %s", m.name, strings.Join(args, " "), code, redactKit(s.stdout.String()), redactKit(s.stderr.String()))
-	return code
 }
 
 // must runs a command off the terminal and fails the test unless it

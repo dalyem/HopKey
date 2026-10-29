@@ -2,13 +2,25 @@
 
 package procs
 
-import "syscall"
+import (
+	"net"
+	"syscall"
+)
 
 // Lookup is not supported here.
 func Lookup(pid int) (Proc, error) { return Proc{}, ErrUnsupported }
 
-// List is not supported here.
-func List(uid int) ([]Proc, error) { return nil, ErrUnsupported }
+// Open is not supported here.
+func Open(pid int) (*Pin, error) { return nil, ErrUnsupported }
 
 // Signal is not supported here.
-func Signal(p Proc, sig syscall.Signal) error { return ErrUnsupported }
+func (p *Pin) Signal(sig syscall.Signal) error { return ErrUnsupported }
+
+// Exited is always true here: nothing is signalled.
+func (p *Pin) Exited() bool { return true }
+
+// Close does nothing here.
+func (p *Pin) Close() {}
+
+// PeerPID is not supported here.
+func PeerPID(c *net.UnixConn) (int, error) { return 0, ErrUnsupported }

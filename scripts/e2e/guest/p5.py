@@ -14,7 +14,9 @@ What the README ("What revocation does") documents is asserted as documented:
   after it reconnects, for good.
 - Open sessions end once the device learns it was revoked: the README says
   within seconds, both hop exec and a plain ssh through hop's config. s2
-  asserts each ends within SESSION_END_LIMIT seconds of B's agent emptying
+  asserts each ends within SESSION_END_LIMIT seconds of B's agent emptying,
+  and that B's daemon names their ssh processes among the sessions it ended
+  (hop status --json, ended_sessions), so it was the daemon that ended them
   (r2-gap4 tags a failure).
 
 Steps: localb-setup | ensure-t1 | revoke <device> <n> | access <tag> <work|cut> |
@@ -571,18 +573,26 @@ def step_sessions_start():
     cmd = 'for i in $(seq 1 45); do echo "tick $i"; sleep 1; done'
     # The wrapper is sh, not ssh, so ending the sessions leaves it to record when they ended.
     wrap = ['sh', '-c', '"$@"; echo "hk-end rc=$? t=$(date +%s.%N)"', 'sh']
+    sids = {}
     for name, argv in (('open-hopexec', ['hop', 'exec', 't1', '--', 'sh', '-c', cmd]),
                        ('open-plain', ['ssh', '-o', 'BatchMode=yes', 't1', cmd])):
         f = open('/var/e2e/state/%s.out' % name, 'w')
-        subprocess.Popen(L.user_argv('tester', wrap + argv, 120), env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                         start_new_session=True)
+        sids[name] = subprocess.Popen(L.user_argv('tester', wrap + argv, 120), env=env, stdout=f, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL, start_new_session=True).pid
 
     def connected():
         got = [n for n in SESSIONS if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
         return got if len(got) == len(SESSIONS) else None
     got, secs = L.wait_for(connected, 20, 0.5)
     got = got or [n for n in SESSIONS if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
-    L.state_put('sessions-start', {'connected': got, 't': time.time()})
+    # The ssh processes of each session (its own session ID): the ones B's daemon must say it ended.
+    pids = {n: [] for n in SESSIONS}
+    for line in root('ps -e -o pid=,sid=,comm=').out.splitlines():
+        f = line.split()
+        for n, sid in sids.items():
+            if len(f) == 3 and f[1] == str(sid) and f[2] == 'ssh':
+                pids[n].append(int(f[0]))
+    L.state_put('sessions-start', {'connected': got, 't': time.time(), 'pids': pids})
     if len(got) != len(SESSIONS):
         L.harness('B.sessions-start', 'both sessions are connected and running before the revoke', 'connected: %s' % got)
 
@@ -616,6 +626,17 @@ def step_sessions_end(tag):
             bad.append('%s ended %.1fs before B was cut off' % (n, -dt))
         elif dt > SESSION_END_LIMIT:
             bad.append('%s ended %.1fs after B was cut off' % (n, dt))
+    # They ended because B's daemon ended them: it names their ssh processes (hop status --json, ended_sessions).
+    j = L.status_json() or {}
+    es = j.get('ended_sessions') or {}
+    ended_pids = [x.get('pid') for x in es.get('sessions') or []]
+    ends['daemon'] = 'ended %s when %s' % (ended_pids, es.get('why'))
+    for n in SESSIONS:
+        mine = (pre.get('pids') or {}).get(n) or []
+        if not mine:
+            bad.append('%s: no ssh process was recorded at the start' % n)
+        elif not set(mine) <= set(ended_pids):
+            bad.append('%s: ssh %s is not among the sessions B\'s daemon ended %s' % (n, mine, ended_pids))
     c(cid, label, not bad, '; '.join(bad) or 'ended, relative to the cutoff: %s' % ends, ticks + ' | ' + str(ends),
       'r2-gap4' if bad else None, ref=REF_SESSIONS)
 

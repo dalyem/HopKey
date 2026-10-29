@@ -2,13 +2,11 @@ package daemon
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -18,18 +16,53 @@ import (
 	"github.com/dalyem/hopkey/internal/procs"
 )
 
-// sshProc is a real ssh that hangs before it logs in: its ProxyCommand is
-// a sleep that never answers, so it stays connected to nothing for a
-// minute. env is added to this process's environment, which loses its own
-// SSH_AUTH_SOCK.
-type sshProc struct {
+// Environment of this test binary run as hop session attach (TestMain):
+// the file it writes the daemon's answer to, and whether it then stays,
+// to hold up the ssh that runs it as its ProxyCommand.
+const (
+	attachOutVar  = "HOPKEY_TEST_ATTACH_OUT"
+	attachHoldVar = "HOPKEY_TEST_ATTACH_HOLD"
+)
+
+// TestMain runs this binary as hop session attach --control SOCKET ALIAS
+// when it is called that way (cli.SessionAttach).
+func TestMain(m *testing.M) {
+	if len(os.Args) >= 3 && os.Args[1] == "session" && os.Args[2] == "attach" {
+		var sock, alias string
+		for i := 3; i < len(os.Args); i++ {
+			if os.Args[i] == "--control" && i+1 < len(os.Args) {
+				i++
+				sock = os.Args[i]
+			} else {
+				alias = os.Args[i]
+			}
+		}
+		res := "ok"
+		if err := Attach(sock, alias); err != nil {
+			res = err.Error()
+		}
+		if out := os.Getenv(attachOutVar); out != "" {
+			os.WriteFile(out, []byte(res), 0o600)
+		}
+		if os.Getenv(attachHoldVar) != "" {
+			time.Sleep(time.Minute)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+// proc is a process a test started: an ssh, or something else.
+type proc struct {
 	cmd  *exec.Cmd
 	done chan struct{}
 	err  error
 	log  string
 }
 
-func startProc(t *testing.T, env []string, name string, args ...string) *sshProc {
+// startProc starts name with args; env is added to this process's
+// environment, which loses its own SSH_AUTH_SOCK.
+func startProc(t *testing.T, env []string, name string, args ...string) *proc {
 	t.Helper()
 	path, err := exec.LookPath(name)
 	if err != nil {
@@ -51,14 +84,14 @@ func startProc(t *testing.T, env []string, name string, args ...string) *sshProc
 		}
 	}
 	cmd.Env = append(cmd.Env, env...)
-	// A file, not a pipe: the ProxyCommand holds stderr open after ssh ends.
+	// A file, not a pipe: a child may hold stderr open after it ends.
 	cmd.Stderr = f
-	// Its own group, so the ProxyCommand sleep goes with it at the end.
+	// Its own group, so its children go with it at the end.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	p := &sshProc{cmd: cmd, done: make(chan struct{}), log: errFile}
+	p := &proc{cmd: cmd, done: make(chan struct{}), log: errFile}
 	go func() {
 		p.err = cmd.Wait()
 		close(p.done)
@@ -70,15 +103,7 @@ func startProc(t *testing.T, env []string, name string, args ...string) *sshProc
 	return p
 }
 
-// ssh runs it with exec itself.
-const hangProxy = "ProxyCommand=sleep 60"
-
-func hangingSSH(t *testing.T, env []string, args ...string) *sshProc {
-	t.Helper()
-	return startProc(t, env, "ssh", append([]string{"-o", "BatchMode=yes", "-o", hangProxy}, args...)...)
-}
-
-func (p *sshProc) running() bool {
+func (p *proc) running() bool {
 	select {
 	case <-p.done:
 		return false
@@ -87,14 +112,14 @@ func (p *sshProc) running() bool {
 	}
 }
 
-func (p *sshProc) stderr() string {
+func (p *proc) stderr() string {
 	b, _ := os.ReadFile(p.log)
 	return string(b)
 }
 
 // waitEnd waits for p to end and says how: "signal: hangup" for one the
 // daemon ended with SIGHUP.
-func (p *sshProc) waitEnd(t *testing.T, within time.Duration, what string) string {
+func (p *proc) waitEnd(t *testing.T, within time.Duration, what string) string {
 	t.Helper()
 	select {
 	case <-p.done:
@@ -109,98 +134,56 @@ func (p *sshProc) waitEnd(t *testing.T, within time.Duration, what string) strin
 // 255 once it caught it.
 func hungUp(how string) bool { return how == "signal: hangup" || how == "exit status 255" }
 
-func allRunning(t *testing.T, ps map[string]*sshProc) {
+// self is this test binary, which runs as hop session attach (TestMain).
+func self(t *testing.T) string {
 	t.Helper()
-	time.Sleep(time.Second)
-	for name, p := range ps {
-		if !p.running() {
-			t.Fatalf("%s ended before the test: %v\n%s", name, p.err, p.stderr())
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exe
+}
+
+// waitAttach waits for the hop session attach that writes out to finish,
+// and returns the daemon's answer: "ok", or why it refused.
+func waitAttach(t *testing.T, out string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if b, err := os.ReadFile(out); err == nil && len(b) > 0 {
+			return string(b)
 		}
+		if time.Now().After(deadline) {
+			t.Fatal("hop session attach never answered")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
-// A device that learns, online, that it was revoked ends the plain ssh
-// sessions that use hop: the one to a hop alias through hop's config, and
-// one whose SSH_AUTH_SOCK is hop's agent. An ssh to another destination,
-// one that reads another config, and a process that is not ssh but names
-// the alias keep running.
-func TestRevocationEndsPlainSSHThroughHop(t *testing.T) {
-	x := newSyncSetup(t)
-	x.w.start(x.n1, x.n1.st, SyncOptions{})
-	x.w.start(x.n2, x.n2.st, SyncOptions{})
-	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.16"))
-	eventually(t, 10*time.Second, "web1 reaches the laptop", func() bool { return strings.Contains(x.n2.config(), "Host web1\n") })
-	cfg := filepath.Join(x.n2.paths.ConfigDir, "config")
-
-	end := map[string]*sshProc{
-		"ssh web1 with hop's config": hangingSSH(t, nil, "-F", cfg, "web1"),
-		"ssh with hop's agent":       hangingSSH(t, []string{"SSH_AUTH_SOCK=" + x.n2.d.AgentSocket()}, "-F", "/dev/null", "other.example"),
-	}
-	keep := map[string]*sshProc{
-		"ssh to another destination":   hangingSSH(t, nil, "-F", cfg, "other.example"),
-		"ssh web1 with another config": hangingSSH(t, nil, "-F", "/dev/null", "web1"),
-		"sh naming web1":               startProc(t, nil, "sh", "-c", "sleep 60", "ssh", "web1"),
-	}
-	allRunning(t, end)
-	allRunning(t, keep)
-
-	x.revokeLaptop(t)
-	revoked := time.Now()
-	for name, p := range end {
-		how := p.waitEnd(t, 20*time.Second, name)
-		t.Logf("%s ended %v after the revoke: %s", name, time.Since(revoked).Round(time.Millisecond), how)
-		if !hungUp(how) {
-			t.Errorf("%s ended with %q, want SIGHUP", name, how)
-		}
-	}
-	time.Sleep(time.Second)
-	for name, p := range keep {
-		if !p.running() {
-			t.Errorf("%s was ended: %v", name, p.err)
-		}
-	}
-	var st StatusResult
-	x.n2.must(OpStatus, nil, &st)
-	if e := st.EndedSessions; e == nil || e.Count != 2 || e.Why != whyRevoked {
-		t.Fatalf("status: ended sessions %+v", e)
-	}
-	for _, s := range st.EndedSessions.Sessions {
-		if s.Via != "ssh" || (s.Alias != "web1" && s.Alias != "other.example") {
-			t.Errorf("ended session %+v", s)
-		}
-	}
+// attachedSSH is a real ssh whose child is hop session attach for alias,
+// as LocalCommand makes it once ssh has logged in. There is no server to
+// log in to, so the child is its ProxyCommand, which ssh runs the same
+// way (exec, through the shell), and which stays to hold the ssh up. It
+// returns once the daemon has answered, and that answer.
+func attachedSSH(t *testing.T, sock, alias string) (*proc, string) {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "attach")
+	proxy := fmt.Sprintf("ProxyCommand=%s session attach --control %s %s", self(t), sock, alias)
+	p := startProc(t, []string{attachOutVar + "=" + out, attachHoldVar + "=1"},
+		"ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", proxy, alias)
+	return p, waitAttach(t, out)
 }
 
-// The max-offline policy's lock ends the sessions too: the laptop's clock
-// jumps two hours past its last contact, with a one-hour policy.
-func TestMaxOfflineLockEndsSessions(t *testing.T) {
-	x := newSyncSetup(t)
-	var skew atomic.Int64
-	clock := func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }
-	x.w.start(x.n1, x.n1.st, SyncOptions{})
-	x.w.startWith(x.n2, x.n2.st, Options{offlineEvery: 50 * time.Millisecond, now: clock})
-	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.16"))
-	x.n1.must(OpPolicy, PolicyParams{MaxOffline: 3600}, nil)
-	eventually(t, 10*time.Second, "the policy and web1 reach the laptop", func() bool {
-		x.n1.call(OpSyncNow, nil, nil)
-		x.n2.call(OpSyncNow, nil, nil)
-		return x.n2.policy() == 3600 && strings.Contains(x.n2.config(), "Host web1\n")
-	})
-	p := hangingSSH(t, nil, "-F", filepath.Join(x.n2.paths.ConfigDir, "config"), "web1")
-	allRunning(t, map[string]*sshProc{"ssh web1": p})
-
-	skew.Store(int64(2 * time.Hour))
-	if how := p.waitEnd(t, 15*time.Second, "ssh web1 after the max-offline lock"); !hungUp(how) {
-		t.Errorf("ssh ended with %q, want SIGHUP", how)
+// registered is the PIDs the daemon holds as sessions.
+func registered(d *Daemon) []int {
+	s := d.sessions
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var pids []int
+	for pid := range s.reg {
+		pids = append(pids, pid)
 	}
-	if s := x.n2.status(); s.OfflineLocked == "" {
-		t.Errorf("the vault did not lock for the policy: %+v", s)
-	}
-	var st StatusResult
-	x.n2.must(OpStatus, nil, &st)
-	if e := st.EndedSessions; e == nil || e.Count != 1 || e.Why != whyOffline {
-		t.Errorf("status: ended sessions %+v", e)
-	}
+	return pids
 }
 
 // startLocal starts a daemon over an empty local store with opts' hooks.
@@ -212,7 +195,10 @@ func startLocal(t *testing.T, opts Options) (*Daemon, *Client) {
 		cfgDir = filepath.Join(base, "cfg")
 	}
 	opts.Paths = Paths{RunDir: filepath.Join(base, "run"), ConfigDir: cfgDir, StateDir: filepath.Join(base, "state")}
-	opts.Store, opts.Version, opts.Tailscale, opts.Logf = modeltest.New(), "test", fakeTS{}, t.Logf
+	opts.Store, opts.Version, opts.Tailscale = modeltest.New(), "test", fakeTS{}
+	if opts.Logf == nil {
+		opts.Logf = t.Logf
+	}
 	d, err := Start(opts)
 	if err != nil {
 		t.Fatal(err)
@@ -226,53 +212,152 @@ func startLocal(t *testing.T, opts Options) (*Daemon, *Client) {
 	return d, c
 }
 
-// A registered session is checked against its process: one whose start
-// time is not the process's is refused, and one that matches is ended
-// with SIGHUP and reported.
-func TestRegisteredSessionIsEnded(t *testing.T) {
+// A real ssh whose child is hop session attach is registered, and ended
+// with SIGHUP; status names it by its alias, and session.ended says why,
+// once.
+func TestAttachedSSHIsEnded(t *testing.T) {
+	d, c := startLocal(t, Options{})
+	p, res := attachedSSH(t, d.ControlSocket(), "web1")
+	if res != "ok" {
+		t.Fatalf("the daemon refused a real ssh: %s", res)
+	}
+	pid := p.cmd.Process.Pid
+	if got := registered(d); len(got) != 1 || got[0] != pid {
+		t.Fatalf("registered %v, want the ssh, %d", got, pid)
+	}
+	got := <-d.endSessions(whyLock)
+	if len(got) != 1 || got[0] != (EndedSession{PID: pid, Alias: "web1"}) {
+		t.Errorf("ended %+v", got)
+	}
+	if how := p.waitEnd(t, 5*time.Second, "the attached ssh"); !hungUp(how) {
+		t.Errorf("ended with %q, want SIGHUP", how)
+	}
+	ctx := context.Background()
+	var r SessionEndedResult
+	if err := c.Call(ctx, OpSessionEnded, SessionEndedParams{PID: pid}, &r); err != nil || r.Ended != whyLock {
+		t.Errorf("session.ended: %+v, %v", r, err)
+	}
+	r = SessionEndedResult{}
+	if err := c.Call(ctx, OpSessionEnded, SessionEndedParams{PID: pid}, &r); err != nil || r.Ended != "" {
+		t.Errorf("session.ended a second time: %+v, %v", r, err)
+	}
+	if st := d.endedSessions(); st == nil || st.Count != 1 || st.Why != whyLock || st.NotEnded != 0 {
+		t.Errorf("status: %+v", st)
+	}
+	if len(registered(d)) != 0 {
+		t.Errorf("the ended session is still registered: %v", registered(d))
+	}
+}
+
+// session.attach registers the caller's parent only when the kernel shows
+// it is an ssh of this user: not when the caller's parent is the daemon,
+// a shell, or another program named ssh. None of them is registered, so
+// none is ended.
+func TestAttachRefusesAParentThatIsNotSSH(t *testing.T) {
+	d, _ := startLocal(t, Options{})
+	sock := d.ControlSocket()
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another program named ssh: a copy of sh.
+	fake := filepath.Join(t.TempDir(), "ssh")
+	if b, err := os.ReadFile(shell); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(fake, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The child is hop session attach, and the parent stays.
+	script := `"$0" session attach --control "$1" web1; exec sleep 60`
+	cases := []struct {
+		name, why string
+		start     func(out string) *proc
+	}{
+		{"a shell", "not ssh", func(out string) *proc {
+			return startProc(t, []string{attachOutVar + "=" + out}, "sh", "-c", script, self(t), sock)
+		}},
+		{"a copy of sh named ssh", "not ssh", func(out string) *proc {
+			return startProc(t, []string{attachOutVar + "=" + out}, fake, "-c", script, self(t), sock, "-F", "cfg", "web1")
+		}},
+	}
+	var parents []*proc
+	for _, c := range cases {
+		out := filepath.Join(t.TempDir(), "attach")
+		p := c.start(out)
+		parents = append(parents, p)
+		if res := waitAttach(t, out); !strings.Contains(res, c.why) {
+			t.Errorf("%s: the daemon answered %q, want a refusal (%s)", c.name, res, c.why)
+		}
+	}
+	// The caller's parent is the daemon itself.
+	out := filepath.Join(t.TempDir(), "attach")
+	cmd := exec.Command(self(t), "session", "attach", "--control", sock, "web1")
+	cmd.Env = append(os.Environ(), attachOutVar+"="+out)
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if res := waitAttach(t, out); !strings.Contains(res, "parent is the daemon") {
+		t.Errorf("a child of the daemon: the daemon answered %q", res)
+	}
+
+	if got := registered(d); len(got) != 0 {
+		t.Fatalf("registered %v", got)
+	}
+	if got := <-d.endSessions(whyRevoked); len(got) != 0 {
+		t.Errorf("ended %+v", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	for i, p := range parents {
+		if !p.running() {
+			t.Errorf("%s was ended: %v", cases[i].name, p.err)
+		}
+	}
+}
+
+// The registration that took any process the caller named, session.start,
+// is gone: a process of this user that names itself is not ended.
+func TestNamedPIDIsNotRegistered(t *testing.T) {
 	d, c := startLocal(t, Options{})
 	p := startProc(t, nil, "sleep", "60")
 	pr, err := procs.Lookup(p.cmd.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.Background()
-	bad := SessionParams{PID: pr.PID, Start: pr.Start + "1", Alias: "web1", Via: "hop exec"}
-	if err := c.Call(ctx, OpSessionStart, bad, nil); !IsCode(err, CodeInvalid) {
-		t.Fatalf("a wrong start time was registered: %v", err)
+	params := map[string]any{"pid": pr.PID, "start": pr.Start, "alias": "web1", "via": "hop exec"}
+	if err := c.Call(context.Background(), "session.start", params, nil); err == nil {
+		t.Error("session.start registered a PID the caller named")
 	}
-	if err := c.Call(ctx, OpSessionStart, SessionParams{PID: pr.PID, Start: pr.Start, Alias: "web1", Via: "hop exec"}, nil); err != nil {
-		t.Fatal(err)
-	}
-	got := <-d.endSessions(whyLock)
-	if len(got) != 1 || got[0] != (EndedSession{PID: pr.PID, Alias: "web1", Via: "hop exec"}) {
+	if got := <-d.endSessions(whyRevoked); len(got) != 0 {
 		t.Errorf("ended %+v", got)
 	}
-	if how := p.waitEnd(t, 5*time.Second, "the registered sleep"); how != "signal: hangup" {
-		t.Errorf("ended with %q", how)
+	time.Sleep(200 * time.Millisecond)
+	if !p.running() {
+		t.Fatalf("the named process was ended: %v", p.err)
+	}
+}
+
+// register adds a running process the test started as a session, held
+// by a real pin, as session.attach would.
+func register(t *testing.T, d *Daemon, p *proc) {
+	t.Helper()
+	pr, pn, err := d.procs.Open(p.cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.sessions.add(d, &session{proc: pr, pin: pn}); err != nil {
+		t.Fatal(err)
 	}
 }
 
 // A session that outlasts SIGHUP gets SIGTERM, and one that outlasts that
 // too gets SIGKILL, and status says it was killed.
 func TestStubbornSessionsAreKilled(t *testing.T) {
-	d, c := startLocal(t, Options{sessionTerm: 300 * time.Millisecond, sessionKill: 800 * time.Millisecond})
-	ctx := context.Background()
-	register := func(p *sshProc) {
-		t.Helper()
-		pr, err := procs.Lookup(p.cmd.Process.Pid)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := c.Call(ctx, OpSessionStart, SessionParams{PID: pr.PID, Start: pr.Start, Via: "hop exec"}, nil); err != nil {
-			t.Fatal(err)
-		}
-	}
+	d, _ := startLocal(t, Options{sessionTerm: 300 * time.Millisecond, sessionKill: 800 * time.Millisecond})
 	noHUP := startProc(t, nil, "sh", "-c", `trap "" HUP; sleep 60; :`)
 	neither := startProc(t, nil, "sh", "-c", `trap "" HUP TERM; sleep 60; :`)
-	allRunning(t, map[string]*sshProc{"noHUP": noHUP, "neither": neither})
-	register(noHUP)
-	register(neither)
+	time.Sleep(500 * time.Millisecond) // the traps are set
+	register(t, d, noHUP)
+	register(t, d, neither)
 	start := time.Now()
 	got := <-d.endSessions(whyLock)
 	if how := noHUP.waitEnd(t, 5*time.Second, "the shell that ignores SIGHUP"); how != "signal: terminated" {
@@ -311,8 +396,9 @@ func TestReusedPIDIsNotSignalled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pr.Start = "an earlier process"
 	d.sessions.mu.Lock()
-	d.sessions.reg[pr.PID] = SessionParams{PID: pr.PID, Start: "an earlier process", Via: "hop exec"}
+	d.sessions.reg[pr.PID] = &session{proc: pr}
 	d.sessions.mu.Unlock()
 	if got := <-d.endSessions(whyLock); len(got) != 0 {
 		t.Errorf("ended %+v", got)
@@ -321,145 +407,128 @@ func TestReusedPIDIsNotSignalled(t *testing.T) {
 	if !p.running() {
 		t.Fatalf("the process that has the PID now was signalled: %v", p.err)
 	}
-	// The last check is the signal's own: a PID reused between the scan
-	// and the signal is not signalled either.
-	stale := pr
-	stale.Start += "1"
-	if err := procs.Signal(stale, syscall.SIGHUP); !errors.Is(err, procs.ErrGone) {
-		t.Errorf("Signal with another start time: %v", err)
+}
+
+// noPins is this machine's processes, but none can be pinned, as on a
+// Linux with no pidfd.
+type noPins struct{ sysProcs }
+
+func (noPins) Open(int) (procs.Proc, pin, error) {
+	return procs.Proc{}, nil, fmt.Errorf("%w: pidfd_open: %v", procs.ErrNoPin, syscall.ENOSYS)
+}
+
+// A session that can't be pinned is registered but never signalled: there
+// is no kill(2) by PID to fall back to. Status counts it as not ended.
+func TestUnpinnedSessionIsNotSignalled(t *testing.T) {
+	d, _ := startLocal(t, Options{procs: noPins{}})
+	p, res := attachedSSH(t, d.ControlSocket(), "web1")
+	if res != "ok" {
+		t.Fatalf("the daemon refused a real ssh: %s", res)
 	}
-	time.Sleep(200 * time.Millisecond)
+	if got := registered(d); len(got) != 1 {
+		t.Fatalf("registered %v", got)
+	}
+	if got := <-d.endSessions(whyRevoked); len(got) != 0 {
+		t.Errorf("ended %+v", got)
+	}
+	time.Sleep(300 * time.Millisecond)
 	if !p.running() {
-		t.Fatalf("procs.Signal signalled a reused PID: %v", p.err)
+		t.Fatalf("an unpinned session was signalled: %v\n%s", p.err, p.stderr())
 	}
-}
-
-// fakeProcs is a process table with processes of other users in it; the
-// ones signalled end at once.
-type fakeProcs struct {
-	mu       sync.Mutex
-	list     []procs.Proc
-	signaled []int
-}
-
-func (f *fakeProcs) Lookup(pid int) (procs.Proc, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if slices.Contains(f.signaled, pid) {
-		return procs.Proc{}, procs.ErrGone
-	}
-	for _, p := range f.list {
-		if p.PID == pid {
-			return p, nil
-		}
-	}
-	return procs.Proc{}, procs.ErrGone
-}
-
-func (f *fakeProcs) List(int) ([]procs.Proc, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return slices.Clone(f.list), nil
-}
-
-func (f *fakeProcs) Signal(p procs.Proc, sig syscall.Signal) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if slices.Contains(f.signaled, p.PID) {
-		return procs.ErrGone
-	}
-	f.signaled = append(f.signaled, p.PID)
-	return nil
-}
-
-// Only ssh processes of this user that use hop are ended, whatever else
-// the process table shows. hop's config is ~/.ssh/hop/config here, so an
-// ssh with no -F reads it.
-func TestOnlyThisUsersSSHThroughHopIsEnded(t *testing.T) {
-	home := shortDir(t)
-	t.Setenv("HOME", home)
-	f := &fakeProcs{}
-	d, _ := startLocal(t, Options{procs: f, Paths: Paths{ConfigDir: filepath.Join(home, ".ssh", "hop")}})
-	if err := os.MkdirAll(d.opts.Paths.ConfigDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cfg := filepath.Join(d.opts.Paths.ConfigDir, "config")
-	if err := os.WriteFile(cfg, []byte("# Generated by hop\n\nHost web1\n  HostName 203.0.113.16\n\nHost Db-2\n  HostName 203.0.113.17\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	me, other := os.Getuid(), os.Getuid()+1
-	proc := func(pid, uid int, exe, sock string, args ...string) procs.Proc {
-		return procs.Proc{PID: pid, UID: uid, EUID: uid, Start: "s", Exe: exe, Args: args, AgentSocket: sock}
-	}
-	f.list = []procs.Proc{
-		proc(1001, me, "ssh", "", "ssh", "web1"),
-		proc(1002, me, "ssh", "", "ssh", "-l", "deploy", "-p22", "-tt", "db-2", "uptime"),
-		proc(1003, me, "ssh", "", "ssh", "-F", cfg, "-o", "BatchMode=yes", "--", "deploy@web1"),
-		proc(1004, me, "ssh", d.AgentSocket(), "ssh", "elsewhere.example"),
-		proc(1005, me, "ssh", "", "ssh", "ssh://ops@web1:2222"),
-		// Never: another user, as real or effective user; not ssh; not
-		// hop's destination; another config; exited.
-		proc(2001, other, "ssh", d.AgentSocket(), "ssh", "web1"),
-		{PID: 2002, UID: me, EUID: other, Start: "s", Exe: "ssh", Args: []string{"ssh", "web1"}},
-		proc(2003, me, "bash", d.AgentSocket(), "ssh", "web1"),
-		proc(2004, me, "ssh", "", "ssh", "elsewhere.example"),
-		proc(2005, me, "ssh", "", "ssh", "-F", "/home/me/.ssh/other", "web1"),
-		proc(2006, me, "ssh", "", "ssh", "-o", "web1", "elsewhere.example"),
-		{PID: 2007, UID: me, EUID: me, Start: "s", Exe: "ssh", Args: []string{"ssh", "web1"}, Exited: true},
-		proc(os.Getpid(), me, "ssh", d.AgentSocket(), "ssh", "web1"),
-	}
-	got := <-d.endSessions(whyRevoked)
-	ended := func(got []EndedSession) []int {
-		var pids []int
-		for _, e := range got {
-			pids = append(pids, e.PID)
-		}
-		return pids
-	}
-	pids := ended(got)
-	if want := []int{1001, 1002, 1003, 1004, 1005}; !slices.Equal(pids, want) {
-		t.Errorf("ended %v, want %v", pids, want)
-	}
-	slices.Sort(f.signaled)
-	if want := []int{1001, 1002, 1003, 1004, 1005}; !slices.Equal(f.signaled, want) {
-		t.Errorf("signalled %v, want %v", f.signaled, want)
-	}
-	if st := d.endedSessions(); st == nil || st.Count != 5 || st.Why != whyRevoked || st.Sessions[1].Alias != "db-2" {
+	if st := d.endedSessions(); st == nil || st.Count != 0 || st.NotEnded != 1 || st.Why != whyRevoked {
 		t.Errorf("status: %+v", st)
 	}
+}
 
-	// Under another home, hop's config is not the one ssh reads by
-	// default: an ssh with no -F is not hop's.
-	t.Setenv("HOME", shortDir(t))
-	f.mu.Lock()
-	f.signaled = nil
-	f.mu.Unlock()
-	if got, want := ended(<-d.endSessions(whyRevoked)), []int{1003, 1004}; !slices.Equal(got, want) {
-		t.Errorf("with another home, ended %v, want %v", got, want)
+// A device that learns, online, that it was revoked ends the registered
+// sessions. An ssh to the same alias through hop's config that never ran
+// hop session attach (it never logged in) is not registered, and keeps
+// running: nothing is found by looking at processes.
+func TestRevocationEndsRegisteredSessions(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.w.start(x.n2, x.n2.st, SyncOptions{})
+	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.16"))
+	eventually(t, 10*time.Second, "web1 reaches the laptop", func() bool { return strings.Contains(x.n2.config(), "Host web1\n") })
+	cfg := filepath.Join(x.n2.paths.ConfigDir, "config")
+
+	ended, res := attachedSSH(t, x.n2.d.ControlSocket(), "web1")
+	if res != "ok" {
+		t.Fatalf("the daemon refused a real ssh: %s", res)
+	}
+	kept := startProc(t, []string{"SSH_AUTH_SOCK=" + x.n2.d.AgentSocket()}, "ssh", "-F", cfg, "-o", "BatchMode=yes", "-o", "ProxyCommand=sleep 60", "web1")
+	time.Sleep(time.Second)
+	if !kept.running() {
+		t.Fatalf("the unregistered ssh ended before the test: %v\n%s", kept.err, kept.stderr())
+	}
+
+	x.revokeLaptop(t)
+	revoked := time.Now()
+	how := ended.waitEnd(t, 20*time.Second, "the registered ssh")
+	t.Logf("the registered ssh ended %v after the revoke: %s", time.Since(revoked).Round(time.Millisecond), how)
+	if !hungUp(how) {
+		t.Errorf("the registered ssh ended with %q, want SIGHUP", how)
+	}
+	time.Sleep(time.Second)
+	if !kept.running() {
+		t.Errorf("the unregistered ssh was ended: %v", kept.err)
+	}
+	var st StatusResult
+	x.n2.must(OpStatus, nil, &st)
+	if e := st.EndedSessions; e == nil || e.Count != 1 || e.Why != whyRevoked || e.Sessions[0] != (EndedSession{PID: ended.cmd.Process.Pid, Alias: "web1"}) {
+		t.Fatalf("status: ended sessions %+v", e)
 	}
 }
 
-func TestSSHDestination(t *testing.T) {
-	for _, c := range []struct {
-		args       []string
-		dest, conf string
-	}{
-		{[]string{"ssh", "web1"}, "web1", ""},
-		{[]string{"ssh", "-v", "-p", "22", "user@web1", "ls"}, "user@web1", ""},
-		{[]string{"ssh", "-vp22", "-Fcfg", "web1"}, "web1", "cfg"},
-		{[]string{"ssh", "-o", "User=x", "-tt", "--", "-weird"}, "-weird", ""},
-		{[]string{"ssh", "-i"}, "", ""},
-		{[]string{"ssh", "-NL", "8080:localhost:80", "web1"}, "web1", ""},
-		{[]string{"ssh"}, "", ""},
-	} {
-		dest, conf := sshDestination(c.args)
-		if dest != c.dest || conf != c.conf {
-			t.Errorf("%q: dest %q config %q, want %q %q", c.args, dest, conf, c.dest, c.conf)
-		}
+// The max-offline policy's lock ends the sessions too: the laptop's clock
+// jumps two hours past its last contact, with a one-hour policy.
+func TestMaxOfflineLockEndsSessions(t *testing.T) {
+	x := newSyncSetup(t)
+	var skew atomic.Int64
+	clock := func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.w.startWith(x.n2, x.n2.st, Options{offlineEvery: 50 * time.Millisecond, now: clock})
+	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.16"))
+	x.n1.must(OpPolicy, PolicyParams{MaxOffline: 3600}, nil)
+	eventually(t, 10*time.Second, "the policy and web1 reach the laptop", func() bool {
+		x.n1.call(OpSyncNow, nil, nil)
+		x.n2.call(OpSyncNow, nil, nil)
+		return x.n2.policy() == 3600 && strings.Contains(x.n2.config(), "Host web1\n")
+	})
+	p, res := attachedSSH(t, x.n2.d.ControlSocket(), "web1")
+	if res != "ok" {
+		t.Fatalf("the daemon refused a real ssh: %s", res)
 	}
-	for in, want := range map[string]string{"web1": "web1", "u@web1": "web1", "ssh://u@web1:22": "web1", "a@b@web1": "web1", "": ""} {
-		if got := destHost(in); got != want {
-			t.Errorf("destHost(%q) = %q, want %q", in, got, want)
-		}
+
+	skew.Store(int64(2 * time.Hour))
+	if how := p.waitEnd(t, 15*time.Second, "ssh web1 after the max-offline lock"); !hungUp(how) {
+		t.Errorf("ssh ended with %q, want SIGHUP", how)
+	}
+	if s := x.n2.status(); s.OfflineLocked == "" {
+		t.Errorf("the vault did not lock for the policy: %+v", s)
+	}
+	var st StatusResult
+	x.n2.must(OpStatus, nil, &st)
+	if e := st.EndedSessions; e == nil || e.Count != 1 || e.Why != whyOffline {
+		t.Errorf("status: ended sessions %+v", e)
+	}
+}
+
+// With Hop set, each host's block in the config the daemon writes runs hop
+// session attach on this daemon's control socket; without it, nothing.
+func TestConfigRegistersSessionsWithHop(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.w.startWith(x.n2, x.n2.st, Options{Hop: "/opt/hop bin/hop"})
+	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.16"))
+	eventually(t, 10*time.Second, "web1 reaches both", func() bool {
+		return strings.Contains(x.n2.config(), "Host web1\n") && strings.Contains(x.n1.config(), "Host web1\n")
+	})
+	want := fmt.Sprintf("  PermitLocalCommand yes\n  LocalCommand exec '/opt/hop bin/hop' session attach --control '%s' web1\n", x.n2.d.ControlSocket())
+	if !strings.Contains(x.n2.config(), want) {
+		t.Errorf("the config with Hop has no %q:\n%s", want, x.n2.config())
+	}
+	if strings.Contains(x.n1.config(), "LocalCommand") {
+		t.Errorf("the config without Hop has a LocalCommand:\n%s", x.n1.config())
 	}
 }

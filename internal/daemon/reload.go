@@ -299,7 +299,7 @@ func (d *Daemon) apply(ctx context.Context, snap model.Snapshot, gen uint64) (*s
 	old := d.live.swap(kr, gen)
 	old.RemoveAll() // best effort: drop the old key material
 
-	err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, hosts)
+	err := d.writeConfig(d.sshOptions(), hosts)
 	if err != nil {
 		err = &configWriteError{cause: err}
 		st.configErr = err.Error()
@@ -364,7 +364,7 @@ func CleanupLeft(pending func() (bool, error), o sshconfig.Options) string {
 
 // sshOptions is where the daemon writes the ssh config.
 func (d *Daemon) sshOptions() sshconfig.Options {
-	return sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}
+	return sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path(), Hop: d.opts.Hop, ControlSocket: d.opts.Paths.ControlSocket()}
 }
 
 // cleanupLeft is CleanupLeft for this daemon's store and ssh config, ""

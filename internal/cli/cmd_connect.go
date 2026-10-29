@@ -151,20 +151,11 @@ func runConnect(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintf(e.Stderr, "hop: %s\n", hint)
 	}
 	argv := append([]string{e.sshBinary()}, e.sshArgs(t, addr)...)
-	// The daemon ends the session if this device is revoked: this process
-	// becomes ssh, with its PID and start time. A test's ExecSSH does not
-	// replace the process, so it is not registered.
-	undo := func() string { return "" }
-	if e.ExecSSH == nil {
-		undo = e.trackSelf(ctx, t.alias)
-	}
 	// ssh takes over this process's terminal (or runs as a child on the same
 	// streams). Its session is the user's own and is not sanitized, on purpose.
-	err = e.execSSH(argv)
-	if err != nil {
-		undo()
-	}
-	return err
+	// It registers itself with the daemon through hop's config, so that a
+	// revocation ends it (SessionAttach).
+	return e.execSSH(argv)
 }
 
 // execSSH replaces this process with ssh, falling back to a child process
@@ -362,7 +353,7 @@ func runExec(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintf(e.Stderr, "hop: %s\n", hint)
 	}
 
-	r := remoteRun{command: remoteCommand(words, *sudo), timeout: *timeout, stdin: e.Stdin, via: "hop exec"}
+	r := remoteRun{command: remoteCommand(words, *sudo), timeout: *timeout, stdin: e.Stdin}
 	if !*asJSON {
 		// The remote command's output goes straight through, not sanitized, on
 		// purpose: it is the user's own terminal session. With --json it is
@@ -401,9 +392,6 @@ type remoteRun struct {
 	// stdout and stderr receive the output as it comes. Nil keeps the last
 	// tailLimit bytes of that stream in the result instead.
 	stdout, stderr io.Writer
-	// via is the hop command, as the daemon's record of the session names
-	// it (trackSession).
-	via string
 }
 
 // runRemote runs one command on t at addr with ssh: no PTY, and BatchMode,
@@ -441,7 +429,7 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	}
 
 	start := time.Now()
-	endedWhy, runErr := e.runSSH(ctx, cmd, t.alias, r.via)
+	endedWhy, runErr := e.runSSH(ctx, cmd)
 	res := ExecResult{Host: t.rr.Result.HostName, DurationMS: time.Since(start).Milliseconds()}
 	var ee *exec.ExitError
 	switch {
@@ -850,7 +838,7 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		// runRemote bounds it: stdin closed, output capped, and WaitDelay,
 		// so a ProxyJump child that keeps stderr open cannot hold it past
 		// the timeout.
-		res, err := e.runRemote(ctx, t, addr, remoteRun{command: "true", timeout: authCheckTimeout, via: "hop check"})
+		res, err := e.runRemote(ctx, t, addr, remoteRun{command: "true", timeout: authCheckTimeout})
 		if err != nil {
 			return stepFail, err.Error() // composed by failf: already display-safe
 		}

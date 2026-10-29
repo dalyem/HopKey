@@ -26,6 +26,14 @@ func stopSignals(hangupIgnored bool) []os.Signal {
 }
 
 func main() {
+	// ssh runs this as the LocalCommand of hop's hosts and waits for it:
+	// nothing else is set up for it, it says nothing, and it exits 0.
+	if len(os.Args) >= 2 && os.Args[1] == "session" {
+		if len(os.Args) >= 3 && os.Args[2] == "attach" {
+			cli.SessionAttach(os.Args[3:])
+		}
+		os.Exit(0)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		os.Stderr.WriteString("hop: cannot find your home directory: " + err.Error() + "\n")

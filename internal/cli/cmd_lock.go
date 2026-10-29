@@ -19,11 +19,11 @@ type LockResult struct {
 
 // runLock is `hop lock`: the daemon drops every secret and the agent holds
 // no keys until hop unlock. Open ssh sessions keep running, unless
-// --end-sessions ends the ones hop is responsible for, as a revocation
-// does.
+// --end-sessions ends the ones that registered through hop's ssh config,
+// as a revocation does.
 func runLock(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "lock", commands["lock"].usage)
-	endSessions := fs.Bool("end-sessions", false, "also end the ssh sessions hop started, and plain ssh sessions that use hop's ssh config")
+	endSessions := fs.Bool("end-sessions", false, "also end the ssh sessions that registered through hop's ssh config, as a revocation does")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {

@@ -29,6 +29,14 @@ import (
 const envDumpVar = "HOPKEY_TEST_DUMP_ENV"
 
 func TestMain(m *testing.M) {
+	// ssh runs this binary as hop session attach, the LocalCommand of a
+	// machine whose daemon has hopBin (sessions_e2e_test.go).
+	if len(os.Args) >= 2 && os.Args[1] == "session" {
+		if len(os.Args) >= 3 && os.Args[2] == "attach" {
+			SessionAttach(os.Args[3:])
+		}
+		os.Exit(0)
+	}
 	if out := os.Getenv(envDumpVar); out != "" && len(os.Args) > 1 {
 		if last := os.Args[len(os.Args)-1]; last == "daemon" || last == "dump" {
 			if err := os.WriteFile(out, []byte(strings.Join(os.Environ(), "\x00")), 0o600); err != nil {

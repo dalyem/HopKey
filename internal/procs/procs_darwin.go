@@ -4,94 +4,128 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"os/exec"
-	"strconv"
-	"strings"
+	"net"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-// psColumns are what ps prints for each process: the PID, the effective
-// and the real user, the state, the start time (five words in the C
-// locale, "Thu Oct 29 10:00:00 2026") and the command line.
-var psColumns = []string{"-o", "pid=,uid=,ruid=,stat=,lstart=,command="}
+// szomb is a zombie's p_stat (SZOMB in sys/proc.h).
+const szomb = 5
 
-// ps runs ps in the C locale and UTC, so the start time reads the same
-// for every caller.
-func ps(args ...string) ([]byte, error) {
-	cmd := exec.Command("/bin/ps", args...)
-	cmd.Env = []string{"LC_ALL=C", "TZ=UTC"}
-	return cmd.Output()
-}
-
-// Lookup reads process pid with ps. ErrGone means there is no such
-// process.
+// Lookup asks the kernel about process pid (sysctl kern.proc.pid): its
+// parent, users, start time and state, and its program from the exec path
+// of kern.procargs2. ErrGone means there is no such process.
 func Lookup(pid int) (Proc, error) {
-	out, err := ps(append([]string{"-ww", "-p", strconv.Itoa(pid)}, psColumns...)...)
-	var ee *exec.ExitError
-	if errors.As(err, &ee) && len(bytes.TrimSpace(out)) == 0 {
+	if pid <= 0 {
 		return Proc{}, ErrGone
 	}
+	k, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
 	if err != nil {
-		return Proc{}, err
+		// A PID with no process answers with no data, which reads as EIO.
+		return Proc{}, fmt.Errorf("%w (%v)", ErrGone, err)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if p, ok := parsePS(line); ok && p.PID == pid {
-			return p, nil
-		}
+	if int(k.Proc.P_pid) != pid {
+		return Proc{}, ErrGone
 	}
-	return Proc{}, ErrGone
+	p := Proc{
+		PID:    pid,
+		PPID:   int(k.Eproc.Ppid),
+		UID:    int(k.Eproc.Pcred.P_ruid),
+		EUID:   int(k.Eproc.Ucred.Uid),
+		Start:  fmt.Sprintf("%d.%06d", k.Proc.P_starttime.Sec, k.Proc.P_starttime.Usec),
+		Exited: k.Proc.P_stat == szomb,
+	}
+	p.Exe, _ = execPath(pid)
+	return p, nil
 }
 
-// List returns the processes uid runs. ps shows no environment, so
-// AgentSocket is never set.
-func List(uid int) ([]Proc, error) {
-	out, err := ps(append([]string{"-axww"}, psColumns...)...)
+// execPath is the path the kernel recorded when pid last ran exec: the
+// first string kern.procargs2 returns, after argc and before the
+// arguments.
+func execPath(pid int) (string, error) {
+	b, err := unix.SysctlRaw("kern.procargs2", pid)
 	if err != nil {
-		return nil, fmt.Errorf("procs: ps: %w", err)
+		return "", err
 	}
-	var list []Proc
-	for _, line := range strings.Split(string(out), "\n") {
-		if p, ok := parsePS(line); ok && p.OwnedBy(uid) {
-			list = append(list, p)
-		}
+	if len(b) < 5 {
+		return "", errors.New("procs: malformed procargs2")
 	}
-	return list, nil
+	b = b[4:]
+	i := bytes.IndexByte(b, 0)
+	if i <= 0 {
+		return "", errors.New("procs: malformed procargs2")
+	}
+	return string(b[:i]), nil
 }
 
-// Signal sends sig to p's PID only while it is still p (Proc.Same). A
-// reuse of the PID in the moment between the check and kill(2) is still
-// possible.
-func Signal(p Proc, sig syscall.Signal) error {
+// Open reads process pid to signal it. macOS has no handle that holds a
+// process, so the Pin checks it again before each signal (Signal).
+func Open(pid int) (*Pin, error) {
+	p, err := Lookup(pid)
+	if err != nil {
+		return nil, err
+	}
+	if p.Exited {
+		return nil, ErrGone
+	}
+	return &Pin{Proc: p, fd: -1}, nil
+}
+
+// still reports whether pid is still the process p read: the same start
+// time, users and program, not exited.
+func (p *Pin) still() bool {
 	q, err := Lookup(p.PID)
-	if err != nil || !p.Same(q) {
+	return err == nil && p.Same(q) && q.Exe == p.Exe
+}
+
+// Signal sends sig to the process if its PID still has the start time and
+// program it was read with. Between that check and kill(2) the process
+// may end and the PID go to another one; that moment is short, and PIDs
+// are not reused at once, but it is not closed.
+func (p *Pin) Signal(sig syscall.Signal) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.still() {
 		return ErrGone
 	}
-	err = syscall.Kill(p.PID, sig)
+	err := syscall.Kill(p.PID, sig)
 	if errors.Is(err, syscall.ESRCH) {
 		return ErrGone
 	}
 	return err
 }
 
-// parsePS reads one line of ps with psColumns. The command line is split
-// at spaces, so an argument with spaces in it reads as several.
-func parsePS(line string) (Proc, bool) {
-	f := strings.Fields(line)
-	if len(f) < 10 {
-		return Proc{}, false
+// Exited reports whether the process has exited, or its PID names another
+// one.
+func (p *Pin) Exited() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.still()
+}
+
+// Close does nothing here: nothing is held.
+func (p *Pin) Close() {}
+
+// PeerPID is the PID of the process that connected c (LOCAL_PEERPID), as
+// the kernel recorded it at connect time.
+func PeerPID(c *net.UnixConn) (int, error) {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
 	}
-	pid, err1 := strconv.Atoi(f[0])
-	euid, err2 := strconv.Atoi(f[1])
-	uid, err3 := strconv.Atoi(f[2])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return Proc{}, false
+	var pid int
+	var sockErr error
+	if err := raw.Control(func(fd uintptr) {
+		pid, sockErr = unix.GetsockoptInt(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERPID)
+	}); err != nil {
+		return 0, err
 	}
-	p := Proc{
-		PID: pid, UID: uid, EUID: euid,
-		Exited: strings.HasPrefix(f[3], "Z"),
-		Start:  strings.Join(f[4:9], " "),
-		Args:   f[9:],
+	if sockErr != nil {
+		return 0, sockErr
 	}
-	p.Exe = base(p.Args[0])
-	return p, true
+	if pid <= 0 {
+		return 0, errors.New("procs: no peer PID")
+	}
+	return pid, nil
 }

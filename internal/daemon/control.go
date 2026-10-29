@@ -59,7 +59,7 @@ func (d *Daemon) serveControl() {
 	}
 }
 
-func (d *Daemon) serveConn(c net.Conn) {
+func (d *Daemon) serveConn(c *net.UnixConn) {
 	defer d.control.untrack(c)
 	sc := bufio.NewScanner(c)
 	sc.Buffer(make([]byte, 0, 64<<10), maxRequest)
@@ -82,6 +82,9 @@ func (d *Daemon) serveConn(c net.Conn) {
 		var resp Response
 		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
 			resp = errorResponse(invalidf("malformed request: %v", err))
+		} else if req.Op == OpSessionAttach {
+			// Who is asking is the request (sessions.go).
+			resp = d.attachResponse(c, req)
 		} else {
 			resp = d.handle(req)
 		}

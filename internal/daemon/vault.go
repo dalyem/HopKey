@@ -41,7 +41,7 @@ type Vault interface {
 }
 
 // LockParams is the request for OpLock. EndSessions also ends the ssh
-// sessions hop is responsible for (sessions.go), which a lock by itself
+// sessions registered through hop's config (sessions.go), which a lock by itself
 // leaves running.
 type LockParams struct {
 	EndSessions bool `json:"end_sessions,omitempty"`

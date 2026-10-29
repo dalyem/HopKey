@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,70 +17,116 @@ import (
 // root is where /proc is; tests point it at a tree of their own.
 var root = "/proc"
 
-// Lookup reads process pid: its users, start time, program and command
-// line. ErrGone means there is no such process.
-func Lookup(pid int) (Proc, error) { return read(root, pid, false) }
+// pidfdOpen is pidfd_open(2); tests make it fail.
+var pidfdOpen = unix.PidfdOpen
 
-// List returns the processes uid runs, as Lookup reads them, with the
-// agent socket of each whose environment can be read. Processes that end
-// while it reads are left out.
-func List(uid int) ([]Proc, error) {
-	des, err := os.ReadDir(root)
+// Lookup reads process pid: its parent, users, start time and program.
+// ErrGone means there is no such process.
+func Lookup(pid int) (Proc, error) { return read(root, pid) }
+
+// Open pins process pid with a pidfd and reads it. What it reads is the
+// pinned process: it was still running once the read was done, so its PID
+// had not been reused. ErrGone means there is no such process (or it is a
+// zombie); ErrNoPin that the kernel gave no pidfd (before Linux 5.3, or a
+// seccomp filter that refuses it), and the process must not be signalled.
+func Open(pid int) (*Pin, error) {
+	fd, err := pidfdOpen(pid, 0)
+	if errors.Is(err, unix.ESRCH) {
+		return nil, ErrGone
+	}
 	if err != nil {
+		return nil, fmt.Errorf("%w: pidfd_open: %v", ErrNoPin, err)
+	}
+	p, err := Lookup(pid)
+	if err != nil {
+		unix.Close(fd)
 		return nil, err
 	}
-	var out []Proc
-	for _, de := range des {
-		pid, err := strconv.Atoi(de.Name())
-		if err != nil || pid <= 0 {
-			continue
-		}
-		p, err := read(root, pid, true)
-		if err != nil || !p.OwnedBy(uid) {
-			continue
-		}
-		out = append(out, p)
+	pin := &Pin{Proc: p, fd: fd}
+	if p.Exited || pin.Exited() {
+		pin.Close()
+		return nil, ErrGone
 	}
-	return out, nil
+	return pin, nil
 }
 
-// Signal sends sig to p's PID only while it is still p (Proc.Same). Where
-// the kernel has pidfds the PID is pinned before the check, so the signal
-// can't reach a process that took the PID after it; without them a reuse
-// in the moment between the check and kill(2) is still possible.
-func Signal(p Proc, sig syscall.Signal) error {
-	fd, err := unix.PidfdOpen(p.PID, 0)
-	if errors.Is(err, unix.ESRCH) {
+// Signal sends sig to the pinned process, and to no other. ErrGone means
+// it has exited (or the Pin is closed).
+func (p *Pin) Signal(sig syscall.Signal) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fd < 0 {
 		return ErrGone
 	}
-	if err == nil {
-		defer unix.Close(fd)
-	}
-	q, lerr := Lookup(p.PID)
-	if lerr != nil || !p.Same(q) {
-		return ErrGone
-	}
-	if err == nil {
-		err = unix.PidfdSendSignal(fd, sig, nil, 0)
-	} else {
-		err = syscall.Kill(p.PID, sig)
-	}
+	err := unix.PidfdSendSignal(p.fd, sig, nil, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return ErrGone
 	}
 	return err
 }
 
-// read reads /proc/<pid> under dir: stat for the start time and state,
-// status for the users, exe (or comm, when exe can't be read) for the
-// program, cmdline, and with env the environment.
-func read(dir string, pid int, env bool) (Proc, error) {
+// Exited reports whether the pinned process has exited: its pidfd polls
+// readable once it has, zombie or reaped. A closed Pin counts as exited.
+func (p *Pin) Exited() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fd < 0 {
+		return true
+	}
+	fds := []unix.PollFd{{Fd: int32(p.fd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(fds, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		// An error leaves it as exited: then it is never signalled.
+		return err != nil || (n > 0 && fds[0].Revents != 0)
+	}
+}
+
+// Close lets the process go.
+func (p *Pin) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.fd >= 0 {
+		unix.Close(p.fd)
+		p.fd = -1
+	}
+}
+
+// PeerPID is the PID of the process that connected c (SO_PEERCRED), as
+// the kernel recorded it at connect time.
+func PeerPID(c *net.UnixConn) (int, error) {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var cred *unix.Ucred
+	var sockErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, sockErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return 0, err
+	}
+	if sockErr != nil {
+		return 0, sockErr
+	}
+	if cred.Pid <= 0 {
+		return 0, errors.New("procs: no peer PID")
+	}
+	return int(cred.Pid), nil
+}
+
+// read reads /proc/<pid> under dir: stat for the parent, start time and
+// state, status for the users, and exe for the program. A process whose
+// exe can't be read (another user's, a kernel thread) has no Exe.
+func read(dir string, pid int) (Proc, error) {
 	d := filepath.Join(dir, strconv.Itoa(pid))
 	stat, err := os.ReadFile(filepath.Join(d, "stat"))
 	if err != nil {
 		return Proc{}, fmt.Errorf("%w (%v)", ErrGone, err)
 	}
-	start, state, err := parseStat(stat)
+	st, err := parseStat(stat)
 	if err != nil {
 		return Proc{}, err
 	}
@@ -91,41 +138,37 @@ func read(dir string, pid int, env bool) (Proc, error) {
 	if err != nil {
 		return Proc{}, err
 	}
-	p := Proc{PID: pid, UID: uid, EUID: euid, Start: start, Exited: state == 'Z' || state == 'X'}
+	p := Proc{PID: pid, PPID: st.ppid, UID: uid, EUID: euid, Start: st.start, Exited: st.state == 'Z' || st.state == 'X'}
 	if exe, err := os.Readlink(filepath.Join(d, "exe")); err == nil {
-		p.Exe = base(exe)
-	} else if comm, err := os.ReadFile(filepath.Join(d, "comm")); err == nil {
-		p.Exe = strings.TrimSpace(string(comm))
-	}
-	if b, err := os.ReadFile(filepath.Join(d, "cmdline")); err == nil {
-		p.Args = splitNUL(b)
-	}
-	if env {
-		if b, err := os.ReadFile(filepath.Join(d, "environ")); err == nil {
-			for _, kv := range splitNUL(b) {
-				if v, ok := strings.CutPrefix(kv, "SSH_AUTH_SOCK="); ok {
-					p.AgentSocket = v
-				}
-			}
-		}
+		p.Exe = strings.TrimSuffix(exe, " (deleted)")
 	}
 	return p, nil
 }
 
-// parseStat returns the start time (field 22, clock ticks since boot) and
-// the state (field 3) from /proc/<pid>/stat. The command name, field 2, is
-// in parentheses and may hold anything, so fields are counted from the
-// last ')'.
-func parseStat(b []byte) (start string, state byte, err error) {
+type statFields struct {
+	state byte
+	ppid  int
+	start string
+}
+
+// parseStat returns the state (field 3), the parent (field 4) and the
+// start time (field 22, clock ticks since boot) from /proc/<pid>/stat.
+// The command name, field 2, is in parentheses and may hold anything, so
+// fields are counted from the last ')'.
+func parseStat(b []byte) (statFields, error) {
 	i := bytes.LastIndexByte(b, ')')
 	if i < 0 {
-		return "", 0, errors.New("procs: malformed stat")
+		return statFields{}, errors.New("procs: malformed stat")
 	}
 	f := strings.Fields(string(b[i+1:]))
 	if len(f) < 20 || len(f[0]) != 1 {
-		return "", 0, errors.New("procs: malformed stat")
+		return statFields{}, errors.New("procs: malformed stat")
 	}
-	return f[19], f[0][0], nil
+	ppid, err := strconv.Atoi(f[1])
+	if err != nil {
+		return statFields{}, errors.New("procs: malformed stat")
+	}
+	return statFields{state: f[0][0], ppid: ppid, start: f[19]}, nil
 }
 
 // parseUids returns the real and effective user IDs from
@@ -149,12 +192,4 @@ func parseUids(b []byte) (uid, euid int, err error) {
 		return uid, euid, nil
 	}
 	return 0, 0, errors.New("procs: no Uid line in status")
-}
-
-func splitNUL(b []byte) []string {
-	b = bytes.TrimRight(b, "\x00")
-	if len(b) == 0 {
-		return nil
-	}
-	return strings.Split(string(b), "\x00")
 }

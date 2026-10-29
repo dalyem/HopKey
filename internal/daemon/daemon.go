@@ -81,6 +81,11 @@ type Options struct {
 	Sync SyncOptions
 	// Logf receives log lines. Nil discards them.
 	Logf func(format string, args ...any)
+	// Hop is the absolute path of the hop binary. The ssh config the
+	// daemon writes then has each session run hop session attach, so
+	// that a revocation can end it (sessions.go). Empty, or a path a
+	// LocalCommand can't hold, leaves sessions unregistered.
+	Hop string
 
 	// Test hooks: writeConfig replaces sshconfig.Write, wipeConfig
 	// sshconfig.WipeIf with no condition, and configRetry
@@ -210,6 +215,12 @@ func Start(opts Options) (*Daemon, error) {
 	if d.procs == nil {
 		d.procs = sysProcs{}
 	}
+	if opts.Hop != "" {
+		if _, err := sshconfig.SessionCommand(opts.Hop, opts.Paths.ControlSocket(), "x"); err != nil {
+			logf("ssh sessions will not register, so a revocation can't end them: %v", err)
+			d.opts.Hop = ""
+		}
+	}
 	if d.writeConfig == nil {
 		d.writeConfig = sshconfig.Write
 	}
@@ -279,6 +290,7 @@ func (d *Daemon) shutdown() {
 			err = aerr
 		}
 		d.wg.Wait()
+		d.sessions.closeAll()
 		if c, ok := d.store.(io.Closer); ok {
 			if cerr := c.Close(); err == nil {
 				err = cerr

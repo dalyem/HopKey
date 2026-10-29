@@ -313,6 +313,7 @@ func init() {
 		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|policy|logout|rotate|passwd|merge|resume> [--json]"},
 		"login":   {runLogin, "hop login [flags of hop auth login]"},
 		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
+		"session": {runSession, "hop session attach --control SOCKET ALIAS (run by ssh, from hop's ssh config)"},
 	}
 }
 

@@ -1279,7 +1279,7 @@ func (s *mcpServer) auditText(text string) string { return exact(s.redact(text))
 
 func (s *mcpServer) runOne(ctx context.Context, t *target, command string, timeout time.Duration) ExecResult {
 	addr, _ := chooseAddress(ctx, s.e, t)
-	res, err := s.e.runRemote(ctx, t, addr, remoteRun{command: command, timeout: timeout, via: "hop mcp"})
+	res, err := s.e.runRemote(ctx, t, addr, remoteRun{command: command, timeout: timeout})
 	res.Stderr = markSSHUser(t, addr, res.Stderr)
 	if err != nil {
 		res.ExitCode, res.Error = ExitFailure, err.Error()

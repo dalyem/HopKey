@@ -279,7 +279,6 @@ func (d *Daemon) reportedLocked(rep *store.ServerReport, passphrase []byte) {
 			e.retired = &ServerRetirement{How: rep.How, Seq: rep.Seq, Unverified: true}
 		}
 	})
-	// Before the ssh config is emptied: its aliases name the sessions.
 	d.endSessions(whyRevoked)
 	d.dropKeysLocked(true)
 	d.logf("sync stopped: %s", why)

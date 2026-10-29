@@ -1414,11 +1414,9 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 	if stdout == nil {
 		cmd.Stdout = io.Discard
 	}
-	alias := r.t.alias
-	if r.cfg != "" {
-		alias = rotCheckAlias
-	}
-	endedWhy, runErr := r.e.runSSH(ctx, cmd, alias, "hop key rotate")
+	// Through hop's config the session registers itself (SessionAttach);
+	// a check's own config has no LocalCommand, and its sessions are short.
+	endedWhy, runErr := r.e.runSSH(ctx, cmd)
 	res := rotResult{ExecResult: ExecResult{Host: r.t.rr.Result.HostName}}
 	var ee *exec.ExitError
 	switch {

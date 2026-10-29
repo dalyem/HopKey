@@ -65,6 +65,9 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	}
 	d, err := daemon.Start(daemon.Options{
 		Paths: e.Paths, Store: vault, Version: version.Version,
+		// The ssh config runs this binary when a session starts, so that a
+		// revocation can end the session (daemon/sessions.go).
+		Hop: e.Executable,
 		Logf: func(format string, args ...any) {
 			fmt.Fprintf(e.Stderr, "%s %s\n", time.Now().Format(time.RFC3339), safef(format, args...))
 		},
