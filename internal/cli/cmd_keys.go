@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
@@ -23,7 +24,7 @@ const maxKeyFile = 64 << 10
 func runKey(ctx context.Context, e *Env, args []string) error {
 	if len(args) == 0 {
 		fmt.Fprintf(e.Stderr, "usage: %s\n", commands["key"].usage)
-		return failf("key needs a subcommand: add, ls, rm or rotate")
+		return failf("key needs a subcommand: add, ls, pub, rm or rotate")
 	}
 	switch args[0] {
 	case "add":
@@ -32,10 +33,12 @@ func runKey(ctx context.Context, e *Env, args []string) error {
 		return runKeyLs(ctx, e, args[1:])
 	case "rm":
 		return runKeyRm(ctx, e, args[1:])
+	case "pub":
+		return runKeyPub(ctx, e, args[1:])
 	case "rotate":
 		return runKeyRotate(ctx, e, args[1:])
 	}
-	return failf("unknown key subcommand %q (add, ls, rm, rotate)", args[0])
+	return failf("unknown key subcommand %q (add, ls, pub, rm, rotate)", args[0])
 }
 
 // readPrivateKey reads the private key file at path, asking for its
@@ -174,6 +177,78 @@ func runKeyLs(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintln(tw, row)
 	}
 	return tw.Flush()
+}
+
+// KeyPubView is the --json shape of hop key pub: the public half only.
+type KeyPubView struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	KeyType     string `json:"key_type"`
+	PublicKey   string `json:"public_key"` // an authorized_keys line: type, base64, comment
+	Fingerprint string `json:"fingerprint"`
+}
+
+func runKeyPub(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "key pub", "hop key pub <name> [--fingerprint] [--json]")
+	fingerprint := fs.Bool("fingerprint", false, "print the SHA256 fingerprint instead of the public key")
+	asJSON := fs.Bool("json", false, "print the key's public fields as JSON")
+	pos, _, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		fs.Usage()
+		return failf("expected exactly one key name")
+	}
+	l, err := listAll(ctx, e)
+	if err != nil {
+		return err
+	}
+	id, err := findKey(l, pos[0])
+	if err != nil {
+		return err
+	}
+	var info daemon.KeyInfo
+	for _, k := range l.Keys {
+		if k.ID == id.String() {
+			info = k
+		}
+	}
+	// Rebuilt from the parsed key, not echoed from the vault, so that what
+	// is printed is one well-formed line whatever the stored text was.
+	pub, err := sshkeys.ParsePublic(info.PublicKey)
+	if err != nil {
+		return failf("key %s has no usable public key in the vault: %v", oneLine(info.Name), err)
+	}
+	view := KeyPubView{
+		ID: info.ID, Name: info.Name, KeyType: info.KeyType,
+		PublicKey:   sshkeys.Line(pub) + " " + keyComment(info.Name),
+		Fingerprint: sshkeys.Fingerprint(pub),
+	}
+	switch {
+	case *asJSON:
+		return printJSON(e, view)
+	case *fingerprint:
+		e.printf("%s\n", view.Fingerprint)
+	default:
+		e.printf("%s\n", view.PublicKey)
+	}
+	return nil
+}
+
+// keyComment is a key's name as the comment of an authorized_keys line: a
+// single word, so the vault's text cannot add a field, an option or a line.
+func keyComment(name string) string {
+	c := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) || !unicode.IsPrint(r) {
+			return '_'
+		}
+		return r
+	}, name)
+	if c == "" {
+		return "hop"
+	}
+	return c
 }
 
 func runKeyRm(ctx context.Context, e *Env, args []string) error {

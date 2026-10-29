@@ -110,6 +110,10 @@ type ResolveParams struct {
 	// a host with agent_access deny is left out, as if it were not in the
 	// vault, so it is neither matched nor offered as a candidate.
 	AgentOnly bool `json:"agent_only,omitempty"`
+	// AgentTags narrows AgentOnly to the hosts that carry at least one of
+	// these tags (hop mcp --tag): any other host is left out exactly as a
+	// denied one is. Empty means no narrowing.
+	AgentTags []string `json:"agent_tags,omitempty"`
 }
 
 // ResolveResult answers OpResolve.
@@ -133,6 +137,11 @@ type ResolveResult struct {
 	// CaughtUp means the target first matched nothing and a catch-up pull
 	// ran before this answer.
 	CaughtUp bool `json:"caught_up,omitempty"`
+	// AgentTagsApplied says the daemon narrowed the resolution to the
+	// request's AgentTags. A daemon from before agent_tags ignores the field
+	// and leaves this out, so hop mcp --tag can tell an unscoped answer from
+	// a scoped one and refuse to use it.
+	AgentTagsApplied bool `json:"agent_tags_applied,omitempty"`
 }
 
 // PutHostParams is the request for OpPutHost. A zero ItemID creates the host.

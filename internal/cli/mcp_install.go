@@ -53,9 +53,11 @@ func mcpClientCommands(server []string) map[string]string {
 }
 
 func runMCPInstall(ctx context.Context, e *Env, args []string) error {
-	fs := newFlags(e, "mcp install", "hop mcp install [--client claude|codex|print] [--read-only] [--json]")
+	fs := newFlags(e, "mcp install", "hop mcp install [--client claude|codex|print] [--read-only] [--tag T]... [--json]")
 	client := fs.String("client", "print", "claude (Claude Code, for this user), codex (Codex CLI), or print to show the config to paste")
 	readOnly := fs.Bool("read-only", false, "register hop mcp --read-only, which offers no tool that runs a command")
+	var tags stringList
+	fs.Var(&tags, "tag", "register hop mcp --tag T, which shows agents only the hosts with a tag (repeatable)")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
 	pos, rest, err := parseFlags(fs, args)
 	if err != nil {
@@ -72,6 +74,13 @@ func runMCPInstall(ctx context.Context, e *Env, args []string) error {
 	server := []string{exe, "mcp"}
 	if *readOnly {
 		server = append(server, "--read-only")
+	}
+	scope, err := parseAgentTags(tags.vals)
+	if err != nil {
+		return err
+	}
+	for _, t := range scope {
+		server = append(server, "--tag", t)
 	}
 	switch *client {
 	case "claude":
@@ -133,8 +142,15 @@ func runClientCLI(ctx context.Context, e *Env, asJSON bool, name, client string,
 	if errors.Is(err, exec.ErrNotFound) {
 		if asJSON {
 			// The config is not printed with --json, so point to the
-			// command that gives it as JSON.
-			return failf("%s is not on PATH; add hop to %s by hand with the config from: hop mcp install --client print --json", argv[0], name)
+			// command that gives it as JSON: the same server, so the
+			// same --read-only and --tag.
+			cmd := quoteArgv(append([]string{"hop", "mcp", "install", "--client", "print", "--json"}, server[2:]...))
+			if safef("%s", cmd) != cmd {
+				// A tag this message can't show as it is: a command with
+				// it replaced would register another scope.
+				return failf("%s is not on PATH; add hop to %s by hand with the config from hop mcp install --client print --json, given the same --read-only and --tag flags", argv[0], name)
+			}
+			return failf("%s is not on PATH; add hop to %s by hand with the config from: %s", argv[0], name, cmd)
 		}
 		printMCPConfig(e, server)
 		return failf("%s is not on PATH; add hop to %s by hand with the config above", argv[0], name)
