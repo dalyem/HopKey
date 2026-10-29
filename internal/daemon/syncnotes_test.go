@@ -90,7 +90,7 @@ func TestSyncNowStepErrorKeepsTheServersAnswer(t *testing.T) {
 	defer cancel()
 	<-expired.Done()
 	caller := context.Background()
-	for _, err := range []error{store.ErrSessionEnded, fmt.Errorf("pull: %w", store.ErrSessionEnded), store.ErrDeviceRevoked} {
+	for _, err := range []error{store.ErrSessionEnded, fmt.Errorf("pull: %w", store.ErrSessionEnded), store.ErrDeviceRevoked, context.Canceled} {
 		if got := syncNowStepError(err, expired, caller); got != err {
 			t.Errorf("%v became %v", err, got)
 		}

@@ -1104,7 +1104,7 @@ func syncNowStepError(err error, sctx, rctx context.Context) error {
 	if err == nil || sctx.Err() != context.DeadlineExceeded || rctx.Err() != nil {
 		return err
 	}
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && !errors.Is(err, syncclient.ErrUnreachable) {
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, syncclient.ErrUnreachable) {
 		return err
 	}
 	return fmt.Errorf("%w: the server did not answer within %s", syncclient.ErrUnreachable, syncNowStepTimeout)
