@@ -766,3 +766,120 @@ func TestMCPTailCutKeepsWholeRunes(t *testing.T) {
 		}
 	}
 }
+
+// A vault password written with a backslash, `left\nright`, stands as it
+// is in what ssh's stderr prints, and in the error hop's own ssh client
+// makes of a server's disconnect message holding a newline, which %q
+// writes `left\nright`. hop looks for it in the text as it came as well
+// as in the server's message unquoted: under redacted and full, in both,
+// the password is replaced, not decoded into a form that hides it.
+func TestMCPCheckFindsALiteralBackslashSecret(t *testing.T) {
+	const password = `left\nright`
+	e, _, _ := redactWorld(t)
+	if _, err := e.store.PutCredential(context.Background(), model.Credential{Name: "backslash", Username: "admin", Password: password}); err != nil {
+		t.Fatal(err)
+	}
+	e.server.mu.Lock()
+	e.server.trueErr = `ssh: disconnect, reason 2: "` + password + `"` + "\n"
+	e.server.mu.Unlock()
+	port := startDisconnectServer(t, "go away left\nright")
+	e.addHost(t, "gate", func(h *model.Host) { h.Port = uint32(port) })
+	m := e.startMCP(t)
+	for _, c := range []struct{ host, step, want string }{
+		{"web-1", "auth_ok", `ssh did not log in: ssh: disconnect, reason 2: "[redacted by hop: vault-password]"`},
+		{"gate", "host_key_matches", `"go away [redacted by hop: vault-password]"`},
+	} {
+		for _, policy := range []string{"redacted", "full"} {
+			if code, _, stderr := e.hop(t, "edit", c.host, "--agent-output", policy); code != 0 {
+				t.Fatalf("hop edit %s --agent-output %s: exit %d: %s", c.host, policy, code, stderr)
+			}
+			name := c.host + " " + policy
+			status, detail := mcpCall[agentCheck](m, "check_host", map[string]any{"host": c.host}).step(t, c.step)
+			if status != "fail" || !strings.Contains(detail, c.want) {
+				t.Errorf("%s: %s %s %q, want %q in it", name, c.step, status, detail, c.want)
+			}
+			if strings.Contains(detail, password) || strings.Contains(detail, "right") {
+				t.Errorf("%s: the agent got the password: %q", name, detail)
+			}
+		}
+	}
+}
+
+// What exec returns is not scrubbed a second time on its way out: the
+// markers it put in stay whole, however often hop mcp's own secret
+// stands in them, so the 64 KiB limit and the counts hold for what the
+// agent gets.
+func TestMCPDoesNotRescanItsOwnMarkers(t *testing.T) {
+	e := newE2E(t)
+	leak := strings.Repeat("e", 64<<10)
+	e.server.mu.Lock()
+	e.server.leak = leak
+	e.server.mu.Unlock()
+	if code, stdout, _ := e.hop(t, "exec", "web-1", "--", "leak"); code != 0 || stdout != leak {
+		t.Errorf("hop exec: exit %d, %d bytes, want the remote's %d unchanged", code, len(stdout), len(leak))
+	}
+	env := e.env(t, nil, nil, nil)
+	env.Environ = append(os.Environ(), "HOP_KIT_CONFIRM=e")
+	m := startMCP(t, env)
+	const marker = "[redacted by hop]"
+	for _, cmd := range []string{"leak", "leakerr"} {
+		r := mcpCall[agentExec](m, "exec", map[string]any{"hosts": "web-1", "command": cmd}).Results[0]
+		got := r.Stdout
+		if cmd == "leakerr" {
+			got = r.Stderr
+		}
+		if len(got) > 64<<10 || len(got) < 60<<10 || !r.Truncated {
+			t.Errorf("%s: %d bytes, truncated %v; want at most 64 KiB, cut", cmd, len(got), r.Truncated)
+		}
+		if rest := strings.ReplaceAll(got, marker, ""); rest != "" {
+			t.Errorf("%s: %d bytes that are not whole markers: %.60q", cmd, len(rest), rest)
+		}
+		if n := strings.Count(got, marker); r.Redactions["hop-secret"] != n || len(r.Redactions) != 1 {
+			t.Errorf("%s: redactions %v, but %d markers returned", cmd, r.Redactions, n)
+		}
+	}
+}
+
+// check_host's limit holds for the detail as the agent gets it: a server
+// message of 20,000 NUL bytes is 80,000 bytes once x/crypto quotes it,
+// and the detail is cut to 64 KiB, at a whole escape, and says so.
+func TestMCPCheckLimitHoldsAfterQuoting(t *testing.T) {
+	e := newE2E(t)
+	port := startDisconnectServer(t, strings.Repeat("\x00", 20000))
+	e.addHost(t, "gate", func(h *model.Host) { h.Port = uint32(port) })
+	m := e.startMCP(t)
+	status, detail := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "gate"}).step(t, "host_key_matches")
+	const lead = "could not read the server's host key: (earlier output cut) "
+	if status != "fail" || len(detail) > 64<<10 || !strings.HasPrefix(detail, lead) {
+		t.Fatalf("host_key_matches: %s, %d bytes beginning %.80q; want at most 64 KiB, the cut noted", status, len(detail), detail)
+	}
+	body, ok := strings.CutSuffix(strings.TrimPrefix(detail, lead), `"`)
+	if !ok || len(body) < 60<<10 || strings.ReplaceAll(body, `\x00`, "") != "" {
+		t.Errorf("%d bytes after the note, beginning %.20q: want whole \\x00 escapes and the closing quote", len(body), body)
+	}
+}
+
+// JSON writes each byte of output that is not UTF-8 as U+FFFD, three
+// bytes: the 64 KiB limit holds for what the agent decodes. A person's
+// hop exec still gets the bytes.
+func TestMCPOutputLimitHoldsForBytesNotUTF8(t *testing.T) {
+	e := newE2E(t)
+	leak := strings.Repeat("\xff", 30000) + "\n"
+	e.server.mu.Lock()
+	e.server.leak = leak
+	e.server.mu.Unlock()
+	if code, stdout, _ := e.hop(t, "exec", "web-1", "--", "leak"); code != 0 || stdout != leak {
+		t.Errorf("hop exec: exit %d, %d bytes, want the remote's %d unchanged", code, len(stdout), len(leak))
+	}
+	m := e.startMCP(t)
+	for _, cmd := range []string{"leak", "leakerr"} {
+		r := mcpCall[agentExec](m, "exec", map[string]any{"hosts": "web-1", "command": cmd}).Results[0]
+		got := r.Stdout
+		if cmd == "leakerr" {
+			got = r.Stderr
+		}
+		if len(got) > 64<<10 || len(got) < 60<<10 || !r.Truncated || strings.Trim(got, "�") != "\n" {
+			t.Errorf("%s: %d bytes, truncated %v, ending %q; want at most 64 KiB of U+FFFD, cut", cmd, len(got), r.Truncated, got[max(0, len(got)-8):])
+		}
+	}
+}

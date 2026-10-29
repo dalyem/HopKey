@@ -751,10 +751,13 @@ type echo struct {
 	quote func(string) string
 	// login, if set, is applied to ssh's stderr from a login to t at addr.
 	login func(t *target, addr, stderr string) string
-	// remote, if set, is applied to text the network supplied (ssh's
-	// stderr, after login; a server's handshake error) as it came, before
-	// hop puts it into a step's detail. cut says it kept only the end.
-	remote func(text string) (shown string, cut bool)
+	// remote, if set, makes a step's detail of text the network supplied
+	// (ssh's stderr, after login; a server's handshake error), as it came,
+	// and lead, hop's own words before it. lines, if not 0, shows only the
+	// last lines of text, joined into one line as lastLines does. fromGo
+	// says text is an error from hop's own ssh client (fetchHostKey),
+	// which quotes a server's disconnect message as %q does.
+	remote func(lead, text string, lines int, fromGo bool) string
 	// loginTail is how much of ssh's stderr from the login is kept for
 	// login and remote; 0 means tailLimit. hop mcp keeps more, so that
 	// remote checks the bytes before its own cut too.
@@ -763,7 +766,7 @@ type echo struct {
 
 var plainEcho = echo{quote: strconv.Quote}
 
-// cutNote leads a step's detail when echo.remote kept only the end of the
+// cutNote follows a step's lead when echo.remote kept only the end of the
 // text it quotes.
 const cutNote = "(earlier output cut) "
 
@@ -853,14 +856,11 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		key, err := fetchHostKey(ctx, addr, port, algorithmsFor(pins), e.dialTimeout())
 		if err != nil {
 			// The error can quote the server: a disconnect's message.
-			msg, cut := err.Error(), false
+			const lead = "could not read the server's host key: "
 			if ec.remote != nil {
-				msg, cut = ec.remote(msg)
+				return stepFail, ec.remote(lead, err.Error(), 0, true)
 			}
-			if cut {
-				msg = cutNote + msg
-			}
-			return stepFail, safef("could not read the server's host key: %s", msg)
+			return stepFail, lead + oneLine(err.Error())
 		}
 		for _, p := range pins {
 			if bytes.Equal(p.Marshal(), key.Marshal()) {
@@ -888,12 +888,13 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		}
 		if res.ExitCode != 0 || res.Error != "" {
 			// ssh's stderr is remote text; lastLines makes each line safe.
-			stderr, cut := res.Stderr, false
+			const lead = "ssh did not log in: "
+			stderr := res.Stderr
 			if ec.login != nil {
 				stderr = ec.login(t, addr, stderr)
 			}
-			if ec.remote != nil {
-				stderr, cut = ec.remote(stderr)
+			if ec.remote != nil && strings.TrimSpace(unmark.Replace(stderr)) != "" {
+				return stepFail, ec.remote(lead, stderr, 3, false)
 			}
 			msg := strings.TrimSpace(stderr)
 			if msg == "" {
@@ -902,11 +903,7 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 			if msg == "" {
 				msg = fmt.Sprintf("exit status %d", res.ExitCode)
 			}
-			msg = lastLines(msg, 3)
-			if cut {
-				msg = cutNote + msg
-			}
-			return stepFail, "ssh did not log in: " + msg
+			return stepFail, lead + lastLines(msg, 3)
 		}
 		return stepPass, safef("logged in with ssh %s", t.alias)
 	})

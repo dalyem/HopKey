@@ -339,26 +339,74 @@ func TestKeepTailKeepsWholeRunes(t *testing.T) {
 	}
 }
 
-// A disconnect's message, quoted by x/crypto, is checked as the server
-// sent it and quoted again on the way out; one that does not unquote is
-// withheld with the rest of its text.
-func TestQuotedSpans(t *testing.T) {
-	msg := `ab"cd\ef`
-	text := "ssh: handshake failed: ssh: disconnect, reason 2: " + strconv.Quote(msg) + " (more)"
-	ss := quotedSpans([]span{{text: text}})
-	if got := joinSpans(ss); got != `ssh: handshake failed: ssh: disconnect, reason 2: "`+msg+`" (more)` {
+// A disconnect's message, quoted by x/crypto, stands as it is quoted in
+// a span of its own, and as the server sent it beside, with where each of
+// its bytes was written; one that does not unquote is withheld with the
+// rest of its text.
+func TestQuotedMsgs(t *testing.T) {
+	msg := "ab\"cd\\ef\x00\u00e9!"
+	q := strconv.Quote(msg) // "ab\"cd\\ef\x00é!"
+	text := "ssh: handshake failed: ssh: disconnect, reason 2: " + q + " (more)"
+	ss, msgs := quotedMsgs(text)
+	if got := joinSpans(ss); got != text {
 		t.Errorf("joined: %q", got)
 	}
-	if !slices.ContainsFunc(ss, func(sp span) bool { return sp.kind == quotedText && sp.text == msg }) {
-		t.Errorf("no span of the server's text: %+v", ss)
+	if !slices.ContainsFunc(ss, func(sp span) bool { return sp.kind == quotedText && sp.text == q[1:len(q)-1] }) {
+		t.Errorf("no span of the server's text as quoted: %+v", ss)
+	}
+	if len(msgs) != 1 || msgs[0].raw != msg {
+		t.Fatalf("messages: %+v", msgs)
+	}
+	m := msgs[0]
+	if text[m.lo:m.hi] != q[1:len(q)-1] {
+		t.Errorf("bounds: %q", text[m.lo:m.hi])
+	}
+	// raw[2:6] stands as \"cd\; \x00 writes one byte; é writes its own two.
+	for _, c := range []struct {
+		lo, hi int
+		want   string
+	}{{2, 6, `\"cd\\`}, {8, 9, `\x00`}, {9, 11, "é"}, {9, 10, "\xc3"}} {
+		h := m.mapHits([]redact.Hit{{Lo: c.lo, Hi: c.hi, Kind: "k"}})[0]
+		if got := text[h.Lo:h.Hi]; got != c.want {
+			t.Errorf("raw %d-%d: %q, want %q", c.lo, c.hi, got, c.want)
+		}
 	}
 	for _, bad := range []string{`"unterminated \"`, `'x' and more`, "no quote"} {
-		ss := quotedSpans([]span{{text: "x: ssh: disconnect, reason 2: " + bad}})
-		if got, want := joinSpans(ss), "x: ssh: disconnect, reason 2: (withheld: hop could not read the server's message)"; got != want {
+		ss, msgs := quotedMsgs("x: ssh: disconnect, reason 2: " + bad)
+		if got, want := joinSpans(ss), "x: ssh: disconnect, reason 2: (withheld: hop could not read the server's message)"; got != want || len(msgs) != 0 {
 			t.Errorf("%q: %q, want %q", bad, got, want)
 		}
 	}
-	if got := joinSpans(quotedSpans([]span{{text: "ssh: disconnect, reason x"}})); got != "ssh: disconnect, reason x" {
-		t.Errorf("not the format: %q", got)
+	if ss, _ := quotedMsgs("ssh: disconnect, reason x"); joinSpans(ss) != "ssh: disconnect, reason x" {
+		t.Errorf("not the format: %q", joinSpans(ss))
+	}
+}
+
+// A secret found in a message as the server sent it that begins or ends
+// inside the bytes one escape writes cannot be put back exactly where it
+// stands quoted: the whole message goes.
+func TestQuotedMsgWithholdsAnInexactHit(t *testing.T) {
+	text := `ssh: disconnect, reason 2: "a\u00e9b"`
+	_, msgs := quotedMsgs(text)
+	if len(msgs) != 1 || msgs[0].raw != "aéb" {
+		t.Fatalf("messages: %+v", msgs)
+	}
+	for _, h := range []redact.Hit{{Lo: 0, Hi: 2}, {Lo: 2, Hi: 4}} { // "a\xc3", "\xa9b"
+		got := msgs[0].mapHits([]redact.Hit{h})[0]
+		if text[got.Lo:got.Hi] != `a\u00e9b` {
+			t.Errorf("raw %d-%d: %q, want the whole message", h.Lo, h.Hi, text[got.Lo:got.Hi])
+		}
+	}
+}
+
+// The cut in quoted text moves past an escape it would split.
+func TestCapSpansKeepsWholeEscapes(t *testing.T) {
+	q := `\\` + strings.Repeat(`\x00`, 10)
+	for n := 1; n <= len(q); n++ {
+		got, _ := capSpans([]span{{text: q, kind: quotedText}}, n)
+		s := joinSpans(got)
+		if len(s) > n || s != q && s != "" && (!strings.HasPrefix(s, `\x00`) || len(s)%4 != 0) {
+			t.Errorf("%d: %q", n, s)
+		}
 	}
 }

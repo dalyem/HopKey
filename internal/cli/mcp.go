@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -225,7 +226,10 @@ var mcpRunSnippetSchema = `{
 }`
 
 // addMCPTool registers h. Its errors become tool errors, never a crash: a
-// panic is recovered. Every answer and error text is scrubbed (redact).
+// panic is recovered. Every answer and error text is scrubbed (redact),
+// but for what an answer says h scrubbed, and cut to its limit, already
+// (sanitized): scrubbed again, the markers in it would be, where hop
+// mcp's own secret stands in them, and grow past the limit.
 func addMCPTool[In, Out any](s *mcpServer, srv *mcp.Server, t *mcp.Tool, h func(context.Context, *mcp.CallToolRequest, In) (Out, error)) {
 	mcp.AddTool(srv, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (_ *mcp.CallToolResult, out Out, err error) {
 		defer func() {
@@ -240,9 +244,18 @@ func addMCPTool[In, Out any](s *mcpServer, srv *mcp.Server, t *mcp.Tool, h func(
 			var zero Out
 			return nil, zero, errors.New(s.redact(err.Error()))
 		}
-		return nil, redactValue(s, out), nil
+		red := redactValue(s, out)
+		if k, ok := any(&red).(sanitized[Out]); ok {
+			k.keepSanitized(&out)
+		}
+		return nil, red, nil
 	})
 }
+
+// sanitized is an answer some of whose text its tool scrubbed, and cut
+// to its limit, already: keepSanitized puts that text back from what the
+// tool returned, after redactValue.
+type sanitized[T any] interface{ keepSanitized(from *T) }
 
 // ---- secrets ----
 
@@ -269,8 +282,8 @@ func (s *mcpServer) redact(text string) string {
 const keyRedacted = "[private key " + redacted + "]"
 
 // span is a piece of a message: hop's own text, text the agent typed
-// (typed), a marker redaction put in, or a server's message that the
-// message held quoted, as the server sent it (quotedSpans).
+// (typed), a marker redaction put in, or a server's message that an
+// error of hop's ssh client quotes, as it quotes it (quotedMsgs).
 type span struct {
 	text string
 	kind spanKind
@@ -387,8 +400,9 @@ func keepTail(ss []span, hits []redact.Hit, n int) ([]span, []redact.Hit, bool) 
 
 // capSpans keeps the last n bytes of the text of ss, which redaction and
 // masking have made, and says whether it cut. The cut moves on past what
-// it would split: a marker, a hidden host's placeholder, a character. So
-// what is kept is whole markers and whole runes, and at most n bytes.
+// it would split: a marker, a hidden host's placeholder, an escape of
+// quoted text (quotedText), a character. So what is kept is whole
+// markers, escapes and runes, and at most n bytes.
 func capSpans(ss []span, n int) ([]span, bool) {
 	size := len(joinSpans(ss))
 	if size <= n {
@@ -407,16 +421,36 @@ func capSpans(ss []span, n int) ([]span, bool) {
 			return ss[i+1:], true
 		}
 		k := cut - lo
-		if sp.kind == hopText {
+		if sp.kind == hopText || sp.kind == quotedText {
 			from := max(0, k-len(hiddenHost)+1)
 			if j := strings.Index(sp.text[from:min(len(sp.text), k+len(hiddenHost)-1)], hiddenHost); j >= 0 {
 				k = from + j + len(hiddenHost)
 			}
 		}
+		if sp.kind == quotedText {
+			k = escapeEnd(sp.text, k)
+		}
 		k = runeEnd(sp.text, k)
 		return append([]span{{text: sp.text[k:], kind: sp.kind}}, ss[i+1:]...), true
 	}
 	return nil, true
+}
+
+// validSpans is ss with each byte that is not UTF-8 written as U+FFFD, as
+// JSON writes it, so that capSpans measures what the agent gets.
+func validSpans(ss []span) []span {
+	out := slices.Clone(ss)
+	for i, sp := range out {
+		if utf8.ValidString(sp.text) {
+			continue
+		}
+		var b strings.Builder
+		for _, c := range sp.text {
+			b.WriteRune(c) // a byte that is not UTF-8 comes as utf8.RuneError
+		}
+		out[i].text = b.String()
+	}
+	return out
 }
 
 // runeEnd is i, or, where i falls inside a character of t, the end of
@@ -471,7 +505,7 @@ func cutSpans(out, run []span, from, to int) []span {
 		if k := len(out) - 1; k >= 0 && out[k].kind == sp.kind && sp.kind != markerText {
 			out[k].text += piece
 		} else {
-			out = append(out, span{text: piece, kind: sp.kind})
+			out = append(out, span{text: piece, kind: sp.kind, what: sp.what})
 		}
 	}
 	return out
@@ -735,11 +769,12 @@ func (m masker) hide(text string) string {
 // each hidden name replaced in hop's own text, as hide does.
 func (m masker) hideSpans(ss []span) string { return joinSpans(m.maskSpans(ss)) }
 
-// maskSpans is ss with each hidden name replaced in hop's own text.
+// maskSpans is ss with each hidden name replaced in hop's own text, and
+// in a server's message as hop's ssh client quotes it (quotedText).
 func (m masker) maskSpans(ss []span) []span {
 	out := slices.Clone(ss)
 	for i, sp := range out {
-		if sp.kind == hopText {
+		if sp.kind == hopText || sp.kind == quotedText {
 			for _, n := range m.names {
 				out[i].text = replaceWord(out[i].text, n, hiddenHost)
 			}
@@ -1054,128 +1089,310 @@ type mcpHostIn struct {
 	Host string `json:"host" jsonschema:"a host name, alias or address, optionally user@host"`
 }
 
-func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mcpHostIn) (CheckResult, error) {
+// mcpCheckResult answers check_host: hop check's answer, and which steps'
+// details remoteText made, which addMCPTool does not scrub again.
+type mcpCheckResult struct {
+	CheckResult
+	final []bool
+}
+
+// keepSanitized puts back the details remoteText made (addMCPTool).
+func (c *mcpCheckResult) keepSanitized(from *mcpCheckResult) {
+	for i, f := range from.final {
+		if f && i < len(c.Steps) {
+			c.Steps[i].Detail = from.Steps[i].Detail
+		}
+	}
+}
+
+func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mcpHostIn) (mcpCheckResult, error) {
 	l, err := s.list(ctx)
 	if err != nil {
-		return CheckResult{}, err
+		return mcpCheckResult{}, err
 	}
 	rr, err := s.resolve(ctx, in.Host, l)
 	if err != nil {
-		return CheckResult{}, err
+		return mcpCheckResult{}, err
 	}
-	out := CheckResult{Target: in.Host, Host: rr.Result.HostName}
+	out := mcpCheckResult{CheckResult: CheckResult{Target: in.Host, Host: rr.Result.HostName}}
 	// Steps quote what the network supplied: a server's handshake error,
 	// and ssh's stderr from the login, which carries what the remote
 	// prints too (a banner, a shell's startup files). That is filtered as
-	// exec's output is, by the host's agent_output policy (remoteText).
+	// exec's output is, by the host's agent_output policy (remoteText),
+	// which makes the step's whole detail: it is not scrubbed again.
 	policy := model.AgentOutputRedacted
 	if rr.Host != nil {
 		policy = model.AgentOutputPolicy(*rr.Host)
 	}
 	m := s.masker(l)
 	ec := mcpEcho
-	ec.remote = s.remoteText(ctx, policy, m)
+	made := map[string]bool{}
+	remote := s.remoteText(ctx, policy, m)
+	ec.remote = func(lead, text string, lines int, fromGo bool) string {
+		d := remote(lead, text, lines, fromGo)
+		made[d] = true
+		return d
+	}
 	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly, ec)
+	out.final = make([]bool, len(out.Steps))
 	for i := range out.Steps {
-		out.Steps[i].Detail = m.hide(out.Steps[i].Detail)
+		if out.final[i] = made[out.Steps[i].Detail]; !out.final[i] {
+			out.Steps[i].Detail = m.hide(out.Steps[i].Detail)
+		}
 	}
 	return out, nil
 }
 
-// remoteText is what check_host shows of text the network supplied, as
-// it came, under a host's agent_output policy: under none, a note that it
-// is withheld; otherwise the text redacted as exec's output is
-// (agentView), checked as a whole before hop cuts it to its last 64 KiB
-// (keepTail, capSpans), its last lines or one line, so a secret's line
-// goes whole; it says when it cut. A server's message the text quotes is
-// checked as the server sent it (quotedSpans). Text that cannot be checked
-// is withheld. What comes back is marked (typed) where it is not hop's
-// own, the markers included, so hide leaves it be.
-func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) func(string) (string, bool) {
-	return func(text string) (string, bool) {
-		if strings.TrimSpace(unmark.Replace(text)) == "" {
-			return text, false
-		}
+// remoteText makes a step's detail of lead, hop's own words, and text the
+// network supplied, as it came, under a host's agent_output policy: under
+// none, a note that it is withheld; otherwise the text redacted as exec's
+// output is (agentView), all of it checked before hop keeps its last
+// lines, makes it one line (lastLines, oneLine), hides the denied hosts
+// in it (maskSpans) and, last, cuts it so that the detail is at most
+// 64 KiB (capSpans), saying so when it cut. A server's message that an
+// error of hop's own ssh client quotes is checked as it stands there and
+// as the server sent it (quotedMsgs). Text that cannot be checked is
+// withheld. What comes back is the detail as the agent gets it.
+func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) func(lead, text string, lines int, fromGo bool) string {
+	return func(lead, text string, lines int, fromGo bool) string {
 		if policy == model.AgentOutputNone {
-			return "(withheld: the host's agent_output policy is none)", false
+			return lead + "(withheld: the host's agent_output policy is none)"
 		}
-		ss := quotedSpans(typedSpans(text))
-		found, err := s.findSecrets(ctx, []string{joinSpans(ss)}, policy == model.AgentOutputRedacted)
+		var ss []span
+		var msgs []quotedMsg
+		if fromGo {
+			ss, msgs = quotedMsgs(unmark.Replace(text))
+		} else {
+			ss = typedSpans(text)
+		}
+		t := joinSpans(ss)
+		texts := []string{t}
+		for _, q := range msgs {
+			texts = append(texts, q.raw)
+		}
+		found, err := s.findSecrets(ctx, texts, policy == model.AgentOutputRedacted)
 		if err != nil {
-			return "(withheld: hop could not check it for the vault's secrets: " + m.hide(err.Error()) + ")", false
+			return lead + "(withheld: hop could not check it for the vault's secrets: " + m.hide(err.Error()) + ")"
 		}
-		ss, hits, cutTail := keepTail(ss, findHits(joinSpans(ss), m.secrets, found[0]), tailLimit)
-		ss, cutCap := capSpans(applyHits(ss, hits), tailLimit)
-		var b strings.Builder
-		for _, sp := range ss {
-			switch sp.kind {
-			case hopText:
-				b.WriteString(sp.text)
-			case quotedText:
-				// Quoted again as it was: each piece as %q would have it.
-				q := strconv.Quote(sp.text)
-				b.WriteString(q[1 : len(q)-1])
-			default:
-				b.WriteString(typed(sp.text))
+		more := found[0]
+		for i, q := range msgs {
+			more = append(more, q.mapHits(findHits(q.raw, m.secrets, found[i+1]))...)
+		}
+		hits := findHits(t, m.secrets, more)
+		if len(msgs) > 0 {
+			// A stretch that runs into a message ends at whole escapes.
+			for i := range hits {
+				for _, q := range msgs {
+					hits[i].Lo, hits[i].Hi = q.unitStart(hits[i].Lo), q.unitEnd(hits[i].Hi)
+				}
+			}
+			hits = findHits(t, nil, hits)
+		}
+		ss = applyHits(ss, hits)
+		if lines > 0 {
+			ss = lastLinesSpans(ss, lines)
+		}
+		for i := range ss {
+			if ss[i].kind != markerText {
+				ss[i].text = oneLine(ss[i].text)
 			}
 		}
-		return b.String(), cutTail || cutCap
+		ss, cut := capSpans(m.maskSpans(ss), tailLimit-len(lead)-len(cutNote))
+		if cut || len(t) > tailLimit {
+			lead += cutNote
+		}
+		return lead + joinSpans(ss)
 	}
+}
+
+// lastLinesSpans is lastLines for ss, which redaction has made: the last
+// n lines of its text, without the space around them, joined by "; ".
+// The markers, which hold neither a line break nor space at either end,
+// go whole.
+func lastLinesSpans(ss []span, n int) []span {
+	t := joinSpans(ss)
+	hi := len(strings.TrimRightFunc(t, unicode.IsSpace))
+	lo := len(t) - len(strings.TrimLeftFunc(t, unicode.IsSpace))
+	if lo >= hi {
+		return nil
+	}
+	from := lo
+	for j := hi; n > 0; n-- {
+		i := strings.LastIndexByte(t[lo:j], '\n')
+		if i < 0 {
+			from = lo
+			break
+		}
+		j, from = lo+i, lo+i+1
+	}
+	out := cutSpans(nil, ss, from, hi)
+	for i := range out {
+		if out[i].kind != markerText {
+			out[i].text = strings.ReplaceAll(out[i].text, "\n", "; ")
+		}
+	}
+	return out
 }
 
 // disconnectQuote begins where x/crypto's ssh writes a server's disconnect
 // message into its error: "ssh: disconnect, reason %d: %q".
 const disconnectQuote = "ssh: disconnect, reason "
 
-// quotedSpans finds, in the hop text of ss, each server message that a
-// disconnect error quotes (disconnectQuote), and makes the message, as
-// the server sent it, a span of its own (quotedText): quoted, a secret
-// with a " or a \ in it does not stand as it is. A message that does not
-// unquote is withheld, and so is the rest of its span: hop cannot tell
-// where the server's text ends.
-func quotedSpans(ss []span) []span {
-	var out []span
-	for _, sp := range ss {
-		if sp.kind != hopText {
-			out = append(out, sp)
-			continue
-		}
-		text := sp.text
-		for {
-			i := strings.Index(text, disconnectQuote)
-			if i < 0 {
-				break
-			}
-			j := i + len(disconnectQuote)
-			for j < len(text) && '0' <= text[j] && text[j] <= '9' {
-				j++
-			}
-			if !strings.HasPrefix(text[j:], ": ") {
-				out = append(out, span{text: text[:j]})
-				text = text[j:]
-				continue
-			}
-			j += len(": ")
-			q, err := strconv.QuotedPrefix(text[j:])
-			var raw string
-			if err == nil && q[0] == '"' {
-				raw, err = strconv.Unquote(q)
-			} else if err == nil {
-				err = errors.New("not quoted as %q quotes")
-			}
-			if err != nil {
-				out = append(out, span{text: text[:j] + "(withheld: hop could not read the server's message)"})
-				text = ""
-				break
-			}
-			out = append(out, span{text: text[:j] + `"`}, span{text: raw, kind: quotedText}, span{text: `"`})
-			text = text[j+len(q):]
-		}
-		if text != "" {
-			out = append(out, span{text: text})
+// quotedMsg is a server's message that a disconnect error quotes: lo and
+// hi bound its quoted text, inside the quotes, in the error; raw is the
+// message as the server sent it; at[j] is where, in the error, the piece
+// of quoted text that wrote raw[j] begins (an escape such as \x00 or
+// \u00e9 writes one or more bytes; any other byte writes itself), and
+// at[len(raw)] is hi.
+type quotedMsg struct {
+	lo, hi int
+	raw    string
+	at     []int
+}
+
+// quotedMsgs splits text, an error of hop's own ssh client, into hop's
+// text and, in a span of their own (quotedText), the server messages it
+// quotes (disconnectQuote), as it quotes them; msgs is each of these as
+// the server sent it. A message that does not unquote is withheld, and so
+// is the rest of the text: hop cannot tell where the server's text ends.
+func quotedMsgs(text string) (ss []span, msgs []quotedMsg) {
+	var t strings.Builder
+	hop := func(s string) {
+		t.WriteString(s)
+		if k := len(ss) - 1; k >= 0 && ss[k].kind == hopText {
+			ss[k].text += s
+		} else if s != "" {
+			ss = append(ss, span{text: s})
 		}
 	}
+	for {
+		i := strings.Index(text, disconnectQuote)
+		if i < 0 {
+			break
+		}
+		j := i + len(disconnectQuote)
+		for j < len(text) && '0' <= text[j] && text[j] <= '9' {
+			j++
+		}
+		if !strings.HasPrefix(text[j:], ": ") {
+			hop(text[:j])
+			text = text[j:]
+			continue
+		}
+		j += len(": ")
+		q, err := strconv.QuotedPrefix(text[j:])
+		var msg quotedMsg
+		if err == nil && q[0] == '"' {
+			msg, err = unquoteAt(q[1:len(q)-1], t.Len()+j+1)
+		} else if err == nil {
+			err = errors.New("not quoted as %q quotes")
+		}
+		if err != nil {
+			hop(text[:j] + "(withheld: hop could not read the server's message)")
+			return ss, msgs
+		}
+		hop(text[:j+1])
+		t.WriteString(q[1 : len(q)-1])
+		ss = append(ss, span{text: q[1 : len(q)-1], kind: quotedText})
+		msgs = append(msgs, msg)
+		hop(`"`)
+		text = text[j+len(q):]
+	}
+	hop(text)
+	return ss, msgs
+}
+
+// unquoteAt unquotes in, the text inside a pair of double quotes that
+// begins at offset at of the error, keeping where each byte came from.
+func unquoteAt(in string, at int) (quotedMsg, error) {
+	q := quotedMsg{lo: at, hi: at + len(in)}
+	var raw []byte
+	for s := in; s != ""; {
+		pos := at + len(in) - len(s)
+		if s[0] != '\\' {
+			// A byte as it stands writes itself, a character's every byte too.
+			raw, q.at = append(raw, s[0]), append(q.at, pos)
+			s = s[1:]
+			continue
+		}
+		c, multibyte, rest, err := strconv.UnquoteChar(s, '"')
+		if err != nil {
+			return quotedMsg{}, err
+		}
+		n := len(raw)
+		if c < utf8.RuneSelf || !multibyte {
+			raw = append(raw, byte(c))
+		} else {
+			raw = utf8.AppendRune(raw, c)
+		}
+		for range len(raw) - n {
+			q.at = append(q.at, pos)
+		}
+		s = rest
+	}
+	q.raw, q.at = string(raw), append(q.at, q.hi)
+	return q, nil
+}
+
+// mapHits is hits, offsets into q.raw, as offsets into the error. A hit
+// that does not begin and end where pieces of the quoted text do (inside
+// the bytes one escape writes) cannot be told apart from its neighbours
+// there, so the whole message goes in its stead.
+func (q quotedMsg) mapHits(hits []redact.Hit) []redact.Hit {
+	var out []redact.Hit
+	for _, h := range hits {
+		whole := h.Lo > 0 && q.at[h.Lo-1] == q.at[h.Lo] || h.Hi < len(q.raw) && q.at[h.Hi-1] == q.at[h.Hi]
+		if whole {
+			h.Lo, h.Hi = q.lo, q.hi
+		} else {
+			h.Lo, h.Hi = q.at[h.Lo], q.at[h.Hi]
+		}
+		out = append(out, h)
+	}
 	return out
+}
+
+// unitStart is i, or, where i falls inside an escape of q's quoted text,
+// the escape's start.
+func (q quotedMsg) unitStart(i int) int {
+	if i <= q.lo || i >= q.hi {
+		return i
+	}
+	k, _ := slices.BinarySearch(q.at, i)
+	if q.at[k] == i {
+		return i
+	}
+	return q.at[k-1]
+}
+
+// unitEnd is i, or, where i falls inside an escape of q's quoted text,
+// the escape's end.
+func (q quotedMsg) unitEnd(i int) int {
+	if i <= q.lo || i >= q.hi {
+		return i
+	}
+	k, _ := slices.BinarySearch(q.at, i)
+	return q.at[k]
+}
+
+// escapeEnd is i, or, where i falls inside an escape of t, quoted text
+// that begins at a whole escape, the end of that escape.
+func escapeEnd(t string, i int) int {
+	for at := 0; at < i; {
+		if t[at] != '\\' {
+			at++
+			continue
+		}
+		_, _, rest, err := strconv.UnquoteChar(t[at:], '"')
+		if err != nil {
+			at++
+			continue
+		}
+		if at = len(t) - len(rest); at > i {
+			return at
+		}
+	}
+	return i
 }
 
 // MCPSSHCommand answers ssh_command.
@@ -1258,6 +1475,14 @@ type MCPExec struct {
 	Results []MCPExecResult `json:"results"`
 	// Warning is set when the command ran but its end could not be logged.
 	Warning string `json:"warning,omitempty"`
+}
+
+// keepSanitized puts back each result's stdout and stderr: agentView
+// scrubbed them and cut them to their limit (addMCPTool).
+func (x *MCPExec) keepSanitized(from *MCPExec) {
+	for i := range min(len(x.Results), len(from.Results)) {
+		x.Results[i].Stdout, x.Results[i].Stderr = from.Results[i].Stdout, from.Results[i].Stderr
+	}
 }
 
 // MCPExecResult is one host's result as an agent gets it (agentView): hop
@@ -1557,8 +1782,10 @@ func (s *mcpServer) agentView(ctx context.Context, h model.Host, r ExecResult, m
 	}
 	so, se := tail(stdout, s.secrets, more[0]), m.maskSpans(tail(stderr, m.secrets, more[1]))
 	// A marker can be longer than what it stands for, and so can a hidden
-	// host's placeholder: the limit holds for what is returned, and the
-	// counts are of the markers in it.
+	// host's placeholder, and JSON writes a byte that is not UTF-8 as
+	// U+FFFD, three bytes (validSpans): the limit holds for what is
+	// returned, and the counts are of the markers in it.
+	so, se = validSpans(so), validSpans(se)
 	so, cutOut := capSpans(so, tailLimit)
 	se, cutErr := capSpans(se, tailLimit)
 	out.Truncated = out.Truncated || cutOut || cutErr
