@@ -753,8 +753,8 @@ type echo struct {
 	login func(t *target, addr, stderr string) string
 	// remote, if set, is applied to text the network supplied (ssh's
 	// stderr, after login; a server's handshake error) as it came, before
-	// hop puts it into a step's detail.
-	remote func(text string) string
+	// hop puts it into a step's detail. cut says it kept only the end.
+	remote func(text string) (shown string, cut bool)
 	// loginTail is how much of ssh's stderr from the login is kept for
 	// login and remote; 0 means tailLimit. hop mcp keeps more, so that
 	// remote checks the bytes before its own cut too.
@@ -762,6 +762,10 @@ type echo struct {
 }
 
 var plainEcho = echo{quote: strconv.Quote}
+
+// cutNote leads a step's detail when echo.remote kept only the end of the
+// text it quotes.
+const cutNote = "(earlier output cut) "
 
 // authCheckTimeout bounds hop check's login, ssh's own start included.
 const authCheckTimeout = 20 * time.Second
@@ -849,9 +853,12 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		key, err := fetchHostKey(ctx, addr, port, algorithmsFor(pins), e.dialTimeout())
 		if err != nil {
 			// The error can quote the server: a disconnect's message.
-			msg := err.Error()
+			msg, cut := err.Error(), false
 			if ec.remote != nil {
-				msg = ec.remote(msg)
+				msg, cut = ec.remote(msg)
+			}
+			if cut {
+				msg = cutNote + msg
 			}
 			return stepFail, safef("could not read the server's host key: %s", msg)
 		}
@@ -881,12 +888,12 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 		}
 		if res.ExitCode != 0 || res.Error != "" {
 			// ssh's stderr is remote text; lastLines makes each line safe.
-			stderr := res.Stderr
+			stderr, cut := res.Stderr, false
 			if ec.login != nil {
 				stderr = ec.login(t, addr, stderr)
 			}
 			if ec.remote != nil {
-				stderr = ec.remote(stderr)
+				stderr, cut = ec.remote(stderr)
 			}
 			msg := strings.TrimSpace(stderr)
 			if msg == "" {
@@ -895,7 +902,11 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 			if msg == "" {
 				msg = fmt.Sprintf("exit status %d", res.ExitCode)
 			}
-			return stepFail, "ssh did not log in: " + lastLines(msg, 3)
+			msg = lastLines(msg, 3)
+			if cut {
+				msg = cutNote + msg
+			}
+			return stepFail, "ssh did not log in: " + msg
 		}
 		return stepPass, safef("logged in with ssh %s", t.alias)
 	})

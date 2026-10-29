@@ -130,6 +130,51 @@ func TestLiterals(t *testing.T) {
 	}
 }
 
+// A secret stands escaped in text that programs quote: Go's %q, JSON,
+// and OpenSSH's client printing a server's message (through its log) or
+// banner (in a C and in a UTF-8 locale). Literals finds each form whole.
+func TestLiteralsFindEscapedForms(t *testing.T) {
+	v := `a\b"c<` + "\t\x01\u00e9"
+	secrets := []Secret{{Kind: KindVaultPassword, Value: v}}
+	for name, form := range map[string]string{
+		"raw":              v,
+		"go %q":            `a\\b\"c<\t\x01` + "\u00e9",
+		"json":             `a\\b\"c<\t\u0001` + "\u00e9",
+		"json html":        `a\\b\"c\u003c\t\u0001` + "\u00e9",
+		"ssh log":          `a\\b"c<` + "\t" + `\001\303\251`,
+		"ssh banner":       `a\b"c<` + "\t" + `\001\303\251`,
+		"ssh banner utf-8": `a\b"c<` + "\t" + `\001` + "\u00e9",
+	} {
+		text := "x " + form + " y"
+		hits := Literals(text, secrets)
+		if !slices.ContainsFunc(hits, func(h Hit) bool { return h.Lo <= 2 && 2+len(form) <= h.Hi }) {
+			t.Errorf("%s: Literals(%q) = %v, want %q covered", name, text, hits, form)
+		}
+	}
+}
+
+// Escaped lists each form once, and only forms that differ from the
+// value. The OpenSSH forms are what the 9.2 client prints: a disconnect
+// message through its log, a banner in a C and in a UTF-8 locale.
+func TestEscaped(t *testing.T) {
+	for _, c := range []struct {
+		v    string
+		want []string
+	}{
+		{"", nil},
+		{"hunter2-credential-password", nil},
+		{`a\b"c`, []string{`a\\b\"c`, `a\\b"c`}},
+		{"<\u00e9>", []string{`\u003c` + "\u00e9" + `\u003e`, `<\303\251>`}},
+		{"a\tb\x01\n\a", []string{`a\tb\x01\n\a`, `a\tb\u0001\n\u0007`, "a\tb\\001\n\a", "a\tb\\001\n\\007"}},
+		{"\u2028\xff", []string{`\u2028\xff`, `\u2028` + "\ufffd", `\342\200\250\377`}}, // encoding/json writes a bad byte as U+FFFD
+		{"\u00a0\u200b", []string{`\u00a0\u200b`, `\302\240\342\200\213`}},
+	} {
+		if got := Escaped(c.v); !slices.Equal(got, c.want) {
+			t.Errorf("Escaped(%q) = %q, want %q", c.v, got, c.want)
+		}
+	}
+}
+
 func TestKeyWords(t *testing.T) {
 	for in, want := range map[string]string{
 		"DB_PASSWORD": "db password", "dbPassword": "db password", "APIKey": "api key", "x-api-key": "x api key",

@@ -10,6 +10,7 @@
 package redact
 
 import (
+	"slices"
 	"strings"
 )
 
@@ -115,14 +116,23 @@ var Unmark = strings.NewReplacer(MarkOpen, "", MarkClose, "")
 // secret, overlapping ones included: in "abababa" the value "ababa" stands
 // at 0 and at 2, and the caller joins the two, where taking only the first
 // would leave "ba". t has had the marks taken out, so a value holding a
-// mark is looked for as it stands there too. Every non-empty value counts,
-// however short.
+// mark is looked for as it stands there too. So is each form a program
+// that escapes what it prints may show it in (Escaped): ssh, say, prints
+// a server's message with a backslash doubled. A hit covers the form as
+// it stands in t. Every non-empty value counts, however short.
 func Literals(t string, secrets []Secret) []Hit {
 	var out []Hit
 	for _, s := range secrets {
 		vs := []string{s.Value}
 		if u := Unmark.Replace(s.Value); u != s.Value {
 			vs = append(vs, u)
+		}
+		for _, v := range vs {
+			for _, e := range Escaped(v) {
+				if !slices.Contains(vs, e) {
+					vs = append(vs, e)
+				}
+			}
 		}
 		for _, v := range vs {
 			if v == "" {

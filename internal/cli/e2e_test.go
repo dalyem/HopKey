@@ -870,6 +870,8 @@ type sshServer struct {
 	// trueErr, if set, makes the command "true" print it to stderr and
 	// exit 1, as a shell whose startup files fail does: hop check's login.
 	trueErr string
+	// banner, if set, is sent to each client before it authenticates.
+	banner string
 }
 
 func newSigner(t *testing.T) ssh.Signer {
@@ -919,6 +921,11 @@ func (s *sshServer) setHostKey(signer ssh.Signer) {
 				}
 			}
 			return nil, errors.New("key not accepted")
+		},
+		BannerCallback: func(ssh.ConnMetadata) string {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.banner
 		},
 	}
 	cfg.AddHostKey(signer)

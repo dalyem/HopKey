@@ -416,6 +416,15 @@ func TestMCPRedactsASecretTheTailLimitCuts(t *testing.T) {
 // that turns a client away does before any key is exchanged. It returns
 // the port.
 func startDisconnectServer(t *testing.T, msg string) int {
+	return startDisconnectServerFor(t, msg, 0)
+}
+
+// startDisconnectServerFor is startDisconnectServer, except that a client
+// whose version line says it is Go's (hop's host key probe) is passed
+// through to the ssh server on port upstream, when that is not 0: hop
+// check's probe sees that server's key, and only ssh's login is turned
+// away.
+func startDisconnectServerFor(t *testing.T, msg string, upstream int) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -442,12 +451,27 @@ func startDisconnectServer(t *testing.T, msg string) int {
 			go func() {
 				defer c.Close()
 				c.SetDeadline(time.Now().Add(10 * time.Second))
-				if _, err := io.WriteString(c, "SSH-2.0-test\r\n"); err != nil {
+				// The client's version line: both ssh and Go's client send
+				// it unprompted. A TCP probe sends none.
+				r := bufio.NewReader(c)
+				version, err := r.ReadString('\n')
+				if err != nil {
 					return
 				}
-				// The client's version line: a TCP probe sends none.
-				r := bufio.NewReader(c)
-				if _, err := r.ReadString('\n'); err != nil {
+				if upstream != 0 && strings.HasPrefix(version, "SSH-2.0-Go") {
+					u, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(upstream)))
+					if err != nil {
+						return
+					}
+					defer u.Close()
+					if _, err := io.WriteString(u, version); err != nil {
+						return
+					}
+					go io.Copy(u, r)
+					io.Copy(c, u)
+					return
+				}
+				if _, err := io.WriteString(c, "SSH-2.0-test\r\n"); err != nil {
 					return
 				}
 				if _, err := c.Write(pkt); err != nil {
@@ -617,10 +641,53 @@ func TestMCPCheckFindsSecretsInAQuotedDisconnect(t *testing.T) {
 	}
 }
 
+// ssh prints what a server says during its login escaped, and not as
+// x/crypto does: a disconnect's message through its log, which doubles a
+// backslash and writes other control bytes and every non-ASCII byte in
+// octal (strnvis VIS_SAFE|VIS_OCTAL), and a banner with the backslash as
+// it is but those bytes in octal too (fmprintf). Both forms here are what
+// the OpenSSH 9.2 client prints. hop finds the vault's password in each,
+// under redacted and full: no form of it reaches the agent.
+func TestMCPCheckFindsSecretsSSHEscaped(t *testing.T) {
+	const password = "pw\\vault\tsecret\x01\u00e9-zq9-login"
+	const logForm = `pw\\vault` + "\t" + `secret\001\303\251-zq9-login`
+	const bannerForm = `pw\vault` + "\t" + `secret\001\303\251-zq9-login`
+	const bannerUTF8 = `pw\vault` + "\t" + "secret\\001\u00e9-zq9-login"
+	e, _, _ := redactWorld(t)
+	if _, err := e.store.PutCredential(context.Background(), model.Credential{Name: "escaped", Username: "admin", Password: password}); err != nil {
+		t.Fatal(err)
+	}
+	e.server.mu.Lock()
+	e.server.banner = "Welcome. db password " + password + "\n"
+	e.server.trueErr = "startup failed\n"
+	e.server.mu.Unlock()
+	port := startDisconnectServerFor(t, "go away: db password "+password, e.server.port)
+	e.addHost(t, "gate", func(h *model.Host) { h.Port = uint32(port) })
+	m := e.startMCP(t)
+	for _, host := range []string{"web-1", "gate"} {
+		for _, policy := range []string{"redacted", "full"} {
+			if code, _, stderr := e.hop(t, "edit", host, "--agent-output", policy); code != 0 {
+				t.Fatalf("hop edit %s --agent-output %s: exit %d: %s", host, policy, code, stderr)
+			}
+			name := host + " " + policy
+			c := mcpCall[agentCheck](m, "check_host", map[string]any{"host": host})
+			status, detail := c.step(t, "auth_ok")
+			if status != "fail" || !strings.Contains(detail, "db password [redacted by hop: vault-password]") {
+				t.Errorf("%s: auth_ok %s %q, want ssh's stderr with the password replaced", name, status, detail)
+			}
+			for _, s := range []string{password, logForm, bannerForm, bannerUTF8, "zq9"} {
+				if strings.Contains(detail, s) || strings.Contains(m.raw[len(m.raw)-1], s) {
+					t.Errorf("%s: the agent got %q: %q", name, s, detail)
+				}
+			}
+		}
+	}
+}
+
 // hop mcp's check keeps twice the tail of ssh's stderr from its login,
 // checks all of it, and only then cuts to the last 64 KiB, as exec does:
-// a password the cut would split goes whole. A person's hop check is
-// unchanged.
+// a password the cut would split goes whole, and the detail says that
+// earlier output was cut. A person's hop check is unchanged.
 func TestMCPCheckScansLoginStderrBeforeTheTailCut(t *testing.T) {
 	e, _, _ := redactWorld(t)
 	// The last 64 KiB begin 5 bytes before the password's end.
@@ -629,8 +696,8 @@ func TestMCPCheckScansLoginStderrBeforeTheTailCut(t *testing.T) {
 	e.server.trueErr = vaultPassword + pad
 	e.server.mu.Unlock()
 	tail := vaultPassword[len(vaultPassword)-5:]
-	if _, stdout, _ := e.hop(t, "check", "web-1"); !strings.Contains(stdout, tail+"xxxx") {
-		t.Errorf("hop check: no %q before the padding in %.200q", tail, stdout)
+	if _, stdout, _ := e.hop(t, "check", "web-1"); !strings.Contains(stdout, tail+"xxxx") || strings.Contains(stdout, "earlier output cut") {
+		t.Errorf("hop check: no %q before the padding, or a cut noted, in %.200q", tail, stdout)
 	}
 	m := e.startMCP(t)
 	c := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "web-1"})
@@ -638,7 +705,7 @@ func TestMCPCheckScansLoginStderrBeforeTheTailCut(t *testing.T) {
 	if status != "fail" || !strings.HasSuffix(detail, "xxxxxxxx") {
 		t.Fatalf("auth_ok: %s %.200q, want ssh's stderr", status, detail)
 	}
-	if rest := strings.TrimRight(detail, "x"); !strings.HasSuffix(rest, "ssh did not log in: ") || strings.Contains(detail, tail) {
+	if rest := strings.TrimRight(detail, "x"); !strings.HasSuffix(rest, "ssh did not log in: (earlier output cut) ") || strings.Contains(detail, tail) {
 		t.Errorf("the agent got part of the password: %.200q", rest)
 	}
 }

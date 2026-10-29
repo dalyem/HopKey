@@ -1087,25 +1087,25 @@ func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mc
 // is withheld; otherwise the text redacted as exec's output is
 // (agentView), checked as a whole before hop cuts it to its last 64 KiB
 // (keepTail, capSpans), its last lines or one line, so a secret's line
-// goes whole. A server's message the text quotes is checked as the server
-// sent it (quotedSpans). Text that cannot be checked is withheld. What
-// comes back is marked (typed) where it is not hop's own, the markers
-// included, so hide leaves it be.
-func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) func(string) string {
-	return func(text string) string {
+// goes whole; it says when it cut. A server's message the text quotes is
+// checked as the server sent it (quotedSpans). Text that cannot be checked
+// is withheld. What comes back is marked (typed) where it is not hop's
+// own, the markers included, so hide leaves it be.
+func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) func(string) (string, bool) {
+	return func(text string) (string, bool) {
 		if strings.TrimSpace(unmark.Replace(text)) == "" {
-			return text
+			return text, false
 		}
 		if policy == model.AgentOutputNone {
-			return "(withheld: the host's agent_output policy is none)"
+			return "(withheld: the host's agent_output policy is none)", false
 		}
 		ss := quotedSpans(typedSpans(text))
 		found, err := s.findSecrets(ctx, []string{joinSpans(ss)}, policy == model.AgentOutputRedacted)
 		if err != nil {
-			return "(withheld: hop could not check it for the vault's secrets: " + m.hide(err.Error()) + ")"
+			return "(withheld: hop could not check it for the vault's secrets: " + m.hide(err.Error()) + ")", false
 		}
-		ss, hits, _ := keepTail(ss, findHits(joinSpans(ss), m.secrets, found[0]), tailLimit)
-		ss, _ = capSpans(applyHits(ss, hits), tailLimit)
+		ss, hits, cutTail := keepTail(ss, findHits(joinSpans(ss), m.secrets, found[0]), tailLimit)
+		ss, cutCap := capSpans(applyHits(ss, hits), tailLimit)
 		var b strings.Builder
 		for _, sp := range ss {
 			switch sp.kind {
@@ -1119,7 +1119,7 @@ func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) fun
 				b.WriteString(typed(sp.text))
 			}
 		}
-		return b.String()
+		return b.String(), cutTail || cutCap
 	}
 }
 
