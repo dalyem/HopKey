@@ -248,7 +248,10 @@ func (s *childIO) start() {
 // (0: as long as it takes). After delay it closes the pipes, waits for the
 // copies from stdout and stderr, so nothing writes to them after
 // runChild returns, and returns exec.ErrWaitDelay. A copy to stdin blocked
-// on its reader is left to end on its own, as exec.Cmd does.
+// on its reader is left running and ends when the reader returns; unlike
+// exec.Cmd, which waits for every copy, runChild does not wait for it. So a
+// caller's stdin reader must not block forever once the child has exited
+// (hop's callers pass os.Stdin, a pipe or a bytes reader).
 func (s *childIO) wait(delay time.Duration) error {
 	defer s.closeAll()
 	var timeout <-chan time.Time
