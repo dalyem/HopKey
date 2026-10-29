@@ -110,6 +110,10 @@ type ResolveParams struct {
 	// a host with agent_access deny is left out, as if it were not in the
 	// vault, so it is neither matched nor offered as a candidate.
 	AgentOnly bool `json:"agent_only,omitempty"`
+	// AgentTags narrows AgentOnly to the hosts that carry at least one of
+	// these tags (hop mcp --tag): any other host is left out exactly as a
+	// denied one is. Empty means no narrowing.
+	AgentTags []string `json:"agent_tags,omitempty"`
 }
 
 // ResolveResult answers OpResolve.

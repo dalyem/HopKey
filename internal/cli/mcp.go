@@ -41,6 +41,8 @@ import (
 //   - every exec and run_snippet is logged to mcpAuditFile before it runs
 //     and after, and nothing runs if the log cannot be written;
 //   - --read-only registers no tool that runs a command;
+//   - --tag limits every tool to the hosts that carry one of the tags: any
+//     other host is treated as one agent_access denies (agentScope);
 //   - the hop auth secrets and the device key passphrase leave this
 //     process's environment, so neither ssh nor a daemon it starts gets
 //     them;
@@ -55,8 +57,8 @@ import (
 //   - a denied host used as a jump host is named in no answer: its names
 //     and addresses are masked in diagnostics (hide).
 //
-// agent_access deny is a guardrail for well-behaved agents, not a security
-// boundary: an agent runs as the user, and can reach the agent socket.
+// agent_access deny and --tag are guardrails for well-behaved agents, not a
+// security boundary: an agent runs as the user, and can reach the agent socket.
 
 const (
 	mcpParallel       = 8 // hosts an exec runs on at once
@@ -83,6 +85,8 @@ func runMCP(ctx context.Context, e *Env, args []string) error {
 	}
 	fs := newFlags(e, "mcp", commands["mcp"].usage)
 	readOnly := fs.Bool("read-only", false, "offer no tool that runs a command (no exec, no run_snippet)")
+	var tags stringList
+	fs.Var(&tags, "tag", "only show agents the hosts with this tag (repeatable: a host with any of the tags is shown)")
 	helpNote(e, fs, "\nhop mcp speaks MCP on stdin and stdout; an AI client starts it. To register it, run hop mcp install.\n")
 	pos, rest, err := parseFlags(fs, args)
 	if err != nil {
@@ -91,6 +95,11 @@ func runMCP(ctx context.Context, e *Env, args []string) error {
 	if len(pos) > 0 || rest != nil {
 		fs.Usage()
 		return failf("hop mcp takes no arguments")
+	}
+
+	scope, err := parseAgentTags(tags.vals)
+	if err != nil {
+		return err
 	}
 
 	// The hop auth secrets answer that command's prompts, and the device
@@ -115,7 +124,7 @@ func runMCP(ctx context.Context, e *Env, args []string) error {
 	e.Stdout, e.Stdin = io.Discard, strings.NewReader("")
 	e.StdoutTTY, e.StdinTTY = false, false
 
-	srv, s := newMCPServer(e, *readOnly, secrets)
+	srv, s := newMCPServer(e, *readOnly, secrets, scope)
 	t := &mcp.IOTransport{Reader: readCloser(in), Writer: writeCloser(out)}
 	err = srv.Run(ctx, t)
 	if err == nil || ctx.Err() != nil || errors.Is(err, io.EOF) || errors.Is(err, mcp.ErrConnectionClosed) {
@@ -153,10 +162,27 @@ func writeCloser(w io.Writer) io.WriteCloser {
 	return nopWriteCloser{w}
 }
 
+// parseAgentTags checks the --tag values of hop mcp: none may be empty. A
+// tag that no host carries is allowed; the agent then sees no host.
+func parseAgentTags(tags []string) ([]string, error) {
+	var out []string
+	for _, t := range tags {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			return nil, failf("hop mcp --tag needs a tag")
+		}
+		if !slices.ContainsFunc(out, func(o string) bool { return strings.EqualFold(o, t) }) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
 type mcpServer struct {
 	e        *Env
 	readOnly bool
 	secrets  []string
+	tags     []string // hop mcp --tag: the agent sees only hosts with one of them; none means all
 	audit    *auditLog
 
 	ownOnce sync.Once
@@ -178,8 +204,8 @@ func hopMatcher(values []string) redact.Matcher {
 	return redact.Prepare(own)
 }
 
-func newMCPServer(e *Env, readOnly bool, secrets []string) (*mcp.Server, *mcpServer) {
-	s := &mcpServer{e: e, readOnly: readOnly, secrets: secrets, audit: newAuditLog(e)}
+func newMCPServer(e *Env, readOnly bool, secrets, tags []string) (*mcp.Server, *mcpServer) {
+	s := &mcpServer{e: e, readOnly: readOnly, secrets: secrets, tags: tags, audit: newAuditLog(e)}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "hop", Title: "HopKey", Version: version.Version},
 		&mcp.ServerOptions{Instructions: mcpInstructions})
 	reads := &mcp.ToolAnnotations{ReadOnlyHint: true}
@@ -844,7 +870,24 @@ func (s *mcpServer) list(ctx context.Context) (*daemon.ListResult, error) {
 		return nil, s.daemonError(err)
 	}
 	unmarkValue(l)
+	s.agentScope(l)
 	return l, nil
+}
+
+// agentScope applies --tag to l: a host with none of the tags becomes one
+// agent_access denies. Everything that hides a denied host (the lists, the
+// resolution filter, the masking of names in diagnostics, the tailnet
+// nodes, a hidden jump host, the tag: expansion of exec) then hides it
+// the same way, and no answer tells the two apart.
+func (s *mcpServer) agentScope(l *daemon.ListResult) {
+	if len(s.tags) == 0 {
+		return
+	}
+	for i := range l.Hosts {
+		if !daemon.InAgentScope(l.Hosts[i], s.tags) {
+			l.Hosts[i].AgentAccess = "deny"
+		}
+	}
 }
 
 // resolve resolves target as hop which --json does, among the hosts agents
@@ -852,7 +895,7 @@ func (s *mcpServer) list(ctx context.Context) (*daemon.ListResult, error) {
 // agent_only, say) is taken out again here, with l.
 func (s *mcpServer) resolve(ctx context.Context, target string, l *daemon.ListResult) (*daemon.ResolveResult, error) {
 	var rr daemon.ResolveResult
-	if err := call(ctx, s.e, daemon.OpResolve, daemon.ResolveParams{Target: target, AgentOnly: true}, &rr); err != nil {
+	if err := call(ctx, s.e, daemon.OpResolve, daemon.ResolveParams{Target: target, AgentOnly: true, AgentTags: s.tags}, &rr); err != nil {
 		return nil, s.daemonError(configStale(s.e, err))
 	}
 	if rr.Result == nil {

@@ -353,9 +353,9 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		return nil, d.configStale(st.configErr)
 	}
 	ts := d.tsStatus(ctx)
-	in := resolve.Input{Target: p.Target, Hosts: resolvable(snap.Hosts, p.AgentOnly), Tailscale: ts, Interactive: p.Interactive}
+	in := resolve.Input{Target: p.Target, Hosts: resolvable(snap.Hosts, p.AgentOnly, p.AgentTags), Tailscale: ts, Interactive: p.Interactive}
 	if p.AgentOnly {
-		in.Tailscale = agentTailnet(ts, snap.Hosts)
+		in.Tailscale = agentTailnet(ts, snap.Hosts, p.AgentTags)
 	}
 	res, err := resolve.Resolve(ctx, in)
 	if err != nil {
@@ -372,9 +372,9 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 		if st.configErr != "" {
 			return nil, d.configStale(st.configErr)
 		}
-		in.Hosts = resolvable(snap.Hosts, p.AgentOnly)
+		in.Hosts = resolvable(snap.Hosts, p.AgentOnly, p.AgentTags)
 		if p.AgentOnly {
-			in.Tailscale = agentTailnet(ts, snap.Hosts)
+			in.Tailscale = agentTailnet(ts, snap.Hosts, p.AgentTags)
 		}
 		if res, err = resolve.Resolve(ctx, in); err != nil {
 			return nil, invalidf("%v", err)
@@ -406,14 +406,32 @@ func (d *Daemon) opResolve(ctx context.Context, p ResolveParams) (*ResolveResult
 }
 
 // resolvable is the hosts a resolution may match: all of them, or with
-// agentOnly only those whose agent_access allows local agents. Only
-// "allow", and the empty value it defaults to, lets an agent in.
-func resolvable(hosts []model.Host, agentOnly bool) []model.Host {
+// agentOnly only those whose agent_access allows local agents and that are
+// in the agent's tag scope. Only "allow", and the empty value it defaults
+// to, lets an agent in.
+func resolvable(hosts []model.Host, agentOnly bool, tags []string) []model.Host {
 	if !agentOnly {
 		return hosts
 	}
-	return slices.DeleteFunc(slices.Clone(hosts), func(h model.Host) bool {
-		return h.AgentAccess != "allow" && h.AgentAccess != ""
+	return slices.DeleteFunc(slices.Clone(hosts), func(h model.Host) bool { return !agentVisible(h, tags) })
+}
+
+// agentVisible reports whether local agents may see h: agent_access allows
+// it, and h is in the tag scope (InAgentScope).
+func agentVisible(h model.Host, tags []string) bool {
+	return (h.AgentAccess == "allow" || h.AgentAccess == "") && InAgentScope(h, tags)
+}
+
+// InAgentScope reports whether h carries at least one of tags, ignoring
+// case. With no tags every host is in scope. hop mcp --tag narrows what
+// agents see to the hosts in scope; a host outside it is treated as one
+// agent_access denies.
+func InAgentScope(h model.Host, tags []string) bool {
+	if len(tags) == 0 {
+		return true
+	}
+	return slices.ContainsFunc(h.Tags, func(t string) bool {
+		return slices.ContainsFunc(tags, func(want string) bool { return strings.EqualFold(t, want) })
 	})
 }
 
@@ -423,13 +441,13 @@ func resolvable(hosts []model.Host, agentOnly bool) []model.Host {
 // the candidates. A node is left out when a denied host owns it
 // (HostOwnsNode), even if an allowed host is linked to it too. The route of
 // a matched host is still chosen with the whole of ts.
-func agentTailnet(ts *tailscale.Status, hosts []model.Host) *tailscale.Status {
+func agentTailnet(ts *tailscale.Status, hosts []model.Host, tags []string) *tailscale.Status {
 	if ts == nil || !ts.Available {
 		return ts
 	}
 	var deniedHosts []model.Host
 	for _, h := range hosts {
-		if h.AgentAccess != "allow" && h.AgentAccess != "" {
+		if !agentVisible(h, tags) {
 			deniedHosts = append(deniedHosts, h)
 		}
 	}

@@ -53,9 +53,11 @@ func mcpClientCommands(server []string) map[string]string {
 }
 
 func runMCPInstall(ctx context.Context, e *Env, args []string) error {
-	fs := newFlags(e, "mcp install", "hop mcp install [--client claude|codex|print] [--read-only] [--json]")
+	fs := newFlags(e, "mcp install", "hop mcp install [--client claude|codex|print] [--read-only] [--tag T]... [--json]")
 	client := fs.String("client", "print", "claude (Claude Code, for this user), codex (Codex CLI), or print to show the config to paste")
 	readOnly := fs.Bool("read-only", false, "register hop mcp --read-only, which offers no tool that runs a command")
+	var tags stringList
+	fs.Var(&tags, "tag", "register hop mcp --tag T, which shows agents only the hosts with a tag (repeatable)")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
 	pos, rest, err := parseFlags(fs, args)
 	if err != nil {
@@ -72,6 +74,13 @@ func runMCPInstall(ctx context.Context, e *Env, args []string) error {
 	server := []string{exe, "mcp"}
 	if *readOnly {
 		server = append(server, "--read-only")
+	}
+	scope, err := parseAgentTags(tags.vals)
+	if err != nil {
+		return err
+	}
+	for _, t := range scope {
+		server = append(server, "--tag", t)
 	}
 	switch *client {
 	case "claude":
