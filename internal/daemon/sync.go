@@ -89,6 +89,8 @@ type syncStore interface {
 	PushHead(ctx context.Context, r store.Remote) (store.PushResult, error)
 	Replacements() (store.Replacements, error)
 	AckReplacements(r store.Replacements) error
+	SyncNotes() (store.SyncNotes, error)
+	AckSyncNotes(n store.SyncNotes) error
 	Lock()
 
 	Retirement() (string, error)
@@ -192,7 +194,8 @@ type syncer struct {
 	equivoc   bool
 	notes     []string // from the startup work: things that need the user
 	// replaced are the newest notes of pushed changes that replaced
-	// another device's (noteReplaced), at most maxReplacedNotes.
+	// another device's (noteReplaced) or were combined with one
+	// (noteSyncNotes), at most maxReplacedNotes.
 	replaced []string
 	// notesErr is the last error reading or acknowledging the store's
 	// notes, logged once.
@@ -677,6 +680,9 @@ func (e *syncer) noteReplaced() {
 		}
 		err = e.st.AckReplacements(rs)
 	}
+	if err == nil {
+		err = e.noteSyncNotes()
+	}
 	// A locked store keeps its notes for after the next unlock.
 	why := ""
 	if err != nil && !errors.Is(err, model.ErrLocked) {
@@ -689,6 +695,46 @@ func (e *syncer) noteReplaced() {
 	if first {
 		e.d.logf("sync: the notes of replaced edits: %s", why)
 	}
+}
+
+// noteSyncNotes does for the store's sync notes what noteReplaced does
+// for the notes of replaced edits: a combined note says that a push wrote
+// this device's change together with another device's change to the same
+// item, one rev 16 would have held for hop sync resolve (rev 17, §5.4). The
+// caller holds noteMu.
+func (e *syncer) noteSyncNotes() error {
+	ns, err := e.st.SyncNotes()
+	if err != nil || ns.Empty() {
+		return err
+	}
+	var msgs []string
+	if ns.Discarded {
+		msgs = append(msgs, "sync notes from before this device's local key was replaced were discarded")
+	}
+	if c := ns.Evicted[store.NoteCombined]; c > 0 {
+		msgs = append(msgs, fmt.Sprintf("%d older notes of combined changes were dropped before they were shown", c))
+	}
+	for _, why := range ns.Dropped {
+		e.d.logf("sync: %s", why)
+	}
+	for _, c := range ns.Combined {
+		what := fmt.Sprintf("%s %q", c.Type, c.Name)
+		if c.Name == "" {
+			what = fmt.Sprintf("%s %s", c.Type, c.ItemID)
+		}
+		msgs = append(msgs, fmt.Sprintf("%s: this device's change to %s was combined with another device's change to %s, "+
+			"which this device had not seen (each field kept the change made to it)", what, strings.Join(c.Local, ", "), strings.Join(c.Remote, ", ")))
+	}
+	for _, msg := range msgs {
+		e.d.logf("sync: %s", msg)
+		e.set(func() {
+			e.replaced = append(e.replaced, msg)
+			if len(e.replaced) > maxReplacedNotes {
+				e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
+			}
+		})
+	}
+	return e.st.AckSyncNotes(ns)
 }
 
 func (e *syncer) noteHalt(why string, equivocation bool) {

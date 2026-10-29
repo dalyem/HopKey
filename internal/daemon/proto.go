@@ -380,17 +380,26 @@ type HeldChange struct {
 	Current json.RawMessage `json:"current"`
 	// Hold says why it is held now; nil if a retry would apply it.
 	Hold *store.HoldInfo `json:"hold"`
-	// Choices are the resolutions on offer: keep-mine, edit, take-theirs
-	// and retry, less what the hold refuses.
+	// Choices are the resolutions on offer: keep-mine, keep-mine-merge,
+	// edit, take-theirs-merge, take-theirs and retry, less what the hold
+	// refuses.
 	Choices []string `json:"choices"`
 	// KeepMine is what keep-mine would write, with its token, or nil
 	// when keep-mine is refused (KeepMineRefused says why).
 	KeepMine        *Proposal `json:"keep_mine,omitempty"`
 	KeepMineRefused string    `json:"keep_mine_refused,omitempty"`
+	// KeepMineMerge and TakeTheirsMerge are the computed edits of a hold
+	// on a unit, class or coupling conflict (rev 17): the conflicts as
+	// this device's or as the server's, everything else merged. Each is
+	// nil when refused, and the matching *Refused says why.
+	KeepMineMerge          *Proposal `json:"keep_mine_merge,omitempty"`
+	KeepMineMergeRefused   string    `json:"keep_mine_merge_refused,omitempty"`
+	TakeTheirsMerge        *Proposal `json:"take_theirs_merge,omitempty"`
+	TakeTheirsMergeRefused string    `json:"take_theirs_merge_refused,omitempty"`
 }
 
-// Proposal is the replacement a keep-mine or edit resolution writes, and
-// the token that confirms it. Confirm is opaque: a MAC, under a key only
+// Proposal is the replacement a keep-mine, edit or --merge resolution
+// writes, and the token that confirms it. Confirm is opaque: a MAC, under a key only
 // this daemon process holds, of the proposal's §5.4 digest, which covers
 // the secrets left out of Seen and Want. It reveals nothing about them,
 // and it no longer confirms once the daemon restarts or anything in the
@@ -413,13 +422,17 @@ const (
 	ChoiceEdit       = "edit"
 	ChoiceTakeTheirs = "take-theirs"
 	ChoiceRetry      = "retry"
+	// ChoiceKeepMineMerge and ChoiceTakeTheirsMerge are hop sync resolve's
+	// --keep-mine --merge and --take-theirs --merge.
+	ChoiceKeepMineMerge   = "keep-mine-merge"
+	ChoiceTakeTheirsMerge = "take-theirs-merge"
 )
 
 // SyncResolveParams is the request for OpSyncResolve. N names the held
-// record (HeldChange.N). keep-mine and edit write only with Confirm, the
-// token of the proposal (from HeldChange.KeepMine, or from a Propose
-// call for edit); with Propose they return the proposal and write
-// nothing. Edited is the edited item's plaintext JSON, for edit only, and
+// record (HeldChange.N). keep-mine, edit and the two -merge choices write
+// only with Confirm, the token of the proposal (from HeldChange.KeepMine,
+// KeepMineMerge or TakeTheirsMerge, or from a Propose call); with Propose
+// they return the proposal and write nothing. Edited is the edited item's plaintext JSON, for edit only, and
 // only for hosts and snippets: a key's or credential's secret never
 // crosses the control socket.
 type SyncResolveParams struct {

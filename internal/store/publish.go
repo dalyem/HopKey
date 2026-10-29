@@ -527,6 +527,24 @@ type singletonResponse struct {
 	} `json:"head"`
 }
 
+// singletonLen is the server's admission measure of a wire whose canonical
+// encoding is b (plan R9): the length of the log response that holds only
+// its entry, with 20 digits for the head's seq. That is 212 + digits(seq) +
+// len(b) (crypto spec rev 17 amendment, §3.1).
+func singletonLen(w *vaultlog.Wire, b []byte) (int, error) {
+	h, err := w.Entry.Hash()
+	if err != nil {
+		return 0, err
+	}
+	resp := singletonResponse{Entries: []singletonEntry{{Seq: w.Entry.Seq, H: h, Wire: b}}}
+	resp.Head.Seq, resp.Head.H = strings.Repeat("9", 20), h
+	rb, err := canonjson.Marshal(resp)
+	if err != nil {
+		return 0, err
+	}
+	return len(rb), nil
+}
+
 type singletonEntry struct {
 	Seq  uint64        `json:"seq,string"`
 	H    crypto.Hash   `json:"h"`
@@ -570,18 +588,12 @@ func checkUpload(j *publicationJSON, wires []*vaultlog.Wire) error {
 		if d := jsonDepth(b) + 2; d > maxJSONDepth {
 			return fmt.Errorf("%w: entry %d nests %d levels deep, at most %d", ErrUploadTooLarge, i, d, maxJSONDepth)
 		}
-		h, err := w.Entry.Hash()
+		n, err := singletonLen(w, b)
 		if err != nil {
 			return err
 		}
-		resp := singletonResponse{Entries: []singletonEntry{{Seq: w.Entry.Seq, H: h, Wire: b}}}
-		resp.Head.Seq, resp.Head.H = strings.Repeat("9", 20), h
-		rb, err := canonjson.Marshal(resp)
-		if err != nil {
-			return err
-		}
-		if len(rb) > maxSingletonWire {
-			return fmt.Errorf("%w: entry %d is %d bytes as a log response, at most %d", ErrUploadTooLarge, i, len(rb), maxSingletonWire)
+		if n > maxSingletonWire {
+			return fmt.Errorf("%w: entry %d is %d bytes as a log response, at most %d", ErrUploadTooLarge, i, n, maxSingletonWire)
 		}
 		total += len(b)
 		if i > 0 {

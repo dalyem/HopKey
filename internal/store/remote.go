@@ -367,6 +367,10 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 	if err := s.settle(t, w.Entry.Seq, hashAt, rec, st.VaultID); err != nil {
 		return err
 	}
+	// So are the sync notes, whether or not the outbox has records.
+	if err := s.settleSyncNotes(t, w.Entry.Seq, hashAt, rec, st.VaultID); err != nil {
+		return err
+	}
 	// A journaled checkpoint's candidate at this seq is settled in the same
 	// commit (checkpoint.go).
 	if err := s.settleCheckpointJournal(t, w, h, st, rec); err != nil {
@@ -458,13 +462,17 @@ func (s *Store) settle(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, er
 	return s.addNotes(t, rec, vaultID, replaced)
 }
 
-// settleAtUnlock settles candidates that verified history already decides.
-// Every verified commit settles its own, so this finds work only in a vault
-// whose commits did not (a crash in an older build). The caller holds s.mu
-// and the file lock.
+// settleAtUnlock settles candidates and sync notes that verified history
+// already decides. Every verified commit settles its own, so this finds
+// work only in a vault whose commits did not: a crash in an older build, or
+// a note whose record an older build settled (it never reads the notes).
+// The caller holds s.mu and the file lock.
 func (s *Store) settleAtUnlock() error {
 	t := &txn{}
 	if err := s.settle(t, s.state.Head.Seq, s.entryHash, s.rec, s.state.VaultID); err != nil {
+		return err
+	}
+	if err := s.settleSyncNotes(t, s.state.Head.Seq, s.entryHash, s.rec, s.state.VaultID); err != nil {
 		return err
 	}
 	return s.commitTxn(t)
@@ -536,11 +544,15 @@ type HoldInfo struct {
 	Cause  merge.Cause `json:"cause"`
 	Local  []string    `json:"local,omitempty"`
 	Remote []string    `json:"remote,omitempty"`
-	Reason string      `json:"reason,omitempty"`
+	// Conflicts, for a guarded conflict, are the units, selector classes
+	// and couplings that hold it (rev 17). None when the rev 16 rule
+	// decided the item.
+	Conflicts []merge.Conflict `json:"conflicts,omitempty"`
+	Reason    string           `json:"reason,omitempty"`
 }
 
 func holdInfo(res merge.Result) *HoldInfo {
-	h := &HoldInfo{Cause: res.Cause, Local: res.Local, Remote: res.Remote}
+	h := &HoldInfo{Cause: res.Cause, Local: res.Local, Remote: res.Remote, Conflicts: res.Conflicts}
 	if res.Err != nil {
 		h.Reason = res.Err.Error()
 	}
@@ -687,6 +699,15 @@ func (s *Store) prepareHead(gen, pushed uint64) (PushResult, *vaultlog.Wire, err
 	}
 	if err := s.putRecord(t, rec); err != nil {
 		return out, nil, err
+	}
+	// A write rev 16 would have held gets a combined note, pending until
+	// verified history settles the candidate (sync-notes.json).
+	if note, err := combinedNote(rec.Intent, ev.res); err != nil {
+		return out, nil, err
+	} else if note != nil {
+		if err := s.journalSyncNote(t, s.rec, s.state.VaultID, w.Entry.Seq, h, rec.N, *note); err != nil {
+			return out, nil, err
+		}
 	}
 	if err := s.commitTxn(t); err != nil {
 		return out, nil, err

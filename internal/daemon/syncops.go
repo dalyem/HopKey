@@ -304,16 +304,31 @@ func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 		Choices: []string{},
 	}
 	if !h.Import {
-		if p, err := st.Propose(store.Resolution{Choice: merge.ChoiceKeepMine}); err == nil {
-			hc.KeepMine = d.sync.proposalOf(p)
-		} else {
-			hc.KeepMineRefused = err.Error()
+		propose := func(c merge.Choice, into **Proposal, refused *string) {
+			if p, err := st.Propose(store.Resolution{Choice: c}); err == nil {
+				*into = d.sync.proposalOf(p)
+			} else {
+				*refused = err.Error()
+			}
+		}
+		propose(merge.ChoiceKeepMine, &hc.KeepMine, &hc.KeepMineRefused)
+		// The --merge proposals exist only for a hold on a unit, class or
+		// coupling conflict; there is nothing to say otherwise.
+		if h.Hold != nil && len(h.Hold.Conflicts) > 0 {
+			propose(merge.ChoiceKeepMineMerge, &hc.KeepMineMerge, &hc.KeepMineMergeRefused)
+			propose(merge.ChoiceTakeTheirsMerge, &hc.TakeTheirsMerge, &hc.TakeTheirsMergeRefused)
 		}
 		if hc.KeepMine != nil {
 			hc.Choices = append(hc.Choices, ChoiceKeepMine)
 		}
+		if hc.KeepMineMerge != nil {
+			hc.Choices = append(hc.Choices, ChoiceKeepMineMerge)
+		}
 		if h.Hold != nil && editable(h.Type) {
 			hc.Choices = append(hc.Choices, ChoiceEdit)
+		}
+		if hc.TakeTheirsMerge != nil {
+			hc.Choices = append(hc.Choices, ChoiceTakeTheirsMerge)
 		}
 		hc.Choices = append(hc.Choices, ChoiceTakeTheirs, ChoiceRetry)
 	}
@@ -364,6 +379,10 @@ func choiceName(c merge.Choice) string {
 		return ChoiceTakeTheirs
 	case merge.ChoiceRetry:
 		return ChoiceRetry
+	case merge.ChoiceKeepMineMerge:
+		return ChoiceKeepMineMerge
+	case merge.ChoiceTakeTheirsMerge:
+		return ChoiceTakeTheirsMerge
 	}
 	return string(c)
 }
@@ -378,8 +397,13 @@ func parseChoice(s string) (merge.Choice, error) {
 		return merge.ChoiceTakeTheirs, nil
 	case ChoiceRetry:
 		return merge.ChoiceRetry, nil
+	case ChoiceKeepMineMerge:
+		return merge.ChoiceKeepMineMerge, nil
+	case ChoiceTakeTheirsMerge:
+		return merge.ChoiceTakeTheirsMerge, nil
 	}
-	return "", invalidf("choice must be %s, %s, %s or %s, not %q", ChoiceKeepMine, ChoiceEdit, ChoiceTakeTheirs, ChoiceRetry, s)
+	return "", invalidf("choice must be %s, %s, %s, %s, %s or %s, not %q",
+		ChoiceKeepMine, ChoiceKeepMineMerge, ChoiceEdit, ChoiceTakeTheirsMerge, ChoiceTakeTheirs, ChoiceRetry, s)
 }
 
 // redacted is an item's plaintext JSON without its secret: a key's
@@ -448,9 +472,10 @@ func (d *Daemon) opSyncResolve(ctx context.Context, p SyncResolveParams) (*SyncR
 			return nil, invalidf("confirm: %v", err)
 		}
 	}
-	needsConfirm := choice == merge.ChoiceKeepMine || choice == merge.ChoiceEdit
+	needsConfirm := choice == merge.ChoiceKeepMine || choice == merge.ChoiceEdit ||
+		choice == merge.ChoiceKeepMineMerge || choice == merge.ChoiceTakeTheirsMerge
 	if p.Propose && !needsConfirm {
-		return nil, invalidf("only %s and %s have a proposal", ChoiceKeepMine, ChoiceEdit)
+		return nil, invalidf("only %s, %s, %s and %s have a proposal", ChoiceKeepMine, ChoiceKeepMineMerge, ChoiceEdit, ChoiceTakeTheirsMerge)
 	}
 	if !needsConfirm && (p.Confirm != "" || p.NewID != "") {
 		return nil, invalidf("%s takes no confirm or new_id", p.Choice)

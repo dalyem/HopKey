@@ -20,7 +20,7 @@ SIP = L.env_get('HK_SERVER_IP')
 EMAIL = L.env_get('HK_EMAIL')
 PTYLOG = '/var/e2e/logs/pty-blogin.log'
 INBOX = '/var/e2e/state/blogin.in'
-REF_FIELDS = 'README, Sync: "Two changes to different protected fields of one item are held too."'
+REF_FIELDS = 'README, Sync: "Fields that only make sense together form a unit, and two different changes to one unit are held" (port and user are both in how a host connects)'
 DAEMON_LOG = '/home/tester/.local/state/hop/daemon.log'
 
 

@@ -128,22 +128,22 @@ func TestRebuildPut(t *testing.T) {
 			result: mods{name("x"), hostDesc("l")},
 		},
 		{
-			name:   "lists are compared whole",
+			// Rev 16 held this (lists compared whole). Rev 17 merges tags by
+			// class: c added here, b removed there.
+			name:   "a set both sides changed merges by class",
 			seen:   mods{tags("a", "b")},
 			want:   mods{tags("a", "b", "c")},
 			s:      mods{tags("a")},
-			hold:   CauseGuardedConflict,
-			local:  []string{"tags"},
-			remote: []string{"tags"},
+			result: mods{tags("a", "c")},
 		},
 		{
-			name:   "a reordered list is a change",
+			// A reorder is a change to tags, which is in no unit with the
+			// addresses, so rev 17 writes both (rev 16 held it).
+			name:   "a reordered list is a change, and merges with an address",
 			seen:   mods{tags("a", "b")},
 			want:   mods{tags("b", "a")},
 			s:      mods{tags("a", "b"), addrs("10.0.0.2")},
-			hold:   CauseGuardedConflict,
-			local:  []string{"tags"},
-			remote: []string{"addresses"},
+			result: mods{tags("b", "a"), addrs("10.0.0.2")},
 		},
 		{
 			name:   "identical list edits write",

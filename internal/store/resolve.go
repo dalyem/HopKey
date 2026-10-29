@@ -48,9 +48,9 @@ type Resolution struct {
 	// NewID is the fresh item ID of a put turned into a create. Propose
 	// picks one; pass it back to Resolve.
 	NewID model.ID
-	// Confirm is the digest c of the proposal, needed for keep mine and
-	// edit. Resolve recomputes it against current state and refuses a
-	// different one.
+	// Confirm is the digest c of the proposal, needed for keep mine, edit
+	// and the two --merge choices. Resolve recomputes it against current
+	// state and refuses a different one.
 	Confirm crypto.Hash
 }
 
@@ -68,8 +68,9 @@ type HeldRecord struct {
 	Hold *HoldInfo
 }
 
-// Proposal is the replacement a keep mine or edit would write, with the
-// digest c the user confirms (§5.4). Take theirs and retry need none.
+// Proposal is the replacement a keep mine, an edit or a --merge choice
+// would write, with the digest c the user confirms (§5.4). Take theirs and
+// retry need none.
 type Proposal struct {
 	N      uint64
 	Choice merge.Choice
@@ -138,7 +139,7 @@ func (s *Store) Propose(r Resolution) (Proposal, error) {
 		return Proposal{}, err
 	}
 	p := Proposal{N: rec.N, Choice: r.Choice}
-	if r.Choice != merge.ChoiceKeepMine && r.Choice != merge.ChoiceEdit {
+	if !confirmed(r.Choice) {
 		return p, nil
 	}
 	repl, newID, err := s.replacement(rec, ev, &r)
@@ -165,7 +166,8 @@ func (s *Store) Propose(r Resolution) (Proposal, error) {
 //   - keep mine and edit replace the record's intent at the same n, using
 //     the §5.4 table, keep its (dead) candidates and clear held. They need
 //     r.Confirm to equal the digest of the replacement against current
-//     state.
+//     state. Keep mine --merge and take theirs --merge are computed edits
+//     (rev 17) and do the same with their proposals.
 //   - take theirs deletes the record.
 //   - retry re-evaluates the unchanged intent against current verified
 //     state and clears held only if every rule passes; otherwise it
@@ -199,7 +201,7 @@ func (s *Store) Resolve(r Resolution) error {
 		if ev.res.Kind == merge.KindHold {
 			return fmt.Errorf("%w: %s", ErrStillHeld, ev.res.Cause)
 		}
-	case merge.ChoiceKeepMine, merge.ChoiceEdit:
+	case merge.ChoiceKeepMine, merge.ChoiceEdit, merge.ChoiceKeepMineMerge, merge.ChoiceTakeTheirsMerge:
 		repl, _, err := s.replacement(rec, ev, &r)
 		if err != nil {
 			return err
@@ -246,8 +248,18 @@ func (s *Store) heldHeadLocked() (*record, evaluation, error) {
 	return rec, ev, err
 }
 
-// replacement computes the keep mine or edit replacement with the §5.4
-// table, from the held intent and why it holds now. It returns the fresh ID
+// confirmed reports whether choice writes a replacement the user confirms
+// with its digest.
+func confirmed(c merge.Choice) bool {
+	switch c {
+	case merge.ChoiceKeepMine, merge.ChoiceEdit, merge.ChoiceKeepMineMerge, merge.ChoiceTakeTheirsMerge:
+		return true
+	}
+	return false
+}
+
+// replacement computes the keep mine, edit or --merge replacement with the
+// §5.4 table, from the held intent and why it holds now. It returns the fresh ID
 // a put turned into a create uses.
 func (s *Store) replacement(rec *record, ev evaluation, r *Resolution) (merge.Intent, model.ID, error) {
 	if ev.res.Kind != merge.KindHold {
@@ -260,9 +272,14 @@ func (s *Store) replacement(rec *record, ev evaluation, r *Resolution) (merge.In
 	}
 	var repl merge.Intent
 	var newID model.ID
-	if r.Choice == merge.ChoiceKeepMine {
+	switch r.Choice {
+	case merge.ChoiceKeepMine:
 		repl, err = merge.KeepMine(held, cause, cur)
-	} else {
+	case merge.ChoiceKeepMineMerge:
+		repl, err = merge.KeepMineMerge(held, cause, cur)
+	case merge.ChoiceTakeTheirsMerge:
+		repl, err = merge.TakeTheirsMerge(held, cause, cur)
+	default:
 		var edited *merge.Item
 		if r.Edited != nil {
 			if edited, err = merge.ItemOf(r.Edited); err != nil {
