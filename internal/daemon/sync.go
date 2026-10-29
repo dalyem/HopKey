@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/syncclient"
@@ -149,6 +148,11 @@ type syncer struct {
 	wakeCh chan struct{}
 	// pause stops the loop from pulling or pushing (tests).
 	pause atomic.Bool
+	// held counts the server checks in progress (holdPolls): while any
+	// is, the loop starts no step, so no long-poll holds the store's sync
+	// lock for them to wait on. parked says the loop waits for them.
+	held   atomic.Int32
+	parked atomic.Bool
 
 	mu        sync.Mutex
 	pollStop  context.CancelFunc // ends the long-poll in flight
@@ -180,9 +184,21 @@ type syncer struct {
 	// noteMu makes each noteReplaced's read, record and acknowledgement
 	// one step, so no note is recorded twice.
 	noteMu sync.Mutex
-	// retired is the server's unverified word that this device left the
-	// account (sessionEnded).
+	// retired is the server's word that this device left the account
+	// (reportedLocked), and whether its proof wiped the device.
 	retired *ServerRetirement
+	// checkSkipped says why the last question to the server before keys
+	// loaded went unanswered (checkServer); "" once one is answered.
+	checkSkipped string
+	// maxOffline is the account's max-offline policy (0: off), lastContact
+	// the last authenticated contact as last read, and offline why the
+	// policy locked the vault (enforceOfflineLocked).
+	maxOffline  time.Duration
+	lastContact time.Time
+	offline     string
+	// unconfirmed says why the server's answer kept the vault locked
+	// (unconfirmedLocked); "" once it accepts the device.
+	unconfirmed string
 
 	// confirmKey keys the confirmation tokens of resolution proposals
 	// (confirmToken). It is random per daemon process.
@@ -224,13 +240,19 @@ func newSyncer(d *Daemon, st syncStore, opts SyncOptions) *syncer {
 	return e
 }
 
-// startSync starts the engine for a store that can sync.
+// newSync makes the engine for a store that can sync, without starting
+// it.
+func (d *Daemon) newSync() {
+	if st, ok := d.store.(syncStore); ok {
+		d.sync = newSyncer(d, st, d.opts.Sync)
+	}
+}
+
+// startSync starts the engine newSync made.
 func (d *Daemon) startSync() {
-	st, ok := d.store.(syncStore)
-	if !ok {
+	if d.sync == nil {
 		return
 	}
-	d.sync = newSyncer(d, st, d.opts.Sync)
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
@@ -256,6 +278,37 @@ func (e *syncer) wake() {
 	if stop != nil {
 		stop()
 	}
+}
+
+// holdPolls ends the long-poll in flight and keeps the loop from taking
+// the store's sync lock again until the func it returns is called, so a
+// server check (checkServer) gets it at once. A loop that waited for it
+// resumes then. It does not wake the loop otherwise: the loop's own checks
+// (sessionEnded, retryUnconfirmed) hold it too.
+func (e *syncer) holdPolls() func() {
+	e.held.Add(1)
+	e.mu.Lock()
+	stop := e.pollStop
+	e.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	return func() {
+		if e.held.Add(-1) == 0 && e.parked.Swap(false) {
+			e.wake()
+		}
+	}
+}
+
+// parkForCheck reports whether a server check holds the loop
+// (holdPolls); the loop then waits for it to end.
+func (e *syncer) parkForCheck() bool {
+	if e.held.Load() == 0 {
+		return false
+	}
+	e.parked.Store(true)
+	// Released meanwhile: then nothing wakes the loop, so it goes on.
+	return e.held.Load() > 0 || !e.parked.Swap(false)
 }
 
 func (e *syncer) run(ctx context.Context) {
@@ -319,7 +372,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 	if e.terminal() {
 		return stepStop
 	}
-	if e.pause.Load() {
+	if e.pause.Load() || e.parkForCheck() {
 		return stepIdle
 	}
 	if e.status().Halted != "" {
@@ -327,9 +380,10 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		// store stays halted until it is opened again.
 		return stepIdle
 	}
+	gen := e.st.Generation()
 	// A logout in progress resumes first. It needs no unlock.
 	if state, err := e.st.Retirement(); err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	} else if state != "" {
 		return e.resumeLogout(ctx)
 	}
@@ -338,22 +392,42 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 	case info.Revoked:
 		e.setPhase(SyncRevoked)
 		return stepStop
+	case info.ServerReport != nil:
+		// Until the server authenticates this device again (an unlock or
+		// a start asks it), nothing syncs.
+		rep := info.ServerReport
+		e.set(func() {
+			e.phase = SyncRevoked
+			if e.retired == nil {
+				e.retired = &ServerRetirement{How: rep.How, Seq: rep.Seq, Unverified: true}
+			}
+		})
+		return stepIdle
+	case info.Locked && info.ServerUnconfirmed:
+		// The server answered without confirming this device: ask again.
+		e.setPhase(SyncLocked)
+		if e.d.retryUnconfirmed(ctx) {
+			return stepNow
+		}
+		return stepIdle
 	case info.Locked:
 		e.setPhase(SyncLocked)
 		return stepIdle
 	}
 	e.set(func() {
-		if e.phase == SyncLocked || e.phase == SyncOff {
-			e.phase = SyncStarting
+		if e.phase == SyncLocked || e.phase == SyncOff || (e.phase == SyncRevoked && e.retired != nil && e.retired.Unverified) {
+			e.phase, e.retired = SyncStarting, nil
 		}
 	})
-	gen := e.st.Generation()
+	// The generation the requests below are made in: a refusal is acted
+	// on only while the store is still in it (sessionEnded).
+	gen = e.st.Generation()
 	if d, done := e.resumeUnlocked(ctx, gen); !done {
 		return d
 	}
 	r, err := e.remoteFor(gen)
 	if err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	}
 	if r == nil {
 		e.setPhase(SyncOff)
@@ -361,7 +435,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 	}
 	st, err := e.st.Status()
 	if err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	}
 	if st.Halted != "" {
 		e.noteHalt(st.Halted, false)
@@ -371,7 +445,7 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		res, err := e.pushHead(ctx, r)
 		if err != nil {
 			e.reconcile(ctx, gen, &st)
-			return e.fail(ctx, err)
+			return e.fail(ctx, gen, err)
 		}
 		e.pushed(ctx, gen, res)
 		if res.Outcome != store.PushEmpty {
@@ -390,6 +464,10 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		// Woken before the long-poll could be ended by it.
 		cancel()
 	default:
+	}
+	if e.held.Load() > 0 {
+		// A server check began since the step did: it goes first.
+		cancel()
 	}
 	// Only once the server has answered does a pull wait for news: until
 	// then, at start and after a failure, status would say starting or
@@ -410,16 +488,19 @@ func (e *syncer) step(ctx context.Context) time.Duration {
 		return stepNow
 	}
 	if err != nil {
-		return e.fail(ctx, err)
+		return e.fail(ctx, gen, err)
 	}
 	e.pulled(ctx, gen)
 	return stepNow
 }
 
+// terminal reports whether sync has stopped for good: a verified
+// revocation, or a finished logout. A revocation only the server reports is
+// not (reportedLocked).
 func (e *syncer) terminal() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.phase == SyncRevoked || e.phase == SyncLoggedOut
+	return (e.phase == SyncRevoked && (e.retired == nil || !e.retired.Unverified)) || e.phase == SyncLoggedOut
 }
 
 // pushHead pushes the outbox's head record under the per-push deadline,
@@ -483,8 +564,9 @@ func (e *syncer) pushed(ctx context.Context, gen uint64, res store.PushResult) {
 
 // fail records err and says what to do next: wait for a wake when the
 // vault is locked or sync has halted, stop on a revocation, and otherwise
-// back off.
-func (e *syncer) fail(ctx context.Context, err error) time.Duration {
+// back off. gen is the store's generation the failed request was made in
+// (sessionEnded).
+func (e *syncer) fail(ctx context.Context, gen uint64, err error) time.Duration {
 	if ctx.Err() != nil || errors.Is(err, store.ErrClosed) {
 		return stepStop
 	}
@@ -511,8 +593,8 @@ func (e *syncer) fail(ctx context.Context, err error) time.Duration {
 		e.setPhase(SyncOff)
 		return stepIdle
 	case errors.Is(err, store.ErrSessionEnded):
-		if e.sessionEnded(ctx) {
-			return stepStop
+		if e.sessionEnded(ctx, gen) {
+			return stepIdle
 		}
 	}
 	var wait time.Duration
@@ -589,77 +671,51 @@ func (e *syncer) noteHalt(why string, equivocation bool) {
 
 // revoked stops sync for good and takes the daemon to the revoked state:
 // an empty agent and an empty ssh config.
+// A verified revocation then wipes this device's copy of the vault
+// (wipeVerified).
 func (e *syncer) revoked(err error) {
 	e.setPhase(SyncRevoked)
 	e.d.mu.Lock()
 	e.d.followStore(store.ErrDeviceRevoked)
 	e.d.mu.Unlock()
 	e.d.logf("sync stopped: %v", err)
+	e.d.wipeVerified()
 }
 
 // sessionEnded handles the server refusing this device a session: an
-// active device always gets one, so it left the account. Its entries are
-// not served to it any more, so the revocation can't be verified from the
-// log; retire-status says how it left (§9). If it did, sync stops, and
-// the vault is locked and the agent emptied, as for a verified
-// revocation, but not durably: the store is not marked revoked on the
-// server's word, and sync.status labels it server-reported and
-// unverified. A lock or a close cancels the request, and an answer counts
-// only in the unlocked session it was asked in. It reports whether sync
-// stopped.
-func (e *syncer) sessionEnded(ctx context.Context) bool {
-	info, err := e.st.ServerInfo()
-	if err != nil {
-		return false
+// active device always gets one, so it may have left the account. Its
+// entries are not served to it any more, so the revocation can't be
+// verified from the log; CheckServer asks again and, if the server says it
+// left, records the report and locks the vault (reportedLocked), and the
+// proof is asked for. Any other outcome but the server accepting the
+// device, a server that can't be asked again included, locks the vault
+// until it does (unconfirmedLocked): the refusal was the server's answer.
+// gen is the store's generation the refused request was made in: a lock
+// or an unlock since (hop lock, say, while the request was out) is not
+// taken over, so a refusal only locks, or labels a lock unconfirmed, while
+// the store is still in gen. It reports whether sync stopped.
+func (e *syncer) sessionEnded(ctx context.Context, gen uint64) bool {
+	if e.d.opts.sessionRefused != nil {
+		e.d.opts.sessionRefused()
 	}
-	c, err := e.client(info.Server)
-	if err != nil {
+	res, err := e.d.checkServer(ctx, sessionCheckTimeout, nil, gen)
+	switch {
+	case err == nil && res.Report != nil:
+		e.d.mu.Lock()
+		defer e.d.mu.Unlock()
+		e.d.reportedLocked(res.Report, nil)
+		return true
+	case err == nil:
 		return false
-	}
-	auth, err := e.st.DeviceAuth()
-	if err != nil {
-		return false
-	}
-	rctx, gen, done, err := e.st.RequestContext(ctx)
-	if err != nil {
-		return false
-	}
-	rs, err := c.Retirer(info.VaultID).RetireStatus(rctx, auth, crypto.Hash{})
-	done()
-	if err != nil || rs.Receipt == nil {
-		return false
-	}
-	return e.serverRetired(gen, info, auth, *rs.Receipt)
-}
-
-// serverRetired acts on the receipt retire-status returned for a request
-// made in store generation gen, if it is this device's and says it was
-// retired or revoked, and the store is still unlocked in gen. It reports
-// whether it acted.
-func (e *syncer) serverRetired(gen uint64, info store.ServerInfo, auth store.DeviceAuth, rc store.DeviceReceipt) bool {
-	if rc.How != "retired" && rc.How != "revoked" {
-		e.d.logf("sync: ignoring a retire-status receipt that says %q", rc.How)
-		return false
-	}
-	if info.AccountID.IsZero() || auth.AccountID != info.AccountID || auth.DeviceID.IsZero() || rc.DeviceID != auth.DeviceID {
-		e.d.logf("sync: ignoring a retire-status receipt for another device or account")
-		return false
+	case unreachable(err):
+		err = fmt.Errorf("the server refused this device a session, and could not be asked again: %w", err)
 	}
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
-	// Lock and unlock take d.mu, so the store can't reach another
-	// unlocked session between this check and the lock below.
-	if e.st.Generation() != gen || e.st.Info().Locked {
+	if !e.d.stillUnconfirmed(err, gen) {
 		return false
 	}
-	ret := &ServerRetirement{How: rc.How, Seq: rc.Seq, Unverified: true}
-	why := fmt.Sprintf("the server reports this device %s from the account at seq %d (server-reported, unverified)", rc.How, rc.Seq)
-	e.set(func() {
-		e.phase, e.lastErr, e.lastErrAt, e.retired = SyncRevoked, why, time.Now(), ret
-	})
-	e.st.Lock()
-	e.d.dropKeysLocked(true)
-	e.d.logf("sync stopped: %s", why)
+	e.d.unconfirmedLocked(err)
 	return true
 }
 
@@ -667,20 +723,21 @@ func (e *syncer) serverRetired(gen uint64, info store.ServerInfo, auth store.Dev
 // resolution and RETIRED its cleanup.
 func (e *syncer) resumeLogout(ctx context.Context) time.Duration {
 	e.setPhase(SyncLoggingOut)
+	gen := e.st.Generation()
 	var r store.Retirer
 	if info, err := e.st.ServerInfo(); err == nil && info.Server != "" && !info.VaultID.IsZero() {
 		c, err := e.client(info.Server)
 		if err != nil {
-			return e.fail(ctx, err)
+			return e.fail(ctx, gen, err)
 		}
 		r = c.Retirer(info.VaultID)
 	}
 	res, err := e.st.Logout(ctx, r, store.LogoutOptions{})
 	if err != nil {
 		if errors.Is(err, store.ErrDeviceRevoked) || errors.Is(err, store.ErrClosed) || ctx.Err() != nil {
-			return e.fail(ctx, err)
+			return e.fail(ctx, gen, err)
 		}
-		d := e.fail(ctx, err)
+		d := e.fail(ctx, gen, err)
 		e.setPhase(SyncLoggingOut)
 		return d
 	}
@@ -730,7 +787,7 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 	}
 	if p, err := e.st.Publication(); err != nil {
 		if retry(err) {
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		}
 		note("the pending publication can't be read", err)
 	} else if p != nil {
@@ -749,7 +806,7 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 			e.noteHalt(err.Error(), true)
 			return stepIdle, false
 		case err != nil && retry(err):
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		case err != nil:
 			note("the pending publication did not finish (run hop auth signup again)", err)
 		default:
@@ -760,13 +817,13 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 	}
 	if cp, err := e.st.PendingCheckpoint(); err != nil {
 		if retry(err) {
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		}
 		note("the pending checkpoint can't be read", err)
 	} else if cp != nil && !cp.Committed {
 		r, err := e.remoteFor(gen)
 		if err != nil {
-			return e.fail(ctx, err), false
+			return e.fail(ctx, gen, err), false
 		}
 		if r != nil {
 			_, err := e.st.ResumeCheckpoint(ctx, r)
@@ -776,7 +833,7 @@ func (e *syncer) resumeUnlocked(ctx context.Context, gen uint64) (d time.Duratio
 			switch {
 			case errors.Is(err, store.ErrNoCheckpoint):
 			case err != nil && retry(err):
-				return e.fail(ctx, err), false
+				return e.fail(ctx, gen, err), false
 			case err != nil:
 				note("a "+cp.Kind+" checkpoint did not finish (run the same command again)", err)
 			default:
@@ -955,6 +1012,8 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 			e.revoked(err)
 		case errors.As(err, &eq), errors.Is(err, store.ErrSyncHalted):
 			e.noteHalt(err.Error(), eq != nil)
+		case errors.Is(err, store.ErrSessionEnded):
+			e.sessionEnded(ctx, gen)
 		}
 		if req.kind == reqSyncNow {
 			e.set(func() { e.lastErr, e.lastErrAt = err.Error(), time.Now() })
@@ -993,10 +1052,16 @@ func (e *syncer) catchUp(ctx context.Context) bool {
 func (e *syncer) status() SyncStatusResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	out := SyncStatusResult{State: e.phase, LastError: e.lastErr, Halted: e.halted, Equivocation: e.equivoc}
+	out := SyncStatusResult{State: e.phase, LastError: e.lastErr, Halted: e.halted, Equivocation: e.equivoc,
+		CheckSkipped: e.checkSkipped, MaxOffline: int64(e.maxOffline / time.Second), OfflineLocked: e.offline,
+		ServerUnconfirmed: e.unconfirmed}
 	if e.retired != nil {
 		r := *e.retired
 		out.ServerRetirement = &r
+	}
+	if !e.lastContact.IsZero() {
+		t := e.lastContact
+		out.LastContact = &t
 	}
 	if !e.syncedAt.IsZero() {
 		t := e.syncedAt

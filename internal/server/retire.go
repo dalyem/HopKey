@@ -347,3 +347,116 @@ func (s *Server) retirePost(w http.ResponseWriter, r *http.Request, c *call) err
 	writeJSON(w, http.StatusOK, result)
 	return nil
 }
+
+// maxProofEntries bounds one page of a revocation proof.
+const maxProofEntries = 256
+
+type retireProofRequest struct {
+	AccountID model.ID `json:"account_id"`
+	After     uint64   `json:"after,string"`
+	Challenge []byte   `json:"challenge"`
+	DeviceID  model.ID `json:"device_id"`
+	Sig       []byte   `json:"sig"`
+}
+
+type proofEntryJSON struct {
+	H    crypto.Hash   `json:"h"`
+	Seq  uint64        `json:"seq,string"`
+	Wire canonjson.Raw `json:"wire"`
+}
+
+type retireProofResponse struct {
+	Entries []proofEntryJSON `json:"entries"`
+	Receipt receiptJSON      `json:"receipt"`
+}
+
+// retireProof: POST /v1/retire-status/proof {account_id, device_id,
+// challenge, sig, after} → {entries:[{seq,h,wire}], receipt}, or 404 when
+// the device has no receipt. It serves a device that left the account the
+// entries after after up to and including the one its receipt names, each
+// wire without its objects: the signed entries alone, so the device can
+// verify, from its own last verified head, that the entry that removed it
+// was signed by the account and a device it knows. Nothing past the
+// receipt's entry, and no object (no ciphertext), is ever served to it. A
+// page holds at most maxProofEntries entries and fits the log page byte
+// limit; the device asks again from the last one. The challenge is
+// consumed as retire-status consumes it.
+func (s *Server) retireProof(w http.ResponseWriter, r *http.Request, c *call) error {
+	var req retireProofRequest
+	if err := s.decode(c.body, &req); err != nil {
+		return err
+	}
+	var resp retireProofResponse
+	var refused error
+	authenticated := false
+	err := s.store.Update(r.Context(), func(tx Tx) error {
+		ch, _, err := s.retireAuth(tx, req.AccountID, req.DeviceID, req.Challenge, req.Sig)
+		if err != nil {
+			return err
+		}
+		authenticated = true
+		if err := tx.DeleteChallenge(ch.Hash); err != nil {
+			return err
+		}
+		if !s.limiter.allow(c.route.pattern+"|account", ch.AccountID.String(), s.rates.Account) {
+			refused = errRateLimited
+			return nil
+		}
+		rc, err := tx.Receipt(ch.AccountID, ch.DeviceID)
+		if errors.Is(err, ErrNotFound) {
+			refused = errNotFound
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		a, err := tx.Account(ch.AccountID)
+		if err != nil {
+			return err
+		}
+		resp.Receipt = receiptJSON{DeviceID: rc.DeviceID, H: rc.H, How: string(rc.How), Seq: rc.Seq}
+		resp.Entries = []proofEntryJSON{}
+		if req.After >= rc.Seq {
+			return nil
+		}
+		size := 0
+		var inner error
+		err = tx.Entries(a.VaultID, req.After, false, maxProofEntries, func(e *LogEntry) bool {
+			if e.Seq > rc.Seq {
+				return false
+			}
+			wire, err := vaultlog.ParseWire(e.Wire)
+			if err != nil {
+				inner = err
+				return false
+			}
+			wire.Objects = []vaultlog.Object{}
+			b, err := wire.Marshal()
+			if err != nil {
+				inner = err
+				return false
+			}
+			if len(resp.Entries) > 0 && size+len(b) > s.lim.MaxPageBytes/2 {
+				return false
+			}
+			size += len(b)
+			resp.Entries = append(resp.Entries, proofEntryJSON{H: e.H, Seq: e.Seq, Wire: b})
+			return true
+		})
+		if err == nil {
+			err = inner
+		}
+		return err
+	})
+	if err != nil {
+		if authenticated {
+			return s.spendChallenge(r, c, req.AccountID, req.DeviceID, req.Challenge, req.Sig, err)
+		}
+		return err
+	}
+	if refused != nil {
+		return refused
+	}
+	writeJSON(w, http.StatusOK, resp)
+	return nil
+}

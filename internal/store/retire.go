@@ -423,7 +423,7 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 	unlock()
 	// The candidate is built from the vault as verified on disk, by the same
 	// load a resumed logout uses.
-	v, unlock, err := s.loadVault(true)
+	v, unlock, err := s.loadVault(true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -651,6 +651,43 @@ func ClearLogoutCleanup(dataDir string) error {
 // directory, for the daemon, which never sees the path.
 func (s *Store) ClearLogoutCleanup() error { return ClearLogoutCleanup(s.l.data) }
 
+// LogoutCleanupPending is LogoutCleanupPending of this store's data
+// directory.
+func (s *Store) LogoutCleanupPending() (bool, error) { return LogoutCleanupPending(s.l.data) }
+
+// OweSSHCleanup reports whether the cleanup outside the store is owed in
+// dataDir: the mark is there (LogoutCleanupPending), or this device's copy
+// of the vault is gone after a verified revocation (no vault, and the
+// revocation record ReadRevocation reads) and left reports that the ssh
+// config directory still holds what the vault decrypted. In that case the
+// mark is written first, so the cleanup stays owed until ClearLogoutCleanup
+// however it ends. A vault that is there, a new sign-in's, owes nothing
+// beyond the mark. It is for sshconfig.WipeIf's owed, so it runs under
+// config.lock: no config is written between the decision and the wipe.
+func OweSSHCleanup(dataDir string, left func() (bool, error)) (bool, error) {
+	if pending, err := LogoutCleanupPending(dataDir); pending || err != nil {
+		return pending, err
+	}
+	if exists, err := Exists(dataDir); exists || err != nil {
+		return false, err
+	}
+	if rev, err := ReadRevocation(dataDir); rev == nil || err != nil {
+		return false, err
+	}
+	if l, err := left(); !l || err != nil {
+		return false, err
+	}
+	if err := markLogoutCleanup(dataDir); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// OweSSHCleanup is OweSSHCleanup of this store's data directory.
+func (s *Store) OweSSHCleanup(left func() (bool, error)) (bool, error) {
+	return OweSSHCleanup(s.l.data, left)
+}
+
 // deleteRetiredRecords deletes, each one conclusively (one already gone
 // counts), the keychain entry of every device record the journal j names,
 // and then of any other device device.json still names. The journal's go
@@ -704,7 +741,7 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 	pending := LogoutResult{State: StateRetiring}
 	ctx, _, untrack := s.trackRequest(ctx)
 	defer untrack()
-	v, unlock, err := s.loadVault(true)
+	v, unlock, err := s.loadVault(true, false)
 	if err != nil {
 		return pending, err
 	}

@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -45,6 +47,7 @@ func init() {
 		"passwd":  {runAuthPasswd, "hop auth passwd [--keep D]... [--exclude D]... [--kit-file PATH] [--password-stdin] [--json]"},
 		"merge":   {runAuthMerge, "hop auth merge [--pause | --resume | --discard [--confirm TOKEN]] [--json]"},
 		"status":  {runAuthStatus, "hop auth status [--json]"},
+		"policy":  {runAuthPolicy, "hop auth policy [--max-offline DURATION|off] [--json]"},
 		"resume":  {runAuthResume, "hop auth resume [--keep D]... [--yes] [--kit-file PATH] [--password-stdin] [--json]"},
 	}
 }
@@ -704,8 +707,16 @@ type AuthStatus struct {
 	// SignedIn means the vault syncs with a server. A revoked device is not
 	// signed in: nothing syncs on it again.
 	SignedIn bool `json:"signed_in"`
-	// Revoked means the account revoked this device (SignedIn is false).
-	Revoked bool `json:"revoked,omitempty"`
+	// Revoked means the account revoked this device (SignedIn is false):
+	// the server reports it (RevokedUnverified while that is not proven,
+	// and the vault stays locked), or the log proved it and the vault was
+	// wiped here (Wiped, and Revocation says when). WipePending means it is
+	// proven, but the wipe has not finished.
+	Revoked           bool                    `json:"revoked,omitempty"`
+	RevokedUnverified bool                    `json:"revoked_unverified,omitempty"`
+	Wiped             bool                    `json:"wiped,omitempty"`
+	WipePending       bool                    `json:"wipe_pending,omitempty"`
+	Revocation        *store.RevocationRecord `json:"revocation,omitempty"`
 	// Vault is false when this device has no vault at all.
 	Vault          bool                     `json:"vault"`
 	Server         string                   `json:"server,omitempty"`
@@ -742,8 +753,18 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		// With no daemon running, a missing vault is not worth starting
 		// one for.
 		if ok, err := store.Exists(e.storeConfig().DataDir); err == nil && !ok {
+			rev, _ := store.ReadRevocation(e.storeConfig().DataDir)
+			pending := rev != nil && sshCleanupPending(e)
 			if o.asJSON {
-				return printJSON(e, AuthStatus{})
+				return printJSON(e, AuthStatus{Revoked: rev != nil, Wiped: rev != nil && !pending, WipePending: pending, Revocation: rev})
+			}
+			switch {
+			case pending:
+				printWipePending(e, rev)
+				return nil
+			case rev != nil:
+				printWipedRevocation(e, rev)
+				return nil
 			}
 			e.printf("signed in:    no; this device has no vault (hop auth login signs in, hop auth signup creates an account)\n")
 			return nil
@@ -758,6 +779,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		return failf("%v", err)
 	}
 	a := AuthStatus{Vault: true, Sync: st.Sync}
+	sshPending := false
 	if v := st.Vault; v != nil {
 		a.DeviceID, a.DeviceKeyStore, a.Locked, a.KitPending, a.AccountID = v.DeviceID, v.DeviceStore, v.Locked, v.KitPending, v.AccountID
 		a.SecretKeyStale = v.SecretKeyStale
@@ -765,6 +787,16 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	}
 	if s := st.Sync; s != nil && s.State != daemon.SyncOff {
 		a.Revoked = s.State == daemon.SyncRevoked
+		if r := s.ServerRetirement; a.Revoked && r != nil {
+			// The daemon decides whether the ssh files are gone too
+			// (daemon.CleanupLeft), so this and its sync block agree.
+			a.Wiped, a.RevokedUnverified, a.WipePending = r.Wiped, r.Unverified, !r.Unverified && !r.Wiped
+			sshPending = a.WipePending && r.SSHFilesLeft
+		}
+		if a.Wiped || sshPending {
+			a.Vault = false
+			a.Revocation, _ = store.ReadRevocation(e.storeConfig().DataDir)
+		}
 		a.SignedIn = !a.Revoked
 		a.Server, a.Email, a.VaultID = s.Server, s.Email, s.VaultID
 		if s.AccountID != "" {
@@ -789,6 +821,27 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	switch {
 	case a.SignedIn:
 		e.printf("signed in:    yes\n")
+	case a.Wiped && a.Revocation != nil:
+		printWipedRevocation(e, a.Revocation)
+		return nil
+	case a.Wiped:
+		e.printf("signed in:    no; this device was revoked from the account, the revocation verified, and this device's copy of the vault, " +
+			"its device key and the ssh files hop wrote were wiped (hop auth login signs in again)\n")
+		return nil
+	case sshPending:
+		printWipePending(e, a.Revocation)
+		return nil
+	case a.WipePending:
+		r := a.Sync.ServerRetirement
+		e.printf("signed in:    no; this device was %s from the account at seq %d, and the revocation verified, so the vault stays locked for good; "+
+			"wiping this device's copy has not finished (%s)\n", oneLine(r.How), r.Seq, oneLine(r.WipeError))
+	case a.RevokedUnverified && a.Sync.ServerRetirement.ReportCorrupt:
+		e.printf("signed in:    no; the server reported that this device left the account, but the record of that report here is corrupt, " +
+			"so the vault stays locked and nothing syncs (hop auth logout wipes this device, then hop auth login signs in again)\n")
+	case a.RevokedUnverified:
+		r := a.Sync.ServerRetirement
+		e.printf("signed in:    no; the server reports that this device was %s from the account at seq %d, so the vault stays locked "+
+			"and nothing syncs (hop auth logout wipes this device, then hop auth login signs in again)\n", oneLine(r.How), r.Seq)
 	case a.Revoked:
 		e.printf("signed in:    no; this device was revoked from the account, so nothing syncs here any more (hop auth logout --local-only wipes this device's copy, then hop auth login signs in again)\n")
 	default:
@@ -800,10 +853,23 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	if a.DeviceKeyStore != "" {
 		e.printf("device key:   %s\n", oneLine(a.DeviceKeyStore))
 	}
-	if a.Locked {
-		e.printf("vault:        locked; run hop unlock\n")
-	} else {
+	switch {
+	case !a.Locked:
 		e.printf("vault:        unlocked\n")
+	case a.Revoked:
+		e.printf("vault:        locked: hop unlock refuses on a revoked device\n")
+	case st.Vault != nil:
+		e.printf("vault:        %s\n", vaultState(st.Vault))
+	default:
+		e.printf("vault:        locked; run hop unlock\n")
+	}
+	if s := a.Sync; s != nil && a.SignedIn {
+		switch {
+		case s.MaxOffline > 0 && s.LastContact != nil:
+			e.printf("max offline:  %s (last server contact %s)\n", fmtSeconds(s.MaxOffline), e.when(*s.LastContact))
+		case s.MaxOffline > 0:
+			e.printf("max offline:  %s\n", fmtSeconds(s.MaxOffline))
+		}
 	}
 	shown := map[string]bool{}
 	if a.Sync != nil && (a.SignedIn || a.Revoked) {
@@ -1155,17 +1221,20 @@ var testHookLogoutCleanup func()
 // finishLogoutCleanup empties the ssh config, as wipeSSHConfig does, if a
 // finished logout still owes it (store.LogoutCleanupPending): one a crash
 // cut short after it was recorded, which store.Open has just finished, or
-// one whose wipe failed. The mark is read, the config emptied and the mark
-// cleared in one hold of config.lock (sshconfig.WipeIf), the lock every
-// config write takes: a new sign-in clears the mark this way before its
-// daemon writes, so a mark read before that sign-in can't wipe its
-// config.
+// one whose wipe failed. A device wiped after a verified revocation whose
+// ssh config still holds what the vault decrypted owes it too, with no
+// mark (store.OweSSHCleanup marks it then). The mark is read, the config
+// emptied and the mark cleared in one hold of config.lock
+// (sshconfig.WipeIf), the lock every config write takes: a new sign-in
+// clears the mark this way before its daemon writes, so a mark read before
+// that sign-in can't wipe its config.
 func finishLogoutCleanup(e *Env, asJSON bool) {
 	dataDir := e.storeConfig().DataDir
+	o := sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()}
 	var readErr error
-	err := sshconfig.WipeIf(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()},
+	err := sshconfig.WipeIf(o,
 		func() (bool, error) {
-			pending, err := store.LogoutCleanupPending(dataDir)
+			pending, err := store.OweSSHCleanup(dataDir, func() (bool, error) { return sshconfig.Generated(o) })
 			if testHookLogoutCleanup != nil {
 				testHookLogoutCleanup()
 			}
@@ -1346,8 +1415,15 @@ func runAuthDevices(ctx context.Context, e *Env, args []string) error {
 		if daemon.IsCode(err, daemon.CodeLocalOnly) {
 			return failf("this vault is local-only, so it has no devices to list")
 		}
+		if daemon.IsCode(err, daemon.CodeRevoked) {
+			return failf("this device was revoked from the account, so it can't list the account's devices any more; " +
+				"hop auth status says what happened, and hop auth login signs in again")
+		}
+		if daemon.IsCode(err, daemon.CodeOffline) {
+			return failf("%v", cleanErr(err))
+		}
 		if daemon.IsCode(err, daemon.CodeLocked) {
-			return failf("%v; run hop unlock first", err)
+			return failf("the vault is locked; run hop unlock first")
 		}
 		return err
 	}
@@ -1383,4 +1459,160 @@ func runAuthDevices(ctx context.Context, e *Env, args []string) error {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", dash(oneLine(d.Name)), oneLine(d.ID.String()), dash(oneLine(d.How)), e.when(d.AddedAt), seen, dash(strings.Join(notes, "; ")))
 	}
 	return tw.Flush()
+}
+
+// printWipedRevocation is hop auth status on a device a verified
+// revocation wiped.
+func printWipedRevocation(e *Env, r *store.RevocationRecord) {
+	e.printf("signed in:    no; this device was %s from the account", oneLine(r.How))
+	if r.Email != "" {
+		e.printf(" %s", oneLine(r.Email))
+	}
+	if r.Seq != 0 {
+		e.printf(" by the entry at seq %d", r.Seq)
+	}
+	e.printf(", verified here on %s\n", e.when(r.At.Time()))
+	e.printf("wiped:        this device's copy of the vault, its device key and the ssh files hop wrote\n")
+	e.printf("kept:         SSH key files you imported yourself; the vault's SSH keys stay valid on your hosts until rotated (hop key rotate)\n")
+	e.printf("next:         hop auth login signs in again as a new device\n")
+}
+
+// printWipePending is printWipedRevocation for a device whose copy of the
+// vault is wiped, but whose ssh files may not be (sshCleanupPending). r may
+// be nil.
+func printWipePending(e *Env, r *store.RevocationRecord) {
+	e.printf("signed in:    no; this device was ")
+	if r == nil {
+		e.printf("revoked from the account")
+	} else {
+		e.printf("%s from the account", oneLine(r.How))
+		if r.Email != "" {
+			e.printf(" %s", oneLine(r.Email))
+		}
+		if r.Seq != 0 {
+			e.printf(" by the entry at seq %d", r.Seq)
+		}
+	}
+	e.printf(", verified; wipe pending (ssh files remain under %s; the daemon retries, and so do hop sync and hop auth logout)\n", oneLine(homePath(e, e.Paths.ConfigDir)))
+	e.printf("wiped so far: this device's copy of the vault and its device key\n")
+	e.printf("next:         hop auth login signs in again as a new device, once the ssh files are gone\n")
+}
+
+// sshCleanupPending reports whether the ssh files hop wrote may still be
+// there on a device whose vault was wiped, as the daemon's status decides
+// it (daemon.CleanupLeft): for hop auth status with no daemon.
+func sshCleanupPending(e *Env) bool {
+	dataDir := e.storeConfig().DataDir
+	return daemon.CleanupLeft(func() (bool, error) { return store.LogoutCleanupPending(dataDir) },
+		sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()}) != ""
+}
+
+// homePath writes p under the home directory as ~/....
+func homePath(e *Env, p string) string {
+	if e.Home == "" {
+		return p
+	}
+	if rel, err := filepath.Rel(e.Home, p); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		return "~/" + filepath.ToSlash(rel)
+	}
+	return p
+}
+
+// fmtSeconds writes a duration of n seconds in days, hours or minutes.
+func fmtSeconds(n int64) string {
+	d := time.Duration(n) * time.Second
+	switch {
+	case d%(24*time.Hour) == 0:
+		return fmt.Sprintf("%dd", d/(24*time.Hour))
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dh", d/time.Hour)
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dm", d/time.Minute)
+	}
+	return d.String()
+}
+
+// parseMaxOffline reads --max-offline: "off", or a duration with an
+// optional d (days) unit, from a minute to ten years.
+func parseMaxOffline(s string) (int64, error) {
+	if s == "off" || s == "0" {
+		return 0, nil
+	}
+	var d time.Duration
+	if days, ok := strings.CutSuffix(s, "d"); ok && days != "" && !strings.ContainsAny(days, "hmsuµn.") {
+		n, err := strconv.ParseInt(days, 10, 64)
+		if err != nil || n <= 0 || n > 3660 {
+			return 0, fmt.Errorf("%q is not a number of days", s)
+		}
+		d = time.Duration(n) * 24 * time.Hour
+	} else {
+		var err error
+		if d, err = time.ParseDuration(s); err != nil {
+			return 0, fmt.Errorf("%q is not a duration (like 12h or 7d) or off", s)
+		}
+	}
+	if d < time.Minute || d > 3660*24*time.Hour {
+		return 0, fmt.Errorf("the max-offline time must be off, or between a minute and ten years")
+	}
+	return int64(d / time.Second), nil
+}
+
+// PolicyStatus is the --json shape of hop auth policy.
+type PolicyStatus struct {
+	MaxOffline  int64      `json:"max_offline"` // seconds; 0 is off
+	Pending     bool       `json:"pending,omitempty"`
+	LastContact *time.Time `json:"last_contact,omitempty"`
+}
+
+// runAuthPolicy is hop auth policy: the account's settings that every
+// device follows. With --max-offline it sets, for every device of the
+// account, how long one may go without reaching the server before it
+// locks and refuses to unlock; off turns that off.
+func runAuthPolicy(ctx context.Context, e *Env, args []string) error {
+	fs := newFlags(e, "auth policy", authCommands["policy"].usage)
+	var o authOpts
+	o.jsonFlag(fs)
+	maxOffline := fs.String("max-offline", "", "lock a device that has not reached the server for this long (like 12h or 7d), or off")
+	pos, _, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if err := noArgs(fs, pos); err != nil {
+		return err
+	}
+	var params any
+	if *maxOffline != "" {
+		n, err := parseMaxOffline(*maxOffline)
+		if err != nil {
+			return failf("%v", err)
+		}
+		params = daemon.PolicyParams{MaxOffline: n}
+	}
+	var res daemon.PolicyResult
+	if err := call(ctx, e, daemon.OpPolicy, params, &res); err != nil {
+		switch {
+		case daemon.IsCode(err, daemon.CodeLocalOnly):
+			return failf("this vault is local-only: an account policy applies only to signed-in devices")
+		case daemon.IsCode(err, daemon.CodeRevoked):
+			return failf("this device was revoked from the account; hop auth status says more")
+		case daemon.IsCode(err, daemon.CodeLocked):
+			return failf("%v; run hop unlock first", err)
+		}
+		return err
+	}
+	if o.asJSON {
+		return printJSON(e, PolicyStatus{MaxOffline: res.MaxOffline, Pending: res.Pending, LastContact: res.LastContact})
+	}
+	if res.MaxOffline == 0 {
+		e.printf("max offline:  off (a device keeps working however long it can't reach the server)\n")
+	} else {
+		e.printf("max offline:  %s (a device that has not reached the server for longer locks, and refuses to unlock until it does)\n", fmtSeconds(res.MaxOffline))
+	}
+	if res.LastContact != nil {
+		e.printf("this device:  last reached the server %s\n", e.when(*res.LastContact))
+	}
+	if res.Pending {
+		e.printf("pending:      the change reaches the other devices once this one syncs\n")
+	}
+	return nil
 }

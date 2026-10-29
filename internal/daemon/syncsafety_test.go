@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -329,10 +330,43 @@ func retireStatusBody(t *testing.T, device model.ID, how string, seq uint64) []b
 	return b
 }
 
+// refuseSessions makes the server refuse device a session while on is
+// set, as it does a device that left the account, and answers its
+// retire-status with answer, when that is set (it may block). Everything
+// else goes to the real server.
+func refuseSessions(w *syncWorld, device model.ID, on *atomic.Bool, answer func(rw http.ResponseWriter, req *http.Request)) {
+	w.setIntercept(func(rw http.ResponseWriter, req *http.Request, _ http.Handler) bool {
+		if !on.Load() {
+			return false
+		}
+		b, _ := io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(b))
+		var body struct {
+			DeviceID  model.ID `json:"device_id"`
+			Operation string   `json:"operation"`
+		}
+		json.Unmarshal(b, &body)
+		if body.DeviceID != device {
+			return false
+		}
+		switch {
+		case req.URL.Path == "/v1/auth/challenge" && body.Operation == "session":
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusUnauthorized)
+			rw.Write([]byte(`{"error":{"code":"unauthorized","message":"unauthorized"}}`))
+			return true
+		case req.URL.Path == "/v1/retire-status" && answer != nil:
+			answer(rw, req)
+			return true
+		}
+		return false
+	})
+}
+
 // A retire-status request in flight when the vault locks is cancelled, and
 // its answer, arriving after an unlock, does nothing. One asked and
-// answered in the same unlocked session locks the vault in memory only,
-// labelled server-reported and unverified.
+// answered in the same unlocked session records the report and locks the
+// vault, but marks nothing revoked and deletes nothing.
 func TestLateRetireStatusAnswerAfterLockAndUnlockDoesNothing(t *testing.T) {
 	x := newSyncSetup(t)
 	ender := &sessionEnder{Store: x.n2.st}
@@ -352,12 +386,8 @@ func TestLateRetireStatusAnswerAfterLockAndUnlockDoesNothing(t *testing.T) {
 	// Before the server closes, which waits for a handler still blocked.
 	t.Cleanup(releaseAll)
 	var calls atomic.Int32
-	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, _ http.Handler) bool {
-		if req.URL.Path != "/v1/retire-status" {
-			return false
-		}
-		// Read to the end, so the server notices the client going away.
-		io.Copy(io.Discard, req.Body)
+	var refuse atomic.Bool
+	refuseSessions(x.w, laptop, &refuse, func(rw http.ResponseWriter, req *http.Request) {
 		if calls.Add(1) == 1 {
 			close(arrived)
 			select {
@@ -369,9 +399,9 @@ func TestLateRetireStatusAnswerAfterLockAndUnlockDoesNothing(t *testing.T) {
 		}
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Write(retireStatusBody(t, laptop, "revoked", 99))
-		return true
 	})
 
+	refuse.Store(true)
 	ender.end.Store(true)
 	x.n2.d.sync.wake()
 	waitClosed(t, arrived, 10*time.Second, "the laptop asks retire-status")
@@ -382,6 +412,7 @@ func TestLateRetireStatusAnswerAfterLockAndUnlockDoesNothing(t *testing.T) {
 		// Go on: the answer must still do nothing.
 		t.Error("the lock did not cancel the retire-status request")
 	}
+	refuse.Store(false)
 	ender.end.Store(false)
 	x.n2.must(OpUnlock, UnlockParams{}, nil)
 	releaseAll()
@@ -403,14 +434,15 @@ func TestLateRetireStatusAnswerAfterLockAndUnlockDoesNothing(t *testing.T) {
 	}
 
 	// Asked and answered in one session, the receipt counts.
+	refuse.Store(true)
 	ender.end.Store(true)
 	x.n2.d.sync.wake()
 	eventually(t, 10*time.Second, "the laptop stops on the receipt", func() bool { return x.n2.status().State == SyncRevoked })
 	st := x.n2.status()
-	if r := st.ServerRetirement; r == nil || r.How != "revoked" || r.Seq != 99 || !r.Unverified {
+	if r := st.ServerRetirement; r == nil || r.How != "revoked" || r.Seq != 99 || !r.Unverified || r.Wiped {
 		t.Errorf("server retirement %+v", r)
 	}
-	if !slices.ContainsFunc(st.Warnings, func(w string) bool { return strings.Contains(w, "server-reported, unverified") }) {
+	if !slices.ContainsFunc(st.Warnings, func(w string) bool { return strings.Contains(w, "the server reports that this device was revoked") }) {
 		t.Errorf("warnings %q", st.Warnings)
 	}
 	if !x.n2.st.Info().Locked || x.n2.agentKeys() != 0 {
@@ -419,20 +451,20 @@ func TestLateRetireStatusAnswerAfterLockAndUnlockDoesNothing(t *testing.T) {
 	if x.n2.st.IsRevoked() || x.n2.st.Info().Revoked {
 		t.Error("the store was marked revoked on the server's word")
 	}
+	if rep, err := x.n2.st.Report(); err != nil || rep == nil || rep.Seq != 99 {
+		t.Errorf("the report on disk: %+v, %v", rep, err)
+	}
 }
 
-// A retire-status receipt acts only if it names this device in this
-// device's account, says retired or revoked, and the store is still in the
-// unlocked session the request was made in.
-func TestServerRetirementChecksTheReceiptAndTheSession(t *testing.T) {
+// A retire-status receipt is recorded only if it names this device and
+// says retired or revoked. Any other is not recorded, but the session was
+// refused, so the vault locks in memory until the server accepts the
+// device again.
+func TestServerRetirementChecksTheReceipt(t *testing.T) {
 	x := newSyncSetup(t)
 	x.w.start(x.n2, x.n2.st, SyncOptions{noPoll: true})
 	e := x.n2.d.sync
-	info, err := x.n2.st.ServerInfo()
-	if err != nil {
-		t.Fatal(err)
-	}
-	auth, err := x.n2.st.DeviceAuth()
+	laptop, err := model.ParseID(x.n2.st.Info().DeviceID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,35 +472,37 @@ func TestServerRetirementChecksTheReceiptAndTheSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	good := store.DeviceReceipt{DeviceID: auth.DeviceID, How: "revoked", Seq: 7}
-	gen := x.n2.st.Generation()
-	otherAccount := info
-	otherAccount.AccountID = stranger
-
-	for name, tc := range map[string]struct {
-		info store.ServerInfo
-		rc   store.DeviceReceipt
-	}{
-		"another device":  {info, store.DeviceReceipt{DeviceID: stranger, How: "revoked", Seq: 7}},
-		"another account": {otherAccount, good},
-		"an unknown how":  {info, store.DeviceReceipt{DeviceID: auth.DeviceID, How: "suspended", Seq: 7}},
+	var refuse atomic.Bool
+	refuse.Store(true)
+	var rc atomic.Pointer[[]byte]
+	refuseSessions(x.w, laptop, &refuse, func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Write(*rc.Load())
+	})
+	for name, body := range map[string][]byte{
+		"another device": retireStatusBody(t, stranger, "revoked", 7),
+		"an unknown how": retireStatusBody(t, laptop, "suspended", 7),
 	} {
-		if e.serverRetired(gen, tc.info, auth, tc.rc) {
-			t.Errorf("%s: acted on the receipt", name)
+		rc.Store(&body)
+		if !e.sessionEnded(context.Background(), e.st.Generation()) {
+			t.Errorf("%s: sync went on after a refused session", name)
+		}
+		if info := x.n2.st.Info(); !info.Locked || !info.ServerUnconfirmed || x.n2.agentKeys() != 0 {
+			t.Errorf("%s: the vault did not lock, or the agent kept its key", name)
+		}
+		if rep, _ := x.n2.st.Report(); rep != nil || e.status().ServerRetirement != nil {
+			t.Fatalf("%s: a bad receipt was recorded: %+v", name, rep)
+		}
+		refuse.Store(false)
+		x.n2.must(OpUnlock, nil, nil)
+		refuse.Store(true)
+		if x.n2.agentKeys() != 1 {
+			t.Fatalf("%s: the key is not back once the server accepts the device", name)
 		}
 	}
-
-	// A lock and an unlock since the request: another session.
-	x.n2.must(OpLock, nil, nil)
-	x.n2.must(OpUnlock, UnlockParams{}, nil)
-	if e.serverRetired(gen, info, auth, good) {
-		t.Error("acted on a receipt asked for in an earlier session")
-	}
-	if x.n2.st.Info().Locked || x.n2.agentKeys() != 1 || e.status().ServerRetirement != nil {
-		t.Fatal("a stale receipt had an effect")
-	}
-
-	if !e.serverRetired(x.n2.st.Generation(), info, auth, good) {
+	good := retireStatusBody(t, laptop, "revoked", 7)
+	rc.Store(&good)
+	if !e.sessionEnded(context.Background(), e.st.Generation()) {
 		t.Fatal("did not act on a good receipt")
 	}
 	if !x.n2.st.Info().Locked || x.n2.agentKeys() != 0 {
@@ -479,10 +513,11 @@ func TestServerRetirementChecksTheReceiptAndTheSession(t *testing.T) {
 	}
 }
 
-// After the server's unverified word that this device left the account,
-// hop unlock brings the keys back, but sync stays stopped until the daemon
-// restarts, and sync.status says how to restart it or sign in again.
-func TestUnlockAfterAnUnverifiedRetirementKeepsSyncStopped(t *testing.T) {
+// After the server's word that this device left the account, hop unlock
+// refuses while the server still refuses the device, and works once the
+// server authenticates it again: the report was wrong. Status never
+// suggests hop unlock meanwhile.
+func TestUnlockAfterAServerReportWaitsForTheServer(t *testing.T) {
 	x := newSyncSetup(t)
 	ender := &sessionEnder{Store: x.n2.st}
 	x.w.start(x.n2, ender, SyncOptions{minBackoff: 10 * time.Millisecond, maxBackoff: 20 * time.Millisecond})
@@ -491,14 +526,11 @@ func TestUnlockAfterAnUnverifiedRetirementKeepsSyncStopped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, _ http.Handler) bool {
-		if req.URL.Path != "/v1/retire-status" {
-			return false
-		}
-		io.Copy(io.Discard, req.Body)
+	var refuse atomic.Bool
+	refuse.Store(true)
+	refuseSessions(x.w, laptop, &refuse, func(rw http.ResponseWriter, req *http.Request) {
 		rw.Header().Set("Content-Type", "application/json")
 		rw.Write(retireStatusBody(t, laptop, "retired", 7))
-		return true
 	})
 	ender.end.Store(true)
 	x.n2.d.sync.wake()
@@ -506,8 +538,29 @@ func TestUnlockAfterAnUnverifiedRetirementKeepsSyncStopped(t *testing.T) {
 	if !x.n2.st.Info().Locked || x.n2.agentKeys() != 0 {
 		t.Fatal("the receipt did not lock the vault and empty the agent")
 	}
+	st := x.n2.status()
+	i := slices.IndexFunc(st.Warnings, func(w string) bool { return strings.Contains(w, "the server reports that this device was retired") })
+	if i < 0 {
+		t.Fatalf("warnings %q", st.Warnings)
+	}
+	for _, want := range []string{"hop auth logout", "hop auth login"} {
+		if !strings.Contains(st.Warnings[i], want) {
+			t.Errorf("the warning %q does not say %q", st.Warnings[i], want)
+		}
+	}
+	if strings.Contains(st.Warnings[i], "hop unlock") {
+		t.Errorf("the warning %q suggests hop unlock", st.Warnings[i])
+	}
 
-	// The server would serve this device again; only a restart asks.
+	if err := x.n2.call(OpUnlock, UnlockParams{}, nil); !IsCode(err, CodeRevoked) {
+		t.Fatalf("unlock while the server still refuses: %v", err)
+	}
+	if x.n2.agentKeys() != 0 {
+		t.Fatal("the refused unlock loaded keys")
+	}
+
+	// The server serves this device again.
+	refuse.Store(false)
 	ender.end.Store(false)
 	x.n2.must(OpUnlock, UnlockParams{}, nil)
 	if x.n2.st.Info().Locked {
@@ -516,22 +569,8 @@ func TestUnlockAfterAnUnverifiedRetirementKeepsSyncStopped(t *testing.T) {
 	if got := x.n2.agentKeys(); got != 1 {
 		t.Errorf("the agent holds %d keys after the unlock; want 1", got)
 	}
-	// The unlock woke the loop; give it time to (not) start again.
-	time.Sleep(200 * time.Millisecond)
-	if err := x.n2.call(OpSyncNow, nil, nil); !IsCode(err, CodeRevoked) {
-		t.Errorf("sync.now after the unlock: %v", err)
+	if rep, _ := x.n2.st.Report(); rep != nil {
+		t.Errorf("the report is still recorded: %+v", rep)
 	}
-	st := x.n2.status()
-	if st.State != SyncRevoked || st.ServerRetirement == nil || !st.ServerRetirement.Unverified {
-		t.Errorf("sync.status after the unlock: %+v", st)
-	}
-	i := slices.IndexFunc(st.Warnings, func(w string) bool { return strings.Contains(w, "server-reported, unverified") })
-	if i < 0 {
-		t.Fatalf("warnings %q", st.Warnings)
-	}
-	for _, want := range []string{"hop auth login", "hop unlock", "until the daemon restarts", "hop daemon stop"} {
-		if !strings.Contains(st.Warnings[i], want) {
-			t.Errorf("the warning %q does not say %q", st.Warnings[i], want)
-		}
-	}
+	eventually(t, 10*time.Second, "sync resumes", func() bool { return x.n2.status().State == SyncOnline })
 }

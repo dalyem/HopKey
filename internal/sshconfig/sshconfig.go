@@ -251,6 +251,39 @@ func WipeIf(opts Options, owed func() (bool, error), done func() error) error {
 	return nil
 }
 
+// Generated reports whether opts.Dir still holds anything Write generated
+// from the vault that Wipe removes: a config other than the empty one Wipe
+// leaves, a key file, a pins file, or a temp file of one. A directory that
+// does not exist holds nothing. It takes no lock: the answer is for
+// status, and may be out of date as soon as it is given.
+func Generated(opts Options) (bool, error) {
+	cfg, err := os.ReadFile(filepath.Join(opts.Dir, "config"))
+	switch {
+	case err == nil && string(cfg) != configHeader:
+		return true, nil
+	case err != nil && !errors.Is(err, os.ErrNotExist):
+		return false, err
+	}
+	for _, d := range []struct {
+		dir   string
+		match *regexp.Regexp
+	}{{opts.Dir, pinsFileRe}, {filepath.Join(opts.Dir, "keys"), keyFileRe}} {
+		entries, err := os.ReadDir(d.dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		for _, e := range entries {
+			if !e.IsDir() && (d.match.MatchString(e.Name()) || isTemp(e.Name())) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // wipeLocked is Wipe's work in dir, the resolved opts.Dir. The caller
 // holds config.lock.
 func wipeLocked(opts Options, dir string) error {

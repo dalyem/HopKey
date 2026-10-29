@@ -22,6 +22,8 @@ func newPlain(t model.Type) (crypto.Item, error) {
 		return new(model.Credential), nil
 	case model.TypeSnippet:
 		return new(model.Snippet), nil
+	case model.TypePolicy:
+		return new(model.Policy), nil
 	}
 	return nil, fmt.Errorf("store: %q items do not queue", t)
 }

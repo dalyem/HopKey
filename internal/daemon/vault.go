@@ -173,7 +173,9 @@ func (d *Daemon) followStore(err error) {
 	if herr == nil {
 		return
 	}
-	revoked := errors.Is(herr, store.ErrDeviceRevoked)
+	// A revocation the server reports empties the ssh config as a
+	// verified one does.
+	revoked := errors.Is(herr, store.ErrDeviceRevoked) || errors.Is(herr, store.ErrServerRevoked)
 	if cur := d.state.Load(); cur != nil && cur.locked && (cur.revoked || !revoked) {
 		return
 	}
@@ -207,22 +209,46 @@ func (d *Daemon) watchRevoked() {
 	}()
 }
 
+// unlockVault unlocks the store and loads the agent, with the device key,
+// its passphrase, or the password. On a signed-in device the server is
+// asked first whether the device is still in the account, and the
+// max-offline policy applied (revocation.go): a vault the server reported
+// revoked unlocks only once the server authenticates the device again. The
+// questions share one deadline (unlockCheck), which bounds how long d.mu
+// is held for them.
 func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	var pass []byte
+	if p.DevicePassphrase != "" {
+		pass = []byte(p.DevicePassphrase)
+		defer clear(pass)
+	}
+	chk := &unlockCheck{parent: ctx}
+	defer chk.done()
+	if v.Info().ServerReport != nil {
+		if err := d.recheckReportLocked(chk, pass); err != nil {
+			return err
+		}
+	}
 	var err error
 	switch {
 	case p.Password != "":
 		err = v.UnlockWithPassword(ctx, []byte(p.Password), p.SecretKey)
-	case p.DevicePassphrase != "":
-		pass := []byte(p.DevicePassphrase)
+	case pass != nil:
 		err = v.UnlockWithPassphrase(ctx, pass)
-		clear(pass)
 	default:
 		err = v.Unlock(ctx)
 	}
 	if err != nil {
 		return err
+	}
+	if err := d.checkBeforeKeysLocked(chk, pass); err != nil {
+		d.sync.wake()
+		return err
+	}
+	if d.sync != nil {
+		d.sync.set(func() { d.sync.offline, d.sync.unconfirmed = "", "" })
 	}
 	_, err = d.reloadLocked(ctx)
 	// Sync resumes from the last verified head (§11.2).
@@ -250,6 +276,10 @@ func vaultError(err error) *Error {
 		return &Error{Code: CodeNeedSecretKey, Message: err.Error()}
 	case errors.Is(err, store.ErrKitPending):
 		return &Error{Code: CodeKitPending, Message: err.Error()}
+	case errors.Is(err, store.ErrServerRevoked), errors.Is(err, store.ErrDeviceRevoked):
+		return &Error{Code: CodeRevoked, Message: err.Error()}
+	case errors.Is(err, store.ErrOfflineTooLong):
+		return &Error{Code: CodeOffline, Message: err.Error()}
 	case errors.Is(err, model.ErrLocked):
 		return &Error{Code: CodeLocked, Message: err.Error()}
 	}

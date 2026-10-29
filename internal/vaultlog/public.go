@@ -67,7 +67,29 @@ func CheckPublic(pre *State, w *Wire, objs ObjectFetcher) (*Candidate, error) {
 	return checkPublic(pre, nil, w, objs)
 }
 
+// CheckHeader is the public stage without the objects: seq, prev, the
+// header rules, the closed schemas, the public §5.3 rules for the entry's
+// kind against pre, and every required signature, over an entry whose
+// wire may carry no objects. The digests the entry names are covered by
+// its signatures, but the objects behind them are neither fetched nor
+// checked, so the candidate it returns says only who signed what, in
+// which order: it serves a device that left the account to verify the
+// entry that removed it (its revocation proof), and is never a step of
+// the transition algorithm. pre must be a verified state.
+func CheckHeader(pre *State, w *Wire) (*Candidate, error) {
+	if pre == nil {
+		return nil, fail(RuleAnchorKind, "a header is checked only against a verified state")
+	}
+	return checkEntry(pre, nil, w, nil, false)
+}
+
 func checkPublic(pre *State, pin *crypto.AccountPin, w *Wire, objs ObjectFetcher) (*Candidate, error) {
+	return checkEntry(pre, pin, w, objs, true)
+}
+
+// checkEntry is the public stage; withObjects fetches and checks the
+// objects the entry names.
+func checkEntry(pre *State, pin *crypto.AccountPin, w *Wire, objs ObjectFetcher, withObjects bool) (*Candidate, error) {
 	e := &w.Entry
 	if err := e.validate(); err != nil {
 		return nil, err
@@ -113,6 +135,9 @@ func checkPublic(pre *State, pin *crypto.AccountPin, w *Wire, objs ObjectFetcher
 	}
 	if err := c.checkPublicInvariants(); err != nil {
 		return nil, err
+	}
+	if !withObjects {
+		return c, nil
 	}
 	if err := c.fetchObjects(objs); err != nil {
 		return nil, err

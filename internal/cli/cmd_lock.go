@@ -86,6 +86,9 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 		}
 		pass := []byte(e.Getenv(store.PassphraseEnv))
 		w, err := unlock(pass)
+		if err := refusedUnlock(err); err != nil {
+			return err
+		}
 		if err != nil && len(pass) == 0 && canAskPassphrase(e) {
 			// The daemon has no passphrase of its own, or the wrong one.
 			if pass, err = e.ReadPassword("Device passphrase: "); err != nil {
@@ -93,6 +96,9 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 			}
 			defer clear(pass)
 			w, err = unlock(pass)
+			if err := refusedUnlock(err); err != nil {
+				return err
+			}
 		}
 		if err := changeWarning(e, *asJSON, w, err); err != nil {
 			return failf("%v", err)
@@ -121,10 +127,28 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	if daemon.IsCode(err, daemon.CodeWrongPassword) {
 		return failf("wrong master password or Secret Key; the vault was not unlocked")
 	}
+	if err := refusedUnlock(err); err != nil {
+		return err
+	}
 	if err := changeWarning(e, *asJSON, w, err); err != nil {
 		return failf("%v", err)
 	}
 	return done(true)
+}
+
+// refusedUnlock is the message for an unlock that no passphrase or
+// password changes: this device was revoked (the server says so, or the
+// log proved it), or the account's max-offline policy locked it. Any other
+// error is nil.
+func refusedUnlock(err error) error {
+	switch {
+	case daemon.IsCode(err, daemon.CodeRevoked):
+		return failf("the vault was not unlocked: this device was revoked from the account. " +
+			"hop auth status says what the server reported; hop auth logout wipes this device, and hop auth login signs in again")
+	case daemon.IsCode(err, daemon.CodeOffline):
+		return failf("the vault was not unlocked: %v", cleanErr(err))
+	}
+	return nil
 }
 
 // canAskPassphrase reports whether hop unlock may ask for the device
@@ -171,16 +195,12 @@ func printVaultStatus(e *Env, v *store.Info) {
 	if v == nil {
 		return
 	}
-	if v.Locked {
-		e.printf("vault:        locked; run hop unlock\n")
-	} else {
-		e.printf("vault:        unlocked\n")
-	}
+	e.printf("vault:        %s\n", vaultState(v))
 	e.printf("device key:   %s\n", oneLine(v.DeviceStore))
 	if v.Head != nil {
 		e.printf("log head:     seq %s\n", v.Head.Short())
 	}
-	if v.LockReason != "" {
+	if v.LockReason != "" && v.Locked && !v.Revoked && v.ServerReport == nil {
 		e.printf("unlock error: %s\n", oneLine(v.LockReason))
 	}
 	if v.KitPending {
@@ -189,4 +209,24 @@ func printVaultStatus(e *Env, v *store.Info) {
 	for _, w := range v.Warnings {
 		e.printf("warning:      %s\n", oneLine(w))
 	}
+}
+
+// vaultState says whether the vault is unlocked and, when it is locked,
+// what opens it, if anything does.
+func vaultState(v *store.Info) string {
+	switch {
+	case !v.Locked:
+		return "unlocked"
+	case v.Revoked:
+		return "locked for good: this device was revoked from the account (hop auth status)"
+	case v.ServerReport != nil && v.ServerReportCorrupt:
+		return "locked: the server reported this device revoked, and the record of that report here is corrupt (hop auth status)"
+	case v.ServerReport != nil:
+		return "locked: the server reports this device was revoked from the account (hop auth status)"
+	case v.ServerUnconfirmed:
+		return "locked: the server did not confirm this device is still in the account; hop unlock asks it again"
+	case v.OfflineTooLong:
+		return "locked: offline too long; connect to the server, then run hop unlock"
+	}
+	return "locked; run hop unlock"
 }

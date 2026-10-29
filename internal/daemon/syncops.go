@@ -109,8 +109,10 @@ func syncError(err error) error {
 	}
 	code := ""
 	switch {
-	case errors.Is(err, store.ErrDeviceRevoked), errors.Is(err, store.ErrSessionEnded):
+	case errors.Is(err, store.ErrDeviceRevoked), errors.Is(err, store.ErrSessionEnded), errors.Is(err, store.ErrServerRevoked):
 		code = CodeRevoked
+	case errors.Is(err, store.ErrOfflineTooLong):
+		code = CodeOffline
 	case errors.Is(err, model.ErrLocked):
 		code = CodeLocked
 	case errors.Is(err, store.ErrNotServerBacked):
@@ -142,6 +144,26 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 	out := e.status()
 	warn := func(format string, args ...any) { out.Warnings = append(out.Warnings, fmt.Sprintf(format, args...)) }
 	info := e.st.Info()
+	if rep := info.ServerReport; rep != nil && out.ServerRetirement == nil {
+		out.State = SyncRevoked
+		out.ServerRetirement = &ServerRetirement{How: rep.How, Seq: rep.Seq, Unverified: true}
+	}
+	if r := out.ServerRetirement; r != nil && r.Unverified && info.ServerReportCorrupt {
+		r.ReportCorrupt, r.How, r.Seq = true, "", 0
+	}
+	if r := out.ServerRetirement; r != nil && !r.Unverified {
+		// Proven. Wiped once the store's wipe and the ssh files are done.
+		if r.WipeError == "" {
+			left := d.pendingClear()
+			if left == "" {
+				left = d.cleanupLeft()
+			}
+			if left != "" {
+				r.WipeError, r.SSHFilesLeft = "the ssh files hop wrote are not removed yet: "+left, true
+			}
+		}
+		r.Wiped = r.WipeError == ""
+	}
 	out.Logout, out.Publishing, out.Merge, out.SecretKeyStale = info.Logout, info.Publishing, info.Merge, info.SecretKeyStale
 	out.Head = info.Head
 	if si, err := e.st.ServerInfo(); err == nil {
@@ -184,10 +206,36 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 		}
 	}
 
-	if r := out.ServerRetirement; r != nil {
-		warn("server-reported, unverified: the server says this device was %s from the account at seq %d, so the vault was locked and sync stopped. "+
-			"If that is right, sign in again with hop auth login. If it is wrong, hop unlock brings the keys back, but sync stays stopped "+
-			"until the daemon restarts: run hop daemon stop, and the next hop command starts the daemon again, which asks the server again", r.How, r.Seq)
+	switch r := out.ServerRetirement; {
+	case r == nil:
+	case r.Wiped:
+		warn("this device was %s from the account (at seq %d), and the entry that did it verified here: "+
+			"this device's copy of the vault, its device key and the ssh files hop wrote were wiped. hop auth login signs in again as a new device", r.How, r.Seq)
+	case !r.Unverified:
+		warn("this device was %s from the account (at seq %d), and the entry that did it verified here, so the vault stays locked for good; "+
+			"wiping this device's copy has not finished (%s). The daemon tries the ssh files again, and the next start finishes the rest", r.How, r.Seq, r.WipeError)
+	case r.ReportCorrupt:
+		warn("the server reported that this device left the account, but the record of that report here is corrupt (it does not parse, or its MAC does not verify), " +
+			"so what it says is not shown. The vault stays locked, as for any report, until the server accepts this device again; " +
+			"hop auth logout wipes this device, and hop auth login signs in again. Nothing was deleted")
+	default:
+		msg := fmt.Sprintf("the server reports that this device was %s from the account at seq %d: the vault stays locked and nothing syncs, after a restart too. "+
+			"hop auth logout wipes this device, and hop auth login signs in again. Nothing was deleted, since the report is not proven", r.How, r.Seq)
+		if r.ProofError != "" {
+			msg += fmt.Sprintf(" (%s)", r.ProofError)
+		}
+		warn("%s. If the server is wrong, the vault unlocks again once the server accepts this device: the daemon asks it each time it starts", msg)
+	}
+	if out.CheckSkipped != "" && out.State != SyncRevoked {
+		warn("the check with the server before the keys loaded was skipped, since the server did not answer (%s): "+
+			"this device uses its keys without knowing whether it is still in the account", out.CheckSkipped)
+	}
+	if out.ServerUnconfirmed != "" && info.Locked && out.State != SyncRevoked {
+		warn("the server did not confirm that this device is still in the account, so the vault stays locked (%s); "+
+			"nothing was deleted, and hop unlock, or the next sync, asks again", out.ServerUnconfirmed)
+	}
+	if out.OfflineLocked != "" && info.Locked {
+		warn("offline too long; connect to the server (%s), then run hop unlock", out.OfflineLocked)
 	}
 	if cur := d.state.Load(); cur != nil && cur.configErr != "" {
 		warn("%s", d.configWarning(cur.configErr))

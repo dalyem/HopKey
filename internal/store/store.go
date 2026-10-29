@@ -184,6 +184,21 @@ type Info struct {
 	// Merge is the state of a login merge in progress (§4.4), or "present"
 	// while the vault is locked and its journal can't be read.
 	Merge string `json:"merge,omitempty"`
+	// ServerReport is the server's report that this device left the
+	// account: the vault stays locked until the server authenticates the
+	// device again (ErrServerRevoked).
+	ServerReport *ServerReport `json:"server_report,omitempty"`
+	// ServerReportCorrupt means the record of that report does not parse,
+	// or its MAC does not verify: it still keeps the vault locked, but its
+	// metadata (ServerReport is then empty) is not shown as the server's.
+	ServerReportCorrupt bool `json:"server_report_corrupt,omitempty"`
+	// OfflineTooLong means the account's max-offline policy locked the
+	// vault (ErrOfflineTooLong); LockReason says more.
+	OfflineTooLong bool `json:"offline_too_long,omitempty"`
+	// ServerUnconfirmed means the server answered without confirming that
+	// this device is still in the account, so the vault is locked until
+	// it does (ErrServerUnconfirmed); LockReason says more.
+	ServerUnconfirmed bool `json:"server_unconfirmed,omitempty"`
 	// Warnings are for the user, one sentence each.
 	Warnings []string `json:"warnings,omitempty"`
 }
@@ -210,8 +225,13 @@ type Store struct {
 	rec     *deviceRecord
 	devCfg  deviceConfig
 	lockErr error
-	kit     *Kit   // a committed password change whose kit is not confirmed
-	kitSeq  uint64 // the seq of kit's journal
+	// contactAt is the last authenticated contact with the server this
+	// Store saw (noteContact); reportVerdict what verifyReport found of
+	// server-revoked.json.
+	contactAt     time.Time
+	reportVerdict *reportVerdict
+	kit           *Kit   // a committed password change whose kit is not confirmed
+	kitSeq        uint64 // the seq of kit's journal
 	// kitServer means kit is a server-backed checkpoint's, journaled in
 	// vault/checkpoint.json (checkpoint.go), of kind kitKind.
 	kitServer bool
@@ -232,8 +252,8 @@ type Store struct {
 	// server says the vault is server-backed (vault/server.json).
 	server bool
 	// syncMu serializes Pull and PushHead. Neither holds mu while it waits
-	// on the server. Take it with lockSync.
-	syncMu sync.Mutex
+	// on the server. Take it with lockSync, or lockSyncCtx.
+	syncMu ctxMutex
 	// closing is set, under mu, once Close begins: lockSync refuses from
 	// then on, and trackRequest returns contexts already cancelled.
 	closing bool
@@ -244,6 +264,10 @@ type Store struct {
 	gen      atomic.Uint64
 	cancels  map[uint64]context.CancelFunc
 	cancelID uint64
+
+	// unconfirmedGen is the generation of the lock made because the server
+	// did not confirm this device (UnconfirmedLock), or 0.
+	unconfirmedGen uint64
 	// syncHalt is the error that stopped syncing (an equivocation or a
 	// rule violation in a server entry).
 	syncHalt error
@@ -343,7 +367,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) &&
-		!errors.Is(err, ErrKeyStoreUnavailable) && !errors.Is(err, ErrLoggingOut) {
+		!errors.Is(err, ErrKeyStoreUnavailable) && !errors.Is(err, ErrLoggingOut) && !errors.Is(err, ErrServerRevoked) {
 		s.Close()
 		return nil, err
 	}
@@ -353,6 +377,13 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		s.Close()
 		return nil, err
 	}
+	// The record a revocation that wiped this machine left belongs to the
+	// vault before this one.
+	s.mu.Lock()
+	if s.revoked == nil && s.refuseReported() == nil {
+		ClearRevocation(s.l.data)
+	}
+	s.mu.Unlock()
 	return s, nil
 }
 
@@ -414,6 +445,7 @@ func (s *Store) Close() error {
 	if s.owner == nil {
 		return nil
 	}
+	s.saveContact()
 	err := s.owner.Close()
 	s.owner = nil
 	return err
@@ -422,7 +454,15 @@ func (s *Store) Close() error {
 // lockSync takes syncMu, or returns ErrClosed (without it) once Close has
 // begun. The caller releases syncMu.
 func (s *Store) lockSync() error {
-	s.syncMu.Lock()
+	return s.lockSyncCtx(context.Background())
+}
+
+// lockSyncCtx is lockSync that gives up when ctx ends first, with an error
+// that wraps ctx's: no request was made.
+func (s *Store) lockSyncCtx(ctx context.Context) error {
+	if err := s.syncMu.LockContext(ctx); err != nil {
+		return fmt.Errorf("store: waiting for the sync in progress: %w", err)
+	}
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
@@ -475,6 +515,10 @@ func (s *Store) dropLocked(reason error) {
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
 	s.kitServer, s.kitKind = false, ""
 	s.lockErr = reason
+	s.unconfirmedGen = 0
+	if errors.Is(reason, ErrServerUnconfirmed) {
+		s.unconfirmedGen = s.gen.Load()
+	}
 	// §11.2: locking stops pulls and pushes. In-flight requests are
 	// cancelled, and their responses are discarded by generation.
 	for id, cancel := range s.cancels {
@@ -536,12 +580,13 @@ func (s *Store) unlockDevice() error {
 }
 
 func (s *Store) unlockLocked() error {
-	v, unlock, err := s.loadVault(false)
+	v, unlock, err := s.loadVault(false, false)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	s.state, s.sec, s.dev, s.rec, s.repaired, s.server = v.st, v.sec, v.dev, v.rec, v.repaired, v.server
+	s.lockErr = nil
 	s.gen.Add(1)
 	return s.finishUnlock()
 }
@@ -579,9 +624,11 @@ func (v *loaded) zero() {
 // result without installing it. It returns holding the file lock, with the
 // func that releases it. A vault with a retirement journal (retire.go) is
 // refused with ErrLoggingOut unless forRetirement: only a logout's own
-// resolution may load it, and never for application use. The caller holds
-// s.mu.
-func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
+// resolution may load it, and never for application use. So is one the
+// server reported revoked (ErrServerRevoked), unless forRetirement or
+// ignoreReport: CheckServer and ProveRevocation load it to authenticate,
+// and never install it. The caller holds s.mu.
+func (s *Store) loadVault(forRetirement, ignoreReport bool) (*loaded, func(), error) {
 	if s.owner == nil {
 		return nil, nil, ErrClosed
 	}
@@ -593,6 +640,11 @@ func (s *Store) loadVault(forRetirement bool) (*loaded, func(), error) {
 	if !forRetirement {
 		if err := s.refuseRetiring(); err != nil {
 			return nil, nil, err
+		}
+		if !ignoreReport {
+			if err := s.refuseReported(); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 	cfg, err := s.readDeviceConfig()
@@ -971,6 +1023,12 @@ func (s *Store) lockedErr() error {
 	if s.revoked != nil {
 		return s.revoked
 	}
+	if s.refuseReported() != nil {
+		return ErrServerRevoked
+	}
+	if errors.Is(s.lockErr, ErrOfflineTooLong) || errors.Is(s.lockErr, ErrServerUnconfirmed) {
+		return s.lockErr
+	}
 	return errLocked
 }
 
@@ -1174,6 +1232,8 @@ func (s *Store) Info() Info {
 	}
 	if s.lockErr != nil {
 		info.LockReason = s.lockErr.Error()
+		info.OfflineTooLong = s.state == nil && errors.Is(s.lockErr, ErrOfflineTooLong)
+		info.ServerUnconfirmed = s.state == nil && errors.Is(s.lockErr, ErrServerUnconfirmed)
 	}
 	if s.state != nil {
 		info.Head = &Head{Seq: s.state.Head.Seq, H: s.state.Head.H.String()}
@@ -1233,6 +1293,9 @@ func (s *Store) Info() Info {
 	}
 	if j, err := s.readRetireFile(); err == nil && j != nil {
 		info.Logout = j.State
+	}
+	if r, corrupt, err := s.readReport(); err == nil && r != nil {
+		info.ServerReport, info.ServerReportCorrupt = r, corrupt
 	}
 	if exists, _ := s.l.mergeExists(); exists {
 		info.Merge = "present"
@@ -1370,6 +1433,8 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 			c := *v
 			c.Params = slices.Clone(v.Params)
 			snap.Snippets = append(snap.Snippets, c)
+		case *model.Policy:
+			snap.Policies = append(snap.Policies, *v)
 		}
 	}
 	byName := func(a, b model.Header, an, bn string) int {
@@ -1382,6 +1447,7 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 	slices.SortFunc(snap.Keys, func(a, b model.Key) int { return byName(a.Header, b.Header, a.Name, b.Name) })
 	slices.SortFunc(snap.Credentials, func(a, b model.Credential) int { return byName(a.Header, b.Header, a.Name, b.Name) })
 	slices.SortFunc(snap.Snippets, func(a, b model.Snippet) int { return byName(a.Header, b.Header, a.Name, b.Name) })
+	slices.SortFunc(snap.Policies, func(a, b model.Policy) int { return byName(a.Header, b.Header, "", "") })
 	return snap
 }
 
@@ -1441,6 +1507,15 @@ func (s *Store) PutSnippet(_ context.Context, sn model.Snippet) (model.Snippet, 
 	return c, nil
 }
 
+// PutPolicy creates or replaces a policy item (model.Policy).
+func (s *Store) PutPolicy(_ context.Context, p model.Policy) (model.Policy, error) {
+	out, err := put(s, &p, model.TypePolicy)
+	if err != nil {
+		return model.Policy{}, err
+	}
+	return *out, nil
+}
+
 // header returns the shared header of an item pointer.
 func header(it crypto.Item) *model.Header {
 	switch v := it.(type) {
@@ -1451,6 +1526,8 @@ func header(it crypto.Item) *model.Header {
 	case *model.Credential:
 		return &v.Header
 	case *model.Snippet:
+		return &v.Header
+	case *model.Policy:
 		return &v.Header
 	}
 	return nil
@@ -1546,4 +1623,39 @@ func (s *Store) Delete(_ context.Context, id model.ID) error {
 		}
 		return nil
 	})
+}
+
+// ctxMutex is a mutex that a waiter can stop waiting for (LockContext).
+// The zero value is unlocked.
+type ctxMutex struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (m *ctxMutex) c() chan struct{} {
+	m.once.Do(func() { m.ch = make(chan struct{}, 1) })
+	return m.ch
+}
+
+func (m *ctxMutex) Lock() { m.c() <- struct{}{} }
+
+// LockContext takes the mutex, or returns ctx's error when ctx ends first.
+func (m *ctxMutex) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.c() <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *ctxMutex) Unlock() {
+	select {
+	case <-m.c():
+	default:
+		panic("store: unlock of an unlocked ctxMutex")
+	}
 }
