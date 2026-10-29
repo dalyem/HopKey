@@ -74,7 +74,7 @@ func TestAuthStatusWipedOnlyOnceTheSSHFilesAreGone(t *testing.T) {
 	}
 	stopped := func(e *cli.Env) { e.DataDir, e.Paths.RunDir = data, filepath.Join(f.base, "no-daemon") }
 	running := func(e *cli.Env) { e.DataDir = data }
-	const pending = "verified; wipe pending (ssh files remain under ~/.ssh/hop; any hop command or the daemon retries)"
+	const pending = "verified; wipe pending (ssh files remain under ~/.ssh/hop; the daemon retries, and so do hop sync and hop auth logout)"
 
 	for _, c := range []struct {
 		name        string

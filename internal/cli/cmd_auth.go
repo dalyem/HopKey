@@ -1426,7 +1426,7 @@ func printWipePending(e *Env, r *store.RevocationRecord) {
 			e.printf(" by the entry at seq %d", r.Seq)
 		}
 	}
-	e.printf(", verified; wipe pending (ssh files remain under %s; any hop command or the daemon retries)\n", oneLine(homePath(e, e.Paths.ConfigDir)))
+	e.printf(", verified; wipe pending (ssh files remain under %s; the daemon retries, and so do hop sync and hop auth logout)\n", oneLine(homePath(e, e.Paths.ConfigDir)))
 	e.printf("wiped so far: this device's copy of the vault and its device key\n")
 	e.printf("next:         hop auth login signs in again as a new device, once the ssh files are gone\n")
 }
