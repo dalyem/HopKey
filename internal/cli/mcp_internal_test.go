@@ -276,3 +276,21 @@ func TestRedactSpansOnePass(t *testing.T) {
 		t.Errorf("clamped hit: %q", got)
 	}
 }
+
+// Overlapping stretches of kinds that rank the same are named for the
+// kind that sorts first, whatever order they were found in, so the same
+// output is always attributed the same way.
+func TestRedactSpansBreaksRankTiesByKind(t *testing.T) {
+	text := "AKIA0123456789ABCDEF"
+	a := redact.Hit{Lo: 0, Hi: len(text), Kind: redact.KindGitHubToken}
+	b := redact.Hit{Lo: 0, Hi: len(text), Kind: redact.KindAWSAccessKeyID}
+	if redact.Rank(a.Kind) != redact.Rank(b.Kind) {
+		t.Fatal("the kinds do not rank the same")
+	}
+	for _, hits := range [][]redact.Hit{{a, b}, {b, a}} {
+		out := redactSpans([]span{{text: text}}, nil, hits)
+		if len(out) != 1 || out[0].what != redact.KindAWSAccessKeyID {
+			t.Errorf("hits %v: %+v, want one %s marker", hits, out, redact.KindAWSAccessKeyID)
+		}
+	}
+}

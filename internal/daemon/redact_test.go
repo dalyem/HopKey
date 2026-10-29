@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/redact"
@@ -135,5 +137,92 @@ func TestPutHostAgentOutput(t *testing.T) {
 	h := f.host("bad", func(h *model.Host) { h.AgentOutput = "some" })
 	if err := c.Call(ctx, OpPutHost, PutHostParams{Host: h}, nil); !IsCode(err, CodeInvalid) || !strings.Contains(err.Error(), "agent_output") {
 		t.Errorf("a bad agent_output: %v", err)
+	}
+}
+
+// OpRedact looks text up in the vault's secrets, so it is rationed: a
+// request holds at most 256 KiB, and the daemon takes about 8 MiB a
+// minute after a 1 MiB burst. Past that it refuses until the budget
+// refills. A request refused for its size costs nothing.
+func TestRedactIsRationed(t *testing.T) {
+	f := newFixture(t, nil)
+	c := f.client()
+	ctx := context.Background()
+	half := []byte(strings.Repeat("a", 128<<10))
+	if err := c.Call(ctx, OpRedact, RedactParams{Texts: [][]byte{half, half, []byte("a")}}, nil); !IsCode(err, CodeInvalid) {
+		t.Errorf("a request of 256 KiB and a byte: %v, want it refused as invalid", err)
+	}
+	full := RedactParams{Texts: [][]byte{half, half}}
+	for i := range 4 {
+		if err := c.Call(ctx, OpRedact, full, nil); err != nil {
+			t.Fatalf("request %d of 256 KiB, within the burst: %v", i+1, err)
+		}
+	}
+	if err := c.Call(ctx, OpRedact, full, nil); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("a fifth request of 256 KiB: %v, want the budget exhausted", err)
+	}
+}
+
+// The budget refills at about 8 MiB a minute, and never holds more than
+// the 1 MiB burst.
+func TestRedactBudgetRefills(t *testing.T) {
+	f := newFixture(t, nil)
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC).UnixNano())
+	f.d.redactBudget.mu.Lock()
+	f.d.redactBudget.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	f.d.redactBudget.mu.Unlock()
+	c := f.client()
+	ctx := context.Background()
+	half := []byte(strings.Repeat("a", 128<<10))
+	full := RedactParams{Texts: [][]byte{half, half}}
+	drain := func(want int) {
+		t.Helper()
+		for i := range want {
+			if err := c.Call(ctx, OpRedact, full, nil); err != nil {
+				t.Fatalf("request %d of %d: %v", i+1, want, err)
+			}
+		}
+		if err := c.Call(ctx, OpRedact, full, nil); !IsCode(err, CodeRedactBudget) {
+			t.Fatalf("request %d: %v, want the budget exhausted", want+1, err)
+		}
+	}
+	drain(4)
+	clock.Add(int64(2 * time.Second)) // 2 s of 8 MiB a minute: 273 KiB
+	drain(1)
+	clock.Add(int64(time.Hour)) // far more than the burst
+	drain(4)
+}
+
+// At most four OpRedact calls run at once; a fifth waits for one to end.
+func TestRedactRunsFourAtOnce(t *testing.T) {
+	f := newFixture(t, nil)
+	c := f.client()
+	ctx := context.Background()
+	if cap(f.d.redactSlots) != 4 {
+		t.Fatalf("%d slots", cap(f.d.redactSlots))
+	}
+	for range 3 {
+		f.d.redactSlots <- struct{}{}
+	}
+	if err := c.Call(ctx, OpRedact, RedactParams{Texts: [][]byte{[]byte("x")}}, nil); err != nil {
+		t.Fatalf("with a slot free: %v", err)
+	}
+	f.d.redactSlots <- struct{}{}
+	done := make(chan error, 1)
+	go func() { done <- c.Call(ctx, OpRedact, RedactParams{Texts: [][]byte{[]byte("x")}}, nil) }()
+	select {
+	case err := <-done:
+		t.Fatalf("a call ran with four running: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	<-f.d.redactSlots
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call did not run once a slot was free")
 	}
 }

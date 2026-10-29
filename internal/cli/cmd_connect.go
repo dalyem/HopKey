@@ -410,8 +410,10 @@ type remoteRun struct {
 	// a remote prompt reads end-of-file instead of waiting.
 	stdin io.Reader
 	// stdout and stderr receive the output as it comes. Nil keeps the last
-	// tailLimit bytes of that stream in the result instead.
+	// tail bytes of that stream in the result instead.
 	stdout, stderr io.Writer
+	// tail is how much of a stream the result keeps; 0 means tailLimit.
+	tail int
 }
 
 // runRemote runs one command on t at addr with ssh: no PTY, and BatchMode,
@@ -439,7 +441,11 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	cmd.Env = e.sshEnviron()
 	cmd.Stdin = r.stdin
 	cmd.WaitDelay = time.Second
-	outTail, errTail := &tailBuffer{max: tailLimit}, &tailBuffer{max: tailLimit}
+	keep := tailLimit
+	if r.tail > 0 {
+		keep = r.tail
+	}
+	outTail, errTail := &tailBuffer{max: keep}, &tailBuffer{max: keep}
 	cmd.Stdout, cmd.Stderr = r.stdout, r.stderr
 	if r.stdout == nil {
 		cmd.Stdout = outTail
@@ -745,6 +751,10 @@ type echo struct {
 	quote func(string) string
 	// login, if set, is applied to ssh's stderr from a login to t at addr.
 	login func(t *target, addr, stderr string) string
+	// remote, if set, is applied to text the network supplied (ssh's
+	// stderr, after login; a server's handshake error) as it came, before
+	// hop puts it into a step's detail.
+	remote func(text string) string
 }
 
 var plainEcho = echo{quote: strconv.Quote}
@@ -834,7 +844,12 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 	probe("host_key_matches", []string{"tcp_reachable", "host_key_pinned"}, func() (string, string) {
 		key, err := fetchHostKey(ctx, addr, port, algorithmsFor(pins), e.dialTimeout())
 		if err != nil {
-			return stepFail, safef("could not read the server's host key: %v", err)
+			// The error can quote the server: a disconnect's message.
+			msg := err.Error()
+			if ec.remote != nil {
+				msg = ec.remote(msg)
+			}
+			return stepFail, safef("could not read the server's host key: %s", msg)
 		}
 		for _, p := range pins {
 			if bytes.Equal(p.Marshal(), key.Marshal()) {
@@ -865,6 +880,9 @@ func (e *Env) diagnose(ctx context.Context, rr *daemon.ResolveResult, login bool
 			stderr := res.Stderr
 			if ec.login != nil {
 				stderr = ec.login(t, addr, stderr)
+			}
+			if ec.remote != nil {
+				stderr = ec.remote(stderr)
 			}
 			msg := strings.TrimSpace(stderr)
 			if msg == "" {

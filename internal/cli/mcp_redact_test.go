@@ -1,12 +1,17 @@
 package cli_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -367,5 +372,209 @@ func TestMCPRedactsTheSecretKey(t *testing.T) {
 	}
 	if msg := m.mcpError("exec", map[string]any{"hosts": "vh", "command": "leak"}); !strings.Contains(msg, "locked") {
 		t.Errorf("exec while locked: %s", msg)
+	}
+}
+
+// The tail limit cuts what an agent gets only after it is checked: a
+// secret that the last 64 KiB would start inside goes whole, and the cut
+// moves past it, so its tail is not left for a pattern to miss. A person
+// still gets the remote's bytes.
+func TestMCPRedactsASecretTheTailLimitCuts(t *testing.T) {
+	e, _, _ := redactWorld(t)
+	m := e.startMCP(t)
+	const limit = 64 << 10
+	// The last limit bytes begin 5 bytes before the secret's end.
+	after := " " + strings.Repeat("x", limit-7) + "\n"
+	for _, c := range []struct{ name, secret string }{{"password", vaultPassword}, {"token", githubToken}} {
+		leak := strings.Repeat("y", 1000) + " " + c.secret + after
+		e.server.mu.Lock()
+		e.server.leak = leak
+		e.server.mu.Unlock()
+		if code, stdout, _ := e.hop(t, "exec", "web-1", "--", "leak"); code != 0 || stdout != leak {
+			t.Errorf("%s: hop exec: exit %d, %d bytes, want the remote's %d unchanged", c.name, code, len(stdout), len(leak))
+		}
+		for _, cmd := range []string{"leak", "leakerr"} {
+			r := mcpCall[agentExec](m, "exec", map[string]any{"hosts": "web-1", "command": cmd}).Results[0]
+			got := r.Stdout
+			if cmd == "leakerr" {
+				got = r.Stderr
+			}
+			if tail := c.secret[len(c.secret)-5:]; strings.Contains(r.Stdout+r.Stderr, tail) {
+				t.Errorf("%s %s: the agent got the secret's tail %q: %.40q...", c.name, cmd, tail, got)
+			}
+			if got != after || !r.Truncated || r.Withheld != nil {
+				t.Errorf("%s %s: %d bytes beginning %.20q, truncated %v, withheld %v; want the %d bytes after the secret",
+					c.name, cmd, len(got), got, r.Truncated, r.Withheld, len(after))
+			}
+		}
+	}
+}
+
+// startDisconnectServer listens for ssh and answers each connection with
+// a version line and then a disconnect whose message is msg, as a server
+// that turns a client away does before any key is exchanged. It returns
+// the port.
+func startDisconnectServer(t *testing.T, msg string) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	payload := ssh.Marshal(struct {
+		Reason   uint32 `sshtype:"1"`
+		Message  string
+		Language string
+	}{Reason: 11, Message: msg})
+	pad := 8 - (5+len(payload))%8
+	if pad < 4 {
+		pad += 8
+	}
+	pkt := binary.BigEndian.AppendUint32(nil, uint32(1+len(payload)+pad))
+	pkt = append(append(append(pkt, byte(pad)), payload...), make([]byte, pad)...)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(10 * time.Second))
+				if _, err := io.WriteString(c, "SSH-2.0-test\r\n"); err != nil {
+					return
+				}
+				// The client's version line: a TCP probe sends none.
+				r := bufio.NewReader(c)
+				if _, err := r.ReadString('\n'); err != nil {
+					return
+				}
+				if _, err := c.Write(pkt); err != nil {
+					return
+				}
+				io.Copy(io.Discard, r)
+			}()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// agentCheck is check_host's answer as an agent reads it.
+type agentCheck struct {
+	OK    bool `json:"ok"`
+	Steps []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+		Detail string `json:"detail"`
+	} `json:"steps"`
+}
+
+func (c agentCheck) step(t *testing.T, name string) (status, detail string) {
+	t.Helper()
+	for _, s := range c.Steps {
+		if s.Name == name {
+			return s.Status, s.Detail
+		}
+	}
+	t.Fatalf("no step %s in %+v", name, c.Steps)
+	return "", ""
+}
+
+// What a server says while hop reads its host key is the remote's text,
+// filtered by the host's policy as a command's output is, in read-only
+// hop mcp too: under none no word of it reaches the agent.
+func TestMCPCheckFiltersTheHandshake(t *testing.T) {
+	e, _, _ := redactWorld(t)
+	port := startDisconnectServer(t, "go away: db password "+vaultPassword+" token "+githubToken)
+	e.addHost(t, "gate", func(h *model.Host) { h.Port = uint32(port) })
+	m := e.startMCP(t, "--read-only")
+
+	c := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "gate"})
+	status, detail := c.step(t, "host_key_matches")
+	if status != "fail" || !strings.Contains(detail, "go away") {
+		t.Fatalf("host_key_matches: %s %q, want the server's message", status, detail)
+	}
+	for _, s := range []string{vaultPassword, githubToken} {
+		if strings.Contains(m.raw[len(m.raw)-1], s) {
+			t.Errorf("redacted: the answer holds %.20s...: %q", s, detail)
+		}
+	}
+	for _, want := range []string{"[redacted by hop: vault-password]", "[redacted by hop: github-token]"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("redacted: no %q in %q", want, detail)
+		}
+	}
+
+	if code, _, stderr := e.hop(t, "edit", "gate", "--agent-output", "none"); code != 0 {
+		t.Fatalf("hop edit --agent-output none: exit %d: %s", code, stderr)
+	}
+	c = mcpCall[agentCheck](m, "check_host", map[string]any{"host": "gate"})
+	status, detail = c.step(t, "host_key_matches")
+	if status != "fail" || c.OK {
+		t.Errorf("none: host_key_matches %s, ok %v; the step still fails", status, c.OK)
+	}
+	for _, s := range []string{vaultPassword, githubToken, "go away", "db password", "disconnect"} {
+		if strings.Contains(m.raw[len(m.raw)-1], s) {
+			t.Errorf("none: the answer holds %q: %q", s, detail)
+		}
+	}
+}
+
+// ssh's stderr from hop check's login is scanned as the remote printed
+// it, line by line, before hop joins its last lines into one: a line
+// "password: ..." goes whole.
+func TestMCPCheckScansLoginStderrAsPrinted(t *testing.T) {
+	e, _, _ := redactWorld(t)
+	e.server.mu.Lock()
+	e.server.trueErr = "Last login: never\npassword: correct horse battery\n"
+	e.server.mu.Unlock()
+	m := e.startMCP(t)
+	c := mcpCall[agentCheck](m, "check_host", map[string]any{"host": "web-1"})
+	status, detail := c.step(t, "auth_ok")
+	if status != "fail" || !strings.Contains(detail, "Last login: never") {
+		t.Fatalf("auth_ok: %s %q, want ssh's messages", status, detail)
+	}
+	for _, s := range []string{"correct", "horse", "battery"} {
+		if strings.Contains(detail, s) {
+			t.Errorf("the agent got %q of the password: %q", s, detail)
+		}
+	}
+	if !strings.Contains(detail, "password: [redacted by hop: secret-value]") {
+		t.Errorf("no whole redaction in %q", detail)
+	}
+}
+
+// When the daemon's redaction budget is spent, exec withholds the output
+// rather than return it unchecked, and says why. One call on 16 hosts,
+// each printing 120 KiB to stdout and to stderr, asks to check close to
+// 4 MiB at once, far past the 1 MiB burst however slowly it runs.
+func TestMCPWithholdsOutputPastTheRedactionBudget(t *testing.T) {
+	e, _, _ := redactWorld(t)
+	e.server.mu.Lock()
+	e.server.leak = strings.Repeat("x", 120<<10) + "\n" + vaultPassword + "\n"
+	e.server.mu.Unlock()
+	hosts := []string{"web-1"}
+	for i := range 15 {
+		name := fmt.Sprintf("many-%d", i)
+		e.addHost(t, name, nil)
+		hosts = append(hosts, name)
+	}
+	m := e.startMCP(t)
+	out := mcpCall[agentExec](m, "exec", map[string]any{"hosts": hosts, "command": "leakboth"})
+	withheld := 0
+	for _, r := range out.Results {
+		if strings.Contains(r.Stdout+r.Stderr, vaultPassword) {
+			t.Errorf("%s: the agent got the password", r.Host)
+		}
+		if r.Withheld == nil {
+			continue
+		}
+		withheld++
+		if r.Stdout != "" || r.Stderr != "" || !strings.Contains(r.Withheld.Note, "redaction budget is exhausted; try again shortly") {
+			t.Errorf("%s: withheld %+v, stdout %d bytes", r.Host, *r.Withheld, len(r.Stdout))
+		}
+	}
+	if withheld == 0 {
+		t.Errorf("16 hosts of 240 KiB each never ran out of the daemon's 1 MiB burst: %d results", len(out.Results))
 	}
 }

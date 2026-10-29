@@ -290,9 +290,14 @@ const (
 // a block's -----BEGIN line would leave its body unrecognised), and one
 // that runs across two spans, or over a block's edge, goes whole.
 // Overlapping stretches become one marker span, named for the kind that
-// ranks first (redact.Rank).
+// comes first (redact.Before).
 func redactSpans(ss []span, secrets []string, more []redact.Hit) []span {
-	t := joinSpans(ss)
+	return applyHits(ss, findHits(joinSpans(ss), secrets, more))
+}
+
+// findHits is what redactSpans replaces in t: the stretches it finds, in
+// order, overlapping ones joined.
+func findHits(t string, secrets []string, more []redact.Hit) []redact.Hit {
 	var hits []redact.Hit
 	blocks := pemBlockRe.FindAllStringIndex(t, -1)
 	for _, b := range blocks {
@@ -319,20 +324,54 @@ func redactSpans(ss []span, secrets []string, more []redact.Hit) []span {
 		}
 	}
 	slices.SortFunc(hits, func(a, b redact.Hit) int { return a.Lo - b.Lo })
-	var out []span
-	last := 0
+	var out []redact.Hit
 	for i := 0; i < len(hits); {
-		lo, hi, kind := hits[i].Lo, hits[i].Hi, hits[i].Kind
-		for i++; i < len(hits) && hits[i].Lo < hi; i++ {
-			hi = max(hi, hits[i].Hi)
-			if redact.Rank(hits[i].Kind) < redact.Rank(kind) {
-				kind = hits[i].Kind
+		h := hits[i]
+		for i++; i < len(hits) && hits[i].Lo < h.Hi; i++ {
+			h.Hi = max(h.Hi, hits[i].Hi)
+			if redact.Before(hits[i].Kind, h.Kind) {
+				h.Kind = hits[i].Kind
 			}
 		}
-		out = append(cutSpans(out, ss, last, lo), span{text: markerFor(kind), kind: markerText, what: kind})
-		last = hi
+		out = append(out, h)
 	}
-	return cutSpans(out, ss, last, len(t))
+	return out
+}
+
+// applyHits replaces each of hits, offsets into the text of ss in order
+// and apart (findHits), with a marker span.
+func applyHits(ss []span, hits []redact.Hit) []span {
+	var out []span
+	last := 0
+	for _, h := range hits {
+		out = append(cutSpans(out, ss, last, h.Lo), span{text: markerFor(h.Kind), kind: markerText, what: h.Kind})
+		last = h.Hi
+	}
+	return cutSpans(out, ss, last, len(joinSpans(ss)))
+}
+
+// keepTail cuts ss, whose hits findHits found, to its last n bytes, and
+// says whether it cut. The cut never falls inside a hit: it moves on past
+// one it would split, so what is kept holds no part of a secret, only
+// whole markers. hits come back as offsets into what is kept.
+func keepTail(ss []span, hits []redact.Hit, n int) ([]span, []redact.Hit, bool) {
+	size := len(joinSpans(ss))
+	if size <= n {
+		return ss, hits, false
+	}
+	cut := size - n
+	for _, h := range hits {
+		if h.Lo < cut && cut < h.Hi {
+			cut = h.Hi
+		}
+	}
+	var kept []redact.Hit
+	for _, h := range hits {
+		if h.Lo >= cut {
+			kept = append(kept, redact.Hit{Lo: h.Lo - cut, Hi: h.Hi - cut, Kind: h.Kind})
+		}
+	}
+	return cutSpans(nil, ss, cut, size), kept, true
 }
 
 // markerFor is what stands where a secret of kind was: hop's own values
@@ -445,6 +484,9 @@ func (s *mcpServer) daemonError(err error) error {
 	}
 	if daemon.IsCode(err, daemon.CodeLocked) {
 		return errors.New("the vault is locked; the user unlocks it from a terminal with hop unlock, then this can be tried again")
+	}
+	if daemon.IsCode(err, daemon.CodeRedactBudget) {
+		return errors.New("the hop daemon's redaction budget is exhausted; try again shortly")
 	}
 	var de *daemon.Error
 	if !errors.As(err, &de) {
@@ -960,38 +1002,54 @@ func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mc
 		return CheckResult{}, err
 	}
 	out := CheckResult{Target: in.Host, Host: rr.Result.HostName}
-	// The login step quotes ssh's stderr, which carries what the remote
-	// prints too (a banner, a shell's startup files): it is filtered as
-	// exec's output is, by the host's agent_output policy.
+	// Steps quote what the network supplied: a server's handshake error,
+	// and ssh's stderr from the login, which carries what the remote
+	// prints too (a banner, a shell's startup files). That is filtered as
+	// exec's output is, by the host's agent_output policy (remoteText).
 	policy := model.AgentOutputRedacted
 	if rr.Host != nil {
 		policy = model.AgentOutputPolicy(*rr.Host)
 	}
-	ec := mcpEcho
-	if policy == model.AgentOutputNone {
-		ec.login = func(_ *target, _, stderr string) string {
-			if strings.TrimSpace(stderr) == "" {
-				return ""
-			}
-			return "(ssh's messages are withheld: the host's agent_output policy is none)"
-		}
-	}
-	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly, ec)
 	m := s.masker(l)
-	for i, st := range out.Steps {
-		ss := typedSpans(st.Detail)
-		var more []redact.Hit
-		if st.Name == "auth_ok" && st.Status == stepFail {
-			found, err := s.findSecrets(ctx, []string{joinSpans(ss)}, policy == model.AgentOutputRedacted)
-			if err != nil {
-				out.Steps[i].Detail = "ssh did not log in; its messages are withheld, since hop could not check them for the vault's secrets: " + m.hide(err.Error())
-				continue
-			}
-			more = found[0]
-		}
-		out.Steps[i].Detail = m.hideSpans(redactSpans(ss, m.secrets, more))
+	ec := mcpEcho
+	ec.remote = s.remoteText(ctx, policy, m)
+	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly, ec)
+	for i := range out.Steps {
+		out.Steps[i].Detail = m.hide(out.Steps[i].Detail)
 	}
 	return out, nil
+}
+
+// remoteText is what check_host shows of text the network supplied, as
+// it came, under a host's agent_output policy: under none, a note that it
+// is withheld; otherwise the text redacted as exec's output is
+// (agentView), checked as a whole before hop cuts it to its last lines or
+// puts it on one line, so a secret's line goes whole. Text that cannot be
+// checked is withheld. What comes back is marked (typed) where it is not
+// hop's own, the markers included, so hide leaves it be.
+func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) func(string) string {
+	return func(text string) string {
+		if strings.TrimSpace(unmark.Replace(text)) == "" {
+			return text
+		}
+		if policy == model.AgentOutputNone {
+			return "(withheld: the host's agent_output policy is none)"
+		}
+		ss := typedSpans(text)
+		found, err := s.findSecrets(ctx, []string{joinSpans(ss)}, policy == model.AgentOutputRedacted)
+		if err != nil {
+			return "(withheld: hop could not check it for the vault's secrets: " + m.hide(err.Error()) + ")"
+		}
+		var b strings.Builder
+		for _, sp := range redactSpans(ss, m.secrets, found[0]) {
+			if sp.kind == hopText {
+				b.WriteString(sp.text)
+			} else {
+				b.WriteString(typed(sp.text))
+			}
+		}
+		return b.String()
+	}
 }
 
 // MCPSSHCommand answers ssh_command.
@@ -1363,7 +1421,15 @@ func (s *mcpServer) agentView(ctx context.Context, h model.Host, r ExecResult, m
 	if err != nil {
 		return withhold(out, "hop could not check the output for the vault's secrets, so it is withheld: "+m.hide(err.Error()))
 	}
-	so, se := redactSpans(stdout, s.secrets, more[0]), redactSpans(stderr, m.secrets, more[1])
+	// runOne kept twice the tail an agent gets (mcpTail), all of it
+	// checked: a secret the last tailLimit bytes would begin inside is
+	// found whole, and the cut moves past it (keepTail).
+	tail := func(ss []span, secrets []string, more []redact.Hit) []span {
+		ss, hits, cut := keepTail(ss, findHits(joinSpans(ss), secrets, more), tailLimit)
+		out.Truncated = out.Truncated || cut
+		return applyHits(ss, hits)
+	}
+	so, se := tail(stdout, s.secrets, more[0]), tail(stderr, m.secrets, more[1])
 	out.Stdout, out.Stderr = joinSpans(so), m.hideSpans(se)
 	counts := map[string]int{}
 	countMarkers(counts, so)
@@ -1427,9 +1493,13 @@ func (s *mcpServer) logf(format string, args ...any) {
 // secret hop knows of and nothing a terminal would act on.
 func (s *mcpServer) auditText(text string) string { return exact(s.redact(text)) }
 
+// mcpTail is how much of each stream runOne keeps: twice what an agent
+// gets, so that agentView checks the bytes before the cut too.
+const mcpTail = 2 * tailLimit
+
 func (s *mcpServer) runOne(ctx context.Context, t *target, command string, timeout time.Duration) ExecResult {
 	addr, _ := chooseAddress(ctx, s.e, t)
-	res, err := s.e.runRemote(ctx, t, addr, remoteRun{command: command, timeout: timeout})
+	res, err := s.e.runRemote(ctx, t, addr, remoteRun{command: command, timeout: timeout, tail: mcpTail})
 	res.Stderr = markSSHUser(t, addr, res.Stderr)
 	if err != nil {
 		res.ExitCode, res.Error = ExitFailure, err.Error()

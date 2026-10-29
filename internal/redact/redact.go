@@ -13,6 +13,36 @@ import (
 	"strings"
 )
 
+// MinKeyLine is the shortest line of a private key's body looked for on
+// its own: the last line of a block can be a few characters, which would
+// match ordinary text.
+const MinKeyLine = 16
+
+// PrivateKeyForms is a vault key's private half as a remote may print it:
+// whole, its body without line breaks, and each body line long enough to
+// stand alone (MinKeyLine).
+func PrivateKeyForms(privateKey string) []Secret {
+	if privateKey == "" {
+		return nil
+	}
+	out := []Secret{{Kind: KindVaultPrivateKey, Value: privateKey}}
+	var body []string
+	for _, l := range strings.Split(strings.ReplaceAll(privateKey, "\r\n", "\n"), "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "-----") {
+			continue
+		}
+		body = append(body, l)
+		if len(l) >= MinKeyLine {
+			out = append(out, Secret{Kind: KindVaultPrivateKey, Value: l})
+		}
+	}
+	if joined := strings.Join(body, ""); len(joined) >= MinKeyLine {
+		out = append(out, Secret{Kind: KindVaultPrivateKey, Value: joined})
+	}
+	return out
+}
+
 // Hit is a stretch of text to replace: bytes Lo to Hi, and the kind of
 // secret found there, which the replacement names (Marker).
 type Hit struct {
@@ -36,6 +66,7 @@ const (
 	KindVaultSecretKey   = "vault-secret-key"   // the account Secret Key
 	KindVaultRecoveryKey = "vault-recovery-key" // the Recovery Key of a kit not yet confirmed
 	KindVaultDeviceKey   = "vault-device-key"   // this device's own key material
+	KindVaultAccountKey  = "vault-account-key"  // the account's private keys and the vault key
 )
 
 // Marker is what stands where a secret of kind was.
@@ -56,6 +87,17 @@ func Rank(kind string) int {
 		return 4
 	}
 	return 3
+}
+
+// Before reports whether kind a names a stretch where hits of kinds a and
+// b overlap: the lower rank, and between kinds of one rank the first by
+// name, so that the same text is always named the same way whatever order
+// its hits were found in.
+func Before(a, b string) bool {
+	if ra, rb := Rank(a), Rank(b); ra != rb {
+		return ra < rb
+	}
+	return a < b
 }
 
 // The marks hop mcp puts around text the agent typed. They are taken out

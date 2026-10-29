@@ -142,6 +142,10 @@ type Daemon struct {
 	tsCached *tailscale.Status
 	tsAt     time.Time
 
+	// redactBudget and redactSlots ration OpRedact (redact.go).
+	redactBudget redactBudget
+	redactSlots  chan struct{}
+
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -197,6 +201,7 @@ func Start(opts Options) (*Daemon, error) {
 		started: time.Now(), live: live, agent: agentSrv, control: control,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		writeConfig: opts.writeConfig, wipeConfig: opts.wipeConfig,
+		redactSlots: make(chan struct{}, redactSlots),
 	}
 	if d.writeConfig == nil {
 		d.writeConfig = sshconfig.Write

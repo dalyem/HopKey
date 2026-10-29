@@ -867,6 +867,9 @@ type sshServer struct {
 	conns    int
 	accepted ssh.PublicKey
 	leak     string // what the command "leak" prints
+	// trueErr, if set, makes the command "true" print it to stderr and
+	// exit 1, as a shell whose startup files fail does: hop check's login.
+	trueErr string
 }
 
 func newSigner(t *testing.T) ssh.Signer {
@@ -990,8 +993,9 @@ func (s *sshServer) serve(c net.Conn, cfg *ssh.ServerConfig) {
 
 // session answers exec requests. Commands: "echo ok", "true", "exit N", "cat"
 // (echoes stdin), "stderr" (writes to stderr, exits 1), "big" (writes more than
-// 64 KB, ending in END), "sleep" (waits), "leak" (prints s.leak) and "leakerr"
-// (prints s.leak to stderr). Anything else is recorded and exits 0. hop mcp's
+// 64 KB, ending in END), "sleep" (waits), "leak" (prints s.leak), "leakerr"
+// (prints s.leak to stderr) and "leakboth" (to both). "true" fails with s.trueErr when it is set.
+// Anything else is recorded and exits 0. hop mcp's
 // mcpEnvPrefix is recorded, then ignored.
 func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
@@ -1008,7 +1012,7 @@ func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 		req.Reply(true, nil)
 		s.mu.Lock()
 		s.cmds = append(s.cmds, p.Command)
-		leak := s.leak
+		leak, trueErr := s.leak, s.trueErr
 		s.mu.Unlock()
 		// hop mcp puts its pager settings before every command.
 		p.Command = strings.TrimPrefix(p.Command, mcpEnvPrefix)
@@ -1019,12 +1023,18 @@ func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			ch.Write([]byte(leak))
 		case p.Command == "leakerr":
 			ch.Stderr().Write([]byte(leak))
+		case p.Command == "leakboth":
+			ch.Write([]byte(leak))
+			ch.Stderr().Write([]byte(leak))
 		case p.Command == "echo ok":
 			ch.Write([]byte("ok\n"))
 		case p.Command == "cat":
 			io.Copy(ch, ch)
 		case p.Command == "stderr":
 			ch.Stderr().Write([]byte("oops\n"))
+			status = 1
+		case p.Command == "true" && trueErr != "":
+			ch.Stderr().Write([]byte(trueErr))
 			status = 1
 		case p.Command == "big":
 			ch.Write(bytes.Repeat([]byte("a"), 100000))
