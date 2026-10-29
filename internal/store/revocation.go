@@ -156,27 +156,44 @@ const maxServerText = 400
 // \xNN or \uNNNN, a backslash is doubled, and it is cut at maxServerText
 // bytes.
 func EscapeServerText(s string) string {
-	var b strings.Builder
-	i := 0
-	for i < len(s) && b.Len() < maxServerText {
+	const cut = "..."
+	var frags []string
+	total := 0
+	for i := 0; i < len(s); {
 		c, n := utf8.DecodeRuneInString(s[i:])
+		var frag string
 		switch {
 		case c == utf8.RuneError && n == 1:
-			fmt.Fprintf(&b, `\x%02x`, s[i])
+			frag = fmt.Sprintf(`\x%02x`, s[i])
 		case c == '\\':
-			b.WriteString(`\\`)
+			frag = `\\`
 		case c < ' ' || c == 0x7f || (c >= 0x80 && c < 0xa0):
-			fmt.Fprintf(&b, `\x%02x`, c)
+			frag = fmt.Sprintf(`\x%02x`, c)
 		case c == '\u2028' || c == '\u2029' || unicode.Is(unicode.Cf, c):
-			fmt.Fprintf(&b, `\u%04x`, c)
+			frag = fmt.Sprintf(`\u%04x`, c)
 		default:
-			b.WriteRune(c)
+			frag = string(c)
 		}
 		i += n
+		frags = append(frags, frag)
+		total += len(frag)
+		if total > maxServerText {
+			break
+		}
 	}
-	if i < len(s) {
-		b.WriteString("...")
+	if total <= maxServerText {
+		return strings.Join(frags, "")
 	}
+	// Too long: whole fragments up to the limit less the cut mark, so an
+	// escape is never split and the result never passes maxServerText.
+	var b strings.Builder
+	for _, f := range frags {
+		if b.Len()+len(f) > maxServerText-len(cut) {
+			break
+		}
+		b.WriteString(f)
+	}
+	b.WriteString(cut)
 	return b.String()
 }
 

@@ -590,3 +590,41 @@ func TestLogoutWhileDisabledBehindTheServer(t *testing.T) {
 		t.Error("the logout left device.json")
 	}
 }
+
+// An "active" answer to a question asked before the operator's refusal
+// never clears that refusal, even when the refusal lands while the answer
+// is on its way back: the generation is compared where the hold is
+// cleared.
+func TestStaleActiveAnswerKeepsANewerAdminLock(t *testing.T) {
+	x := newSyncSetup(t)
+	var hook atomic.Pointer[func()]
+	o := Options{Sync: SyncOptions{noPoll: true}, afterCheck: func() {
+		if f := hook.Swap(nil); f != nil {
+			(*f)()
+		}
+	}}
+	x.w.startWith(x.n2, x.n2.st, o)
+	x.n2.pause(true)
+	d := x.n2.d
+	d.mu.Lock()
+	d.unconfirmedLocked(store.ErrServerUnconfirmed)
+	d.mu.Unlock()
+	refuse := func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.unconfirmedLocked(&store.AdminRefusal{Code: store.AdminAccountDisabled})
+	}
+	hook.Store(&refuse)
+	if d.retryUnconfirmed(context.Background()) {
+		t.Fatal("the retry unlocked although a refusal landed during its check")
+	}
+	if hook.Load() != nil {
+		t.Fatal("setup: the refusal did not land")
+	}
+	adminHeld(t, x.n2, store.AdminAccountDisabled)
+
+	x.w.down.Store(true)
+	if err := x.n2.call(OpUnlock, nil, nil); err == nil {
+		t.Error("hop unlock with the server unreachable loaded keys after the stale answer")
+	}
+}

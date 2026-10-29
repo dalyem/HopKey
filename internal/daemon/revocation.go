@@ -161,13 +161,19 @@ func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphr
 	case err != nil:
 		d.logf("asking the server whether this device is still in the account: %v", err)
 	case res.Active:
-		// An answer to a question asked before the operator's refusal
-		// locked the vault (which moved the generation) is no answer to
-		// it: the refusal stays until a later question is answered.
-		current := e.st.Generation() == gen
+		if d.opts.afterCheck != nil {
+			d.opts.afterCheck()
+		}
 		e.set(func() {
 			e.checkSkipped, e.unconfirmed = "", ""
-			if current {
+			// An answer to a question asked before the operator's
+			// refusal locked the vault (which moved the generation) is
+			// no answer to it: the refusal stays until a later question
+			// is answered. The generation is read under e.mu, where the
+			// refusal is installed after the store moved it, so a
+			// refusal that lands while this answer is in flight is
+			// never cleared by it.
+			if e.st.Generation() == gen {
 				e.admin = nil
 			}
 			if e.retired != nil && e.retired.Unverified {

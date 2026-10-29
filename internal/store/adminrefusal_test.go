@@ -27,9 +27,18 @@ func TestEscapeServerText(t *testing.T) {
 			t.Errorf("EscapeServerText(%q) = %q, want %q", in, got, want)
 		}
 	}
-	long := EscapeServerText(strings.Repeat("x", 1000))
-	if len(long) != maxServerText+3 || !strings.HasSuffix(long, "...") {
-		t.Errorf("long text: %d bytes", len(long))
+	// A cut text, the mark included, is never longer than the limit,
+	// and an escape is never split.
+	for _, in := range []string{
+		strings.Repeat("x", 1000),
+		strings.Repeat("x", maxServerText+1),
+		strings.Repeat("x", maxServerText-1) + "\u202e",
+		strings.Repeat("x", maxServerText-4) + "\u202e" + "y",
+	} {
+		got := EscapeServerText(in)
+		if len(got) > maxServerText || !strings.HasSuffix(got, "...") || strings.Contains(got, `\u202`) && !strings.Contains(got, `\u202e`) {
+			t.Errorf("%d bytes in: %d bytes out, %q", len(in), len(got), got[max(0, len(got)-12):])
+		}
 	}
 	if got := EscapeServerText(strings.Repeat("x", maxServerText)); got != strings.Repeat("x", maxServerText) {
 		t.Errorf("text of exactly the limit was cut: %q", got)
