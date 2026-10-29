@@ -207,6 +207,9 @@ type session struct {
 	wrongTypeBack bool
 	// ctx, when set, is the context the command runs under.
 	ctx context.Context
+	// exit, when set, is Env.Exit: what hop calls to end the process after
+	// a signal.
+	exit func(code int)
 
 	stdout, stderr syncBuffer
 }
@@ -269,7 +272,7 @@ func (m *machine) hop(t *testing.T, s *session, args ...string) int {
 		Home:   m.home, Paths: m.paths, DataDir: m.data, Keyring: m.ring,
 		StdinTTY: s.tty, StdoutTTY: s.tty,
 		StartDaemon: m.startDaemon(t), SyncClient: syncclient.Options{RootCAs: m.w.pool},
-		DialTimeout: 5 * time.Second,
+		DialTimeout: 5 * time.Second, Exit: s.exit,
 		ReadPassword: func(prompt string) ([]byte, error) {
 			if strings.HasPrefix(prompt, "Type the last group of your ") {
 				if s.wrongTypeBack {

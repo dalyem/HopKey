@@ -122,6 +122,11 @@ var (
 	// unlocked vault. It is for a lost device key, so it runs only locked.
 	ErrAlreadyUnlocked = errors.New("store: the vault is already unlocked; hop lock first to replace the device key with the password")
 
+	// ErrChanged refuses a conditional write (SetHostKeyIfChain): an item it
+	// depends on changed, or is gone, since the caller looked. Nothing is
+	// written.
+	ErrChanged = errors.New("store: an item this write depends on changed")
+
 	// ErrClosed means the Store is closed, or closing: Close refuses every
 	// operation that would wait on the server once it has begun.
 	ErrClosed = errors.New("store: the vault store is closed")
@@ -1464,21 +1469,123 @@ func cloneHost(h model.Host) model.Host {
 }
 
 func (s *Store) PutHost(_ context.Context, h model.Host) (model.Host, error) {
-	h = cloneHost(h)
-	for _, l := range []*[]string{&h.Aliases, &h.Addresses, &h.Tags, &h.HostKeys} {
-		if *l == nil {
-			*l = []string{}
-		}
+	return s.putHost(h)
+}
+
+// ChangedError refuses a conditional write: the item ID is gone, or no
+// longer at the version the caller named. It matches ErrChanged.
+type ChangedError struct{ ID model.ID }
+
+func (e *ChangedError) Error() string {
+	return fmt.Sprintf("store: item %s changed; nothing was written", e.ID)
+}
+
+func (e *ChangedError) Is(target error) bool { return target == ErrChanged }
+
+// HostExpect is what SetHostKeyIfChain requires of an item on a host's way:
+// a host, live at Version, whose model.ConnDigest is Conn. The digest of
+// the host being written covers its key too (withKey); a jump host's
+// does not.
+type HostExpect struct {
+	Version uint64
+	Conn    string
+}
+
+// SetHostKeyIfChain points host id at key keyID, written only while every
+// item in expect is as it names: the host and each jump host on its way,
+// at the version and with the connection it names. The check runs in the
+// write's own transaction, under s.mu and the file lock, on the items the
+// write is checked against (the overlay in a server-backed vault), so a
+// pull that commits after the caller's snapshot is seen, and so is a held
+// edit resolved in place, which changes an item without changing its
+// overlay version. A mismatch is a *ChangedError, and nothing is written.
+//
+// The write changes the key and nothing else. It is made from the host as
+// the check reads it, so a field outside the digests that changed after
+// the caller's snapshot (a description, tags, a credential) is kept.
+func (s *Store) SetHostKeyIfChain(_ context.Context, id, keyID model.ID, expect map[model.ID]HostExpect) (model.Host, error) {
+	if id.IsZero() {
+		return model.Host{}, model.ErrNotFound
 	}
-	out, err := put(s, &h, model.TypeHost)
+	if expect == nil {
+		expect = map[model.ID]HostExpect{}
+	}
+	h := model.Host{Header: model.Header{ItemID: id}}
+	out, err := put(s, &h, model.TypeHost, &hostKeyWrite{expect: expect, keyID: keyID})
 	if err != nil {
 		return model.Host{}, err
 	}
 	return cloneHost(*out), nil
 }
 
+func (s *Store) putHost(h model.Host) (model.Host, error) {
+	h = cloneHost(h)
+	nonNilLists(&h)
+	out, err := put(s, &h, model.TypeHost, nil)
+	if err != nil {
+		return model.Host{}, err
+	}
+	return cloneHost(*out), nil
+}
+
+func nonNilLists(h *model.Host) {
+	for _, l := range []*[]string{&h.Aliases, &h.Addresses, &h.Tags, &h.HostKeys} {
+		if *l == nil {
+			*l = []string{}
+		}
+	}
+}
+
+// hostKeyWrite is a conditional write of a host's key (SetHostKeyIfChain).
+type hostKeyWrite struct {
+	expect map[model.ID]HostExpect
+	keyID  model.ID
+}
+
+// apply checks w's expectations and then makes it, the host being
+// written, the host as the write sees it with only the key changed. at
+// reads an item as the write sees it.
+func (w *hostKeyWrite) apply(it crypto.Item, at func(model.ID) (crypto.Item, bool)) error {
+	dst := it.(*model.Host)
+	if err := checkExpect(w.expect, dst.ItemID, at); err != nil {
+		return err
+	}
+	cur, ok := at(dst.ItemID)
+	h, isHost := cur.(*model.Host)
+	if !ok || !isHost {
+		return &ChangedError{ID: dst.ItemID}
+	}
+	next := cloneHost(*h)
+	next.KeyID = w.keyID
+	nonNilLists(&next)
+	next.V, next.Type = dst.V, dst.Type
+	*dst = next
+	return nil
+}
+
+// checkExpect refuses the write of dest unless each item in expect is as
+// it names (HostExpect). at reads an item as the write sees it.
+func checkExpect(expect map[model.ID]HostExpect, dest model.ID, at func(model.ID) (crypto.Item, bool)) error {
+	ids := make([]model.ID, 0, len(expect))
+	for id := range expect {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b model.ID) int { return strings.Compare(a.String(), b.String()) })
+	for _, id := range ids {
+		it, ok := at(id)
+		if !ok {
+			return &ChangedError{ID: id}
+		}
+		h, ok := it.(*model.Host)
+		if !ok || h.ItemVersion != expect[id].Version || model.ConnDigest(*h, id == dest) != expect[id].Conn {
+			return &ChangedError{ID: id}
+		}
+	}
+	return nil
+}
+
 func (s *Store) PutKey(_ context.Context, k model.Key) (model.Key, error) {
-	out, err := put(s, &k, model.TypeKey)
+	out, err := put(s, &k, model.TypeKey, nil)
 	if err != nil {
 		return model.Key{}, err
 	}
@@ -1486,7 +1593,7 @@ func (s *Store) PutKey(_ context.Context, k model.Key) (model.Key, error) {
 }
 
 func (s *Store) PutCredential(_ context.Context, c model.Credential) (model.Credential, error) {
-	out, err := put(s, &c, model.TypeCredential)
+	out, err := put(s, &c, model.TypeCredential, nil)
 	if err != nil {
 		return model.Credential{}, err
 	}
@@ -1498,7 +1605,7 @@ func (s *Store) PutSnippet(_ context.Context, sn model.Snippet) (model.Snippet, 
 	if sn.Params == nil {
 		sn.Params = []string{}
 	}
-	out, err := put(s, &sn, model.TypeSnippet)
+	out, err := put(s, &sn, model.TypeSnippet, nil)
 	if err != nil {
 		return model.Snippet{}, err
 	}
@@ -1509,7 +1616,7 @@ func (s *Store) PutSnippet(_ context.Context, sn model.Snippet) (model.Snippet, 
 
 // PutPolicy creates or replaces a policy item (model.Policy).
 func (s *Store) PutPolicy(_ context.Context, p model.Policy) (model.Policy, error) {
-	out, err := put(s, &p, model.TypePolicy)
+	out, err := put(s, &p, model.TypePolicy, nil)
 	if err != nil {
 		return model.Policy{}, err
 	}
@@ -1536,8 +1643,9 @@ func header(it crypto.Item) *model.Header {
 // put creates (zero ItemID) or replaces an item. A replacement names the
 // live item's current version; the store writes version + 1. In a
 // server-backed vault the write is queued in the outbox, and the result is
-// the overlay item it shows.
-func put[T any](s *Store, it *T, typ model.Type) (*T, error) {
+// the overlay item it shows. A non-nil expect makes the write conditional
+// (checkExpect), on the state the write itself is checked against.
+func put[T any](s *Store, it *T, typ model.Type, cond *hostKeyWrite) (*T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
@@ -1554,12 +1662,23 @@ func put[T any](s *Store, it *T, typ model.Type) (*T, error) {
 	}
 	h.V, h.Type = crypto.Version, typ
 	if s.server {
-		if err := s.queuePut(it, isNew); err != nil {
+		if err := s.queuePut(it, isNew, cond); err != nil {
 			return nil, err
 		}
 		return it, nil
 	}
-	check := func() error { return s.checkPut(it, isNew) }
+	check := func() error {
+		if cond != nil {
+			err := cond.apply(it, func(id model.ID) (crypto.Item, bool) {
+				cur, ok := s.sec.Items[id]
+				return cur.Item, ok
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return s.checkPut(it, isNew)
+	}
 	if err := s.write(vaultlog.Changes{Put: []crypto.Item{it}}, check); err != nil {
 		return nil, err
 	}

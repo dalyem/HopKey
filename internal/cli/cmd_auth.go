@@ -896,6 +896,9 @@ type checkpointReport struct {
 	Kind    string                `json:"kind"`
 	Resumed bool                  `json:"resumed,omitempty"`
 	Devices []store.DeviceListing `json:"devices"`
+	// RotateCommand, after a revoke, replaces the SSH keys the revoked
+	// device could decrypt (offerKeyRotation).
+	RotateCommand string `json:"rotate_command,omitempty"`
 }
 
 func newCheckpointReport(r *authflow.CheckpointResult) *checkpointReport {
@@ -903,7 +906,11 @@ func newCheckpointReport(r *authflow.CheckpointResult) *checkpointReport {
 	if devices == nil {
 		devices = []store.DeviceListing{}
 	}
-	return &checkpointReport{Kind: r.Kind, Resumed: r.Resumed, Devices: devices}
+	out := &checkpointReport{Kind: r.Kind, Resumed: r.Resumed, Devices: devices}
+	if r.Kind == store.CheckpointRevoke {
+		out.RotateCommand = rotateAllCommand
+	}
+	return out
 }
 
 func printSurvivors(e *Env, devices []store.DeviceListing) {
@@ -981,12 +988,20 @@ func runCheckpoint(ctx context.Context, e *Env, name string, args []string, extr
 }
 
 func runAuthRevoke(ctx context.Context, e *Env, args []string) error {
-	return runCheckpoint(ctx, e, "devices revoke", args, nil, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
+	revoked := false
+	err := runCheckpoint(ctx, e, "devices revoke", args, nil, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
 		if len(pos) == 0 {
 			return nil, failf("name the device to revoke: hop auth devices revoke <name|id> (hop auth devices lists them)")
 		}
-		return authflow.RevokeDevices(ctx, env, v, pos)
+		res, err := authflow.RevokeDevices(ctx, env, v, pos)
+		revoked = err == nil && res != nil
+		return res, err
 	})
+	if err != nil || !revoked {
+		return err
+	}
+	// After runCheckpoint, so the daemon has the vault again.
+	return offerKeyRotation(ctx, e, wantsJSON(args))
 }
 
 func runAuthRotate(ctx context.Context, e *Env, args []string) error {

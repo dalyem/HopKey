@@ -194,16 +194,20 @@ func plainSSH(ctx context.Context, e *Env, res *resolve.Result) error {
 		fmt.Fprintf(e.Stderr, "hop: to keep it, run: hop add %s --address %s\n", oneLine(suggestName(res.Target)), oneLine(res.Target))
 		return nil
 	case errors.As(err, &ee):
-		return silent(exitCode(ee))
+		code, _ := exitCode(ee)
+		return silent(code)
 	}
 	return failf("cannot run ssh: %v", err)
 }
 
-func exitCode(ee *exec.ExitError) int {
+// exitCode is the exit status of a command that ended with ee, and
+// whether it exited on its own. A command killed by a signal has no exit
+// status: ExitFailure, and false.
+func exitCode(ee *exec.ExitError) (code int, exited bool) {
 	if c := ee.ExitCode(); c >= 0 {
-		return c
+		return c, true
 	}
-	return ExitFailure // killed by a signal
+	return ExitFailure, false
 }
 
 // suggestName turns a target or a machine's own name into something usable
@@ -437,7 +441,7 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 		res.ExitCode = ExitFailure
 		res.Error = fmt.Sprintf("timed out after %s", r.timeout)
 	case errors.As(runErr, &ee):
-		res.ExitCode = exitCode(ee)
+		res.ExitCode, _ = exitCode(ee)
 	default:
 		return res, failf("cannot run ssh: %v", runErr)
 	}

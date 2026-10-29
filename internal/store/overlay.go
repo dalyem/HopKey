@@ -242,9 +242,11 @@ func (ov *overlay) snapshot() (model.Snapshot, error) {
 // are checked against the overlay, which is what the user sees: a
 // replacement names a live overlay item of the same type at its overlay
 // version, and every reference names a live overlay item of the right
-// type. seen is the overlay item. The record is durable when it returns.
-// The caller holds s.mu.
-func (s *Store) queuePut(it crypto.Item, isNew bool) error {
+// type. seen is the overlay item. A non-nil cond is checked against the
+// overlay too (checkExpect), and it is made from the overlay host
+// (hostKeyWrite.apply): an item a pull deleted is changed. The record is
+// durable when it returns. The caller holds s.mu.
+func (s *Store) queuePut(it crypto.Item, isNew bool, cond *hostKeyWrite) error {
 	unlock, err := s.lockFile()
 	if err != nil {
 		return err
@@ -256,6 +258,19 @@ func (s *Store) queuePut(it crypto.Item, isNew bool) error {
 	ov, err := s.overlayLocked()
 	if err != nil {
 		return err
+	}
+	if cond != nil {
+		err := cond.apply(it, func(id model.ID) (crypto.Item, bool) {
+			cur, ok := ov.items[id]
+			if !ok || cur == nil {
+				return nil, false
+			}
+			p, err := plainOf(cur)
+			return p, err == nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 	h := header(it)
 	in := merge.Intent{Action: merge.ActionCreate, ItemID: h.ItemID, Type: h.Type}

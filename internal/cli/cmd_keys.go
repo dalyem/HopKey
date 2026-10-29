@@ -23,7 +23,7 @@ const maxKeyFile = 64 << 10
 func runKey(ctx context.Context, e *Env, args []string) error {
 	if len(args) == 0 {
 		fmt.Fprintf(e.Stderr, "usage: %s\n", commands["key"].usage)
-		return failf("key needs a subcommand: add, ls or rm")
+		return failf("key needs a subcommand: add, ls, rm or rotate")
 	}
 	switch args[0] {
 	case "add":
@@ -32,8 +32,10 @@ func runKey(ctx context.Context, e *Env, args []string) error {
 		return runKeyLs(ctx, e, args[1:])
 	case "rm":
 		return runKeyRm(ctx, e, args[1:])
+	case "rotate":
+		return runKeyRotate(ctx, e, args[1:])
 	}
-	return failf("unknown key subcommand %q (add, ls, rm)", args[0])
+	return failf("unknown key subcommand %q (add, ls, rm, rotate)", args[0])
 }
 
 // readPrivateKey reads the private key file at path, asking for its

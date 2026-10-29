@@ -24,6 +24,7 @@ const (
 	OpResolve    = "resolve"
 	OpTailscale  = "tailscale"
 	OpPutHost    = "put_host"
+	OpSetHostKey = "set_host_key"
 	OpPutKey     = "put_key"
 	OpPutSnippet = "put_snippet"
 	OpDelete     = "delete"
@@ -45,6 +46,9 @@ const (
 	CodeNotFound = "not_found" // no such item
 	CodeLocked   = "locked"    // the vault is locked
 	CodeInternal = "internal"
+	// CodeChanged refuses a conditional write: an item it depends on is
+	// no longer at the version the caller named.
+	CodeChanged = "changed"
 
 	CodeLocalOnly    = "local_only"    // the vault has no server to sync with
 	CodeRevoked      = "revoked"       // this device was revoked from the account
@@ -134,6 +138,33 @@ type ResolveResult struct {
 // PutHostParams is the request for OpPutHost. A zero ItemID creates the host.
 type PutHostParams struct {
 	Host model.Host `json:"host"`
+}
+
+// SetHostKeyParams is the request for OpSetHostKey: point host HostID at
+// key KeyID, but only if the host and every jump host on its way are still
+// as in Chain. Chain is the whole way, in order: the host itself first,
+// then its jump host, then that one's, and so on. The check and the write
+// happen under the daemon's lock, and the store checks again in the
+// write's own transaction, so nothing changes between them. A host, or a
+// jump host, at another version, with another connection, missing, or
+// with a longer or shorter way than Chain is CodeChanged, and nothing is
+// written. hop key rotate uses it to point a host at a key only while the
+// record still reaches the server it checked.
+type SetHostKeyParams struct {
+	HostID string        `json:"host_id"`
+	KeyID  string        `json:"key_id"`
+	Chain  []ItemVersion `json:"chain"`
+}
+
+// ItemVersion names an item at a version. In SetHostKeyParams.Chain, Conn
+// is the model.ConnDigest of the host as the caller checked it: of the
+// host itself with its key, of a jump host without. A version alone does
+// not pin what an item holds: a held edit resolved in place changes an
+// item at the same overlay version.
+type ItemVersion struct {
+	ID      string `json:"id"`
+	Version uint64 `json:"version,string"`
+	Conn    string `json:"conn"`
 }
 
 // PutKeyParams is the request for OpPutKey. PrivateKey is an unencrypted
