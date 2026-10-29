@@ -18,3 +18,11 @@ func SetRotateStepTimeout(t testing.TB, d time.Duration) {
 	rotateStepTimeout = d
 	t.Cleanup(func() { rotateStepTimeout = old })
 }
+
+// SetAKLockWait makes the authorized_keys write script wait n seconds for
+// the lock until the test ends.
+func SetAKLockWait(t testing.TB, n int) {
+	old := akLockWait
+	akLockWait = n
+	t.Cleanup(func() { akLockWait = old })
+}

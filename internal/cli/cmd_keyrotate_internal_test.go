@@ -189,11 +189,15 @@ func TestRotatedName(t *testing.T) {
 	}
 }
 
-// The scripts go through the remote login shell to sh: one line, no '!'.
-func TestAKScriptsAreOneLineWithoutBang(t *testing.T) {
+// The scripts go through the remote login shell to sh as one quoted word:
+// no newline (tcsh), no '!' (csh history), no '#', and no backslash before
+// a backslash or a quote (fish).
+func TestAKScriptsSurviveEveryLoginShell(t *testing.T) {
 	for _, s := range []string{akReadScript, akWriteScript("1 2", "3 4")} {
-		if strings.ContainsAny(s, "\n!") {
-			t.Errorf("script has a newline or '!': %s", s)
+		for _, bad := range []string{"\n", "\r", "!", "#", `\\`, `\'`} {
+			if strings.Contains(s, bad) {
+				t.Errorf("script has %q: %s", bad, s)
+			}
 		}
 	}
 }
