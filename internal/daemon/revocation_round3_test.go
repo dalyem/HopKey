@@ -41,7 +41,7 @@ func TestRefusalNeverTakesOverALaterManualLock(t *testing.T) {
 				t.Fatalf("setup: the agent serves %d key(s)", k)
 			}
 			d := x.n2.d
-			lock := func() { d.lockVault(d.store.(Vault)) }
+			lock := func() { d.lockVault(d.store.(Vault), false) }
 			hook.Store(&lock)
 			const (
 				serve = iota

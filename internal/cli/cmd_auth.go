@@ -731,7 +731,10 @@ type AuthStatus struct {
 	SecretKeyStale bool                     `json:"secret_key_stale,omitempty"`
 	KitPending     bool                     `json:"kit_pending,omitempty"`
 	Sync           *daemon.SyncStatusResult `json:"sync,omitempty"`
-	Warnings       []string                 `json:"warnings,omitempty"`
+	// EndedSessions is the ssh sessions the daemon ended, on a revocation
+	// say.
+	EndedSessions *daemon.EndedSessions `json:"ended_sessions,omitempty"`
+	Warnings      []string              `json:"warnings,omitempty"`
 }
 
 func runAuthStatus(ctx context.Context, e *Env, args []string) error {
@@ -778,7 +781,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	if err := c.Call(ctx, daemon.OpStatus, nil, &st); err != nil {
 		return failf("%v", err)
 	}
-	a := AuthStatus{Vault: true, Sync: st.Sync}
+	a := AuthStatus{Vault: true, Sync: st.Sync, EndedSessions: st.EndedSessions}
 	sshPending := false
 	if v := st.Vault; v != nil {
 		a.DeviceID, a.DeviceKeyStore, a.Locked, a.KitPending, a.AccountID = v.DeviceID, v.DeviceStore, v.Locked, v.KitPending, v.AccountID
@@ -818,18 +821,26 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	if o.asJSON {
 		return printJSON(e, a)
 	}
+	ended := func() {
+		if l := e.endedLine(a.EndedSessions); l != "" {
+			e.printf("sessions:     %s\n", l)
+		}
+	}
 	switch {
 	case a.SignedIn:
 		e.printf("signed in:    yes\n")
 	case a.Wiped && a.Revocation != nil:
 		printWipedRevocation(e, a.Revocation)
+		ended()
 		return nil
 	case a.Wiped:
 		e.printf("signed in:    no; this device was revoked from the account, the revocation verified, and this device's copy of the vault, " +
 			"its device key and the ssh files hop wrote were wiped (hop auth login signs in again)\n")
+		ended()
 		return nil
 	case sshPending:
 		printWipePending(e, a.Revocation)
+		ended()
 		return nil
 	case a.WipePending:
 		r := a.Sync.ServerRetirement
@@ -863,6 +874,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	default:
 		e.printf("vault:        locked; run hop unlock\n")
 	}
+	ended()
 	if s := a.Sync; s != nil && a.SignedIn {
 		switch {
 		case s.MaxOffline > 0 && s.LastContact != nil:

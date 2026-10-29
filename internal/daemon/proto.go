@@ -247,8 +247,11 @@ type StatusResult struct {
 	// store in use and the log head. Nil for other stores.
 	Vault *store.Info `json:"vault,omitempty"`
 	// Sync is sync.status without its device scan, for a store that syncs.
-	Sync      *SyncStatusResult `json:"sync,omitempty"`
-	Tailscale struct {
+	Sync *SyncStatusResult `json:"sync,omitempty"`
+	// EndedSessions is the ssh sessions the daemon ended (sessions.go):
+	// on a revocation, the max-offline lock or hop lock --end-sessions.
+	EndedSessions *EndedSessions `json:"ended_sessions,omitempty"`
+	Tailscale     struct {
 		Available bool   `json:"available"`
 		Reason    string `json:"reason,omitempty"`
 	} `json:"tailscale"`

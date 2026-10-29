@@ -1414,7 +1414,11 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 	if stdout == nil {
 		cmd.Stdout = io.Discard
 	}
-	runErr := cmd.Run()
+	alias := r.t.alias
+	if r.cfg != "" {
+		alias = rotCheckAlias
+	}
+	endedWhy, runErr := r.e.runSSH(ctx, cmd, alias, "hop key rotate")
 	res := rotResult{ExecResult: ExecResult{Host: r.t.rr.Result.HostName}}
 	var ee *exec.ExitError
 	switch {
@@ -1432,6 +1436,9 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 		}
 	default:
 		return res, failf("cannot run ssh: %v", runErr)
+	}
+	if endedWhy != "" && runErr != nil {
+		res.Error = endedError(endedWhy)
 	}
 	res.Stderr = string(errTail.Bytes())
 	return res, nil

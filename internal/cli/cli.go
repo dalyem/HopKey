@@ -306,7 +306,7 @@ func init() {
 		"daemon":  {runDaemon, "hop daemon | hop daemon stop [--json]"},
 		"status":  {runStatus, "hop status [--json]"},
 		"init":    {runInit, "hop init [--device-key-store keychain|file] [--kit-file PATH] [--json]"},
-		"lock":    {runLock, "hop lock [--json]"},
+		"lock":    {runLock, "hop lock [--end-sessions] [--json]"},
 		"unlock":  {runUnlock, "hop unlock [--password] [--json]"},
 		"passwd":  {runPasswd, "hop passwd [--kit-file PATH] (on a server: the flags of hop auth passwd)"},
 		"sync":    {runSync, "hop sync [--json] | hop sync resolve [N] [--keep-mine [--confirm TOKEN] | --edit --set FIELD=VALUE... [--confirm TOKEN] | --take-theirs [--yes] | --retry] [--json]"},

@@ -102,6 +102,10 @@ type Options struct {
 	unconfirmedRead func()
 	beforeCheck     func()
 	sessionRefused  func()
+	// procs replaces this machine's processes, and sessionTerm and
+	// sessionKill the waits before SIGTERM and SIGKILL (sessions.go).
+	procs                    procTable
+	sessionTerm, sessionKill time.Duration
 }
 
 // Daemon is a running daemon.
@@ -137,6 +141,10 @@ type Daemon struct {
 	sync *syncer // nil for a store that does not sync
 	// proving is set while a revocation proof is fetched (prove).
 	proving atomic.Bool
+
+	// sessions are the ssh sessions to end on a revocation (sessions.go).
+	sessions *sessions
+	procs    procTable
 
 	tsMu     sync.Mutex
 	tsCached *tailscale.Status
@@ -197,6 +205,10 @@ func Start(opts Options) (*Daemon, error) {
 		started: time.Now(), live: live, agent: agentSrv, control: control,
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		writeConfig: opts.writeConfig, wipeConfig: opts.wipeConfig,
+		sessions: newSessions(), procs: opts.procs,
+	}
+	if d.procs == nil {
+		d.procs = sysProcs{}
 	}
 	if d.writeConfig == nil {
 		d.writeConfig = sshconfig.Write

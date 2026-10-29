@@ -741,7 +741,7 @@ func (e *syncer) sessionEnded(ctx context.Context, gen uint64) bool {
 	case err == nil:
 		return false
 	case unreachable(err):
-		err = fmt.Errorf("the server refused this device a session, and could not be asked again: %w", err)
+		err = fmt.Errorf("%w, and could not be asked again: %w", store.ErrSessionRefused, err)
 	}
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
@@ -749,6 +749,9 @@ func (e *syncer) sessionEnded(ctx context.Context, gen uint64) bool {
 		return false
 	}
 	e.d.unconfirmedLocked(err)
+	// The refusal is the server's answer (unconfirmedLocked ends the
+	// sessions too when the check saw one).
+	e.d.endSessions(whyRefused)
 	return true
 }
 

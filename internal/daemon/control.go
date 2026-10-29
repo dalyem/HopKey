@@ -254,6 +254,9 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 	case OpShutdown:
 		return nil, nil
 	}
+	if result, ok, err := d.dispatchSessions(req, decode); ok {
+		return result, err
+	}
 	if result, ok, err := d.dispatchVault(ctx, req, decode); ok {
 		return result, err
 	}
@@ -285,6 +288,7 @@ func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 	if d.sync != nil {
 		out.Sync = d.syncStatus(false)
 	}
+	out.EndedSessions = d.endedSessions()
 	out.Tailscale.Available, out.Tailscale.Reason = ts.Available, ts.Reason
 	return out, nil
 }

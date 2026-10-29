@@ -226,6 +226,9 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 	e.printf("keys:         %d in the vault, %d in the agent\n", st.Keys, st.KeysInAgent)
 	e.printf("agent socket: %s\n", oneLine(st.AgentSocket))
 	e.printf("ssh config:   %s\n", oneLine(st.ConfigDir))
+	if l := e.endedLine(st.EndedSessions); l != "" {
+		e.printf("sessions:     %s\n", l)
+	}
 	printVaultStatus(e, st.Vault)
 	if st.Sync != nil {
 		o := syncBlockOpts{shown: map[string]bool{}}

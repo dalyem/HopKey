@@ -51,7 +51,7 @@ func TestUnconfirmedRetryNeverUnlocksAManualLock(t *testing.T) {
 			if info := x.n2.st.Info(); !info.Locked || !info.ServerUnconfirmed {
 				t.Fatalf("setup: the vault is not locked as unconfirmed: %+v", info)
 			}
-			lock := func() { d.lockVault(d.store.(Vault)) }
+			lock := func() { d.lockVault(d.store.(Vault), false) }
 			hook.Store(&lock)
 
 			ctx := context.Background()
