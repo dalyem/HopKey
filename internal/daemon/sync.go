@@ -65,9 +65,9 @@ const (
 	// syncNowStepTimeout bounds each pull or push of an explicit hop sync,
 	// so one against a server that has stopped answering fails in seconds
 	// and says so, not after a request timeout or the HTTP/2 health check.
-	// It bounds a step, not the whole sync, so a long catch-up still
-	// finishes while the server keeps answering. The background loop keeps
-	// its own deadlines and backoff.
+	// It bounds a step, not the whole sync (the control request's own
+	// deadline still bounds that). The background loop keeps its own
+	// deadlines and backoff.
 	syncNowStepTimeout = 5 * time.Second
 	// maxSyncNowPushes bounds the records one sync.now pushes.
 	maxSyncNowPushes = 64
@@ -1001,11 +1001,7 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 		step = func(f func(context.Context) error) error {
 			sctx, cancel := context.WithTimeout(rctx, syncNowStepTimeout)
 			defer cancel()
-			err := f(sctx)
-			if err != nil && sctx.Err() == context.DeadlineExceeded && rctx.Err() == nil {
-				err = fmt.Errorf("%w: the server did not answer within %s", syncclient.ErrUnreachable, syncNowStepTimeout)
-			}
-			return err
+			return syncNowStepError(f(sctx), sctx, rctx)
 		}
 	}
 	err = step(func(c context.Context) error { return e.st.Pull(c, r) })
@@ -1097,4 +1093,19 @@ func (e *syncer) status() SyncStatusResult {
 	out.Warnings = append(out.Warnings, e.notes...)
 	out.Warnings = append(out.Warnings, e.replaced...)
 	return out
+}
+
+// syncNowStepError is the error of one step of an explicit sync whose own
+// deadline (sctx) has passed while the caller (rctx) still waits: one the
+// deadline caused says the server did not answer. Any other error is the
+// server's answer, a session refusal or a revocation say, and is kept as
+// it is, or the refusal handling that follows would never see it.
+func syncNowStepError(err error, sctx, rctx context.Context) error {
+	if err == nil || sctx.Err() != context.DeadlineExceeded || rctx.Err() != nil {
+		return err
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) && !errors.Is(err, syncclient.ErrUnreachable) {
+		return err
+	}
+	return fmt.Errorf("%w: the server did not answer within %s", syncclient.ErrUnreachable, syncNowStepTimeout)
 }

@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -77,6 +79,37 @@ func TestExplicitSyncToAServerThatStoppedAnsweringFailsFast(t *testing.T) {
 	}
 	if took > 8*time.Second {
 		t.Errorf("sync.now took %s to fail, want about 5s", took)
+	}
+}
+
+// A session refusal that comes back just after an explicit sync's step
+// deadline is still a refusal: only an error the deadline caused becomes
+// "the server did not answer", so sessionEnded still sees the refusal.
+func TestSyncNowStepErrorKeepsTheServersAnswer(t *testing.T) {
+	expired, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-expired.Done()
+	caller := context.Background()
+	for _, err := range []error{store.ErrSessionEnded, fmt.Errorf("pull: %w", store.ErrSessionEnded), store.ErrDeviceRevoked} {
+		if got := syncNowStepError(err, expired, caller); got != err {
+			t.Errorf("%v became %v", err, got)
+		}
+	}
+	for _, err := range []error{context.DeadlineExceeded, fmt.Errorf("get: %w", context.DeadlineExceeded), syncclient.ErrUnreachable} {
+		if got := syncNowStepError(err, expired, caller); !errors.Is(got, syncclient.ErrUnreachable) || !strings.Contains(got.Error(), "did not answer") {
+			t.Errorf("%v became %v, want the server did not answer", err, got)
+		}
+	}
+	// Before the deadline, or once the caller gave up, nothing changes.
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+	if got := syncNowStepError(context.DeadlineExceeded, live, caller); got != context.DeadlineExceeded {
+		t.Errorf("before the deadline: %v", got)
+	}
+	gone, cancelGone := context.WithCancel(context.Background())
+	cancelGone()
+	if got := syncNowStepError(context.DeadlineExceeded, expired, gone); got != context.DeadlineExceeded {
+		t.Errorf("caller gone: %v", got)
 	}
 }
 
