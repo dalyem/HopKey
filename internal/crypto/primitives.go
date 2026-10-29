@@ -256,3 +256,18 @@ func OpenHPKE(sk hpke.PrivateKey, e HPKEEnvelope, info, aad []byte) ([]byte, err
 	}
 	return pt, nil
 }
+
+// LabelLocalKeyID labels LocalKeyID.
+const LabelLocalKeyID = "hopkey/v1/local-key-id"
+
+// LocalKeyIDSize is the length of LocalKeyID.
+const LocalKeyIDSize = 16
+
+// LocalKeyID names a generation of a device's local_key:
+// HKDF-Expand(local_key, lp("hopkey/v1/local-key-id"), 16) (crypto spec rev
+// 17 amendment, §3.2). It is one HKDF output under its own label, so it
+// reveals nothing about the key, and a file can carry it outside its seal
+// to say which key sealed it.
+func LocalKeyID(key *SymKey) ([]byte, error) {
+	return hkdfExpand(key[:], LP([]byte(LabelLocalKeyID)), LocalKeyIDSize)
+}

@@ -17,6 +17,7 @@ import (
 	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/shellcmd"
+	"github.com/dalyem/hopkey/internal/store"
 )
 
 // The daemon syncs on its own (design: "Automatic sync"). hop sync is an
@@ -31,9 +32,12 @@ this device was revoked, or the server can't be reached.
 hop sync resolve settles a queued change the daemon held because it
 conflicts with the server. Without a choice it lists the held change and its
 proposals; on a terminal it asks what to do. With --json, or when stdin or
-stdout is not a terminal, it never asks: keep-mine and edit need --confirm
-with the proposal's token, and take-theirs needs --yes. --edit starts from
-the server's current version, so --set names only what you change in it.`
+stdout is not a terminal, it never asks: keep-mine, edit and the --merge
+choices need --confirm with the proposal's token, and take-theirs needs
+--yes. --edit starts from the server's current version, so --set names only
+what you change in it. When a change is held only on some fields, --merge
+with --keep-mine or --take-theirs settles those fields your way or the
+server's and keeps every other field merged.`
 
 // SyncReport is the --json shape of hop sync: the daemon's sync status, with
 // the error when the sync could not run. synced_at is always present (null
@@ -278,13 +282,14 @@ func outageNotice(e *Env, s *daemon.SyncStatusResult, started time.Time) string 
 
 // ---- hop sync resolve ----
 
-const resolveUsage = "hop sync resolve [N] [--keep-mine [--confirm TOKEN] | --edit --set FIELD=VALUE... [--new-id ID] [--confirm TOKEN] | --take-theirs [--yes] | --retry] [--json]"
+const resolveUsage = "hop sync resolve [N] [--keep-mine [--merge] [--confirm TOKEN] | --edit --set FIELD=VALUE... [--new-id ID] [--confirm TOKEN] | --take-theirs --merge [--confirm TOKEN] | --take-theirs [--yes] | --retry] [--json]"
 
 func runSyncResolve(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "sync resolve", resolveUsage)
 	keepMine := fs.Bool("keep-mine", false, "write your change over the server's (needs the proposal's --confirm token)")
 	edit := fs.Bool("edit", false, "write an edited version: the server's, or yours when the server no longer has the item, with --set applied (hosts and snippets; needs the --confirm token)")
 	takeTheirs := fs.Bool("take-theirs", false, "drop your change and keep the server's")
+	mergeRest := fs.Bool("merge", false, "with --keep-mine or --take-theirs: settle only the conflicting fields that way, and keep every other field merged (needs the proposal's --confirm token)")
 	retry := fs.Bool("retry", false, "try the change again as it is")
 	token := fs.String("confirm", "", "the confirmation token of the proposal to apply")
 	newID := fs.String("new-id", "", "for --edit: the new_id of the proposal the token confirms")
@@ -320,8 +325,21 @@ func runSyncResolve(ctx context.Context, e *Env, args []string) error {
 		}
 		choice = f.name
 	}
-	if *token != "" && choice != daemon.ChoiceKeepMine && choice != daemon.ChoiceEdit {
-		return failf("--confirm goes with --keep-mine or --edit")
+	if *mergeRest {
+		switch choice {
+		case daemon.ChoiceKeepMine:
+			choice = daemon.ChoiceKeepMineMerge
+		case daemon.ChoiceTakeTheirs:
+			choice = daemon.ChoiceTakeTheirsMerge
+		default:
+			return failf("--merge goes with --keep-mine or --take-theirs")
+		}
+		if *yes {
+			return failf("--take-theirs --merge writes a merge: it needs --confirm with its token, not --yes")
+		}
+	}
+	if *token != "" && !confirmedChoice(choice) {
+		return failf("--confirm goes with --keep-mine, --edit or --merge")
 	}
 	if (sets.set || *newID != "") && choice != daemon.ChoiceEdit {
 		return failf("--set and --new-id go with --edit")
@@ -377,6 +395,27 @@ type request struct {
 	yes   bool
 }
 
+// confirmedChoice reports whether choice writes a proposal confirmed with
+// its token.
+func confirmedChoice(choice string) bool {
+	switch choice {
+	case daemon.ChoiceKeepMine, daemon.ChoiceEdit, daemon.ChoiceKeepMineMerge, daemon.ChoiceTakeTheirsMerge:
+		return true
+	}
+	return false
+}
+
+// choiceFlags is the command line of a choice.
+func choiceFlags(choice string) string {
+	switch choice {
+	case daemon.ChoiceKeepMineMerge:
+		return "--keep-mine --merge"
+	case daemon.ChoiceTakeTheirsMerge:
+		return "--take-theirs --merge"
+	}
+	return "--" + choice
+}
+
 func findHeld(held []daemon.HeldChange, n uint64) *daemon.HeldChange {
 	for i := range held {
 		if held[i].N == n {
@@ -400,8 +439,8 @@ func (r *resolver) held() ([]daemon.HeldChange, error) {
 	for i := range res.Held {
 		h := &res.Held[i]
 		h.Seen, h.Want, h.Current = stripSecrets(h.Seen), stripSecrets(h.Want), stripSecrets(h.Current)
-		if h.KeepMine != nil {
-			h.KeepMine.Seen, h.KeepMine.Want = stripSecrets(h.KeepMine.Seen), stripSecrets(h.KeepMine.Want)
+		if p := h.KeepMine; p != nil {
+			p.Seen, p.Want = stripSecrets(p.Seen), stripSecrets(p.Want)
 		}
 	}
 	if res.Held == nil {
@@ -445,21 +484,87 @@ func members(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 	return m, true
 }
 
+// heldListing is the JSON of the listing: the daemon's held changes, each
+// with the proposals of the --merge choices it offers, as §2.11 asks of a
+// listing without a terminal.
+type heldListing struct {
+	Held []heldEntry `json:"held"`
+}
+
+type heldEntry struct {
+	daemon.HeldChange
+	KeepMineMerge   *daemon.Proposal `json:"keep_mine_merge,omitempty"`
+	TakeTheirsMerge *daemon.Proposal `json:"take_theirs_merge,omitempty"`
+}
+
+// withMergeProposals fetches the proposals of the --merge choices h
+// offers. One the daemon can no longer propose (the held change moved on
+// since the listing) is dropped from the choices, and its refusal says
+// why.
+func (r *resolver) withMergeProposals(h daemon.HeldChange) heldEntry {
+	out := heldEntry{HeldChange: h}
+	out.Choices = slices.Clone(h.Choices)
+	for _, f := range []struct {
+		choice  string
+		into    **daemon.Proposal
+		refused *string
+	}{
+		{daemon.ChoiceKeepMineMerge, &out.KeepMineMerge, &out.KeepMineMergeRefused},
+		{daemon.ChoiceTakeTheirsMerge, &out.TakeTheirsMerge, &out.TakeTheirsMergeRefused},
+	} {
+		if !slices.Contains(out.Choices, f.choice) {
+			continue
+		}
+		p, err := r.mergeProposal(h.N, f.choice)
+		if err != nil {
+			*f.refused = "its proposal could not be read: " + err.Error()
+			out.Choices = slices.DeleteFunc(out.Choices, func(c string) bool { return c == f.choice })
+			continue
+		}
+		*f.into = p
+	}
+	return out
+}
+
+// mergeProposal asks the daemon for the proposal of a --merge choice for
+// the held change n. The listing names these choices but leaves their
+// proposals out, so that it stays within one response for a large item.
+func (r *resolver) mergeProposal(n uint64, choice string) (*daemon.Proposal, error) {
+	var res daemon.SyncProposalResult
+	if err := r.c.Call(r.ctx, daemon.OpSyncProposal, daemon.SyncProposalParams{N: n, Choice: choice}, &res); err != nil {
+		return nil, r.resolveError(n, err)
+	}
+	p := res.Proposal
+	if p == nil || p.N != n || p.Choice != choice {
+		return nil, failf("the daemon returned no %s proposal for change %d", strings.TrimPrefix(choiceFlags(choice), "--"), n)
+	}
+	p.Seen, p.Want, p.Current = stripSecrets(p.Seen), stripSecrets(p.Want), stripSecrets(p.Current)
+	return p, nil
+}
+
 // list prints the held changes and how to resolve each. It applies
-// nothing. The JSON carries each keep-mine proposal with its token.
+// nothing. The JSON carries each keep-mine and --merge proposal with its
+// token.
 func (r *resolver) list(held []daemon.HeldChange) error {
+	entries := []heldEntry{}
+	for _, h := range held {
+		entries = append(entries, r.withMergeProposals(h))
+	}
 	if r.asJSON {
-		return printJSON(r.e, daemon.SyncHeldResult{Held: held})
+		return printJSON(r.e, heldListing{Held: entries})
 	}
 	if len(held) == 0 {
 		r.e.printf("nothing is held\n")
 		return nil
 	}
-	for i := range held {
-		h := &held[i]
+	for i := range entries {
+		x := &entries[i]
+		h := &x.HeldChange
 		r.describe(h)
-		if h.KeepMine != nil {
-			r.showProposal(h, h.KeepMine)
+		for _, p := range []*daemon.Proposal{h.KeepMine, x.KeepMineMerge, x.TakeTheirsMerge} {
+			if p != nil {
+				r.showProposal(h, p)
+			}
 		}
 		if len(h.Choices) == 0 {
 			continue
@@ -467,9 +572,16 @@ func (r *resolver) list(held []daemon.HeldChange) error {
 		r.e.printf("to resolve it, run one of:\n")
 		for _, ch := range h.Choices {
 			switch ch {
-			case daemon.ChoiceKeepMine:
-				if h.KeepMine != nil {
-					r.e.printf("  hop sync resolve %d --keep-mine --confirm %s\n", h.N, oneLine(h.KeepMine.Confirm))
+			case daemon.ChoiceKeepMine, daemon.ChoiceKeepMineMerge, daemon.ChoiceTakeTheirsMerge:
+				p := h.KeepMine
+				switch ch {
+				case daemon.ChoiceKeepMineMerge:
+					p = x.KeepMineMerge
+				case daemon.ChoiceTakeTheirsMerge:
+					p = x.TakeTheirsMerge
+				}
+				if p != nil {
+					r.e.printf("  hop sync resolve %d %s --confirm %s\n", h.N, choiceFlags(ch), oneLine(p.Confirm))
 				}
 			case daemon.ChoiceEdit:
 				r.e.printf("  hop sync resolve %d --edit --set FIELD=VALUE...   (prints a proposal to confirm)\n", h.N)
@@ -481,6 +593,114 @@ func (r *resolver) list(held []daemon.HeldChange) error {
 		}
 	}
 	return nil
+}
+
+// refusedFor says why a listed choice is not offered, or "".
+func refusedFor(h *daemon.HeldChange, choice string) string {
+	switch choice {
+	case daemon.ChoiceKeepMine:
+		return h.KeepMineRefused
+	case daemon.ChoiceKeepMineMerge:
+		return h.KeepMineMergeRefused
+	case daemon.ChoiceTakeTheirsMerge:
+		return h.TakeTheirsMergeRefused
+	}
+	return ""
+}
+
+// unitText names what a unit of fields decides, for people.
+func unitText(name string) string {
+	switch name {
+	case merge.UnitConnection:
+		return "how it connects (addresses, port, user, route, Tailscale link, pinned keys, jump host, key, credential)"
+	case merge.UnitName:
+		return "its name"
+	case merge.UnitAgent:
+		return "what agents may do on it (agent access and agent output)"
+	case merge.UnitExecutable:
+		return "its name or command"
+	case merge.UnitKey:
+		return "the key"
+	case merge.UnitCredential:
+		return "the credential"
+	case merge.UnitPolicy:
+		return "the policy"
+	}
+	return oneLine(name)
+}
+
+// conflictText explains one conflict of a held change: which fields, what
+// each side did, and, for a coupling, its name and why it holds. spellings
+// are the strings it is about (merge.ConflictSpellings).
+func conflictText(c merge.Conflict, spellings []string) string {
+	here, there := dash(joinOne(c.Local, ", ")), dash(joinOne(c.Remote, ", "))
+	switch c.Kind {
+	case merge.ConflictUnit:
+		return fmt.Sprintf("%s: both changed %s, differently (here %s; on the server %s)", oneLine(c.Name), unitText(c.Name), here, there)
+	case merge.ConflictClass:
+		what := "tag"
+		if c.Name == "aliases" {
+			what = "alias"
+		}
+		return fmt.Sprintf("%s: the same %s was changed differently on each side (%s)", oneLine(c.Name), what, quotedList(spellings))
+	case merge.ConflictCoupling:
+		who, other := "this device", "the server"
+		trig, grp := c.Local, c.Remote
+		if c.Trigger == merge.TriggerRemote {
+			who, other = other, who
+			trig, grp = c.Remote, c.Local
+		}
+		var what string
+		switch c.Name {
+		case merge.CouplingSelectorAdded:
+			what = fmt.Sprintf("%s gave it a new name, alias or tag (%s", who, joinOne(trig, ", "))
+			if len(spellings) > 0 {
+				what += ": " + quotedList(spellings)
+			}
+			what += ")"
+		case merge.CouplingAgentWidening:
+			what = fmt.Sprintf("%s widened what agents may do on it (%s)", who, joinOne(trig, ", "))
+		default:
+			what = fmt.Sprintf("%s changed %s", who, joinOne(trig, ", "))
+		}
+		return fmt.Sprintf("coupling %s: %s while %s changed how it connects (%s); together they would apply one to a machine the other never saw",
+			oneLine(c.Name), what, other, joinOne(grp, ", "))
+	}
+	return fmt.Sprintf("%s %s: here %s; on the server %s", oneLine(string(c.Kind)), oneLine(c.Name), here, there)
+}
+
+// conflictLines explain each conflict of hold, a hold on a put from seen to
+// want while the server has cur. The daemon names a conflict's members
+// only; the strings a class conflict or an added selector is about come
+// from the three versions.
+func conflictLines(t model.Type, seen, want, cur json.RawMessage, hold *store.HoldInfo) []string {
+	if hold == nil || len(hold.Conflicts) == 0 {
+		return nil
+	}
+	items := make([]*merge.Item, 3)
+	for i, raw := range []json.RawMessage{seen, want, cur} {
+		if _, ok := members(raw); ok {
+			items[i], _ = merge.ParseItem(raw)
+		}
+	}
+	var out []string
+	for _, c := range hold.Conflicts {
+		out = append(out, conflictText(c, merge.ConflictSpellings(t, items[0], items[1], items[2], c)))
+	}
+	return out
+}
+
+// quotedList shows strings as a JSON list, through exact, so that no two
+// values look alike.
+func quotedList(ss []string) string {
+	if ss == nil {
+		ss = []string{}
+	}
+	b, err := json.Marshal(ss)
+	if err != nil {
+		return "-"
+	}
+	return exact(string(b))
 }
 
 // causeText says why a change is held, for people.
@@ -531,6 +751,9 @@ func (r *resolver) describe(h *daemon.HeldChange) {
 		if len(h.Hold.Local) > 0 || len(h.Hold.Remote) > 0 {
 			e.printf("  changed: here %s; on the server %s\n", dash(joinOne(h.Hold.Local, ", ")), dash(joinOne(h.Hold.Remote, ", ")))
 		}
+		for _, l := range conflictLines(h.Type, h.Seen, h.Want, h.Current, h.Hold) {
+			e.printf("  conflict: %s\n", l)
+		}
 		if h.Hold.Reason != "" {
 			e.printf("  reason:  %s\n", oneLine(h.Hold.Reason))
 		}
@@ -546,6 +769,14 @@ func (r *resolver) describe(h *daemon.HeldChange) {
 	}
 	if h.KeepMineRefused != "" {
 		e.printf("  keep mine is not offered: %s\n", oneLine(h.KeepMineRefused))
+	}
+	if h.Hold != nil && len(h.Hold.Conflicts) > 0 {
+		if h.KeepMineMergeRefused != "" {
+			e.printf("  keep mine --merge is not offered: %s\n", oneLine(h.KeepMineMergeRefused))
+		}
+		if h.TakeTheirsMergeRefused != "" {
+			e.printf("  take theirs --merge is not offered: %s\n", oneLine(h.TakeTheirsMergeRefused))
+		}
 	}
 	e.printf("  choices: %s\n", dash(joinOne(h.Choices, ", ")))
 }
@@ -615,42 +846,150 @@ func memberText(raw json.RawMessage, member string) string {
 	return exact(compact(v))
 }
 
-// showProposal prints what a keep-mine or edit would write: for a delete,
-// that it deletes; otherwise the item's guarded group (every member that
-// is not free text) as it would be, beside the server's.
+// snapshot is the server's version and the hold p was computed from: its
+// own, from sync.proposal or a propose call, or else the listing's (the
+// listing's keep-mine proposal, or a daemon older than rev 17).
+func snapshot(h *daemon.HeldChange, p *daemon.Proposal) (json.RawMessage, *store.HoldInfo) {
+	if p.Current == nil {
+		return h.Current, h.Hold
+	}
+	return p.Current, p.Hold
+}
+
+// moved reports whether the server's version or the hold p was computed
+// from is not the listing's: the server changed in between.
+func moved(h *daemon.HeldChange, p *daemon.Proposal) bool {
+	cur, hold := snapshot(h, p)
+	return compact(cur) != compact(h.Current) || !sameHold(hold, h.Hold)
+}
+
+// sameHold reports whether a and b say the same of a hold, Reason (an
+// error's text) aside.
+func sameHold(a, b *store.HoldInfo) bool {
+	enc := func(h *store.HoldInfo) string {
+		if h == nil {
+			return ""
+		}
+		j, _ := json.Marshal(store.HoldInfo{Cause: h.Cause, Local: h.Local, Remote: h.Remote, Conflicts: h.Conflicts})
+		return string(j)
+	}
+	return enc(a) == enc(b)
+}
+
+// showMoved says that the server changed between the listing and p, and
+// shows what p was computed from: why it is held now, and every field of
+// the server's version that is not as listed.
+func (r *resolver) showMoved(h *daemon.HeldChange, p *daemon.Proposal) {
+	if !moved(h, p) {
+		return
+	}
+	e := r.e
+	cur, hold := snapshot(h, p)
+	e.printf("the server's version of change %d's item changed since it was listed; this proposal is against it as it is now:\n", h.N)
+	if hold != nil {
+		e.printf("  why now:  %s\n", causeText(hold.Cause))
+		for _, l := range conflictLines(h.Type, h.Seen, h.Want, cur, hold) {
+			e.printf("  conflict: %s\n", l)
+		}
+	} else {
+		e.printf("  why now:  nothing holds it any more\n")
+	}
+	if fields := differing(h.Current, cur); len(fields) > 0 {
+		tw := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "  FIELD\tLISTED\tSERVER NOW")
+		for _, f := range fields {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\n", oneLine(f), memberText(h.Current, f), memberText(cur, f))
+		}
+		tw.Flush()
+	}
+}
+
+// showProposal prints what a keep-mine, edit or --merge choice would
+// write: for a delete, that it deletes; otherwise every field of each
+// conflict, whole (every member of a conflicting unit, and of a
+// coupling's group, changed or not), and every other field the
+// replacement changes against the server's version (marked), beside the
+// server's. A secret field is named but never shown. The server's version
+// and the conflicts are those p was computed from, which its token
+// confirms; if they are not the listing's, it says so first.
 func (r *resolver) showProposal(h *daemon.HeldChange, p *daemon.Proposal) {
 	e := r.e
+	r.showMoved(h, p)
+	current, hold := snapshot(h, p)
 	what := "keep mine"
-	if p.Choice == daemon.ChoiceEdit {
+	switch p.Choice {
+	case daemon.ChoiceEdit:
 		what = "your edit"
+	case daemon.ChoiceKeepMineMerge:
+		what = "keep mine --merge"
+	case daemon.ChoiceTakeTheirsMerge:
+		what = "take theirs --merge"
 	}
 	if p.Action == merge.ActionDelete {
-		e.printf("%s deletes %s %q (%s)\n", what, oneLine(string(p.Type)), oneLine(itemName(p.Seen, h.Current)), oneLine(p.ItemID))
+		e.printf("%s deletes %s %q (%s)\n", what, oneLine(string(p.Type)), oneLine(itemName(p.Seen, current)), oneLine(p.ItemID))
 		return
 	}
 	id := p.ItemID
 	if p.NewID != "" {
 		id = p.NewID
 	}
-	e.printf("%s writes %s %s %q (%s); its protected fields would be:\n", what, oneLine(string(p.Action)), oneLine(string(p.Type)), oneLine(itemName(p.Want)), oneLine(id))
+	e.printf("%s writes %s %s %q (%s); its fields would be:\n", what, oneLine(string(p.Action)), oneLine(string(p.Type)), oneLine(itemName(p.Want)), oneLine(id))
 	m, _ := members(p.Want)
-	var guarded []string
-	for k := range m {
-		if merge.IsGuarded(p.Type, k) && !slices.Contains(secretMembers, k) {
-			guarded = append(guarded, k)
+	shown := map[string]bool{}
+	if hold != nil {
+		for _, k := range append(slices.Clone(hold.Local), hold.Remote...) {
+			shown[k] = true
+		}
+		for _, c := range hold.Conflicts {
+			for _, k := range merge.ConflictMembers(h.Type, c) {
+				shown[k] = true
+			}
 		}
 	}
-	slices.Sort(guarded)
+	cur, _ := members(current)
+	for k := range m {
+		if !slices.Contains(headerMembers, k) && compact(m[k]) != compactMember(current, k) {
+			shown[k] = true
+		}
+	}
+	for k := range cur {
+		if _, ok := m[k]; !ok && !slices.Contains(headerMembers, k) {
+			shown[k] = true // removed
+		}
+	}
+	var fields []string
+	for k := range shown {
+		fields = append(fields, k)
+	}
+	slices.Sort(fields)
 	tw := tabwriter.NewWriter(e.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "  FIELD\tWOULD BE\tSERVER NOW")
-	for _, k := range guarded {
+	for _, k := range fields {
+		if slices.Contains(secretMembers, k) {
+			fmt.Fprintf(tw, "  %s\t(secret, not shown)\t(secret, not shown)\n", oneLine(k))
+			continue
+		}
 		mark := ""
-		if compact(m[k]) != compactMember(h.Current, k) {
+		if compact(m[k]) != compactMember(current, k) {
 			mark = "  (changes)"
 		}
-		fmt.Fprintf(tw, "  %s\t%s\t%s%s\n", oneLine(k), memberText(p.Want, k), memberText(h.Current, k), mark)
+		fmt.Fprintf(tw, "  %s\t%s\t%s%s\n", oneLine(k), memberText(p.Want, k), memberText(current, k), mark)
 	}
 	tw.Flush()
+	if len(fields) == 0 {
+		e.printf("  (no field differs from the server's version)\n")
+	}
+	// Keep mine applies every field this device changed on top of the
+	// server's version: past a coupling that is the very combination the
+	// coupling held apart. It stays allowed, as the user confirms it, but
+	// it says so.
+	if p.Choice == daemon.ChoiceKeepMine && hold != nil {
+		for _, c := range hold.Conflicts {
+			if c.Kind == merge.ConflictCoupling {
+				e.printf("  note: this combines what coupling %s held apart; --keep-mine --merge keeps how it connects as yours\n", oneLine(c.Name))
+			}
+		}
+	}
 }
 
 func compactMember(raw json.RawMessage, k string) string {
@@ -661,9 +1000,12 @@ func compactMember(raw json.RawMessage, k string) string {
 // ask resolves h interactively.
 func (r *resolver) ask(h *daemon.HeldChange) error {
 	r.describe(h)
-	keys := map[string]string{"k": daemon.ChoiceKeepMine, "e": daemon.ChoiceEdit, "t": daemon.ChoiceTakeTheirs, "r": daemon.ChoiceRetry}
+	keys := map[string]string{
+		"k": daemon.ChoiceKeepMine, "m": daemon.ChoiceKeepMineMerge, "e": daemon.ChoiceEdit,
+		"s": daemon.ChoiceTakeTheirsMerge, "t": daemon.ChoiceTakeTheirs, "r": daemon.ChoiceRetry,
+	}
 	var offered []string
-	for _, k := range []string{"k", "e", "t", "r"} {
+	for _, k := range []string{"k", "m", "e", "s", "t", "r"} {
 		if slices.Contains(h.Choices, keys[k]) {
 			offered = append(offered, fmt.Sprintf("%s) %s", k, keys[k]))
 		}
@@ -694,8 +1036,8 @@ const maxStale = 3
 func (r *resolver) apply(h *daemon.HeldChange, choice string, req request) error {
 	if !slices.Contains(h.Choices, choice) {
 		msg := safef("%s is not offered for change %d (offered: %s)", choice, h.N, dash(joinOne(h.Choices, ", ")))
-		if choice == daemon.ChoiceKeepMine && h.KeepMineRefused != "" {
-			msg += safef(": %s", h.KeepMineRefused)
+		if why := refusedFor(h, choice); why != "" {
+			msg += safef(": %s", why)
 		}
 		return failf("%s", msg)
 	}
@@ -714,7 +1056,7 @@ func (r *resolver) apply(h *daemon.HeldChange, choice string, req request) error
 		if !ok {
 			return failf("change %d stays held", h.N)
 		}
-	case daemon.ChoiceKeepMine, daemon.ChoiceEdit:
+	case daemon.ChoiceKeepMine, daemon.ChoiceEdit, daemon.ChoiceKeepMineMerge, daemon.ChoiceTakeTheirsMerge:
 		for attempt := 1; ; attempt++ {
 			p, edited, err := r.propose(h, choice, req)
 			if err != nil {
@@ -766,14 +1108,19 @@ func (r *resolver) apply(h *daemon.HeldChange, choice string, req request) error
 	return r.report(h, choice, res, err)
 }
 
-// propose returns the proposal for keep-mine (from the held listing) or
-// for edit (from the daemon, for the edited item).
+// propose returns the proposal for keep-mine (from the held listing), for
+// a --merge choice (from the daemon, one at a time) or for edit (from the
+// daemon, for the edited item).
 func (r *resolver) propose(h *daemon.HeldChange, choice string, req request) (*daemon.Proposal, json.RawMessage, error) {
-	if choice == daemon.ChoiceKeepMine {
+	switch choice {
+	case daemon.ChoiceKeepMine:
 		if h.KeepMine == nil {
-			return nil, nil, failf("keep mine is not offered for change %d: %s", h.N, orUnknown(h.KeepMineRefused))
+			return nil, nil, failf("keep-mine is not offered for change %d: %s", h.N, orUnknown(h.KeepMineRefused))
 		}
 		return h.KeepMine, nil, nil
+	case daemon.ChoiceKeepMineMerge, daemon.ChoiceTakeTheirsMerge:
+		p, err := r.mergeProposal(h.N, choice)
+		return p, nil, err
 	}
 	sets := req.sets
 	if len(sets) == 0 && r.interactive {
@@ -798,7 +1145,7 @@ func (r *resolver) propose(h *daemon.HeldChange, choice string, req request) (*d
 		return nil, nil, failf("the daemon returned no proposal for the edit")
 	}
 	p := res.Proposal
-	p.Seen, p.Want = stripSecrets(p.Seen), stripSecrets(p.Want)
+	p.Seen, p.Want, p.Current = stripSecrets(p.Seen), stripSecrets(p.Want), stripSecrets(p.Current)
 	return p, edited, nil
 }
 
@@ -946,7 +1293,7 @@ func (r *resolver) unconfirmed(h *daemon.HeldChange, p *daemon.Proposal, req req
 		}
 	} else {
 		r.showProposal(h, p)
-		cmd := fmt.Sprintf("hop sync resolve %d --keep-mine --confirm %s", h.N, oneLine(p.Confirm))
+		cmd := fmt.Sprintf("hop sync resolve %d %s --confirm %s", h.N, choiceFlags(p.Choice), oneLine(p.Confirm))
 		if p.Choice == daemon.ChoiceEdit {
 			cmd = fmt.Sprintf("hop sync resolve %d --edit", h.N)
 			for _, s := range req.sets {

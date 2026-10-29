@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/store"
 	"github.com/dalyem/hopkey/internal/syncclient"
 )
@@ -401,4 +403,100 @@ func countWarnings(ws []string, sub string) int {
 		}
 	}
 	return n
+}
+
+// Two devices change different units of the same host before either sees
+// the other's change: rev 16 held that, rev 17 combines it, and the device
+// that combined them says so in sync.status, naming the host and the
+// fields each side changed, never a value (crypto spec rev 17, §5.4).
+func TestCombinedChangeLeavesANote(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.w.start(x.n2, x.n2.st, SyncOptions{})
+	h := webHost("web2", x.keyID, "203.0.113.40")
+	h.Tags = []string{"old"}
+	x.n1.putHost(h)
+	eventually(t, 10*time.Second, "web2 reaches the laptop", func() bool { return x.n2.host("web2") != nil })
+
+	x.n2.pause(true)
+	desk := *x.n1.host("web2")
+	desk.Addresses = []string{"203.0.113.41"}
+	x.n1.putHost(desk)
+	eventually(t, 10*time.Second, "the desk's edit is pushed", func() bool { return x.n1.status().Pending == 0 })
+	laptop := *x.n2.host("web2")
+	laptop.Tags = []string{} // a removal: it only narrows what tag:old reaches
+	x.n2.putHost(laptop)
+	x.n2.pause(false)
+
+	eventually(t, 10*time.Second, "the combined change reaches the desk", func() bool {
+		h := x.n1.host("web2")
+		return h != nil && len(h.Tags) == 0 && h.Addresses[0] == "203.0.113.41"
+	})
+	eventually(t, 5*time.Second, "the laptop notes the combination", func() bool {
+		return hasWarning(x.n2.status().Warnings, "web2", "tags", "addresses", "combined")
+	})
+	for _, w := range x.n2.status().Warnings {
+		if strings.Contains(w, "203.0.113.4") || strings.Contains(w, `"old"`) {
+			t.Errorf("the note quotes a value: %q", w)
+		}
+	}
+	if st := x.n2.status(); st.Held != 0 {
+		t.Errorf("held %d", st.Held)
+	}
+}
+
+// A coupling hold lists its conflicts and the --merge proposals in
+// sync.held, and keep-mine-merge resolves it with its token.
+func TestCouplingHoldOffersMergeProposals(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.w.start(x.n2, x.n2.st, SyncOptions{})
+	h := x.n1.putHost(webHost("web3", x.keyID, "203.0.113.50"))
+	eventually(t, 10*time.Second, "web3 reaches the laptop", func() bool { return x.n2.host("web3") != nil })
+
+	x.n2.pause(true)
+	time.Sleep(100 * time.Millisecond)
+	desk := *x.n1.host("web3")
+	desk.Addresses = []string{"203.0.113.51"}
+	x.n1.putHost(desk)
+	eventually(t, 10*time.Second, "the desk's edit is pushed", func() bool { return x.n1.status().Pending == 0 })
+	laptop := *x.n2.host("web3")
+	laptop.Aliases = []string{"test-db"}
+	laptop.Description = "from the laptop"
+	x.n2.putHost(laptop)
+	x.n2.pause(false)
+	eventually(t, 5*time.Second, "the laptop's change is held", func() bool { return x.n2.status().Held == 1 })
+
+	var held SyncHeldResult
+	x.n2.must(OpSyncHeld, nil, &held)
+	hc := held.Held[0]
+	if hc.Hold == nil || len(hc.Hold.Conflicts) != 1 || hc.Hold.Conflicts[0].Name != merge.CouplingSelectorAdded ||
+		hc.KeepMineMergeRefused != "" || hc.TakeTheirsMergeRefused != "" ||
+		!slices.Contains(hc.Choices, ChoiceKeepMineMerge) || !slices.Contains(hc.Choices, ChoiceTakeTheirsMerge) {
+		t.Fatalf("held %+v", hc)
+	}
+	// The listing names the --merge choices; sync.proposal has their
+	// proposals. Keep mine's stays in the listing, as before rev 17.
+	var km, tm SyncProposalResult
+	x.n2.must(OpSyncProposal, SyncProposalParams{N: hc.N, Choice: ChoiceKeepMineMerge}, &km)
+	x.n2.must(OpSyncProposal, SyncProposalParams{N: hc.N, Choice: ChoiceTakeTheirsMerge}, &tm)
+	if hc.KeepMine == nil || km.Proposal == nil || tm.Proposal == nil || km.Proposal.Confirm == tm.Proposal.Confirm ||
+		km.Proposal.Confirm == hc.KeepMine.Confirm {
+		t.Fatalf("proposals: keep mine %+v, --merge %+v and %+v", hc.KeepMine, km.Proposal, tm.Proposal)
+	}
+	if err := x.n2.call(OpSyncProposal, SyncProposalParams{N: hc.N + 1, Choice: ChoiceKeepMineMerge}, nil); !IsCode(err, CodeNotHeld) {
+		t.Errorf("a record that is not the held one: %v", err)
+	}
+	// take theirs --merge: the desk's address, no alias, the laptop's
+	// description.
+	var res SyncResolveResult
+	x.n2.must(OpSyncResolve, SyncResolveParams{N: hc.N, Choice: ChoiceTakeTheirsMerge, Confirm: tm.Proposal.Confirm}, &res)
+	eventually(t, 5*time.Second, "the merge reaches the desk", func() bool {
+		got := x.n1.host("web3")
+		return got != nil && got.Description == "from the laptop"
+	})
+	got := x.n1.host("web3")
+	if got.ItemID != h.ItemID || got.Addresses[0] != "203.0.113.51" || len(got.Aliases) != 0 {
+		t.Errorf("host %+v", got)
+	}
 }

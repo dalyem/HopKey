@@ -21,7 +21,7 @@ import (
 // dispatchSync handles the sync ops. handled is false for any other op.
 func (d *Daemon) dispatchSync(ctx context.Context, req Request) (result any, handled bool, err error) {
 	switch req.Op {
-	case OpSyncStatus, OpSyncNow, OpSyncHeld, OpSyncResolve, OpDevicesList:
+	case OpSyncStatus, OpSyncNow, OpSyncHeld, OpSyncProposal, OpSyncResolve, OpDevicesList:
 	default:
 		return nil, false, nil
 	}
@@ -47,6 +47,13 @@ func (d *Daemon) dispatchSync(ctx context.Context, req Request) (result any, han
 			return nil, true, err
 		}
 		res, err := d.opSyncHeld()
+		return res, true, err
+	case OpSyncProposal:
+		var p SyncProposalParams
+		if err := decodeStrict(req, &p); err != nil {
+			return nil, true, err
+		}
+		res, err := d.opSyncProposal(p)
 		return res, true, err
 	case OpSyncResolve:
 		var p SyncResolveParams
@@ -287,12 +294,44 @@ func (d *Daemon) syncStatus(devices bool) *SyncStatusResult {
 	return &out
 }
 
-// opSyncHeld lists the held outbox head with its keep-mine proposal.
+// heldTries is how many times opSyncHeld reads the held head again when
+// the server's version moved between reading it and proposing keep-mine.
+const heldTries = 3
+
+// opSyncHeld lists the held outbox head with its keep-mine proposal. It
+// names the --merge choices it offers but leaves their proposals to
+// opSyncProposal: the response carries the item at most five times over
+// (seen, want, current, and keep-mine's seen and want), which is what it
+// always carried. The hold's conflicts name members only, so they add
+// nothing of the item's size.
 func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 	st := d.sync.st
-	h, err := st.HeldHead()
-	if err != nil {
-		return nil, syncError(err)
+	var h *store.HeldRecord
+	var km *store.Proposal
+	kmErr := ""
+	for try := 1; ; try++ {
+		var err error
+		if h, err = st.HeldHead(); err != nil {
+			return nil, syncError(err)
+		}
+		if h == nil || h.Import {
+			break
+		}
+		p, err := st.Propose(store.Resolution{Choice: merge.ChoiceKeepMine})
+		if err != nil {
+			km, kmErr = nil, err.Error()
+			break
+		}
+		// The listing shows keep-mine beside its own Current and Hold, so
+		// they must be the ones it was computed from.
+		if p.N == h.N && bytes.Equal(p.Current, h.Current) && sameHold(p.Hold, h.Hold) {
+			km, kmErr = &p, ""
+			break
+		}
+		if try == heldTries {
+			km, kmErr = nil, "the server's version kept changing while it was listed: list it again"
+			break
+		}
 	}
 	out := &SyncHeldResult{Held: []HeldChange{}}
 	if h == nil {
@@ -304,21 +343,91 @@ func (d *Daemon) opSyncHeld() (*SyncHeldResult, error) {
 		Choices: []string{},
 	}
 	if !h.Import {
-		if p, err := st.Propose(store.Resolution{Choice: merge.ChoiceKeepMine}); err == nil {
-			hc.KeepMine = d.sync.proposalOf(p)
+		if km != nil {
+			hc.KeepMine = d.sync.proposalOf(*km)
+			hc.KeepMine.Current, hc.KeepMine.Hold = nil, nil
 		} else {
-			hc.KeepMineRefused = err.Error()
+			hc.KeepMineRefused = kmErr
 		}
+		// The --merge proposals exist only for a hold on a unit, class or
+		// coupling conflict; there is nothing to say otherwise.
+		offered := func(c merge.Choice, refused *string) bool {
+			if h.Hold == nil || len(h.Hold.Conflicts) == 0 {
+				return false
+			}
+			if _, err := st.Propose(store.Resolution{Choice: c}); err != nil {
+				*refused = err.Error()
+				return false
+			}
+			return true
+		}
+		keepMerge := offered(merge.ChoiceKeepMineMerge, &hc.KeepMineMergeRefused)
+		theirsMerge := offered(merge.ChoiceTakeTheirsMerge, &hc.TakeTheirsMergeRefused)
 		if hc.KeepMine != nil {
 			hc.Choices = append(hc.Choices, ChoiceKeepMine)
 		}
+		if keepMerge {
+			hc.Choices = append(hc.Choices, ChoiceKeepMineMerge)
+		}
 		if h.Hold != nil && editable(h.Type) {
 			hc.Choices = append(hc.Choices, ChoiceEdit)
+		}
+		if theirsMerge {
+			hc.Choices = append(hc.Choices, ChoiceTakeTheirsMerge)
 		}
 		hc.Choices = append(hc.Choices, ChoiceTakeTheirs, ChoiceRetry)
 	}
 	out.Held = append(out.Held, hc)
 	return out, nil
+}
+
+// opSyncProposal returns the proposal of one --merge choice for the held
+// record p.N, with its token and the server's version and hold it was
+// computed from: one item three times over, whatever its size.
+func (d *Daemon) opSyncProposal(p SyncProposalParams) (*SyncProposalResult, error) {
+	choice, err := parseChoice(p.Choice)
+	if err != nil {
+		return nil, err
+	}
+	if choice != merge.ChoiceKeepMineMerge && choice != merge.ChoiceTakeTheirsMerge {
+		return nil, invalidf("only %s and %s are proposed here; keep-mine's proposal is in %s, and edit's comes from %s with propose",
+			ChoiceKeepMineMerge, ChoiceTakeTheirsMerge, OpSyncHeld, OpSyncResolve)
+	}
+	st := d.sync.st
+	h, err := st.HeldHead()
+	if err != nil {
+		return nil, syncError(err)
+	}
+	if h == nil || h.N != p.N {
+		return nil, &Error{Code: CodeNotHeld, Message: fmt.Sprintf("queued change %d is not the held one; list it again with hop sync", p.N)}
+	}
+	prop, err := st.Propose(store.Resolution{Choice: choice})
+	if err != nil {
+		return nil, syncError(err)
+	}
+	if prop.N != p.N {
+		return nil, &Error{Code: CodeNotHeld, Message: fmt.Sprintf("queued change %d is not the held one; list it again with hop sync", p.N)}
+	}
+	return &SyncProposalResult{Proposal: d.sync.proposalOf(prop)}, nil
+}
+
+// sameHold reports whether a and b hold for the same reason. Reason, an
+// error's text, is left out.
+func sameHold(a, b *store.HoldInfo) bool {
+	return bytes.Equal(holdBytes(a), holdBytes(b))
+}
+
+// holdBytes encodes what a hold says, less its Reason: the cause, the
+// members each side changed and the conflicts.
+func holdBytes(h *store.HoldInfo) []byte {
+	if h == nil {
+		return nil
+	}
+	b, err := json.Marshal(store.HoldInfo{Cause: h.Cause, Local: h.Local, Remote: h.Remote, Conflicts: h.Conflicts})
+	if err != nil {
+		panic(err) // strings and lists of strings
+	}
+	return b
 }
 
 // editable reports whether an item type can be edited over the control
@@ -331,6 +440,7 @@ func (e *syncer) proposalOf(p store.Proposal) *Proposal {
 	out := &Proposal{
 		N: p.N, Choice: choiceName(p.Choice), Action: p.Action, ItemID: p.ItemID.String(), Type: p.Type,
 		Seen: redacted(p.Type, p.Seen), Want: redacted(p.Type, p.Want), Confirm: e.confirmToken(p).String(),
+		Current: redacted(p.Type, p.Current), Hold: p.Hold,
 	}
 	if !p.NewID.IsZero() {
 		out.NewID = p.NewID.String()
@@ -339,16 +449,23 @@ func (e *syncer) proposalOf(p store.Proposal) *Proposal {
 }
 
 // confirmToken is the token that confirms p: HMAC-SHA256, keyed with
-// this daemon's random confirmKey, of n and the store's digest c (§5.4).
-// c hashes the full replacement, a credential's password and a key's
+// this daemon's random confirmKey, of n, the store's digest c (§5.4), and
+// the server's version and the hold the proposal was computed from. c
+// hashes the full replacement, a credential's password and a key's
 // private key included, so on its own it would let anyone holding the
 // redacted proposal test guesses at them; the token is useless without
-// the key, and it still changes whenever c does.
+// the key, and it still changes whenever c does. With the server's version
+// and the hold in it, it also stops confirming once what was shown beside
+// the proposal is out of date, even if the replacement is not.
 func (e *syncer) confirmToken(p store.Proposal) crypto.Hash {
 	m := hmac.New(sha256.New, e.confirmKey[:])
-	m.Write([]byte("hopkey/daemon/resolve-confirm\x00"))
+	m.Write([]byte("hopkey/daemon/resolve-confirm\x01"))
 	m.Write(binary.BigEndian.AppendUint64(nil, p.N))
 	m.Write(p.Digest[:])
+	for _, b := range [][]byte{p.Current, holdBytes(p.Hold)} {
+		m.Write(binary.BigEndian.AppendUint64(nil, uint64(len(b))))
+		m.Write(b)
+	}
 	var out crypto.Hash
 	copy(out[:], m.Sum(nil))
 	return out
@@ -364,6 +481,10 @@ func choiceName(c merge.Choice) string {
 		return ChoiceTakeTheirs
 	case merge.ChoiceRetry:
 		return ChoiceRetry
+	case merge.ChoiceKeepMineMerge:
+		return ChoiceKeepMineMerge
+	case merge.ChoiceTakeTheirsMerge:
+		return ChoiceTakeTheirsMerge
 	}
 	return string(c)
 }
@@ -378,8 +499,13 @@ func parseChoice(s string) (merge.Choice, error) {
 		return merge.ChoiceTakeTheirs, nil
 	case ChoiceRetry:
 		return merge.ChoiceRetry, nil
+	case ChoiceKeepMineMerge:
+		return merge.ChoiceKeepMineMerge, nil
+	case ChoiceTakeTheirsMerge:
+		return merge.ChoiceTakeTheirsMerge, nil
 	}
-	return "", invalidf("choice must be %s, %s, %s or %s, not %q", ChoiceKeepMine, ChoiceEdit, ChoiceTakeTheirs, ChoiceRetry, s)
+	return "", invalidf("choice must be %s, %s, %s, %s, %s or %s, not %q",
+		ChoiceKeepMine, ChoiceKeepMineMerge, ChoiceEdit, ChoiceTakeTheirsMerge, ChoiceTakeTheirs, ChoiceRetry, s)
 }
 
 // redacted is an item's plaintext JSON without its secret: a key's
@@ -448,9 +574,10 @@ func (d *Daemon) opSyncResolve(ctx context.Context, p SyncResolveParams) (*SyncR
 			return nil, invalidf("confirm: %v", err)
 		}
 	}
-	needsConfirm := choice == merge.ChoiceKeepMine || choice == merge.ChoiceEdit
+	needsConfirm := choice == merge.ChoiceKeepMine || choice == merge.ChoiceEdit ||
+		choice == merge.ChoiceKeepMineMerge || choice == merge.ChoiceTakeTheirsMerge
 	if p.Propose && !needsConfirm {
-		return nil, invalidf("only %s and %s have a proposal", ChoiceKeepMine, ChoiceEdit)
+		return nil, invalidf("only %s, %s, %s and %s have a proposal", ChoiceKeepMine, ChoiceKeepMineMerge, ChoiceEdit, ChoiceTakeTheirsMerge)
 	}
 	if !needsConfirm && (p.Confirm != "" || p.NewID != "") {
 		return nil, invalidf("%s takes no confirm or new_id", p.Choice)
