@@ -441,7 +441,11 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 		res.ExitCode = ExitFailure
 		res.Error = fmt.Sprintf("timed out after %s", r.timeout)
 	case errors.As(runErr, &ee):
-		res.ExitCode, _ = exitCode(ee)
+		var exited bool
+		res.ExitCode, exited = exitCode(ee)
+		if !exited {
+			res.Error = "ssh was stopped (" + ee.Error() + ")"
+		}
 	default:
 		return res, failf("cannot run ssh: %v", runErr)
 	}

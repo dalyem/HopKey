@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -48,6 +50,67 @@ func TestPushToAServerThatStoppedAnsweringTimesOut(t *testing.T) {
 		st := x.n1.status()
 		return st.State == SyncBackingOff && st.LastError != "" && st.Pending == 1
 	})
+}
+
+// An explicit sync against a server that has stopped answering (packets
+// dropped on an established connection) fails within a few seconds and
+// says the server is unreachable, rather than waiting out the request
+// timeout or the HTTP/2 health check.
+func TestExplicitSyncToAServerThatStoppedAnsweringFailsFast(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.n1.must(OpSyncNow, nil, nil)
+	blackhole := interceptor(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		<-req.Context().Done()
+		return true
+	})
+	x.w.intercept.Store(&blackhole)
+	t.Cleanup(func() { x.w.intercept.Store(nil) })
+
+	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.10"))
+	start := time.Now()
+	err := x.n1.call(OpSyncNow, nil, nil)
+	took := time.Since(start)
+	if err == nil {
+		t.Fatal("sync.now succeeded against a server that does not answer")
+	}
+	if !IsCode(err, CodeUnreachable) || !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("sync.now error = %v, want an unreachable error that says so", err)
+	}
+	if took > 8*time.Second {
+		t.Errorf("sync.now took %s to fail, want about 5s", took)
+	}
+}
+
+// A session refusal that comes back just after an explicit sync's step
+// deadline is still a refusal: only an error the deadline caused becomes
+// "the server did not answer", so sessionEnded still sees the refusal.
+func TestSyncNowStepErrorKeepsTheServersAnswer(t *testing.T) {
+	expired, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-expired.Done()
+	caller := context.Background()
+	for _, err := range []error{store.ErrSessionEnded, fmt.Errorf("pull: %w", store.ErrSessionEnded), store.ErrDeviceRevoked, context.Canceled} {
+		if got := syncNowStepError(err, expired, caller); got != err {
+			t.Errorf("%v became %v", err, got)
+		}
+	}
+	for _, err := range []error{context.DeadlineExceeded, fmt.Errorf("get: %w", context.DeadlineExceeded), syncclient.ErrUnreachable} {
+		if got := syncNowStepError(err, expired, caller); !errors.Is(got, syncclient.ErrUnreachable) || !strings.Contains(got.Error(), "did not answer") {
+			t.Errorf("%v became %v, want the server did not answer", err, got)
+		}
+	}
+	// Before the deadline, or once the caller gave up, nothing changes.
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+	if got := syncNowStepError(context.DeadlineExceeded, live, caller); got != context.DeadlineExceeded {
+		t.Errorf("before the deadline: %v", got)
+	}
+	gone, cancelGone := context.WithCancel(context.Background())
+	cancelGone()
+	if got := syncNowStepError(context.DeadlineExceeded, expired, gone); got != context.DeadlineExceeded {
+		t.Errorf("caller gone: %v", got)
+	}
 }
 
 // hop auth devices shows when each device last talked to the server, not
