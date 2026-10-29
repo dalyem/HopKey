@@ -493,11 +493,13 @@ func TestMCPExecOnSeveralHostsWhereOneFails(t *testing.T) {
 	}
 }
 
+// exec keeps the end of a stream longer than 64 KiB: the cut leaves
+// cli.MCPCutRoom of the limit free.
 func TestMCPExecKeepsTheLast64KiB(t *testing.T) {
 	e := newE2E(t)
 	m := e.startMCP(t)
 	r := mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": "web-1", "command": "big"}).Results[0]
-	if r.ExitCode != 0 || !r.Truncated || len(r.Stdout) != 64<<10 || !strings.HasSuffix(r.Stdout, "zzzEND\n") {
+	if r.ExitCode != 0 || !r.Truncated || len(r.Stdout) != 64<<10-cli.MCPCutRoom || !strings.HasSuffix(r.Stdout, "zzzEND\n") {
 		t.Errorf("big: exit=%d truncated=%v len=%d tail=%q", r.ExitCode, r.Truncated, len(r.Stdout), r.Stdout[max(0, len(r.Stdout)-10):])
 	}
 }

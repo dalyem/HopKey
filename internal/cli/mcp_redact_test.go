@@ -383,8 +383,9 @@ func TestMCPRedactsTheSecretKey(t *testing.T) {
 func TestMCPRedactsASecretTheTailLimitCuts(t *testing.T) {
 	e, _, _ := redactWorld(t)
 	m := e.startMCP(t)
-	const limit = 64 << 10
-	// The last limit bytes begin 5 bytes before the secret's end.
+	// The cut keeps cli.MCPCutRoom bytes less than the 64 KiB limit: the
+	// last limit-MCPCutRoom bytes begin 5 bytes before the secret's end.
+	const limit = 64<<10 - cli.MCPCutRoom
 	after := " " + strings.Repeat("x", limit-7) + "\n"
 	for _, c := range []struct{ name, secret string }{{"password", vaultPassword}, {"token", githubToken}} {
 		leak := strings.Repeat("y", 1000) + " " + c.secret + after
@@ -749,7 +750,8 @@ func TestMCPOutputLimitHoldsAfterRedaction(t *testing.T) {
 // a stray byte the JSON encoding turns into U+FFFD.
 func TestMCPTailCutKeepsWholeRunes(t *testing.T) {
 	e := newE2E(t)
-	// 80,001 bytes: the last 64 KiB begin inside an é.
+	// 80,001 bytes: the last 64 KiB, less cli.MCPCutRoom, begin inside an
+	// é.
 	leak := strings.Repeat("é", 40000) + "\n"
 	e.server.mu.Lock()
 	e.server.leak = leak
@@ -761,7 +763,7 @@ func TestMCPTailCutKeepsWholeRunes(t *testing.T) {
 		if cmd == "leakerr" {
 			got = r.Stderr
 		}
-		if want := strings.Repeat("é", 32767) + "\n"; got != want || !r.Truncated {
+		if want := strings.Repeat("é", (64<<10-cli.MCPCutRoom)/2-1) + "\n"; got != want || !r.Truncated {
 			t.Errorf("%s: %d bytes beginning %.8q, truncated %v; want the last %d bytes, whole runes", cmd, len(got), got, r.Truncated, len(want))
 		}
 	}

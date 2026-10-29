@@ -12,3 +12,6 @@ func SetRedactHook(f func(texts [][]byte)) (restore func()) {
 	testHookRedact = f
 	return func() { testHookRedact = nil }
 }
+
+// MCPCutRoom is what hop mcp's cut to the output limit leaves free.
+const MCPCutRoom = cutRoom

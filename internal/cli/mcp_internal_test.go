@@ -330,6 +330,34 @@ func TestCapSpansCutsOnlyBetweenWholes(t *testing.T) {
 	}
 }
 
+// capFront cuts as capSpans does, and where the cut falls inside a line
+// of plain text, drops the rest of that line, unless nothing follows it.
+// A cut at a line's start, or past a marker, is kept as it is.
+func TestCapFrontDropsTheLineItCutsInto(t *testing.T) {
+	mk := span{text: "[redacted by hop: x]", kind: markerText, what: "x"}
+	for _, c := range []struct {
+		ss   []span
+		n    int
+		want string
+	}{
+		// The cut after "ab", after "abc" (the line's newline goes too),
+		// and at a line's start.
+		{[]span{{text: "abc\ndef\nghi"}}, 9, "def\nghi"},
+		{[]span{{text: "abc\ndef\nghi"}}, 8, "def\nghi"},
+		{[]span{{text: "abc\ndef\nghi"}}, 7, "def\nghi"},
+		// Nothing after the newline.
+		{[]span{{text: "abcdef\n"}}, 4, "def\n"},
+		// Between two spans of plain text, and past a marker.
+		{[]span{{text: "abc"}, {text: "def\ng", kind: typedText}}, 5, "g"},
+		{[]span{{text: "ab"}, mk, {text: "cd\nef"}}, 6, "cd\nef"},
+	} {
+		got, cut := capFront(c.ss, c.n)
+		if s := joinSpans(got); s != c.want || !cut {
+			t.Errorf("%q, n %d: %q cut %v, want %q", joinSpans(c.ss), c.n, s, cut, c.want)
+		}
+	}
+}
+
 // A disconnect's message, quoted by x/crypto, stands as it is quoted in
 // a span of its own, and as the server sent it beside, with where each of
 // its bytes was written; one that does not unquote is withheld with the
@@ -402,10 +430,10 @@ func TestCapSpansKeepsWholeEscapes(t *testing.T) {
 	}
 }
 
-// rescan looks again only at a stretch formatting wrote in, leaves the
-// markers and placeholders hop put in whole, though its secrets stand in
-// them, and hides a denied name that a marker it puts in leaves standing
-// on its own. (A daemon with no secrets, longest 0, is not asked.)
+// rescan looks again only at a stretch formatting wrote in, and leaves
+// the markers hop put in whole, though its secrets stand in them. A
+// denied name that a marker it puts in leaves standing on its own is
+// hidden after it. (A daemon with no secrets, longest 0, is not asked.)
 func TestRescanLooksOnlyAtWhatFormattingWrote(t *testing.T) {
 	l := &daemon.ListResult{Hosts: []model.Host{
 		{Header: model.Header{ItemID: model.ID{1}}, Name: "db", AgentAccess: "deny"},
@@ -413,15 +441,15 @@ func TestRescanLooksOnlyAtWhatFormattingWrote(t *testing.T) {
 	s := &mcpServer{secrets: []string{"h", "q?x"}}
 	m := s.masker(l)
 	mk := span{text: "[redacted by hop: x]", kind: markerText, what: "x"}
-	in := m.maskSpans([]span{{text: "db:22 q"}, {text: "?", fresh: true}, {text: "xdb"}, mk, {text: "q?x"}})
-	got, err := s.rescan(context.Background(), [][]span{in}, []bool{true}, m, 0, 0, false)
+	in := []span{{text: "db:22 q"}, {text: "?", fresh: true}, {text: "xdb"}, mk, {text: "q?x"}}
+	got, err := s.rescan(context.Background(), [][]span{in}, m.own, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The last "q?x" stood as it is when it was first scanned, so it is
 	// not looked at again.
 	want := hiddenHost + ":22 [redacted by hop]" + hiddenHost + "[redacted by hop: x]q?x"
-	if s := joinSpans(got[0]); s != want {
+	if s := m.hideSpans(got[0]); s != want {
 		t.Errorf("got %q, want %q", s, want)
 	}
 }
@@ -433,7 +461,7 @@ func TestRescanMakesWhatItDidNotCheckEarly(t *testing.T) {
 	s := &mcpServer{}
 	text := "a" + strings.Repeat("b", 100)
 	in := []span{{text: "a"}, {text: "?", fresh: true}, {text: strings.Repeat("b", 100)}}
-	got, err := s.rescan(context.Background(), [][]span{in}, []bool{false}, masker{}, 5, 10, false)
+	got, err := s.rescan(context.Background(), [][]span{in}, redact.Matcher{}, 5, 10, false)
 	if err != nil {
 		t.Fatal(err) // the daemon was asked: there is none here
 	}
