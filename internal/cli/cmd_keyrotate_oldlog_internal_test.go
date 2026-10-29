@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -44,15 +46,55 @@ func TestOldKeyVerdictReadsTheSSHLog(t *testing.T) {
 		// Small wording differences: another debug level, other methods.
 		{"other methods", strings.ReplaceAll(log("proto", "auth", "offer"), "debug1:", "debug2:") + "deploy@203.0.113.10: Permission denied (publickey,keyboard-interactive).\r\n", ""},
 		// ssh logs the host name in lower case.
-		{"host name", strings.Replace(log("proto", "auth", "offer", "denied"), "203.0.113.10", "web.example", 1), ""},
+		{"host name", strings.ReplaceAll(log("proto", "auth", "offer", "denied"), "203.0.113.10", "web.example"), ""},
+
+		// Only ssh's own last line, whole, counts. A server writes text of
+		// its own into the log: a disconnect's description (with newlines
+		// passed through), its identification string, debug messages.
+		{"a disconnect's description", log("proto", "auth", "offer") +
+			"Received disconnect from 203.0.113.10 port 2222:2: deploy@203.0.113.10: Permission denied (publickey).\r\n", "ended the connection itself"},
+		{"a disconnect's description on a line of its own", log("proto", "auth", "offer") +
+			"Received disconnect from 203.0.113.10 port 2222:2: bye\r\n" + lines["denied"] + "\r\n", "ended the connection itself"},
+		{"a disconnect, then ssh's line", log("proto", "auth", "offer") +
+			"Received disconnect from 203.0.113.10 port 2222:2: bye\r\n" + lines["denied"] + "\r\nDisconnected from 203.0.113.10 port 2222\r\n", "ended the connection itself"},
+		{"the server's identification", strings.Replace(log("proto", "auth", "offer"), "Ubuntu-3ubuntu13", "deploy@203.0.113.10: Permission denied (publickey).", 1) +
+			"Connection closed by 203.0.113.10 port 2222\r\n", "without the server refusing"},
+		{"a debug message with a newline, then the real end", log("proto", "auth", "offer") +
+			"debug1: Remote: hello\r\n" + lines["denied"] + "\r\nConnection closed by 203.0.113.10 port 2222\r\n", "without the server refusing"},
+		{"a refusal that is not the last line", log("proto", "auth", "offer", "nomore", "denied") + "debug1: later\r\n", "without the server refusing"},
+		{"another user", log("proto", "auth", "offer") + "root@203.0.113.10: Permission denied (publickey).\r\n", "without the server refusing"},
+		{"another host", log("proto", "auth", "offer") + "deploy@198.51.100.1: Permission denied (publickey).\r\n", "without the server refusing"},
+		{"no publickey among the methods", log("proto", "auth", "offer") + "deploy@203.0.113.10: Permission denied (password).\r\n", "without the server refusing"},
+		{"more on the line", log("proto", "auth", "offer") + "deploy@203.0.113.10: Permission denied (publickey). and more\r\n", "without the server refusing"},
+		// A log hop did not read to its end.
+		{"cut at the cap", log("proto", "auth", "offer", "nomore", "denied"), "cut short"},
+		{"no last line end", strings.TrimSuffix(log("proto", "auth", "offer", "nomore", "denied"), "\r\n"), "cut short"},
 	} {
 		addr := "203.0.113.10"
 		if c.name == "host name" {
 			addr = "Web.Example"
 		}
-		got := oldKeyVerdict(c.log, fp, addr, 2222)
+		got := oldKeyVerdict(c.log, c.name == "cut at the cap", fp, "deploy", addr, 2222)
 		if (c.want == "") != (got == "") || !strings.Contains(got, c.want) {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// readCapped says when the file goes on past what it read.
+func TestReadCappedSaysWhenItStopped(t *testing.T) {
+	name := filepath.Join(t.TempDir(), "log")
+	if err := os.WriteFile(name, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		max  int64
+		want string
+		cut  bool
+	}{{4, "0123", true}, {10, "0123456789", false}, {11, "0123456789", false}} {
+		got, cut, err := readCapped(name, c.max)
+		if err != nil || got != c.want || cut != c.cut {
+			t.Errorf("max %d: %q, cut %v, %v; want %q, cut %v", c.max, got, cut, err, c.want, c.cut)
 		}
 	}
 }

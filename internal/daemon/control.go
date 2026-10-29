@@ -602,16 +602,21 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 	if !ok {
 		return nil, &Error{Code: CodeNotFound, Message: "no host " + hostID.String()}
 	}
+	for _, want := range p.Chain {
+		if want.Conn == "" {
+			return nil, invalidf("chain: %s has no conn digest", want.ID)
+		}
+	}
 	cur := host
-	expect := map[model.ID]uint64{}
+	expect := map[model.ID]store.HostExpect{}
 	for i, want := range p.Chain {
-		if cur.ItemID.String() != want.ID || cur.ItemVersion != want.Version {
+		if cur.ItemID.String() != want.ID || cur.ItemVersion != want.Version || model.ConnDigest(cur, i == 0) != want.Conn {
 			if i == 0 {
 				return nil, changed("the host " + host.Name)
 			}
 			return nil, changed("the way to " + host.Name + " (jump host " + cur.Name + ")")
 		}
-		expect[cur.ItemID] = cur.ItemVersion
+		expect[cur.ItemID] = store.HostExpect{Version: want.Version, Conn: want.Conn}
 		if cur.JumpHostID.IsZero() {
 			if i != len(p.Chain)-1 {
 				return nil, changed("the way to " + host.Name)
@@ -634,9 +639,10 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 		d.opts.beforeHostKeyWrite()
 	}
 	// d.mu does not hold off a background pull, which can change a jump
-	// host after the snapshot: the encrypted store checks the versions again
-	// in the write's own transaction. Every other store has no writer
-	// outside d.mu.
+	// host after the snapshot, nor a held edit resolved in place, which
+	// changes an item at the same overlay version: the encrypted store
+	// checks the versions and connections again in the write's own
+	// transaction. Every other store has no writer outside d.mu.
 	var saved model.Host
 	if cs, ok := d.store.(conditionalHostStore); ok {
 		saved, err = cs.PutHostIfChain(ctx, h, expect)
@@ -663,7 +669,7 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 // conditionalHostStore is a store that checks a write's preconditions in
 // the write's own transaction (*store.Store).
 type conditionalHostStore interface {
-	PutHostIfChain(ctx context.Context, h model.Host, expect map[model.ID]uint64) (model.Host, error)
+	PutHostIfChain(ctx context.Context, h model.Host, expect map[model.ID]store.HostExpect) (model.Host, error)
 }
 
 func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error) {

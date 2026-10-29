@@ -1416,19 +1416,31 @@ func (e *ChangedError) Error() string {
 
 func (e *ChangedError) Is(target error) bool { return target == ErrChanged }
 
+// HostExpect is what PutHostIfChain requires of an item on a host's way:
+// a host, live at Version, whose model.ConnDigest is Conn. The digest of
+// the host being written covers its key too (withKey); a jump host's
+// does not.
+type HostExpect struct {
+	Version uint64
+	Conn    string
+}
+
 // PutHostIfChain is PutHost, written only while every item in expect is
-// live at the version it names: the host and each jump host on its way.
-// The check runs in the write's own transaction, under s.mu and the file
-// lock, so a pull that commits after the caller's snapshot is seen. A
-// mismatch is a *ChangedError, and nothing is written.
-func (s *Store) PutHostIfChain(_ context.Context, h model.Host, expect map[model.ID]uint64) (model.Host, error) {
+// as it names: the host and each jump host on its way, at the version and
+// with the connection it names. The check runs in the write's own
+// transaction, under s.mu and the file lock, on the items the write is
+// checked against (the overlay in a server-backed vault), so a pull that
+// commits after the caller's snapshot is seen, and so is a held edit
+// resolved in place, which changes an item without changing its overlay
+// version. A mismatch is a *ChangedError, and nothing is written.
+func (s *Store) PutHostIfChain(_ context.Context, h model.Host, expect map[model.ID]HostExpect) (model.Host, error) {
 	if expect == nil {
-		expect = map[model.ID]uint64{}
+		expect = map[model.ID]HostExpect{}
 	}
 	return s.putHost(h, expect)
 }
 
-func (s *Store) putHost(h model.Host, expect map[model.ID]uint64) (model.Host, error) {
+func (s *Store) putHost(h model.Host, expect map[model.ID]HostExpect) (model.Host, error) {
 	h = cloneHost(h)
 	for _, l := range []*[]string{&h.Aliases, &h.Addresses, &h.Tags, &h.HostKeys} {
 		if *l == nil {
@@ -1442,16 +1454,21 @@ func (s *Store) putHost(h model.Host, expect map[model.ID]uint64) (model.Host, e
 	return cloneHost(*out), nil
 }
 
-// checkExpect refuses the write unless each item in expect is live at the
-// version it names. at reads an item's current version.
-func checkExpect(expect map[model.ID]uint64, at func(model.ID) (uint64, bool)) error {
+// checkExpect refuses the write of dest unless each item in expect is as
+// it names (HostExpect). at reads an item as the write sees it.
+func checkExpect(expect map[model.ID]HostExpect, dest model.ID, at func(model.ID) (crypto.Item, bool)) error {
 	ids := make([]model.ID, 0, len(expect))
 	for id := range expect {
 		ids = append(ids, id)
 	}
 	slices.SortFunc(ids, func(a, b model.ID) int { return strings.Compare(a.String(), b.String()) })
 	for _, id := range ids {
-		if v, ok := at(id); !ok || v != expect[id] {
+		it, ok := at(id)
+		if !ok {
+			return &ChangedError{ID: id}
+		}
+		h, ok := it.(*model.Host)
+		if !ok || h.ItemVersion != expect[id].Version || model.ConnDigest(*h, id == dest) != expect[id].Conn {
 			return &ChangedError{ID: id}
 		}
 	}
@@ -1508,7 +1525,7 @@ func header(it crypto.Item) *model.Header {
 // server-backed vault the write is queued in the outbox, and the result is
 // the overlay item it shows. A non-nil expect makes the write conditional
 // (checkExpect), on the state the write itself is checked against.
-func put[T any](s *Store, it *T, typ model.Type, expect map[model.ID]uint64) (*T, error) {
+func put[T any](s *Store, it *T, typ model.Type, expect map[model.ID]HostExpect) (*T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sec == nil {
@@ -1532,9 +1549,9 @@ func put[T any](s *Store, it *T, typ model.Type, expect map[model.ID]uint64) (*T
 	}
 	check := func() error {
 		if expect != nil {
-			err := checkExpect(expect, func(id model.ID) (uint64, bool) {
-				cur, ok := s.state.Items[id]
-				return cur.ItemVersion, ok
+			err := checkExpect(expect, h.ItemID, func(id model.ID) (crypto.Item, bool) {
+				cur, ok := s.sec.Items[id]
+				return cur.Item, ok
 			})
 			if err != nil {
 				return err

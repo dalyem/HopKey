@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -120,9 +121,9 @@ type rotHost struct {
 	// jump is the ssh alias of the host's jump host, "" for none.
 	jump string
 	// ident is the record's connection as planned (connIdentity), and
-	// chain the versions of the record and of each jump host on its way
-	// (hostChain): hop points the host at the new key only while they
-	// still hold.
+	// chain the versions and connections of the record and of each jump
+	// host on its way (hostChain): hop points the host at the new key only
+	// while they still hold.
 	ident string
 	chain []daemon.ItemVersion
 	out   *RotateHost
@@ -743,9 +744,10 @@ type rotKeys struct {
 // oldCheck, that offer one key alone.
 type rotWays struct {
 	old, new, oldCheck rotSSH
-	// For oldRefused: the old key, the port oldCheck connects to, and the
-	// jump host, if any.
+	// For oldRefused: the old key, the user and port oldCheck connects
+	// as and to, and the jump host, if any.
 	oldPub ssh.PublicKey
+	user   string
 	port   int
 	jump   string
 }
@@ -764,6 +766,7 @@ func (e *Env) rotWays(h *rotHost, k *rotKeys, addr string) (*rotWays, error) {
 		new:      rotSSH{e: e, t: h.t, addr: addr, cfg: newCfg, dir: k.run.dir},
 		oldCheck: rotSSH{e: e, t: h.t, addr: addr, cfg: oldCfg, dir: k.run.dir},
 		oldPub:   k.oldPub,
+		user:     checkUser(h),
 		port:     checkPort(h.t.rr.Host),
 		jump:     h.jump,
 	}, nil
@@ -982,11 +985,11 @@ func (w *rotWays) oldRefused(ctx context.Context) string {
 	case sshOK(res, err):
 		return "the old key still logs in: the server accepts it from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
 	}
-	log, rerr := readCapped(logFile, sshLogMax)
+	log, cut, rerr := readCapped(logFile, sshLogMax)
 	if rerr != nil {
 		return safef("hop could not confirm that the old key is refused (it could not read the ssh log: %v)", rerr)
 	}
-	why := oldKeyVerdict(log, ssh.FingerprintSHA256(w.oldPub), w.oldCheck.addr, w.port)
+	why := oldKeyVerdict(log, cut, ssh.FingerprintSHA256(w.oldPub), w.user, w.oldCheck.addr, w.port)
 	if why == "" {
 		return ""
 	}
@@ -1004,35 +1007,63 @@ func (w *rotWays) oldRefused(ctx context.Context) string {
 // sshLogMax bounds the ssh debug log hop reads.
 const sshLogMax = 1 << 20
 
-func readCapped(name string, max int64) (string, error) {
+// readCapped reads up to max bytes of the file name, and says whether
+// there was more.
+func readCapped(name string, max int64) (string, bool, error) {
 	f, err := os.Open(name)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, max))
-	return string(b), err
+	b, err := io.ReadAll(io.LimitReader(f, max+1))
+	if int64(len(b)) > max {
+		return string(b[:max]), true, err
+	}
+	return string(b), false, err
 }
 
 const whyNotReached = "the check did not reach the server"
 
 // oldKeyVerdict reads the -vv log of a login that offered the old key, of
-// fingerprint fp, alone to addr:port, and returns "" only if it shows that
-// server refuse it; otherwise what it shows instead. All four must hold:
-// the server's transport came up ("Remote protocol version", "Authenticating
-// to addr:port"), ssh offered the old key ("Offering public key: ... fp"),
-// the server never accepted it ("Server accepts key: ... fp"), and the
-// login ended in the server's "Permission denied (publickey...)". These
-// are OpenSSH's debug1 and error lines, the same from 8.x to 9.x; checked
-// against 9.2 (Debian 12) and 9.6 (Ubuntu 24.04). The refusal comes after
+// fingerprint fp, alone to addr:port as user, and returns "" only if it
+// shows that server refuse it; otherwise what it shows instead. cut says
+// the log was longer than hop read. All of these must hold:
+//   - the server's transport came up ("Remote protocol version",
+//     "Authenticating to addr:port"),
+//   - ssh offered the old key ("Offering public key: ... fp"), and the
+//     server never accepted it ("Server accepts key: ... fp"),
+//   - the log is whole: not cut, and its last line ends,
+//   - nothing after the offer says the server ended the connection itself
+//     ("Received disconnect from", "Disconnected from"),
+//   - the last line is ssh's own verdict, and the whole of it is
+//     "user@addr: Permission denied (methods)." with publickey among the
+//     methods: the fatal error ssh ends with once the server has turned
+//     down every method it offered.
+//
+// Server-supplied text reaches the log: the remote software version,
+// "Remote: " debug messages, a disconnect's description. ssh passes a
+// newline in the last two through, so a server can write a line of its
+// own; no line counts for its content alone. A forged verdict is followed
+// by ssh's real last line, or preceded by the disconnect that carried it.
+//
+// These are OpenSSH's debug1 and fatal lines, the same from 8.x to 9.x,
+// checked against 9.2p1 (Debian 12) runs and 9.6p1's format strings
+// (Ubuntu 24.04): "%s@%s: Permission denied (%s).", unquoted, with the
+// host as in "Authenticating to", lower-cased. The refusal comes after
 // the key exchange, so from the server whose pinned host key ssh checked;
 // the jump host's ssh and the server's banner write to stderr, not to the
 // log.
-func oldKeyVerdict(log, fp, addr string, port int) string {
-	var reached, authTo, offered, accepted, signFailed, denied bool
-	authPrefix := strings.ToLower(fmt.Sprintf("Authenticating to %s:%d ", strings.Trim(addr, "[]"), port))
+func oldKeyVerdict(log string, cut bool, fp, user, addr string, port int) string {
+	var reached, authTo, offered, accepted, signFailed, endedByServer bool
+	host := strings.Trim(addr, "[]")
+	authPrefix := strings.ToLower(fmt.Sprintf("Authenticating to %s:%d ", host, port))
+	last := ""
 	for _, l := range strings.Split(log, "\n") {
 		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		last = l
 		if p, rest, ok := strings.Cut(l, ": "); ok && strings.HasPrefix(p, "debug") {
 			l = rest
 		}
@@ -1051,9 +1082,8 @@ func oldKeyVerdict(log, fp, addr string, port int) string {
 			accepted = true
 		case strings.Contains(l, "signing failed") || strings.Contains(l, "no such identity") || strings.HasPrefix(l, "Load key "):
 			signFailed = true
-		}
-		if i := strings.Index(l, "Permission denied ("); i >= 0 && strings.Contains(l[i:], "publickey") {
-			denied = true
+		case offered && (strings.HasPrefix(l, "Received disconnect from ") || strings.HasPrefix(l, "Disconnected from ")):
+			endedByServer = true
 		}
 	}
 	switch {
@@ -1067,10 +1097,33 @@ func oldKeyVerdict(log, fp, addr string, port int) string {
 		return "the server still accepts the old key, from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
 	case !offered:
 		return "ssh did not offer the old key (hop's agent could not list it)"
-	case !denied:
+	case cut || !strings.HasSuffix(log, "\n"):
+		return "the ssh log is cut short"
+	case endedByServer:
+		return "the server ended the connection itself after the old key was offered"
+	case !sshDenied(last, user, host):
 		return "the login ended without the server refusing the old key"
 	}
 	return ""
+}
+
+// sshDenied says whether line is the whole of ssh's verdict when the
+// server refused every method: "user@host: Permission denied (methods).",
+// with publickey among the methods. ssh writes host lower-cased.
+func sshDenied(line, user, host string) bool {
+	if user == "" || host == "" {
+		return false
+	}
+	rest, ok := strings.CutPrefix(line, user+"@")
+	if !ok || len(rest) < len(host) || !strings.EqualFold(rest[:len(host)], host) {
+		return false
+	}
+	methods, ok := strings.CutPrefix(rest[len(host):], ": Permission denied (")
+	if !ok {
+		return false
+	}
+	methods, ok = strings.CutSuffix(methods, ").")
+	return ok && slices.Contains(strings.Split(methods, ","), "publickey")
 }
 
 // putBack undoes ed on the host after why, and reports the host as failed
@@ -1143,9 +1196,9 @@ var setHostKey = func(ctx context.Context, e *Env, asJSON bool, p daemon.SetHost
 
 // repointHost sets the host's key to the new key in one conditional write:
 // the daemon makes it only while the record and every jump host on its way
-// are at the versions hop planned with (h.chain), so nothing that changes
-// where ssh connects can slip in between. When the write fails hop reads
-// the record back:
+// are at the versions and connections hop planned with (h.chain), so
+// nothing that changes where ssh connects can slip in between. When the
+// write fails hop reads the record back:
 //   - it names the new key and still reaches the server hop checked
 //     (connIdentity): the write went through and only its answer was lost,
 //     or another device made the same change. Done.
@@ -1190,18 +1243,14 @@ func (e *Env) repointHost(ctx context.Context, h *rotHost, k *rotKeys, asJSON bo
 	}
 }
 
-// connIdentity is what decides which server a record reaches and how: its
-// addresses, port, user, route, Tailscale link and pinned host keys, and
-// the same for each jump host on the way, in order.
+// connIdentity is what decides which server a record reaches and how:
+// model.ConnString of the record and of each jump host on the way, in
+// order.
 func connIdentity(h model.Host, hosts []model.Host) string {
 	var b strings.Builder
 	seen := map[model.ID]bool{}
 	for cur := h; ; {
-		ts := "-"
-		if t := cur.Tailscale; t != nil {
-			ts = fmt.Sprintf("%q %q %q", t.StableNodeID, t.DNSName, t.SSH)
-		}
-		fmt.Fprintf(&b, "%s %q %d %q %q %q %s;", cur.ItemID, cur.Addresses, cur.Port, cur.User, cur.Route, cur.HostKeys, ts)
+		b.WriteString(model.ConnString(cur) + ";")
 		if cur.JumpHostID.IsZero() || seen[cur.JumpHostID] {
 			return b.String()
 		}
@@ -1214,14 +1263,15 @@ func connIdentity(h model.Host, hosts []model.Host) string {
 	}
 }
 
-// hostChain is the version of h and of each jump host on its way, in
-// order, as daemon.OpSetHostKey checks them. It stops at a jump host that
-// is missing or seen before; the daemon refuses such a way.
+// hostChain is h and each jump host on its way, in order, as
+// daemon.OpSetHostKey checks them: each one's version and connection
+// (model.ConnDigest; h's with its key). It stops at a jump host that is
+// missing or seen before; the daemon refuses such a way.
 func hostChain(h model.Host, hosts []model.Host) []daemon.ItemVersion {
 	var out []daemon.ItemVersion
 	seen := map[model.ID]bool{}
 	for cur := h; ; {
-		out = append(out, daemon.ItemVersion{ID: cur.ItemID.String(), Version: cur.ItemVersion})
+		out = append(out, daemon.ItemVersion{ID: cur.ItemID.String(), Version: cur.ItemVersion, Conn: model.ConnDigest(cur, cur.ItemID == h.ItemID)})
 		seen[cur.ItemID] = true
 		if cur.JumpHostID.IsZero() || seen[cur.JumpHostID] {
 			return out
@@ -1516,10 +1566,7 @@ func (r *rotateRun) close() {
 func (e *Env) checkConfig(h *rotHost, addr string, a *keyAgent) (string, error) {
 	rec := h.t.rr.Host
 	alias := strings.ToLower(h.t.alias)
-	user := h.t.user
-	if user == "" {
-		user = rec.User
-	}
+	user := configUser(h)
 	port := checkPort(rec)
 	for _, v := range []string{addr, alias, user} {
 		if strings.ContainsFunc(v, func(r rune) bool { return r <= ' ' || r == 0x7f || strings.ContainsRune(`"\%#'`, r) }) {
@@ -1575,6 +1622,26 @@ func (e *Env) checkConfig(h *rotHost, addr string, a *keyAgent) (string, error) 
 }
 
 // checkPort is the port a check connects to.
+// configUser is the user a check's config names, "" for none.
+func configUser(h *rotHost) string {
+	if h.t.user != "" {
+		return h.t.user
+	}
+	return h.t.rr.Host.User
+}
+
+// checkUser is the user a check logs in as: the one its config names, or
+// else, as ssh does, the local user. "" when hop cannot tell.
+func checkUser(h *rotHost) string {
+	if u := configUser(h); u != "" {
+		return u
+	}
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return ""
+}
+
 func checkPort(rec *model.Host) int {
 	if rec.Port == 0 {
 		return 22

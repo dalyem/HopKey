@@ -26,8 +26,8 @@ func TestSetHostKeyIsConditionalOnTheWholeWay(t *testing.T) {
 	web := f.put(f.host("web", func(h *model.Host) { h.JumpHostID = bastion.ItemID; h.Description = "kept" }))
 	chain := func(hs ...model.Host) []ItemVersion {
 		var out []ItemVersion
-		for _, h := range hs {
-			out = append(out, ItemVersion{ID: h.ItemID.String(), Version: h.ItemVersion})
+		for i, h := range hs {
+			out = append(out, ItemVersion{ID: h.ItemID.String(), Version: h.ItemVersion, Conn: model.ConnDigest(h, i == 0)})
 		}
 		return out
 	}
@@ -64,6 +64,27 @@ func TestSetHostKeyIsConditionalOnTheWholeWay(t *testing.T) {
 	web2 = f.put(web2)
 	if err := set(chain(web, bastion2)); !IsCode(err, CodeChanged) {
 		t.Errorf("stale host: %v", err)
+	}
+	// The right versions, but not the connections the caller checked: the
+	// jump host at another address, the host on another key. Refused.
+	stale := chain(web2, bastion2)
+	b3 := bastion2
+	b3.Addresses = []string{"198.51.100.9"}
+	stale[1].Conn = model.ConnDigest(b3, false)
+	if err := set(stale); !IsCode(err, CodeChanged) {
+		t.Errorf("jump host with another connection: %v", err)
+	}
+	stale = chain(web2, bastion2)
+	w3 := web2
+	w3.KeyID = k2.ItemID
+	stale[0].Conn = model.ConnDigest(w3, true)
+	if err := set(stale); !IsCode(err, CodeChanged) {
+		t.Errorf("host on another key: %v", err)
+	}
+	stale = chain(web2, bastion2)
+	stale[1].Conn = ""
+	if err := set(stale); !IsCode(err, CodeInvalid) {
+		t.Errorf("chain without a connection digest: %v", err)
 	}
 	if got := webNow(); got.KeyID != f.key.ItemID {
 		t.Fatalf("a refused write moved the host to %v", got.KeyID)
@@ -180,7 +201,8 @@ func TestSetHostKeyRefusesAJumpHostAPullChanged(t *testing.T) {
 	pushAll(x.n2.st, r2)
 
 	err = x.n1.call(OpSetHostKey, SetHostKeyParams{HostID: web.ItemID.String(), KeyID: k2.ItemID.String(), Chain: []ItemVersion{
-		{ID: web.ItemID.String(), Version: web.ItemVersion}, {ID: bastion.ItemID.String(), Version: seen},
+		{ID: web.ItemID.String(), Version: web.ItemVersion, Conn: model.ConnDigest(web, true)},
+		{ID: bastion.ItemID.String(), Version: seen, Conn: model.ConnDigest(bastion, false)},
 	}}, nil)
 	if !fired.Load() {
 		t.Fatal("the hook never ran")
