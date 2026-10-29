@@ -127,6 +127,34 @@ type Tx interface {
 	// DeleteExpired removes sessions, login tokens, challenges and
 	// mailboxes that expired before now.
 	DeleteExpired(now time.Time) error
+
+	// The operator's view (hop-server accounts, invites and audit).
+
+	// AccountSummaries returns every account, or only the one with ID
+	// only when it is not nil, with its vault head and device counts,
+	// oldest first.
+	AccountSummaries(only *model.ID) ([]*AccountSummary, error)
+	// Devices returns every device the account has had, in the order they
+	// were added.
+	Devices(accountID model.ID) ([]*Device, error)
+	// LiveSessions counts the account's unexpired sessions per device.
+	LiveSessions(accountID model.ID, now time.Time) (map[model.ID]int, error)
+	// CountLoginTokens counts the account's unexpired login and recovery
+	// tokens.
+	CountLoginTokens(accountID model.ID, now time.Time) (int, error)
+	// CountAccountMailboxes counts the unexpired enrollment mailboxes the
+	// account claimed.
+	CountAccountMailboxes(accountID model.ID, now time.Time) (int, error)
+	// Registrations returns the invites for one normalized email, or all of
+	// them when email is "", oldest first.
+	Registrations(email string) ([]*Registration, error)
+	// ExpireRegistration makes an unused, unexpired invite expire at at. It
+	// fails with ErrNotFound when the invite is used, expired or absent.
+	ExpireRegistration(capHash crypto.Hash, at time.Time) error
+	// InsertAudit appends a row to the admin audit trail and sets its ID.
+	InsertAudit(e *AuditEntry) error
+	// AuditEntries returns the audit rows the filter selects, oldest first.
+	AuditEntries(f AuditFilter) ([]*AuditEntry, error)
 }
 
 // Account is one account and the values the server derives from the latest
@@ -278,11 +306,12 @@ type ChallengeScope struct {
 // Registration is a registration capability (an invite) and, once used,
 // its publication acknowledgment.
 type Registration struct {
-	CapHash   crypto.Hash
-	Email     string // normalized
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	Ack       *Ack // set when consumed
+	CapHash    crypto.Hash
+	Email      string // normalized
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	Ack        *Ack      // set when consumed
+	ConsumedAt time.Time // set when consumed
 }
 
 // Ack is a publication acknowledgment (R3): the original upload head and
