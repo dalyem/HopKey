@@ -142,34 +142,78 @@ def m_agent():
     return st == 'keys', 'ssh-add -L on hop\'s agent: %s (%s)' % (st, v)
 
 
+NO_VAULT = 'there is no vault on this device'
+
+
+def proven_wipe():
+    """'' when tester's store (the one hop mcp runs on) holds what a proven revocation leaves:
+    no vault, no device.key, no generated ~/.ssh/hop files, and a readable revocation.json.
+    Otherwise why not: a bare empty store is no evidence of a revocation."""
+    w = wiped_state()
+    if w['vault_files'] or w['device_key'] or w['ssh_hop_files']:
+        return 'the store is not wiped: %s' % json.dumps(w)
+    try:
+        rec = json.load(open('/home/tester/.local/share/hop/revocation.json'))
+    except (OSError, ValueError) as e:
+        return 'no readable revocation.json beside the empty store (%s)' % e.__class__.__name__
+    return '' if isinstance(rec, dict) and rec else 'revocation.json holds no record'
+
+
 def m_mcp():
-    """Works when exec on t1 runs or list_hosts lists hosts. Denied only on one of hop's
-    own refusals (mcpc.REFUSAL: revoked, locked, offline too long, no vault): both tool
-    calls answer with one, or hop mcp exits with one. Any other answer, an EOF, a hang
-    or a crash raises: it says nothing about access."""
+    """Works when list_hosts lists hosts or exec on t1 ran, whatever else hop mcp did:
+    observed access is judged first. Denied only on one of hop's own refusals
+    (mcpc.REFUSAL): both tool calls answer with one, or hop mcp exits with one before
+    any tool call got an answer. "There is no vault on this device" counts only where a
+    proven revocation's wipe of this same store (tester's) is seen in this step, before
+    and after the session. Any other answer, an EOF, a hang or a crash raises: it says
+    nothing about access."""
+    pre = proven_wipe()
     m = MCP(tag='p5-mcp')
     nh, lerr, ltext, eerr, st2, etext = 0, None, '', None, None, ''
+    tool_answers = 0
     if m.healthy:
         lerr, st, ltext = m.call('list_hosts', {})
+        tool_answers += 'transport' not in m.last_raw
         nh = len((st or {}).get('hosts', []))
     if m.healthy:
         eerr, st2, etext = m.call('exec', {'hosts': 't1', 'command': 'echo mcp-exec-ok'})
+        tool_answers += 'transport' not in m.last_raw
     m.close()
     tr = m.transport()
+    host = results(st2).get('t1', {})
+    # Ran: the marker came back, or hop reports the command ran on t1 and exited 0 (output lost).
+    ran = 'mcp-exec-ok' in (host.get('stdout') or '') or (bool(host) and not host.get('error') and host.get('exit_code') == 0)
+    if nh > 0 or ran:
+        return True, 'list_hosts %d hosts; exec on t1 %s (exit %s), stdout %r (transport %s)' % (
+            nh, 'ran' if ran else 'did not run', host.get('exit_code'), L.cut(host.get('stdout') or '', 80), tr)
     if tr == 'broken':
         raise HarnessError('hop mcp gave no real answer: ' + m.why())
+
+    def accept(why):
+        """why is one of hop's refusals; no vault only with the proven wipe seen around the session."""
+        if why != NO_VAULT:
+            return ''
+        post = proven_wipe()
+        return pre or post
     if tr == 'refused':
-        return False, 'hop mcp exited with hop\'s refusal "%s": %s' % (refusal(m.stderr()), m.why())
-    host = results(st2).get('t1', {})
-    if 'mcp-exec-ok' in (host.get('stdout') or '') or nh > 0:
-        return True, 'list_hosts %d hosts; exec stdout %r' % (nh, L.cut(host.get('stdout') or '', 80))
+        rf = refusal(m.stderr())
+        if tool_answers:
+            raise HarnessError('hop mcp exited with "%s" after answering %d tool call(s): a refusal counts only before any '
+                               'tool access, or as an answer to both calls: %s' % (rf, tool_answers, m.why()))
+        bad = accept(rf)
+        if bad:
+            raise HarnessError('hop mcp exited with "%s", but %s: %s' % (rf, bad, m.why()))
+        return False, 'hop mcp exited at start-up, before any tool call, with hop\'s refusal "%s": %s' % (rf, m.why())
     # Not working: only hop's own refusal, in both answers, counts as a denial.
     ewhy = etext if eerr and not st2 else json.dumps(host.get('error'))
-    lr, er = refusal(ltext) if lerr else '', refusal(ewhy)
+    lr, er = refusal(ltext) if lerr else '', refusal(ewhy) if (eerr or host.get('error')) else ''
     ev = 'list_hosts isError=%s %s; exec isError=%s %s' % (lerr, L.cut(ltext, 200), eerr, L.cut(ewhy, 200))
     if lr and er:
+        bad = accept(lr) or accept(er)
+        if bad:
+            raise HarnessError('hop mcp answered "%s" / "%s", but %s: %s' % (lr, er, bad, ev))
         return False, 'refused: list_hosts "%s", exec "%s"' % (lr, er)
-    raise HarnessError('hop mcp answered, but neither with access nor with one of hop\'s refusals: ' + ev)
+    raise HarnessError('hop mcp answered, but neither with access nor with one of hop\'s refusals in both calls: ' + ev)
 
 
 def m_localb():

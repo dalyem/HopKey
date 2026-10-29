@@ -21,6 +21,12 @@ EMAIL = L.env_get('HK_EMAIL')
 PTYLOG = '/var/e2e/logs/pty-blogin.log'
 INBOX = '/var/e2e/state/blogin.in'
 REF_FIELDS = 'README, Sync: "Two changes to different protected fields of one item are held too."'
+DAEMON_LOG = '/home/tester/.local/state/hop/daemon.log'
+
+
+def cf3_notice(text):
+    """The line of text that notes B's description edit of cf3 replaced another value, or ''."""
+    return next((l for l in (text or '').splitlines() if '"cf3"' in l and 'description' in l and 'replaced' in l), '')
 
 
 def block(on):
@@ -247,9 +253,28 @@ def step_conflict_check():
       '(never the values)', drained and 'cf3' not in ever and desc == 'fromB' and bool(note) and 'fromA' not in note and 'fromB' not in note,
       'held: %s; final description %r; note: %s' % (ever, desc, note or ('none of %d replaced-edit notes names cf3' % len(notes) if drained
                                                                         else 'not judged: the queue did not drain')), '', 'r1-P3-1')
-    if note:
-        r = hop('sync', timeout=40)
-        L.log('hop sync with the note', r.all)
+    # The README promises the note in hop status, hop sync and the daemon log (until the daemon
+    # restarts): each must name cf3 and the field, and none may carry either value.
+    if drained:
+        rs = hop('status', timeout=40)
+        rsy = hop('sync', timeout=70)
+        try:
+            dlog = open(DAEMON_LOG).read()
+        except OSError as e:
+            dlog = ''
+            L.log('no daemon.log on B: %s' % e)
+        outs = {'hop status': rs.all, 'hop sync': rsy.all, 'daemon.log': dlog}
+        found = {k: cf3_notice(v) for k, v in outs.items()}
+        leaks = {k: [x for x in ('fromA', 'fromB') if x in v] for k, v in outs.items()}
+        leaks = {k: v for k, v in leaks.items() if v}
+        missing = [k for k, v in found.items() if not v]
+        c('B.conflict-notice-shown', 'B, whose description edit won, names cf3 and the field in hop status, hop sync and its daemon log, '
+          'never the values', not missing and not leaks,
+          'missing from: %s; values present in: %s; hop status rc %d, hop sync rc %d' % (missing or 'none', leaks or 'none', rs.rc, rsy.rc),
+          ' | '.join('%s: %s' % (k, L.cut(v or '(none)', 300)) for k, v in found.items()), 'r1-P3-1')
+    else:
+        c('B.conflict-notice-shown', 'B, whose description edit won, names cf3 and the field in hop status, hop sync and its daemon log, '
+          'never the values', False, 'not judged: the queue did not drain', '', 'r1-P3-1')
     if 'cf1' in resolved:
         r = resolved['cf1']
         c('B.resolve-theirs', 'hop sync resolve --take-theirs keeps the server\'s user', r.rc == 0 and hs.get('cf1', {}).get('user') == 'uA',

@@ -10,9 +10,19 @@
 set -u
 conf=/etc/ssh/sshd_config
 hook=/usr/local/sbin/hk-e2e-ak
+# deploy's authorized-keys settings under the stock config, recorded at setup: restore must match it.
+base=/var/e2e/sshd-ak.orig
+ctx=user=deploy,host=localhost,addr=127.0.0.1
+# akcfg [sshd args]: the authorizedkeysfile and authorizedkeyscommand lines sshd -T gives deploy; fails when sshd -T does.
+akcfg() {
+	t=$(/usr/sbin/sshd -T -C $ctx "$@" 2>&1) || { echo "sshd -T failed: $t" | tail -3; return 1; }
+	printf '%s\n' "$t" | grep -iE '^authorizedkeys(file|command) ' | sort
+}
 case ${1:-} in
 setup)
 	[ -f $conf.hk-e2e-orig ] || cp -p $conf $conf.hk-e2e-orig
+	b=$(akcfg -f $conf.hk-e2e-orig) || { echo "stock config: $b"; exit 1; }
+	printf '%s\n' "$b" >$base
 	install -d -m 755 /etc/ssh/hk-e2e-ak
 	install -m 644 /home/deploy/.ssh/authorized_keys /etc/ssh/hk-e2e-ak/deploy
 	: >/var/e2e/ak-hook.log
@@ -40,13 +50,18 @@ esac
 /usr/sbin/sshd -t || { echo "sshd -t failed"; exit 1; }
 kill -HUP "$(cat /run/sshd.pid)" || { echo "no sshd to reload"; exit 1; }
 sleep 1
-# What sshd now runs for deploy: the hook after setup, the stock file after restore.
-eff=$(/usr/sbin/sshd -T -C user=deploy,host=localhost,addr=127.0.0.1 2>&1 | grep -i '^authorizedkeyscommand ')
+# What sshd now runs for deploy: the hook after setup, the stock settings after restore.
+eff=$(akcfg) || { echo "$eff"; exit 1; }
+cmd=$(printf '%s\n' "$eff" | grep -i '^authorizedkeyscommand ')
 case $1 in
-setup) case $eff in *"$hook"*) ;; *) echo "sshd -T does not show the hook: $eff"; exit 1 ;; esac ;;
+setup) case $cmd in *"$hook"*) ;; *) echo "sshd -T does not show the hook: $cmd"; exit 1 ;; esac ;;
 restore)
 	grep -q 'hk-e2e phase 6' $conf && { echo "the phase 6 block is still in $conf"; exit 1; }
-	case $eff in *hk-e2e*) echo "sshd -T still shows the hook: $eff"; exit 1 ;; esac
+	case $cmd in [Aa]uthorized[Kk]eys[Cc]ommand' none') ;; *) echo "sshd -T does not show AuthorizedKeysCommand none: $cmd"; exit 1 ;; esac
+	printf '%s\n' "$eff" | grep -qiE '^authorizedkeysfile .*\.ssh/authorized_keys' ||
+		{ echo "sshd -T does not read ~/.ssh/authorized_keys: $eff" | tr '\n' ' '; exit 1; }
+	[ -s $base ] || { echo "no stock settings recorded at setup ($base)"; exit 1; }
+	[ "$eff" = "$(cat $base)" ] || { echo "sshd -T differs from the stock config: now $eff; stock $(cat $base)" | tr '\n' ' '; exit 1; }
 	;;
 esac
 echo ok

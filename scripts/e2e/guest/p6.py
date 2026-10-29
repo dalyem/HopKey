@@ -417,6 +417,12 @@ def step_judge_rollback():
           len(probes), len(installed), 'lacks' if restored else 'still holds'), L.cut('\n'.join(lines[-12:]), 1000))
 
 
+# hop key rotate's reason when authorized_keys changed under its edit, and the endings of a
+# failure that left the host as it was (internal/cli/cmd_keyrotate.go, cmd_keyrotate_ak.go).
+EDIT_CONFLICT = '~/.ssh/authorized_keys changed while hop was editing it'
+SAFE_ENDS = ('; nothing was changed', '; put back as it was, and it keeps the old key')
+
+
 def step_cc(rnd, start):
     """Rotate whatever key r-cc uses now, starting at start + 2 s on A's clock: the
     appender on T1 starts at start on its own, so the rotation runs among its writes."""
@@ -483,13 +489,22 @@ def step_judge_cc(rnd, manual, interval):
     has_old = any((split_line(l) or ('', ''))[1] == oldb for l in lines)
     has_new = bool(newb) and any((split_line(l) or ('', ''))[1] == newb for l in lines)
     lost = [l for l in others_b if l and l not in lines]
-    status = st.get('status')
+    status, rstate, reason = st.get('status'), st.get('remote_state'), st.get('reason') or ''
+    # The rotation must have reached the edit: rotated through it, or stopped by hop's own
+    # conflict check on authorized_keys and left with the old key. Any other failure (ssh
+    # auth, a step before the edit) leaves the file alone and proves nothing about appends.
+    if status == 'rotated':
+        exercised = rstate == 'old_key_removed'
+    elif status == 'failed':
+        exercised = rstate == 'unchanged' and EDIT_CONFLICT in reason and reason.endswith(SAFE_ENDS)
+    else:
+        exercised = False
     consistent = (status == 'rotated' and has_new and not has_old) or (status == 'failed' and has_old and not has_new)
-    c(cid, label, not wrong and not extra and consistent and not lost,
-      'rotation of %s %s (%s); %d appends, %d inside the rotation (#%s); tagged lines not exactly once: %s; unexpected tagged lines: %d; '
+    c(cid, label, not wrong and not extra and exercised and consistent and not lost,
+      'rotation of %s %s (%s)%s; %d appends, %d inside the rotation (#%s); tagged lines not exactly once: %s; unexpected tagged lines: %d; '
       'earlier lines lost: %d; old key line %s, new key line %s; %s; %s' % (
-          st.get('key'), status, st.get('remote_state'), manual, len(during), ','.join(map(str, during[:10])), wrong or 'none', len(extra),
-          len(lost), has_old, has_new, window, st.get('reason') or ''), after)
+          st.get('key'), status, rstate, '' if exercised else ' without reaching the edit or its conflict check', manual, len(during),
+          ','.join(map(str, during[:10])), wrong or 'none', len(extra), len(lost), has_old, has_new, window, reason), after)
 
 
 STEPS = {'supported': step_supported, 'keys': step_keys, 'b-target': step_b_target, 'hosts': step_hosts, 'b-wait': step_b_wait,
