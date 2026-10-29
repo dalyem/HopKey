@@ -13,7 +13,7 @@ import time
 
 import e2elib as L
 from e2elib import check as c, hop, has, root, ssh, skip
-from mcpc import MCP, results
+from mcpc import MCP, require_ok, results
 
 M = L.MACHINE
 E = L.env_get
@@ -24,6 +24,7 @@ TARGETS = ('t1', 't2', 't3')
 
 
 def step_a_add():
+    L.ensure_include()
     L.ensure_testkey()
     hs = L.hosts() or {}
     for name, addr in (('t1', T1S), ('t2', T2F), ('t3', T3IP)):
@@ -34,11 +35,11 @@ def step_a_add():
     r = hop('which', 't1', '--json')
     j = r.json() or {}
     c('A.which-short', 'a short MagicDNS name is recognised as a tailnet address', (j.get('route') or {}).get('chosen') == 'tailnet',
-      'route %s' % json.dumps(j.get('route'))[:200], r.ev('which t1'), 'r2-P3-1')
+      'route %s' % L.cut(json.dumps(j.get('route')), 200), r.ev('which t1'), 'r2-P3-1')
     for h in ('t2', 't3'):
         r = hop('which', h, '--json')
         j = r.json() or {}
-        c('A.which-' + h, 'hop which %s routes via the tailnet' % h, (j.get('route') or {}).get('chosen') == 'tailnet', json.dumps(j.get('route'))[:200])
+        c('A.which-' + h, 'hop which %s routes via the tailnet' % h, (j.get('route') or {}).get('chosen') == 'tailnet', L.cut(json.dumps(j.get('route')), 200))
     r = hop('check', 't1')
     c('A.check-unpinned', 'hop check before trust: TCP reaches T1 over the tailnet, the pin step fails and names hop trust',
       r.rc == 255 and has(r.out, '[pass] tcp_reachable', '[fail] host_key_pinned', 'hop trust t1'), '', r.ev('check t1'))
@@ -87,7 +88,7 @@ def step_a_jump():
       '', r.ev('exec t2inner'))
     r = ssh('t2inner', 'echo plain-jump-ok', extra=['-v'])
     c('A.jump-ssh', 'plain ssh t2inner goes through the jump host', r.rc == 0 and 'plain-jump-ok' in r.out and 'proxy' in r.err.lower(),
-      '', '\n'.join(l for l in r.all.splitlines() if 'proxy' in l.lower() or 'plain-jump' in l)[:500])
+      '', L.cut('\n'.join(l for l in r.all.splitlines() if 'proxy' in l.lower() or 'plain-jump' in l), 500))
     skip('A.jump-only', 'port 2222 is reachable only through T2',
          'not provable here: userspace tailscaled on a sandbox forwards inbound tailnet traffic to loopback (REPORT-r2 A7c)')
 
@@ -110,7 +111,7 @@ def step_a_ts():
     r = hop('which', 't1', '--json')
     j = r.json() or {}
     c('A.ts-which', 'after linking, t1 routes via the tailnet IP', (j.get('route') or {}).get('chosen') == 'tailnet' and (j.get('route') or {}).get('address') == T1IP,
-      json.dumps(j.get('route'))[:200])
+      L.cut(json.dumps(j.get('route')), 200))
     bad = []
     for name in (T1S, T3S, T3F):
         r = hop('exec', name, '--', 'echo', 'tsname-ok', timeout=60)
@@ -127,10 +128,11 @@ def step_a_ts_b():
       '', r.ev('ts import') + '\n' + r2.ev('exec'))
     rc, out = L.pty_run('tester', ['hop', BS], [(r'\$ $', 'echo in-hop-shell-$(hostname)-$(id -un)-$(tty); exit 3')], timeout=60)
     c('A.tsb-shell', 'interactive hop <CLI-B node> on a pty (the sandboxes have no pty)', rc == 3 and 'in-hop-shell-' in out and '-target-/dev/pts' in out,
-      'pty exit %d' % rc, out[-300:])
+      'pty exit %d' % rc, L.cut(out, -300))
 
 
 def step_b_use():
+    L.ensure_include()
     want = {'t1', 't2', 't3', 't2inner'}
     got, secs = L.wait_for(lambda: want <= set(L.hosts() or {}), 60, 1)
     hs = L.hosts() or {}
@@ -163,14 +165,15 @@ def step_b_mcp():
     names = sorted(h['name'] for h in (st or {}).get('hosts', []))
     c('B.mcp-list', 'MCP on B: list_hosts tag ts', set(names) >= {'t1', 't2', 't3', 't2inner'}, 'names %s' % names)
     _, st, _ = m.call('resolve_host', {'target': T3S})
-    c('B.mcp-resolve', 'MCP resolve_host by Tailscale name', ((st or {}).get('host') or {}).get('name') == 't3', json.dumps(st)[:200])
+    c('B.mcp-resolve', 'MCP resolve_host by Tailscale name', ((st or {}).get('host') or {}).get('name') == 't3', L.cut(json.dumps(st), 200))
     _, st, _ = m.call('check_host', {'host': 't1'})
-    c('B.mcp-check', 'MCP check_host t1', (st or {}).get('ok') is True, json.dumps(st)[:300])
+    c('B.mcp-check', 'MCP check_host t1', (st or {}).get('ok') is True, L.cut(json.dumps(st), 300))
     _, st, _ = m.call('exec', {'hosts': 'tag:ts', 'command': 'echo mcp-b-ok'})
     res = results(st)
     c('B.mcp-exec', 'MCP exec tag:ts reaches T1-T3 and t2inner', all(res.get(h, {}).get('exit_code') == 0 for h in ('t1', 't2', 't3', 't2inner')),
       json.dumps({h: (r.get('exit_code'), r.get('error')) for h, r in res.items()}))
     m.close()
+    require_ok(m, 'B.mcp-transport', 'hop mcp on B answered every request')
 
 
 def step_conc(epoch):
@@ -185,7 +188,7 @@ def step_conc(epoch):
             s0 = time.time()
             r = hop('exec', h, '--timeout', '40s', '--', 'sh', '-c', 'echo ok-%s-%d' % (h, i), timeout=60)
             with lock:
-                out.append((h, i, r.rc, 'ok-%s-%d' % (h, i) in r.out, r.all.strip()[-200:]))
+                out.append((h, i, r.rc, 'ok-%s-%d' % (h, i) in r.out, L.cut(r.all.strip(), -200)))
                 spans.append((s0, time.time()))
         except Exception as e:  # a lost thread must not shrink the denominator
             with lock:
@@ -204,7 +207,7 @@ def step_conc(epoch):
                   '%d results of %d; thread errors: %s' % (len(out), want, errs[:5]))
         return
     c('%s.concurrency' % M, 'A and B at once: 5 rounds x 3 targets of hop exec in parallel, all succeed', ok == want,
-      '%d/%d ok in %.1fs' % (ok, want, time.time() - t0), '; '.join('%s/%d rc=%d %s' % (h, i, rc, e) for h, i, rc, good, e in out if not good)[:800])
+      '%d/%d ok in %.1fs' % (ok, want, time.time() - t0), L.cut('; '.join('%s/%d rc=%d %s' % (h, i, rc, e) for h, i, rc, good, e in out if not good), 800))
 
 
 def step_syncuse_a(epoch):

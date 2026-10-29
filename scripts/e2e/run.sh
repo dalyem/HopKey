@@ -2,15 +2,22 @@
 # HopKey end-to-end tests on Kiln. Runs on the orchestrator and talks to the
 # test machines only through the kiln CLI; nothing from the repo runs here.
 #
-#   scripts/e2e/run.sh [--phases 1,2,3,4,5] [--keep] [--ttl 4h] [--run-id ID]
+#   scripts/e2e/run.sh [--phases 1,2,3,4,5,6] [--keep] [--ttl 4h] [--run-id ID]
+#                      [--source <worktree>]         (build hop from another worktree)
 #                      [--reuse e2e-out/<old-run>]   (debugging: reset and reuse kept machines)
 #
 # Phases: 1 local only (both VMs), 2 MCP, 3 sync, 4 SSH over Tailscale,
-# 5 revocation matrix. 3-5 need a Tailscale auth key in
-# $HOP_E2E_TS_AUTHKEY_FILE (default ~/hopkey-test/ts-authkey); the file is only
-# ever copied by path (kiln vm put/sandbox write --from-file), never read here.
+# 5 revocation matrix, 6 key rotation on real sshd. 3-6 need a Tailscale
+# auth key in $HOP_E2E_TS_AUTHKEY_FILE (default ~/hopkey-test/ts-authkey);
+# the file is only ever copied by path (kiln vm put/sandbox write
+# --from-file), never read here.
 #
-# Output: e2e-out/<run-id>/REPORT.md and results.jsonl.
+# The kiln identity (kiln whoami) is printed and kept in the ledger before
+# anything is allocated. HOP_E2E_EXPECT_IDENTITY=<name or principal ID>
+# refuses any other. Start a run from an agent's own tool call (not with a
+# plain &): a process that outlives the call runs as the user's identity.
+#
+# Output: e2e-out/<run-id>/REPORT.md and results.jsonl. A run ID is used once.
 # Exit: 0 every check passed; 1 assertion failures; 2 harness failure (setup,
 # collection, masking, a release); 3 missing coverage (a selected phase or step
 # did not finish); 128+n interrupted by signal n.
@@ -18,16 +25,17 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
-PHASES=1,2,3,4,5
+PHASES=1,2,3,4,5,6
 KEEP=0
 TTL=4h
 RUN=""
 REUSE=""
+SOURCE=""
 UBUNTU_IMAGE=${HOP_E2E_UBUNTU_IMAGE:-docker.io/library/ubuntu@sha256:24737cef17f4e22b1977df7d9a05e77c4e28b7da5b8911f8d8ccda136bf3573c}
 KEYFILE=${HOP_E2E_TS_AUTHKEY_FILE:-$HOME/hopkey-test/ts-authkey}
 CLOCK_MAX=0.5 # largest A-B clock offset (plus its uncertainty) the timing checks accept
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,/^set -uo/p' "$0" | sed -n 's/^# \{0,1\}//p'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
 	case $1 in
 	--phases) PHASES=$2; shift 2 ;;
@@ -35,6 +43,7 @@ while [ $# -gt 0 ]; do
 	--ttl) TTL=$2; shift 2 ;;
 	--run-id) RUN=$2; shift 2 ;;
 	--reuse) REUSE=$2; shift 2 ;;
+	--source) SOURCE=$2; shift 2 ;;
 	-h | --help) usage 0 ;;
 	*) echo "unknown argument: $1" >&2; usage 2 ;;
 	esac
@@ -42,25 +51,48 @@ done
 [ -n "$RUN" ] || RUN="$(date -u +%m%d%H%M)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
 want() { case ",$PHASES," in *",$1,"*) return 0 ;; esac; return 1; }
 NEED_TS=0
-for p in 3 4 5; do want $p && NEED_TS=1; done
+for p in 3 4 5 6; do want $p && NEED_TS=1; done
 NEED_SBX=0
-for p in 4 5; do want $p && NEED_SBX=1; done
+for p in 4 5 6; do want $p && NEED_SBX=1; done
+refuse() { echo "run.sh: $*" >&2; exit 2; } # before the run has a directory of its own
 
+case $RUN in '' | .* | *[!A-Za-z0-9._-]*) refuse "bad --run-id '$RUN': letters, digits, '.', '_' and '-' only" ;; esac
+if [ -n "$SOURCE" ]; then
+	SOURCE=$(cd "$SOURCE" 2>/dev/null && pwd) || refuse "no such --source directory"
+	[ -f "$SOURCE/go.mod" ] && [ -d "$SOURCE/cmd/hop" ] || refuse "--source $SOURCE is not a HopKey checkout (no go.mod or cmd/hop)"
+fi
+mkdir -p "$REPO/e2e-out"
 OUT=$REPO/e2e-out/$RUN
+# The run directory is reserved with one mkdir (no -p): it fails when the
+# directory exists, so a repeated --run-id never writes to another run's
+# ledger, and never releases its machines.
+mkdir "$OUT" 2>/dev/null || refuse "run ID $RUN is taken ($OUT exists); pick another --run-id"
 mkdir -p "$OUT/bin" "$OUT/results" "$OUT/logs"
 install -d -m 0700 "$OUT/tmp"
 DLOG=$OUT/driver.log
 DRES=$OUT/results/driver.jsonl
 STEPS=$OUT/steps.jsonl # step and phase start/end records: report.py checks coverage with them
-ALLOC=$OUT/alloc.state  # every machine this run asked for, written the moment its ID exists
+ALLOC=$OUT/alloc.state  # the ledger: identity, reused machines, auth key copies
+ALLOCD=$OUT/alloc       # one record per allocation, written by its own worker (alloc.sh)
+LOCKS=${TMPDIR:-/tmp}/hk-e2e-locks-$(id -u) # one lock file per machine ID, held while a run uses the machine
 : >"$DRES"; : >"$STEPS"; : >"$ALLOC"
+mkdir -p "$ALLOCD"
+install -d -m 0700 "$LOCKS"
 T_START=$(date +%s)
 NODE=hk-$(echo "$RUN" | tr -cd 'a-z0-9')
 EMAIL="hoptest+$(echo "$RUN" | tr -cd 'a-z0-9')@example.com"
 CUR_PHASE=0
 CLOCK_OFF=0 # B's clock minus A's, measured once the tailnet is up
 
-log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$DLOG" >&2; }
+# The log file first, the terminal second: a closed terminal or pipe (the
+# caller went away) must never stop a cleanup, so SIGPIPE is ignored too.
+trap '' PIPE
+log() {
+	local l
+	l="$(date -u +%H:%M:%S) $*"
+	printf '%s\n' "$l" >>"$DLOG"
+	printf '%s\n' "$l" >&2 2>/dev/null || true
+}
 
 # A check recorded by the driver (cross-machine timings, harness failures).
 dcheck() { # phase id name status detail [bug]
@@ -79,8 +111,34 @@ if [ "$NEED_TS" = 1 ] && ! test -s "$KEYFILE"; then
 	die "phases ${PHASES} need a Tailscale auth key (reusable, ephemeral, tagged tag:hoptest) in $KEYFILE; set HOP_E2E_TS_AUTHKEY_FILE, or run with --phases 1,2"
 fi
 command -v kiln >/dev/null || die "the kiln CLI is not on PATH"
-kiln whoami >/dev/null 2>&1 || die "kiln is not logged in (kiln whoami failed)"
-log "run $RUN, phases $PHASES, output $OUT"
+command -v flock >/dev/null || die "flock is not on PATH"
+WHOAMI=$(kiln whoami --json 2>>"$DLOG") || die "kiln is not logged in (kiln whoami failed)"
+IFS=$'\t' read -r K_ID K_NAME K_KIND K_HARNESS <<<"$(python3 -I -c 'import json, sys
+try:
+    j = json.loads(sys.argv[1]); p = j.get("principal") or {}
+    print("\t".join(str(x or "?") for x in (p.get("id"), p.get("name"), p.get("kind"), j.get("harness"))))
+except ValueError:
+    print("?\t?\t?\t?")' "$WHOAMI")"
+echo "identity $K_ID $K_NAME $K_KIND $K_HARNESS" >>"$ALLOC"
+printf 'KILN_PRINCIPAL=%s\nKILN_NAME=%s\nKILN_KIND=%s\nKILN_HARNESS=%s\n' "$K_ID" "$K_NAME" "$K_KIND" "$K_HARNESS" >"$OUT/identity.env"
+log "kiln identity: $K_NAME ($K_KIND, $K_ID), harness $K_HARNESS; every machine of this run belongs to it"
+if [ -n "${HOP_E2E_EXPECT_IDENTITY:-}" ]; then
+	case $HOP_E2E_EXPECT_IDENTITY in
+	"$K_NAME" | "$K_ID") ;;
+	*) die "refusing to run: the kiln identity is $K_NAME ($K_ID), HOP_E2E_EXPECT_IDENTITY wants $HOP_E2E_EXPECT_IDENTITY" ;;
+	esac
+else
+	AGENT_ENV=""
+	for v in CLAUDECODE CLAUDE_CODE_ENTRYPOINT AI_AGENT CODEX_SANDBOX CODEX_THREAD_ID OPENCODE CURSOR_AGENT; do
+		[ -n "${!v:-}" ] && AGENT_ENV="$AGENT_ENV $v"
+	done
+	if [ "$K_HARNESS" = shell ] && [ -n "$AGENT_ENV" ]; then
+		log "WARNING: kiln sees a plain shell ($K_NAME), but this looks like an agent's run (set:$AGENT_ENV). The machines will belong to $K_NAME, and the agent cannot see or release them. A run started with a plain & from a tool call does this: start it with the tool's background mode, or set HOP_E2E_EXPECT_IDENTITY."
+	elif [ "$K_HARNESS" != shell ] && [ -z "$AGENT_ENV" ]; then
+		log "WARNING: kiln sees the agent harness $K_HARNESS ($K_NAME), but nothing here looks like an agent's run. The machines will belong to $K_NAME. Set HOP_E2E_EXPECT_IDENTITY to make this explicit."
+	fi
+fi
+log "run $RUN, phases $PHASES, output $OUT${SOURCE:+, building from $SOURCE}"
 
 # ------------------------------------------------------------------ machines
 
@@ -95,12 +153,15 @@ sx() { # sandbox command-string
 	kiln sandbox exec "$1" --command "$2" 2>>"$DLOG"
 }
 q() { printf '%q ' "$@"; }
-# Diagnostics from a machine, always masked there first (sandboxes hold no hop secrets; only Tailscale keys are scrubbed).
+# Diagnostics from a machine, always masked there first, as a whole file, and only then cut to size.
 vtail() { # vm file [bytes]
 	vx "$1" "if [ -f /opt/e2e/masklogs.py ]; then python3 /opt/e2e/masklogs.py tail $2 ${3:-600}; else echo '<diagnostics withheld: no masking script on the machine>'; fi" | tr '\n' ' '
 }
+# Sandboxes hold no hop secret: the Tailscale key and any private key block are
+# scrubbed there (a block with no END hides the rest of the file), then the tail is cut.
+SBX_MASK='s/tskey-[A-Za-z0-9-]{8,}/<TS-AUTHKEY>/g; /-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/c <PRIVATE-KEY-BLOCK>'
 stail() { # sandbox file [bytes]
-	sx "$1" "tail -c ${3:-600} $2 2>&1" | sed -E 's/tskey-[A-Za-z0-9-]{8,}/<TS-AUTHKEY>/g' | tr '\n' ' '
+	sx "$1" "if [ -f $2 ]; then sed -E '$SBX_MASK' $2 | tail -c ${3:-600}; else echo '<no $2>'; fi" | sed -E "$SBX_MASK" | tr '\n' ' '
 }
 
 # vjob vm phase step cmd... : start a step detached, in hke2e.slice; prints the job name.
@@ -186,52 +247,77 @@ reboot_vm() { reboot_start "$1"; reboot_finish "$1" "$2"; } # vm phase
 
 # ------------------------------------------------------------------ allocation and cleanup
 
-# kiln calls that allocate or release run in their own session, so a Ctrl-C
-# at the terminal reaches only this script, never a half-done allocation.
-op_lease() { # op timeout: the lease ID an operation produced, once it finishes
-	setsid -w kiln op status "$1" --wait --timeout "$2" --json 2>>"$DLOG" | python3 -I -c 'import json,sys
-try: print(json.load(sys.stdin).get("result",{}).get("leaseId",""))
-except Exception: print("")'
+# Every allocation runs in a worker of its own (alloc.sh) under setsid: a
+# signal to this script's process group never reaches it, so it always
+# records the operation and the machine ID it got, and cleanup releases
+# that. Releases run under setsid too.
+start_alloc() { # kind who
+	local rec=$ALLOCD/$1.$2.rec
+	: >"$rec"
+	setsid bash "$HERE/alloc.sh" "$1" "$2" "$rec" "$REPO" "$TTL" "$UBUNTU_IMAGE" </dev/null >>"$DLOG" 2>&1 &
 }
-alloc_vm() { # who
-	local who=$1 op id
-	op=$(setsid -w kiln vm lease --project "$REPO" --template ubuntu-24.04 --ttl "$TTL" --json --no-wait 2>>"$DLOG" | grep -o 'op_[a-z0-9]*' | head -1)
-	[ -n "$op" ] || { log "could not start the lease for CLI-$who"; return 1; }
-	echo "vmop $who $op" >>"$ALLOC"
-	id=$(op_lease "$op" 15m)
-	[ -n "$id" ] || { log "lease operation $op for CLI-$who gave no VM"; return 1; }
-	echo "vm $who $id" >>"$ALLOC"
+# wait_allocs max-seconds: until every worker wrote "done" or is gone.
+wait_allocs() {
+	local f pid t0=$SECONDS said=0
+	for f in "$ALLOCD"/*.rec; do
+		[ -e "$f" ] || continue
+		while ! grep -qx done "$f"; do
+			pid=$(sed -n 's/^pid //p' "$f" | head -1)
+			[ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && break
+			[ -z "$pid" ] && [ $((SECONDS - t0)) -gt 30 ] && break
+			[ $((SECONDS - t0)) -ge "$1" ] && break
+			[ "$said" = 0 ] && [ "$CLEANED" = 1 ] && { log "waiting for the allocation workers to record their machines, so they can be released"; said=1; }
+			sleep 2
+		done
+	done
 }
-alloc_sbx() { # who
-	local who=$1 id
-	id=$(setsid -w kiln sandbox create --project "$REPO" --image "$UBUNTU_IMAGE" --ttl "$TTL" --json 2>>"$DLOG" | grep -o 'sbx_[a-z0-9]*' | head -1)
-	[ -n "$id" ] || { log "could not create sandbox $who"; return 1; }
-	echo "sbx $who $id" >>"$ALLOC"
+ledger() { # "kind who id" of every machine this run holds: reused ones, and every one a worker recorded
+	local f b
+	grep -hE '^(vm|sbx) ' "$ALLOC"
+	for f in "$ALLOCD"/*.rec; do
+		[ -e "$f" ] || continue
+		b=${f##*/}; b=${b%.rec}
+		sed -n "s/^id /${b%%.*} ${b#*.} /p" "$f" | head -1
+	done
 }
-read_allocs() { # set A B T1 T2 T3 from the allocation state
+read_allocs() { # set A B T1 T2 T3 from the ledger
 	local kind who id
-	while read -r kind who id; do
-		case $kind in vm | sbx) printf -v "$who" '%s' "$id" ;; esac
-	done <"$ALLOC"
+	while read -r kind who id; do printf -v "$who" '%s' "$id"; done < <(ledger)
+}
+lock_machines() { # id...: hold a lock per machine for the rest of the run; fails if another run holds one
+	local id fd
+	for id in "$@"; do
+		exec {fd}>>"$LOCKS/$id.lock"
+		flock -n "$fd" || { log "machine $id is in use by another run (lock $LOCKS/$id.lock)"; return 1; }
+	done
 }
 ALLOC_PIDS=() BG_PIDS=()
 reconcile_allocs() {
-	local p t0=$SECONDS kind who op
-	# Allocations still under way finish first; each writes its ID to ALLOC.
-	for p in "${ALLOC_PIDS[@]}"; do
-		while kill -0 "$p" 2>/dev/null && [ $((SECONDS - t0)) -lt 1200 ]; do
-			log "waiting for allocation job $p to finish, so its machine can be released"
-			wait "$p" 2>/dev/null || sleep 1
-		done
+	local f b op res st
+	wait_allocs 1200
+	# A worker with no machine ID: ask kiln about its operation once more. What
+	# stays unresolved may be a live machine nobody can name, so it is a
+	# cleanup failure that names the operation.
+	for f in "$ALLOCD"/*.rec; do
+		[ -e "$f" ] || continue
+		grep -q '^id ' "$f" && continue
+		b=${f##*/}; b=${b%.rec}
+		op=$(sed -n 's/^op //p' "$f" | head -1)
+		res=""
+		[ -n "$op" ] && { log "reconciling operation $op for $b"; res=$(setsid -w bash "$HERE/alloc.sh" resolve "${b%%.*}" "$op" 10m 2>>"$DLOG"); }
+		case $res in
+		"id "*) echo "$res" >>"$f"; continue ;;
+		"ended "*) log "operation $op for $b ${res#ended }, with no machine"; continue ;;
+		esac
+		if [ -z "$op" ] && grep -q '^fail kiln returned no operation' "$f"; then
+			log "allocation $b never started: $(sed -n 's/^fail //p' "$f" | head -1)"
+			continue
+		fi
+		if grep -qx done "$f"; then st="its worker finished: $(sed -n 's/^fail //p' "$f" | head -1)"; else st="its worker is still running"; fi
+		dcheck 0 "harness.alloc-$b" "every allocation of this run is resolved to a machine and released" fail \
+			"unresolved allocation $b: operation ${op:-(none recorded)}; $st; check kiln op status ${op:-?} and kiln vm list / kiln sandbox list" harness
+		RELEASE_FAIL=1
 	done
-	# A lease operation with no VM recorded (its job was cut short): ask the operation.
-	while read -r kind who op; do
-		[ "$kind" = vmop ] || continue
-		grep -q "^vm $who " "$ALLOC" && continue
-		log "reconciling lease operation $op for CLI-$who"
-		id=$(op_lease "$op" 10m)
-		if [ -n "$id" ]; then echo "vm $who $id" >>"$ALLOC"; else log "WARNING: operation $op gave no VM; check: kiln op status $op"; fi
-	done < <(cat "$ALLOC")
 	read_allocs
 }
 # Auth key copies: recorded before each copy, deleted and checked at cleanup on every machine, also with --keep.
@@ -263,16 +349,22 @@ release_all() {
 		*) continue ;;
 		esac
 		log "release $kind $who $id: try $i"
-	done < <(grep -E '^(vm|sbx) ' "$ALLOC" | sort -u)
+	done < <(ledger | sort -u)
+	# Released machines are no ledger for a later --reuse. Only a run that held
+	# machines marks anything: a refused --reuse never marks the ledger it was refused.
+	[ -n "$(ledger)" ] || return 0
+	echo "released by $RUN at $(date -u +%FT%TZ)" >>"$OUT/machines.released"
+	grep -q '^reused-from ' "$ALLOC" && echo "released by $RUN at $(date -u +%FT%TZ)" >>"$REUSE/machines.released"
+	return 0
 }
 verify_released() { # every machine of this run is gone; warns about other live ones made since the start
-	local v s
+	local v s rc
 	v=$(kiln vm list --json 2>>"$DLOG") || { log "WARNING: kiln vm list failed"; RELEASE_FAIL=1; return; }
 	s=$(kiln sandbox list --json 2>>"$DLOG") || { log "WARNING: kiln sandbox list failed"; RELEASE_FAIL=1; return; }
-	python3 -I - "$ALLOC" "$T_START" "$v" "$s" <<'EOF' | tee -a "$DLOG" >&2
+	python3 -I - "$(ledger | awk '{print $3}' | tr '\n' ' ')" "$T_START" "$v" "$s" <<'EOF' >>"$DLOG"
 import datetime, json, sys
-alloc, t0 = sys.argv[1], int(sys.argv[2])
-ours = {l.split()[2] for l in open(alloc) if l.split()[:1] in (['vm'], ['sbx']) and len(l.split()) > 2}
+t0 = int(sys.argv[2])
+ours = set(sys.argv[1].split())
 gone = ('released', 'destroyed', 'expired', 'failed')
 live, ours_live, seen = [], [], set()
 for kind, blob, key in (('vm', sys.argv[3], 'leases'), ('sbx', sys.argv[4], 'sandboxes')):
@@ -302,7 +394,9 @@ if live:
     print('WARNING: live machines created since this run started that it has no record of: %s' % live)
 sys.exit(1 if ours_live or missing else 0)
 EOF
-	[ "${PIPESTATUS[0]}" = 0 ] || RELEASE_FAIL=1
+	rc=${PIPESTATUS[0]}
+	grep -E "^(machines of this run|WARNING)" "$DLOG" | tail -2 >&2 2>/dev/null
+	[ "$rc" = 0 ] || RELEASE_FAIL=1
 }
 stop_bg() { # stop setup jobs still running against the machines
 	local p
@@ -399,13 +493,66 @@ SECTMP=$(mktemp -d "${TMPDIR:-/tmp}/hk-e2e-sec.XXXXXX") || die "mktemp failed"
 chmod 700 "$SECTMP"
 trap cleanup EXIT
 
+# ------------------------------------------------------------------ reused machines
+# Checked before the build, so a refused --reuse costs nothing.
+if [ -n "$REUSE" ]; then
+	REUSE=$(cd "$REUSE" 2>/dev/null && pwd) || die "no --reuse directory"
+	[ -f "$REUSE/machines.env" ] || die "no $REUSE/machines.env"
+	# A ledger whose machines were released (by its run or a later reuse) is stale: never replay it.
+	[ -e "$REUSE/machines.released" ] && die "the machines in $REUSE were released ($(tail -1 "$REUSE/machines.released")); lease new ones"
+	. "$REUSE/machines.env"
+	log "reusing CLI-A $A, CLI-B $B${T1:+, T1 $T1, T2 $T2, T3 $T3}"
+	RIDS=$(for who in A B T1 T2 T3; do [ -n "${!who}" ] && echo "${!who}"; done)
+	# Locked and checked before they enter this run's ledger: a refusal here
+	# must not release machines another run is using.
+	# shellcheck disable=SC2086
+	lock_machines $RIDS || { A="" B="" T1="" T2="" T3=""; die "another run is using the machines of $REUSE"; }
+	# And they must still be up: a ledger can outlive its machines (a TTL, a release by hand).
+	LIVE=$(python3 -I -c 'import json, sys
+live = set()
+for blob, key in ((sys.argv[1], "leases"), (sys.argv[2], "sandboxes")):
+    try:
+        live |= {i["id"] for i in json.loads(blob).get(key, []) if not str(i.get("state", "")).startswith(("released", "destroyed", "expired", "failed"))}
+    except (ValueError, KeyError):
+        pass
+print(" ".join(sorted(live)))' "$(kiln vm list --json 2>>"$DLOG")" "$(kiln sandbox list --json 2>>"$DLOG")")
+	for id in $RIDS; do
+		case " $LIVE " in *" $id "*) ;; *) A="" B="" T1="" T2="" T3=""; die "machine $id from $REUSE is not live for $K_NAME; lease new ones" ;; esac
+	done
+	for who in A B T1 T2 T3; do
+		[ -n "${!who}" ] || continue
+		case $who in T*) echo "sbx $who ${!who}" ;; *) echo "vm $who ${!who}" ;; esac >>"$ALLOC"
+	done
+	echo "reused-from $REUSE" >>"$ALLOC"
+fi
+
 # ------------------------------------------------------------------ build
 
-log "building hop and hop-server (linux-amd64) on Kiln"
-COMMIT=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
-git -C "$REPO" diff --quiet HEAD 2>/dev/null || COMMIT="$COMMIT+dirty"
+# --source: the product comes from another worktree; the suite (this checkout) does not change.
+SRC=${SOURCE:-$REPO}
+log "building hop and hop-server (linux-amd64) on Kiln from $SRC"
+COMMIT=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
+SRC_DIRTY=0
+[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no 2>/dev/null)" ] || { COMMIT="$COMMIT+dirty"; SRC_DIRTY=1; }
+SUITE_COMMIT=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)
+[ -z "$(git -C "$REPO" status --porcelain --untracked-files=no -- scripts/e2e 2>/dev/null)" ] || SUITE_COMMIT="$SUITE_COMMIT+dirty"
+{
+	echo "SOURCE_DIR=$SRC"
+	echo "SOURCE_BRANCH=$(git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+	echo "SOURCE_COMMIT=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+	echo "SOURCE_DIRTY=$SRC_DIRTY"
+	echo "SOURCE_CHANGED=$(git -C "$SRC" status --porcelain --untracked-files=no 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+	echo "SUITE_COMMIT=$SUITE_COMMIT"
+} >"$OUT/source.env"
 BUILD_CMD='export PATH=$PATH:/usr/local/go/bin GOCACHE=$PWD/.check-cache/go-build CGO_ENABLED=0 GOOS=linux GOARCH=amd64; mkdir -p /artifacts && LDF="-s -w -X github.com/dalyem/hopkey/internal/version.Version='$COMMIT'" && go build -trimpath -ldflags "$LDF" -o /artifacts/hop ./cmd/hop && go build -trimpath -ldflags "$LDF" -o /artifacts/hop-server ./cmd/hop-server && cd /artifacts && sha256sum hop hop-server > SHA256SUMS && cat SHA256SUMS'
-kiln checks run --project "$REPO" --json --timeout 20m --command "$BUILD_CMD" >"$OUT/build.json" 2>>"$DLOG" || die "build failed: see $OUT/build.json"
+# Kiln runs at most 3 jobs per identity; other work can hold them for a while.
+for i in $(seq 1 40); do
+	kiln checks run --project "$SRC" --json --timeout 20m --command "$BUILD_CMD" >"$OUT/build.json" 2>>"$DLOG" && break
+	grep -q '"limit_exceeded"' "$OUT/build.json" || die "build failed: see $OUT/build.json"
+	[ "$i" = 1 ] && log "kiln's job limit is reached; retrying the build every 30s for up to 20 minutes"
+	[ "$i" = 40 ] && die "build failed: kiln's job limit stayed reached for 20 minutes"
+	sleep 30
+done
 OP=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["operation"]["id"])' "$OUT/build.json")
 for f in hop hop-server SHA256SUMS; do
 	kiln artifacts get "$OP" "$f" -o "$OUT/bin/$f" 2>>"$DLOG" || die "could not fetch artifact $f from $OP"
@@ -417,22 +564,17 @@ log "built $COMMIT: hop $SHA_HOP, hop-server $SHA_SRV (job $OP)"
 
 # ------------------------------------------------------------------ provision
 
-if [ -n "$REUSE" ]; then
-	. "$REUSE/machines.env" || die "no $REUSE/machines.env"
-	log "reusing CLI-A $A, CLI-B $B${T1:+, T1 $T1, T2 $T2, T3 $T3}"
-	for who in A B T1 T2 T3; do
-		[ -n "${!who}" ] || continue
-		case $who in T*) echo "sbx $who ${!who}" ;; *) echo "vm $who ${!who}" ;; esac >>"$ALLOC"
-	done
-else
+if [ -z "$REUSE" ]; then
 	log "leasing CLI-A and CLI-B$([ "$NEED_SBX" = 1 ] && echo ", creating three sandboxes")"
-	alloc_vm A & ALLOC_PIDS+=($!)
-	alloc_vm B & ALLOC_PIDS+=($!)
+	start_alloc vm A
+	start_alloc vm B
 	if [ "$NEED_SBX" = 1 ]; then
-		for t in T1 T2 T3; do alloc_sbx $t & ALLOC_PIDS+=($!); done
+		for t in T1 T2 T3; do start_alloc sbx $t; done
 	fi
-	for p in "${ALLOC_PIDS[@]}"; do wait "$p"; done
+	wait_allocs 1200
 	read_allocs
+	# shellcheck disable=SC2046
+	lock_machines $(ledger | awk '{print $3}') || die "a machine this run just got is locked by another run"
 fi
 save_machines
 log "CLI-A $A, CLI-B $B${T1:+, T1 $T1, T2 $T2, T3 $T3}"
@@ -474,7 +616,7 @@ setup_vm() { # who vm
 	rc=$(vwait "$vm" "$j" 900)
 	step_rec 0 "$who" setup "$j" end "$rc"
 	[ "$rc" = 0 ] || { log "setup-vm on $who failed ($rc): $(vtail "$vm" "/var/e2e/jobs/$j.out" 400)"; return 1; }
-	log "CLI-$who set up: $(vx "$vm" "hop --version 2>&1 | head -1; echo ntp=\$(cat /var/e2e/state/ntp)" | tr '\n' ' ')"
+	log "CLI-$who set up: $(vx "$vm" "HOME=/root hop --version 2>&1 | head -1; echo ntp=\$(cat /var/e2e/state/ntp)" | tr '\n' ' ')"
 }
 setup_sbx() { # name id
 	local name=$1 id=$2
@@ -734,6 +876,7 @@ phase3() {
 	log "=== phase 3: sync"
 	vrun "$A" 3 server-check 60 $(py p3.py) server-check
 	vrun "$B" 3 server-check 60 $(py p3.py) server-check
+	vrun "$A" 3 seed 120 $(py p3.py) seed
 	vrun "$A" 3 signup 300 $(py p3.py) signup
 	xfer "$A" /var/e2e/state/hosts-A.json "$B" /var/e2e/state/hosts-A.json || return 1
 	vrun "$B" 3 b-refusals 180 $(py p3.py) b-refusals
@@ -908,6 +1051,7 @@ except Exception: print("")'
 	vfinish "$B" "$tw" 5 watch 90
 	vrun "$B" 5 access 240 $(py p5.py) access s1-online cut
 	vrun "$B" 5 inventory 120 $(py p5.py) inventory s1-online
+	vrun "$B" 5 wiped 120 $(py p5.py) wiped s1-online
 	vrun "$B" 5 unlock-after 120 $(py p5.py) unlock-after s1-online
 	relogin cli-r2 || return 1
 
@@ -939,7 +1083,14 @@ except Exception: print("")')
 	cutoff s3u "$t0" 120 0
 	vfinish "$B" "$tw" 5 watch 180
 	vrun "$B" 5 access 240 $(py p5.py) access s3-reconnected cut
+	# Cut off once it reconnects, it stays cut off across a daemon restart, never serving a key.
+	tw=$(vjob "$B" 5 watch $(py p5.py) watch rev2-s3r 40)
+	sleep 2
+	vrun "$B" 5 daemon-restart 120 $(py p5.py) daemon-restart rev2-s3-reconnected
+	vfinish "$B" "$tw" 5 watch 90
+	vrun "$B" 5 nokeys 30 $(py p5.py) nokeys rev2-s3r
 	vrun "$B" 5 inventory 120 $(py p5.py) inventory s3-offline
+	vrun "$B" 5 wiped 120 $(py p5.py) wiped s3-reconnected
 	relogin cli-r4 || return 1
 
 	# B4: daemon stopped during the revoke, then started.
@@ -959,7 +1110,118 @@ except Exception: print("")')
 	vrun "$B" 5 start-window 120 $(py p5.py) start-window s5-reboot
 	vrun "$B" 5 access 240 $(py p5.py) access s5-reboot cut
 	vrun "$B" 5 inventory 120 $(py p5.py) inventory s5-reboot
+	vrun "$B" 5 wiped 120 $(py p5.py) wiped s5-reboot
 	vrun "$B" 5 unlock-after 120 $(py p5.py) unlock-after s5-reboot
+
+	# B6: the account's max-offline policy (1m), signed in and not revoked.
+	relogin cli-r6 || return 1
+	vrun "$A" 5 policy 60 $(py p5.py) policy 1m
+	vrun "$B" 5 policy-seen 120 $(py p5.py) policy-seen 60
+	vrun "$B" 5 policy-idle 420 $(py p5.py) policy-idle 240
+	vrun "$B" 5 block 30 $(py p5.py) block 1
+	vrun "$B" 5 policy-offline 330 $(py p5.py) policy-offline 240
+	vrun "$B" 5 block 30 $(py p5.py) block 0
+	vrun "$B" 5 policy-clear 240 $(py p5.py) policy-clear 150
+	vrun "$A" 5 policy 60 $(py p5.py) policy off
+	return 0
+}
+
+# Phase 6 helpers. authorized_keys files hold only public keys, so they pass through $OUT/tmp.
+AKT="t1-deploy:T1:/home/deploy t2-deploy:T2:/home/deploy t2-deploy2:T2:/home/deploy2 t3-deploy:T3:/home/deploy b-rot:B:/home/rot"
+ak_fetch() { # suffix [name]: copy the targets' authorized_keys to A's state/ak/<name>.<suffix>
+	local e name who home f m
+	mkdir -p "$OUT/tmp/ak"
+	for e in $AKT; do
+		IFS=: read -r name who home <<<"$e"
+		[ -n "${2:-}" ] && [ "$2" != "$name" ] && continue
+		f=$OUT/tmp/ak/$name.$1
+		m=${!who}
+		if [ "$who" = B ]; then
+			kiln vm get "$m" "$home/.ssh/authorized_keys" -o "$f" 2>>"$DLOG"
+		else
+			kiln sandbox read "$m" "$home/.ssh/authorized_keys" -o "$f" 2>>"$DLOG"
+		fi || { dcheck 6 "harness.ak-$name-$1" "$name's authorized_keys is copied ($1)" fail "read failed" harness; return 1; }
+		kiln vm put "$A" "/var/e2e/state/ak/$name.$1" --from-file "$f" >>"$DLOG" 2>&1 ||
+			{ dcheck 6 "harness.ak-$name-$1" "$name's authorized_keys is copied ($1)" fail "copy to A failed" harness; return 1; }
+	done
+}
+rot_targets() { # rotkey's lines on T1-T3, other lines that must survive, and T3's sshd that will refuse the new key
+	local k k2 o r
+	k=$(cut -d' ' -f1,2 "$OUT/tmp/rotkey.pub")
+	k2=$(cut -d' ' -f1,2 "$OUT/tmp/rotkey2.pub")
+	o=$(cut -d' ' -f1,2 "$OUT/tmp/bkey.pub")
+	printf '%s\n' '# hk-e2e: comment lines and other keys must survive the rotation byte for byte' "restrict $k hk-e2e-rot-t1" \
+		"command=\"echo other\",no-pty $o hk-e2e-other-line" >"$OUT/tmp/ak-t1"
+	printf '%s\n' "$k2 hk-e2e-rot-cc" >"$OUT/tmp/ak-t1-cc"
+	printf '%s\n' "$k hk-e2e-rot-t2" "  $o   hk-e2e-other-spaced" >"$OUT/tmp/ak-t2"
+	printf '%s\n' "$k hk-e2e-rot-t2in" >"$OUT/tmp/ak-t2in"
+	printf '%s\n' "$k hk-e2e-rot-t3" >"$OUT/tmp/ak-t3"
+	kiln sandbox write "$T1" /var/e2e/ak-add --from-file "$OUT/tmp/ak-t1" >>"$DLOG" 2>&1 &&
+		kiln sandbox write "$T1" /var/e2e/ak-add-cc --from-file "$OUT/tmp/ak-t1-cc" >>"$DLOG" 2>&1 &&
+		kiln sandbox write "$T1" /var/e2e/rot-append.sh --from-file "$HERE/guest/rot-append.sh" >>"$DLOG" 2>&1 &&
+		kiln sandbox write "$T1" /var/e2e/bkey.pub --from-file "$OUT/tmp/bkey.pub" >>"$DLOG" 2>&1 &&
+		kiln sandbox write "$T2" /var/e2e/ak-add --from-file "$OUT/tmp/ak-t2" >>"$DLOG" 2>&1 &&
+		kiln sandbox write "$T2" /var/e2e/ak-add-in --from-file "$OUT/tmp/ak-t2in" >>"$DLOG" 2>&1 &&
+		kiln sandbox write "$T3" /var/e2e/ak-add --from-file "$OUT/tmp/ak-t3" >>"$DLOG" 2>&1 &&
+		kiln sandbox write "$T3" /var/e2e/rot-t3.sh --from-file "$HERE/guest/rot-t3.sh" >>"$DLOG" 2>&1 ||
+		{ dcheck 6 harness.rot-targets "the rotation fixtures are written to T1-T3" fail "kiln sandbox write failed" harness; return 1; }
+	r=$(sx "$T1" "cat /var/e2e/ak-add >> /home/deploy/.ssh/authorized_keys && cat /var/e2e/ak-add-cc >> /home/deploy2/.ssh/authorized_keys && echo ok")
+	r="$r $(sx "$T2" "cat /var/e2e/ak-add >> /home/deploy/.ssh/authorized_keys && cat /var/e2e/ak-add-in >> /home/deploy2/.ssh/authorized_keys && echo ok")"
+	r="$r $(sx "$T3" "cat /var/e2e/ak-add >> /home/deploy/.ssh/authorized_keys && sh /var/e2e/rot-t3.sh setup 2>&1 | tail -3")"
+	log "rotation targets: $r"
+	[ "$(echo "$r" | tr -s ' \n' ' ' | sed 's/ $//')" = "ok ok ok" ] ||
+		{ dcheck 6 harness.rot-targets "the rotation fixtures are written to T1-T3 and T3's sshd reloads" fail "$r" harness; return 1; }
+}
+
+phase6() {
+	log "=== phase 6: key rotation on real sshd"
+	local aip n i rnd cnt ivl
+	ensure_signed_in cli-k1 || return 1
+	vrun "$A" 6 supported 60 $(py p6.py) supported
+	if [ "$(vx "$A" "cat /var/e2e/state/rot-supported 2>/dev/null")" != yes ]; then
+		log "this build has no hop key rotate: phase 6 recorded a skip"
+		return 0
+	fi
+	aip=$(sed -n 's/^HK_A_IP=//p' "$OUT/tailnet.env")
+	vrun "$A" 6 keys 120 $(py p6.py) keys
+	kiln vm get "$A" /var/e2e/state/rotkey.pub -o "$OUT/tmp/rotkey.pub" 2>>"$DLOG" &&
+		kiln vm get "$A" /var/e2e/state/rotkey2.pub -o "$OUT/tmp/rotkey2.pub" 2>>"$DLOG" ||
+		{ dcheck 6 harness.rot-pub "the rotation keys' public halves come from A" fail "kiln vm get failed" harness; return 1; }
+	kiln vm put "$B" /var/e2e/state/rotkey.pub --from-file "$OUT/tmp/rotkey.pub" >>"$DLOG" 2>&1 || return 1
+	vrun "$B" 6 b-target 60 $(py p6.py) b-target "$aip"
+	rot_targets || return 1
+	vrun "$A" 6 hosts 400 $(py p6.py) hosts
+	vrun "$B" 6 b-wait 180 $(py p6.py) b-wait
+	ak_fetch before || return 1
+	vrun "$A" 6 dry-run 300 $(py p6.py) dry-run
+	ak_fetch dry || return 1
+	vrun "$A" 6 judge 60 $(py p6.py) judge before dry dryrun
+	vrun "$A" 6 rotate 900 $(py p6.py) rotate
+	xfer "$A" /var/e2e/state/rot-newname "$B" /var/e2e/state/rot-newname && xfer "$A" /var/e2e/state/rot-newpub "$B" /var/e2e/state/rot-newpub || return 1
+	ak_fetch after || return 1
+	vrun "$A" 6 judge 60 $(py p6.py) judge before after rot
+	vrun "$A" 6 after-a 300 $(py p6.py) after-a
+	vrun "$B" 6 after-b 300 $(py p6.py) after-b
+
+	# Lines appended on T1 while r-cc's key rotates: dense (hop's edits are likely to see the file change
+	# under them, and must stop with nothing changed), then sparse (the rotation is likely to finish between two).
+	mkdir -p "$OUT/tmp/ak"
+	for rnd in dense:40:0.3 sparse:6:2.5; do
+		IFS=: read -r rnd cnt ivl <<<"$rnd"
+		log "rotation with lines appended during it ($rnd: $cnt every ${ivl}s)"
+		kiln sandbox read "$T1" /home/deploy2/.ssh/authorized_keys -o "$OUT/tmp/ak/cc-$rnd-before" 2>>"$DLOG" &&
+			kiln vm put "$A" "/var/e2e/state/ak/t1-deploy2.cc-$rnd-before" --from-file "$OUT/tmp/ak/cc-$rnd-before" >>"$DLOG" 2>&1 || return 1
+		kiln sandbox exec "$T1" --background --timeout-seconds 120 --command "sh /var/e2e/rot-append.sh /var/e2e/bkey.pub $cnt $ivl $rnd" >>"$DLOG" 2>&1 ||
+			{ dcheck 6 "harness.rot-append-$rnd" "the appender starts on T1" fail "kiln sandbox exec failed" harness; return 1; }
+		vrun "$A" 6 cc 300 $(py p6.py) cc "$rnd"
+		n=""
+		for i in $(seq 1 40); do n=$(sx "$T1" "cat /var/e2e/append-$rnd.done 2>/dev/null" | tr -d '[:space:]'); [ -n "$n" ] && break; sleep 2; done
+		[ -n "$n" ] || { dcheck 6 "harness.rot-append-$rnd" "the appender on T1 finishes" fail "no append-$rnd.done" harness; return 1; }
+		kiln sandbox read "$T1" /home/deploy2/.ssh/authorized_keys -o "$OUT/tmp/ak/cc-$rnd-after" 2>>"$DLOG" &&
+			kiln vm put "$A" "/var/e2e/state/ak/t1-deploy2.cc-$rnd-after" --from-file "$OUT/tmp/ak/cc-$rnd-after" >>"$DLOG" 2>&1 || return 1
+		vrun "$A" 6 judge-cc 60 $(py p6.py) judge-cc "$rnd" "$n" "$ivl"
+	done
+	log "T3 sshd back to stock: $(sx "$T3" "sh /var/e2e/rot-t3.sh restore 2>&1 | tail -2" | tr '\n' ' ')"
 	return 0
 }
 
@@ -973,7 +1235,7 @@ run_phase() { # n
 	fi
 	CUR_PHASE=0
 }
-for p in 1 2 3 4 5; do want $p && run_phase $p; done
+for p in 1 2 3 4 5 6; do want $p && run_phase $p; done
 [ "$NEED_TS" = 1 ] && clock_check clock-end 0 clock-end "the clocks of A and B still agree within ${CLOCK_MAX}s at the end"
 log "all selected phases ran"
 exit 0

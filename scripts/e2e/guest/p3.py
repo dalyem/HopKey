@@ -61,6 +61,34 @@ def step_server_check():
       r.rc == 0 and '"ok":true' in r.out.replace(' ', ''), '', r.ev('curl healthz'))
 
 
+def step_seed():
+    """On A, before signup: the hosts, key, snippet and pin that b-received and
+    a-after-logout look for. Phases 1-2 make them; a phase-3-only run makes them here.
+    Nothing is touched when they are already there."""
+    L.ensure_vault()
+    L.ensure_testkey()
+    hs = L.hosts() or {}
+    made = []
+    if not any(h.get('host_keys') for h in hs.values()) or 'local1' not in hs and 'm1' not in hs:
+        if 'local1' not in hs:
+            hop('add', 'local1', '--address', '127.0.0.1', '--user', 'target', '--key', 'testkey', '--tag', 'lab')
+        hop('trust', 'local1', '--yes')
+        made.append('local1')
+    if not (hop('snippet', 'ls', '--json').json() or []):
+        hop('snippet', 'add', 'up', '--', 'uptime')
+        made.append('snippet up')
+    hs = L.hosts() or {}
+    keys = [k.get('name') for k in (hop('key', 'ls', '--json').json() or [])]
+    snips = hop('snippet', 'ls', '--json').json() or []
+    pins = sum(len(h.get('host_keys') or []) for h in hs.values())
+    usable = ('local1' in hs or 'm1' in hs) and 'testkey' in keys and snips and pins
+    detail = 'seeded: %s; %d hosts, %d pins, keys %s, %d snippets' % (made or 'nothing (phases 1-2 ran)', len(hs), pins, keys, len(snips))
+    if usable:
+        c('A.fixtures', 'A has the hosts, key, snippet and pin phase 3 syncs to B', True, detail)
+    else:
+        L.harness('A.fixtures', 'A has the hosts, key, snippet and pin phase 3 syncs to B', detail)
+
+
 def step_signup():
     had_vault = os.path.exists('/home/tester/.local/share/hop/device.key')
     if not had_vault:
@@ -99,7 +127,7 @@ def step_b_login_approve():
             os.remove(p)
     rc, out = L.pty_run('tester', ['hop', 'auth', 'login', '--server', URL, '--email', EMAIL, '--name', 'cli-b',
                                    '--device-key-store', 'file'], [], timeout=300, inbox=INBOX, logname='blogin')
-    c('B.login-approve', 'hop auth login by approval on a pty signs B in', rc == 0 and 'Signed in' in out, 'pty exit %d' % rc, out[-500:])
+    c('B.login-approve', 'hop auth login by approval on a pty signs B in', rc == 0 and 'Signed in' in out, 'pty exit %d' % rc, L.cut(out, -500))
 
 
 def step_a_approve_start(code):
@@ -399,7 +427,7 @@ def step_names():
 
 
 STEPS = {
-    'server-check': step_server_check, 'signup': step_signup, 'b-refusals': step_b_refusals,
+    'server-check': step_server_check, 'seed': step_seed, 'signup': step_signup, 'b-refusals': step_b_refusals,
     'b-login-approve': step_b_login_approve, 'a-approve-start': step_a_approve_start, 'a-approve-sas': step_a_approve_sas,
     'b-received': step_b_received, 'offline-start': step_offline_start, 'offline-end': step_offline_end,
     'block': step_block, 'conflict-check': step_conflict_check, 'converge': step_converge, 'usebkey': step_usebkey,

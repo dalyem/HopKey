@@ -18,7 +18,7 @@ import time
 
 out, run, phases, t0, t1, mach = sys.argv[1:7]
 t0, t1 = int(t0), int(t1)
-PH = {1: 'Local only, no account', 2: 'MCP', 3: 'Sync', 4: 'Real SSH over Tailscale', 5: 'Revocation matrix'}
+PH = {1: 'Local only, no account', 2: 'MCP', 3: 'Sync', 4: 'Real SSH over Tailscale', 5: 'Revocation matrix', 6: 'Key rotation on real sshd'}
 
 rows = []
 for f in sorted(glob.glob(os.path.join(out, 'results', '*.jsonl'))):
@@ -52,7 +52,9 @@ def esc(s):
 sel = [int(p) for p in phases.split(',') if p.strip().isdigit()]
 
 # Coverage: which selected phases or steps did not finish.
-MACHINES = {1: {'A', 'B'}, 2: {'A'}, 3: {'A', 'B'}, 4: {'A', 'B'}, 5: {'A', 'B'}}
+MACHINES = {1: {'A', 'B'}, 2: {'A'}, 3: {'A', 'B'}, 4: {'A', 'B'}, 5: {'A', 'B'}, 6: {'A', 'B'}}
+if any(r.get('id') == 'p6.A.rot-supported' and r.get('status') == 'skip' for r in rows):
+    MACHINES[6] = {'A'}  # a build without hop key rotate: A records the skip, B has nothing to do
 steps = []
 try:
     for line in open(os.path.join(out, 'steps.jsonl')):
@@ -94,6 +96,25 @@ md.append('- Time: %s to %s UTC (%dm%02ds)' % (time.strftime('%Y-%m-%d %H:%M', t
                                              (t1 - t0) // 60, (t1 - t0) % 60))
 md.append('- Phases selected: %s' % phases)
 md.append('- Machines: ' + ', '.join('%s `%s`' % (k, v) for k, v in machines.items() if v))
+def envfile(name):
+    d = {}
+    try:
+        for line in open(os.path.join(out, name)):
+            k, _, v = line.rstrip('\n').partition('=')
+            d[k] = v
+    except OSError:
+        pass
+    return d
+
+
+src, ident = envfile('source.env'), envfile('identity.env')
+if ident:
+    md.append('- Kiln identity: %s (%s, `%s`), harness %s' % (ident.get('KILN_NAME'), ident.get('KILN_KIND'), ident.get('KILN_PRINCIPAL'),
+                                                         ident.get('KILN_HARNESS')))
+if src:
+    md.append('- Source: `%s`, branch `%s`, commit `%s`%s; suite commit `%s`' % (
+        src.get('SOURCE_DIR'), src.get('SOURCE_BRANCH'), src.get('SOURCE_COMMIT', '?')[:12],
+        ' (dirty: %s)' % src.get('SOURCE_CHANGED', '').strip() if src.get('SOURCE_DIRTY') == '1' else '', src.get('SUITE_COMMIT')))
 try:
     b = json.load(open(os.path.join(out, 'build.json')))
     sn = b.get('snapshot', {})
@@ -107,7 +128,9 @@ except OSError:
     pass
 md.append('')
 md.append('Assertions encode the intended behaviour. A known product gap shows up as FAIL with its bug ID from the earlier reports '
-          '(`r1-` is /tmp/hk/e2e/REPORT.md, `r2-` is REPORT-r2.md). `harness` marks a failure of the test harness itself.')
+          '(`r1-` is /tmp/hk/e2e/REPORT.md, `r2-` is REPORT-r2.md). `harness` marks a failure of the test harness itself. '
+          'Checks named `rev2-*` (revocation enforcement) and `rot-*` (key rotation) test features newer than those reports; on a build '
+          'without them they fail under the r2 bug they close, or are skipped when the command is missing.')
 md.append('')
 md.append('## Summary')
 md.append('')

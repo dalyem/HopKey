@@ -107,7 +107,18 @@ def mask(s, strict=False):
     s = re.sub(r'\bH1-[A-Z0-9]{4,}(-[A-Z0-9]{2,}){3,}', '<SECRET-KEY>', s)
     s = re.sub(r'\bR1-[A-Z0-9$]{4,}(-[A-Z0-9$]{2,}){3,}', '<RECOVERY-KEY>', s)
     s = re.sub(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', '<PRIVATE-KEY-BLOCK>', s, flags=re.S)
+    # Part of a block (output cut short, a block split between reads): withhold
+    # everything from a lone BEGIN on, and everything up to a lone END.
+    s = re.sub(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*', '<PRIVATE-KEY-BLOCK-INCOMPLETE>', s, flags=re.S)
+    s = re.sub(r'^.*-----END [A-Z ]*PRIVATE KEY-----', '<PRIVATE-KEY-BLOCK-INCOMPLETE>', s, flags=re.S)
     return s
+
+
+def cut(s, n):
+    """Mask the whole string, then keep its first n characters (its last -n when n < 0).
+    Never the other way round: a cut can split a secret, and a part of one no longer matches."""
+    s = mask(s)
+    return s[:n] if n >= 0 else s[n:]
 
 
 def log(*parts):
@@ -158,7 +169,7 @@ def guard(cid, name):
                 return fn(*a, **kw)
             except Exception as e:  # a harness error is a failed check, never a silent pass
                 import traceback
-                check(cid, name + ' (harness error)', False, 'exception: %r' % e, traceback.format_exc()[-800:], 'harness')
+                check(cid, name + ' (harness error)', False, 'exception: %r' % e, cut(traceback.format_exc(), -800), 'harness')
         return inner
     return wrap
 
@@ -222,7 +233,7 @@ def run_as(user, argv, timeout=60, nopass=False, env=None, stdin=None, cwd='/tmp
         r = R(-9, e.stdout or '', (e.stderr or '') + '\n<harness timeout>', time.time() - t0)
     log('$', user, ' '.join(argv), '->', r.rc, '(%.1fs)' % r.secs)
     if r.all.strip():
-        log('   ' + r.all.strip()[:4000].replace('\n', '\n   '))
+        log('   ' + cut(r.all.strip(), 4000).replace('\n', '\n   '))
     return r
 
 
@@ -243,9 +254,9 @@ def root(cmd, timeout=120):
         r = R(p.returncode, p.stdout, p.stderr, time.time() - t0)
     except subprocess.TimeoutExpired as e:
         r = R(-9, e.stdout or '', (e.stderr or '') + '\n<harness timeout>', time.time() - t0)
-    log('# root:', cmd[:300], '->', r.rc)
+    log('# root:', cut(cmd, 300), '->', r.rc)
     if r.all.strip():
-        log('   ' + r.all.strip()[:3000].replace('\n', '\n   '))
+        log('   ' + cut(r.all.strip(), 3000).replace('\n', '\n   '))
     return r
 
 
@@ -319,7 +330,7 @@ def state_read(name):
     try:
         return 'ok', json.loads(s)
     except ValueError:
-        return 'malformed', s[:200]
+        return 'malformed', cut(s, 200)
 
 
 def state_get(name, default=None):
@@ -378,14 +389,15 @@ def env_get(name, default=''):
 
 # ---------------------------------------------------------------- pty
 
-def pty_run(user, argv, answers, timeout=120, nopass=False, env=None, inbox=None, logname=None):
+def pty_run(user, argv, answers, timeout=120, nopass=False, env=None, inbox=None, logname=None, raw=False):
     """Run argv on a pty as user.
 
     answers: list of (regex, reply) where reply is a string or a function of
     the output so far returning a string (or None to wait). Each regex fires
     once. inbox: a file whose content, when it appears, is typed and the file
     removed (the driver answers cross-machine prompts that way). Returns
-    (exit code, masked output)."""
+    (exit code, masked output); raw=True returns the output unmasked, for a
+    caller that reads a secret from it and records only masked text."""
     full = user_argv(user, argv, timeout)
     e = user_env(user, nopass, env)
     pid, fd = pty.fork()
@@ -394,7 +406,17 @@ def pty_run(user, argv, answers, timeout=120, nopass=False, env=None, inbox=None
     out = ''
     fired = set()
     t0 = time.time()
-    lf = open('%s/logs/pty-%s.log' % (E2E, logname), 'w') if logname else None
+    # The log is rewritten whole from the masked transcript: masking each read
+    # on its own would miss a secret split between two reads.
+    lf = '%s/logs/pty-%s.log' % (E2E, logname) if logname else None
+    shown = ''
+
+    def flush_log(extra=''):
+        if lf:
+            tmp = lf + '.tmp'
+            with open(tmp, 'w') as f:
+                f.write(mask(shown) + extra)
+            os.replace(tmp, lf)
     while True:
         r, _, _ = select.select([fd], [], [], 0.3)
         if fd in r:
@@ -406,9 +428,8 @@ def pty_run(user, argv, answers, timeout=120, nopass=False, env=None, inbox=None
                 break
             s = d.decode(errors='replace')
             out += s
-            if lf:
-                lf.write(mask(s))
-                lf.flush()
+            shown += s
+            flush_log()
         for i, (rx, reply) in enumerate(answers):
             if i in fired:
                 continue
@@ -421,8 +442,8 @@ def pty_run(user, argv, answers, timeout=120, nopass=False, env=None, inbox=None
         if inbox and os.path.exists(inbox):
             v = open(inbox).read().strip()
             os.remove(inbox)
-            if lf:
-                lf.write('\n<<typed: %s>>\n' % mask(v))
+            shown += '\n<<typed: %s>>\n' % v
+            flush_log()
             os.write(fd, v.encode() + b'\r')
         if time.time() - t0 > timeout + 5:
             os.kill(pid, signal.SIGKILL)
@@ -430,12 +451,10 @@ def pty_run(user, argv, answers, timeout=120, nopass=False, env=None, inbox=None
             break
     _, st = os.waitpid(pid, 0)
     rc = os.WEXITSTATUS(st) if os.WIFEXITED(st) else -1
-    if lf:
-        lf.write('\nPTY_EXIT=%d (%.1fs)\n' % (rc, time.time() - t0))
-        lf.close()
+    flush_log('\nPTY_EXIT=%d (%.1fs)\n' % (rc, time.time() - t0))
     log('pty', user, ' '.join(argv), '-> rc', rc)
-    log('   ' + out.strip()[-3000:].replace('\n', '\n   '))
-    return rc, out
+    log('   ' + cut(out.strip(), -3000).replace('\n', '\n   '))
+    return rc, out if raw else mask(out)
 
 
 def init_vault(user='tester', nopass=False, kitname='kit'):
@@ -466,7 +485,7 @@ def init_vault(user='tester', nopass=False, kitname='kit'):
         (r'last group of your Secret Key', lambda o: (grab(o), sk(o))[1]),
         (r'last group of your Recovery Key', lambda o: (grab(o), rk(o))[1]),
     ]
-    rc, out = pty_run(user, ['hop', 'init', '--device-key-store', 'file'], answers, timeout=120, nopass=nopass)
+    rc, out = pty_run(user, ['hop', 'init', '--device-key-store', 'file'], answers, timeout=120, nopass=nopass, raw=True)
     grab(out)
     if found.get('sk'):
         sec_write(kitname, 'SECRET_KEY=%s\nRECOVERY_KEY=%s' % (found.get('sk', ''), found.get('rk', '')))
@@ -506,11 +525,35 @@ def ensure_testkey():
     return hop('key', 'add', '/home/tester/testkey', '--name', 'testkey').rc == 0
 
 
+def ensure_include(user='tester'):
+    """Plain ssh <alias> reads hop's generated config only through the Include that
+    hop setup adds. Phase 1 runs hop setup; a run without phase 1 must too, or every
+    "plain ssh no longer works" check would pass on a name that never resolved."""
+    try:
+        cfg = open(os.path.join(pwd.getpwnam(user).pw_dir, '.ssh', 'config')).read()
+    except OSError:
+        cfg = ''
+    if re.search(r'^Include ~/\.ssh/hop/config$', cfg, re.M):
+        return True
+    r = hop('setup', '--yes', user=user)
+    if r.rc != 0:
+        harness('%s.ssh-include' % MACHINE, 'hop setup --yes adds the Include plain ssh needs', 'hop setup failed', r.ev('hop setup --yes'))
+    return r.rc == 0
+
+
 def ensure_vault():
     if os.path.exists('/home/tester/.local/share/hop/device.key'):
         return True
     rc, _ = init_vault()
     return rc == 0
+
+
+def glob_files(d):
+    """Every file under d (recursive), [] when d is missing."""
+    out = []
+    for root_, _, files in os.walk(d):
+        out.extend(os.path.join(root_, f) for f in files)
+    return sorted(out)
 
 
 def has(s, *needles):

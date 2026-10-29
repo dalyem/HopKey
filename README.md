@@ -124,13 +124,18 @@ kiln checks run test       # one check
 Prerequisites:
 
 - the `kiln` CLI, logged in;
-- for phases 3-5, a Tailscale auth key that is reusable, ephemeral and tagged `tag:hoptest`, in a file (default `~/hopkey-test/ts-authkey`, or `HOP_E2E_TS_AUTHKEY_FILE`). The tailnet policy must let `tag:hoptest` reach `tag:hoptest`, for example `{"action":"accept","src":["tag:hoptest"],"dst":["tag:hoptest:*"]}`. The script copies the file only by path. Each machine deletes it when `tailscale up` ends, whatever the outcome. The driver deletes it again at cleanup on every machine that got a copy, also with `--keep`, and checks that it is gone.
+- for phases 3-6, a Tailscale auth key that is reusable, ephemeral and tagged `tag:hoptest`, in a file (default `~/hopkey-test/ts-authkey`, or `HOP_E2E_TS_AUTHKEY_FILE`). The tailnet policy must let `tag:hoptest` reach `tag:hoptest`, for example `{"action":"accept","src":["tag:hoptest"],"dst":["tag:hoptest:*"]}`. The script copies the file only by path. Each machine deletes it when `tailscale up` ends, whatever the outcome. The driver deletes it again at cleanup on every machine that got a copy, also with `--keep`, and checks that it is gone.
 
 ```
 scripts/e2e/run.sh                    # all phases
 scripts/e2e/run.sh --phases 1,2       # local only and MCP; no Tailscale key needed
 scripts/e2e/run.sh --keep             # leave the machines up and print their IDs
+scripts/e2e/run.sh --phases 6 --source ../other-worktree   # build hop from another worktree
 ```
+
+`--source <dir>` builds `hop` and `hop-server` from another checkout (a branch in review, say) and runs this checkout's suite against them. The report names that checkout's branch, commit and uncommitted files.
+
+The run's kiln identity (`kiln whoami`) is printed and kept in the ledger before anything is allocated, and the report names it. `HOP_E2E_EXPECT_IDENTITY=<name or principal ID>` refuses to run under any other. Without it, the run warns when kiln sees a plain shell but the environment is an agent's, or the reverse. An agent should start a run from its own tool call (the tool's background mode), not with a plain `&`: a process that outlives the call runs as the user's identity, and the agent can then neither see nor release its machines.
 
 The phases:
 
@@ -138,7 +143,8 @@ The phases:
 2. MCP.
 3. Sync, through a throwaway `hop-server` on CLI-A that is reachable only on the tailnet, with a CA made for the run.
 4. SSH over Tailscale, including a jump host.
-5. The revocation matrix.
+5. The revocation matrix, and what revocation does on the device: an online revoke leaves `hop unlock` refused and the agent empty, a proven revocation wipes the vault, `device.key` and `~/.ssh/hop` but keeps `revocation.json`, a device revoked offline is cut off once it reconnects and stays cut off across a restart, and the account's `--max-offline 1m` policy locks a device blocked from the server and never an idle healthy one (`rev2-*` checks).
+6. `hop key rotate` against real sshd: the sandboxes' stock Ubuntu sshd (StrictModes on), T2's jump-host target and CLI-B's sshd. `--dry-run` changes nothing; rotated hosts keep every other `authorized_keys` line byte for byte and the old line's options (`restrict` and `from=`, which sshd then enforces on the new key); the old key is refused; T3, whose sshd is set to take only the lines it had before (`AuthorizedKeysCommand` on a snapshot), refuses the new key and is put back; a second record of a rotated account is `already-rotated`; B follows with nothing done there; lines appended during a rotation are kept (`rot-*` checks). A build without `hop key rotate` records a skip.
 
 Every check is one JSON line in `e2e-out/<run-id>/results.jsonl`. `REPORT.md` next to it has a table per phase and the failures in detail. Assertions encode the intended behaviour, so known product gaps show up as FAIL, tagged with their bug ID. A check whose prerequisite did not hold (a session that never connected, a daemon that never started, an answer that was not valid JSON, a firewall block that did not take effect) fails as `harness`; it never passes. A full run takes about 20 minutes: about 6 to build, lease and set up the machines, then about 14 for the phases. Phases 1-2 alone should take under 10 minutes.
 
@@ -152,6 +158,8 @@ The exit code is the verdict:
 | 3 | missing coverage: a selected phase that did not run to its end, a step that did not finish with exit 0, or a machine that reported no checks |
 | 128+n | interrupted by signal n |
 
-Cleanup runs on every exit, including Ctrl-C. Each lease's operation ID and each sandbox ID go to `alloc.state` the moment they exist. Cleanup waits for allocations still under way, then releases everything this run asked for and checks with `kiln vm list` and `kiln sandbox list` that it is gone. A second Ctrl-C only skips the rest of the log collection; the releases still run. Logs leave a machine only after its suite jobs are stopped and each file is masked into a separate export directory. A file that cannot be masked is withheld and counted as a harness failure. Cross-machine timings are corrected by the A-B clock offset, measured over the tailnet at the start and the end; an offset over 0.5 s is a harness failure.
+A run ID is used once: the run's directory is reserved with a plain `mkdir`, so a repeated `--run-id` is refused before it can touch another run's ledger.
 
-`--reuse e2e-out/<run>` (with machines kept by `--keep`) is for debugging. It stops every job of the earlier run (they all run in `hke2e.slice`), removes only the firewall rules the suite added (tagged `hk-e2e`), and clears the completion markers, which carry the run ID.
+Cleanup runs on every exit, including Ctrl-C. Each allocation runs in a worker of its own under `setsid` (`scripts/e2e/alloc.sh`), which ignores INT, TERM and HUP and writes the operation ID and the machine ID to `alloc/<kind>.<who>.rec` the moment kiln returns them, so a signal to the run's whole process group cannot lose one. Cleanup waits for those workers, asks kiln about any operation still without a machine, and reports one it cannot resolve as a harness failure that names the operation. It then releases everything this run asked for and checks with `kiln vm list` and `kiln sandbox list` that it is gone. A second Ctrl-C only skips the rest of the log collection; the releases still run. Logs leave a machine only after its suite jobs are stopped and each file is masked into a separate export directory. A file that cannot be masked is withheld and counted as a harness failure. Cross-machine timings are corrected by the A-B clock offset, measured over the tailnet at the start and the end; an offset over 0.5 s is a harness failure.
+
+`--reuse e2e-out/<run>` (with machines kept by `--keep`) is for debugging. Each machine has a lock file (`$TMPDIR/hk-e2e-locks-<uid>/<id>.lock`, held with `flock` for the whole run), so two runs never share machines; a ledger whose machines were released (`machines.released`) or are no longer live is refused. It stops every job of the earlier run (they all run in `hke2e.slice`), removes only the firewall rules the suite added (tagged `hk-e2e`), and clears the completion markers, which carry the run ID.

@@ -84,13 +84,36 @@ class MCP:
         if res is None:
             return True, None, json.dumps(r.get('error'))
         text = '\n'.join(c.get('text', '') for c in res.get('content', []) if c.get('type') == 'text')
-        L.log('MCP', name, json.dumps(args), '->', 'isError=%s' % res.get('isError'), text[:600])
+        L.log('MCP', name, json.dumps(args), '->', 'isError=%s' % res.get('isError'), L.cut(text, 600))
         return bool(res.get('isError')), res.get('structuredContent'), text
 
     @property
     def healthy(self):
         """Every request so far got an answer from hop mcp (no hang, no exit)."""
         return not self.hung and not self.exited and self.answered == self.nid
+
+    def transport(self):
+        """How the session went: 'ok' while every request got an answer from hop mcp;
+        'refused' when hop mcp exited by itself with an error status and said why on
+        stderr (a real answer: it will not serve this device); 'broken' for a hang,
+        a crash, a signal or an exit that said nothing. Only 'ok' and 'refused' may
+        be judged as access denied; 'broken' is a harness failure."""
+        if self.healthy:
+            return 'ok'
+        if self.hung:
+            return 'broken'
+        try:
+            rc = self.p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            return 'broken'
+        err = self.stderr()
+        crashed = 'panic:' in err or 'goroutine ' in err or 'SIGSEGV' in err
+        return 'refused' if rc and rc > 0 and err.strip() and not crashed else 'broken'
+
+    def why(self):
+        """A masked one-line account of the transport, for evidence."""
+        return L.cut('hung %s, exited %s (rc %s), answered %d of %d; stderr: %s' % (
+            self.hung, self.exited, self.p.poll(), self.answered, self.nid, self.stderr().strip().replace('\n', ' ')), -400)
 
     def close(self):
         try:
@@ -111,3 +134,12 @@ class MCP:
 def results(struct):
     """exec/run_snippet results by host."""
     return {r['host']: r for r in (struct or {}).get('results', [])}
+
+
+def require_ok(m, cid, label):
+    """Record a harness failure when hop mcp stopped answering: a check judged on an
+    EOF or a hang would pass for "no access" or fail for the wrong reason."""
+    if m.transport() != 'ok':
+        L.harness(cid, label, 'hop mcp did not answer every request: ' + m.why())
+        return False
+    return True

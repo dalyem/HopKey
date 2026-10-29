@@ -28,7 +28,7 @@ def step_init():
     rc, out = L.init_vault()
     c('init.pty', 'hop init --device-key-store file through a pty (sealed with HOP_DEVICE_PASSPHRASE)',
       rc == 0 and bool(L.kit()[0]) and os.path.exists('/home/tester/.local/share/hop/device.key'),
-      'exit %d, kit captured to a 0600 file: %s' % (rc, bool(L.kit()[0])), out[-600:])
+      'exit %d, kit captured to a 0600 file: %s' % (rc, bool(L.kit()[0])), L.cut(out, -600))
     hop('ls')  # hop status does not start the daemon (r2-P3-7); ls does
     r = hop('status')
     c('init.sealed', 'hop status reports the device key as file (sealed)', has(r.out, 'file (sealed)'), '', r.ev('hop status'))
@@ -105,7 +105,7 @@ def step_trust_exec():
     c('exec.timeout', 'hop exec --timeout 2s stops a long command', r.rc == 255 and 'timed out' in r.all and r.secs < 8, '', r.ev('--timeout 2s sleep 10'))
     rc, out = L.pty_run('tester', ['hop', 'local1'], [(r'\$ $', 'echo in-hop-shell-$(id -un); exit 3')], timeout=40)
     c('shell.pty', 'interactive hop <target> on a pty runs a shell; the exit code passes through',
-      rc == 3 and 'in-hop-shell-target' in out, 'pty exit %d' % rc, out[-300:])
+      rc == 3 and 'in-hop-shell-target' in out, 'pty exit %d' % rc, L.cut(out, -300))
 
 
 def step_import_setup():
@@ -208,7 +208,7 @@ def step_lock():
     for args in (['lock', '--json'], ['unlock', '--json'], ['mcp', 'install', '--client', 'print', '--json']):
         r = hop(*args)
         if r.rc != 0 or r.json() is None:
-            bad.append('%s rc=%d %s' % (' '.join(args), r.rc, r.all.strip()[:80]))
+            bad.append('%s rc=%d %s' % (' '.join(args), r.rc, L.cut(r.all.strip(), 80)))
     hop('unlock')
     c('json.flag', 'lock, unlock and mcp install take --json (README: every command takes --json)', not bad, '; '.join(bad), '', 'r1-P3-3')
 

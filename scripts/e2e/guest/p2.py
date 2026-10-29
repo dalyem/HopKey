@@ -8,7 +8,7 @@ import time
 
 import e2elib as L
 from e2elib import check as c, hop, has, root
-from mcpc import MCP, results
+from mcpc import MCP, require_ok, results
 
 DENIED_WORDS = ('mdeny', 'md1', 'secret db')
 TOOLS7 = sorted(['check_host', 'exec', 'list_hosts', 'list_snippets', 'resolve_host', 'run_snippet', 'ssh_command'])
@@ -69,7 +69,7 @@ def main():
         texts.append((typed, json.dumps(m.last_raw)))
         return err, st, text
 
-    c('init', 'initialize answers with server info', 'result' in m.init, '', json.dumps(m.init)[:300])
+    c('init', 'initialize answers with server info', 'result' in m.init, '', L.cut(json.dumps(m.init), 300))
     tools, _ = m.tools()
     c('tools', 'tools/list has the 7 tools', sorted(tools) == TOOLS7, 'got %s' % sorted(tools))
 
@@ -78,60 +78,60 @@ def main():
     c('list.all', 'list_hosts lists the hosts and hides the denied one', 'm1' in names and 'mdeny' not in names, 'names %s' % names)
     jh = [h for h in (st or {}).get('hosts', []) if h['name'] == 'mjump']
     c('list.jump-hidden', 'a host whose jump host is denied shows it as "(a host hidden from agents)"',
-      bool(jh) and 'hidden' in json.dumps(jh[0]) and 'mdeny' not in json.dumps(jh[0]), json.dumps(jh)[:300])
+      bool(jh) and 'hidden' in json.dumps(jh[0]) and 'mdeny' not in json.dumps(jh[0]), L.cut(json.dumps(jh), 300))
     _, st, _ = call('list_hosts', {'tag': 'mcp'})
     names = sorted(h['name'] for h in (st or {}).get('hosts', []))
     c('list.tag', 'list_hosts tag filter skips the denied host', names == ['m1', 'm2'], 'names %s' % names)
     _, st, _ = call('list_hosts', {'query': 'mdeny'}, typed=('mdeny',))
-    c('list.query-denied', 'list_hosts query for the denied name finds nothing', (st or {}).get('hosts') == [], json.dumps(st)[:200])
+    c('list.query-denied', 'list_hosts query for the denied name finds nothing', (st or {}).get('hosts') == [], L.cut(json.dumps(st), 200))
 
     _, st, _ = call('resolve_host', {'target': 'm1'})
-    c('resolve.exact', 'resolve_host exact name', ((st or {}).get('host') or {}).get('name') == 'm1', json.dumps(st)[:200])
+    c('resolve.exact', 'resolve_host exact name', ((st or {}).get('host') or {}).get('name') == 'm1', L.cut(json.dumps(st), 200))
     for t in ('mdeny', 'md1'):
         _, st, _ = call('resolve_host', {'target': t}, typed=(t,))
-        c('resolve.denied-' + t, 'resolve_host %s (denied) looks like no host' % t, (st or {}).get('status') == 'no_match', json.dumps(st)[:200])
+        c('resolve.denied-' + t, 'resolve_host %s (denied) looks like no host' % t, (st or {}).get('status') == 'no_match', L.cut(json.dumps(st), 200))
     _, st, _ = call('resolve_host', {'target': '127.0.0.1'})
     cands = [x['name'] for x in (st or {}).get('candidates', [])]
     c('resolve.ambiguous', 'resolve_host by a shared address returns candidates without the denied host',
       (st or {}).get('status') != 'matched' and len(cands) >= 2 and 'mdeny' not in cands, 'candidates %s' % cands)
 
     _, st, _ = call('check_host', {'host': 'm1'})
-    c('check.ok', 'check_host passes every step', (st or {}).get('ok') is True, json.dumps(st)[:300])
+    c('check.ok', 'check_host passes every step', (st or {}).get('ok') is True, L.cut(json.dumps(st), 300))
     _, st, _ = call('check_host', {'host': 'mdeny'}, typed=('mdeny',))
-    c('check.denied', 'check_host on the denied host: no host matches', (st or {}).get('ok') is False and 'no host matches' in json.dumps(st), json.dumps(st)[:200])
+    c('check.denied', 'check_host on the denied host: no host matches', (st or {}).get('ok') is False and 'no host matches' in json.dumps(st), L.cut(json.dumps(st), 200))
     err, st, text = call('ssh_command', {'host': 'm1'})
-    c('sshcmd', 'ssh_command gives an ssh -F command line', 'ssh -F' in json.dumps(st), json.dumps(st)[:200])
+    c('sshcmd', 'ssh_command gives an ssh -F command line', 'ssh -F' in json.dumps(st), L.cut(json.dumps(st), 200))
     err, st, text = call('ssh_command', {'host': 'mdeny'}, typed=('mdeny',))
-    c('sshcmd.denied', 'ssh_command on the denied host fails as not found', err and 'no host' in text, text[:200])
+    c('sshcmd.denied', 'ssh_command on the denied host fails as not found', err and 'no host' in text, L.cut(text, 200))
 
     # The output (mcp-42) is not in the command, so the audit check can tell output from command.
     _, st, _ = call('exec', {'hosts': 'm1', 'command': 'echo mcp-$((6*7)); exit 4'})
     r = results(st).get('m1', {})
-    c('exec.one', 'exec on one host passes exit code 4 through', r.get('exit_code') == 4 and 'mcp-42' in r.get('stdout', ''), json.dumps(r)[:300])
+    c('exec.one', 'exec on one host passes exit code 4 through', r.get('exit_code') == 4 and 'mcp-42' in r.get('stdout', ''), L.cut(json.dumps(r), 300))
     _, st, _ = call('exec', {'hosts': ['m1', 'm2'], 'command': 'echo two'})
-    c('exec.list', 'exec on a list of hosts', sorted(results(st)) == ['m1', 'm2'] and all(x.get('exit_code') == 0 for x in results(st).values()), json.dumps(st)[:300])
+    c('exec.list', 'exec on a list of hosts', sorted(results(st)) == ['m1', 'm2'] and all(x.get('exit_code') == 0 for x in results(st).values()), L.cut(json.dumps(st), 300))
     _, st, _ = call('exec', {'hosts': 'tag:mcp', 'command': 'echo tagged'})
     c('exec.tag', 'exec on tag:mcp skips the denied host', sorted(results(st)) == ['m1', 'm2'], 'hosts %s' % sorted(results(st)))
     for t in ('mdeny', 'md1'):
         _, st, _ = call('exec', {'hosts': t, 'command': 'echo SHOULD-NOT-RUN'}, typed=(t,))
         r = results(st).get(t, {})
         c('exec.denied-' + t, 'exec on %s (denied) runs nothing: no host matches' % t,
-          'no host matches' in r.get('error', '') and 'SHOULD-NOT-RUN' not in r.get('stdout', ''), json.dumps(r)[:300])
+          'no host matches' in r.get('error', '') and 'SHOULD-NOT-RUN' not in r.get('stdout', ''), L.cut(json.dumps(r), 300))
     _, st, _ = call('exec', {'hosts': 'mnopin', 'command': 'echo SHOULD-NOT-RUN'})
     r = results(st).get('mnopin', {})
-    c('exec.unpinned', 'exec on an unpinned host is refused and names hop trust', 'hop trust mnopin' in r.get('error', '') and not r.get('stdout'), json.dumps(r)[:300])
+    c('exec.unpinned', 'exec on an unpinned host is refused and names hop trust', 'hop trust mnopin' in r.get('error', '') and not r.get('stdout'), L.cut(json.dumps(r), 300))
     _, st, _ = call('exec', {'hosts': 'mjump', 'command': 'echo via-jump-mcp'})
     r = results(st).get('mjump', {})
-    c('exec.jump', 'exec through a denied jump host works', r.get('exit_code') == 0 and 'via-jump-mcp' in r.get('stdout', ''), json.dumps(r)[:300])
+    c('exec.jump', 'exec through a denied jump host works', r.get('exit_code') == 0 and 'via-jump-mcp' in r.get('stdout', ''), L.cut(json.dumps(r), 300))
     _, st, _ = call('exec', {'hosts': 'm1', 'command': 'sleep 5', 'timeout_s': 1})
     r = results(st).get('m1', {})
-    c('exec.timeout', 'exec timeout_s=1 stops the command', 'timed out' in r.get('error', ''), json.dumps(r)[:300])
+    c('exec.timeout', 'exec timeout_s=1 stops the command', 'timed out' in r.get('error', ''), L.cut(json.dumps(r), 300))
 
     _, st, _ = call('list_snippets', {})
     sn = {s['name'] for s in (st or {}).get('snippets', [])}
     c('snip.list', 'list_snippets', {'greet', 'up', 'twoparam', 'ok_shc'} <= sn, 'got %s' % sorted(sn))
     _, st, _ = call('run_snippet', {'name': 'greet', 'hosts': 'm1', 'params': {'name': 'world'}})
-    c('snip.run', 'run_snippet greet world', results(st).get('m1', {}).get('stdout') == 'hello world\n', json.dumps(st)[:300])
+    c('snip.run', 'run_snippet greet world', results(st).get('m1', {}).get('stdout') == 'hello world\n', L.cut(json.dumps(st), 300))
     hostile = ['$(touch /tmp/pwned1)', "'; touch /tmp/pwned2 #", '`touch /tmp/pwned3`']
     lit = True
     for i, v in enumerate(hostile):
@@ -144,15 +144,15 @@ def main():
     pwned = root('ls /tmp/pwned* 2>/dev/null').out.split()
     c('snip.hostile', 'hostile snippet params are printed literally and run nothing', lit and not pwned, 'files created: %s' % pwned)
     err, st, text = call('run_snippet', {'name': 'twoparam', 'hosts': 'm1', 'params': {'a': 'A1'}})
-    c('snip.missing', 'run_snippet refuses a missing parameter', 'missing parameter' in text + json.dumps(st), text[:200])
+    c('snip.missing', 'run_snippet refuses a missing parameter', 'missing parameter' in text + json.dumps(st), L.cut(text, 200))
     err, st, text = call('run_snippet', {'name': 'twoparam', 'hosts': 'm1', 'params': {'a': 'A1', 'b': 'B1', 'c': 'C1'}})
-    c('snip.unknown', 'run_snippet refuses an unknown parameter', 'unknown parameter' in text + json.dumps(st), text[:200])
+    c('snip.unknown', 'run_snippet refuses an unknown parameter', 'unknown parameter' in text + json.dumps(st), L.cut(text, 200))
     err, st, text = call('run_snippet', {'name': 'nosuch', 'hosts': 'm1', 'params': {}})
-    c('snip.nosuch', 'run_snippet with no such snippet', 'no snippet' in text + json.dumps(st), text[:200])
+    c('snip.nosuch', 'run_snippet with no such snippet', 'no snippet' in text + json.dumps(st), L.cut(text, 200))
     _, st, _ = call('run_snippet', {'name': 'up', 'hosts': 'mdeny', 'params': {}}, typed=('mdeny',))
-    c('snip.denied', 'run_snippet on the denied host runs nothing', 'no host matches' in json.dumps(st), json.dumps(st)[:200])
+    c('snip.denied', 'run_snippet on the denied host runs nothing', 'no host matches' in json.dumps(st), L.cut(json.dumps(st), 200))
     _, st, _ = call('run_snippet', {'name': 'up', 'hosts': 'mnopin', 'params': {}})
-    c('snip.unpinned', 'run_snippet on an unpinned host is refused', 'hop trust mnopin' in json.dumps(st), json.dumps(st)[:200])
+    c('snip.unpinned', 'run_snippet on an unpinned host is refused', 'hop trust mnopin' in json.dumps(st), L.cut(json.dumps(st), 200))
 
     # Secrets the remote prints: private keys and the passphrase hop knows are redacted.
     _, st, _ = call('exec', {'hosts': 'm1', 'command': 'cat leak.pem; echo ---; cat pp.txt; echo ---; cat sk.txt; echo ---; cat mpw.txt'})
@@ -167,12 +167,13 @@ def main():
         c('scrub.unknown-secrets', 'the Secret Key and master password the remote prints are redacted (daemon knows the Secret Key)',
           not leaked, 'passed through: %s (hop mcp was started without them in its env; README calls this best effort)' % leaked, '', 'r1-P1-rule')
     else:
-        L.harness('scrub', 'the planted-secret command runs on m1 and prints its four parts', 'result: %s' % json.dumps(pr)[:200])
+        L.harness('scrub', 'the planted-secret command runs on m1 and prints its four parts', 'result: %s' % L.cut(json.dumps(pr), 200))
     healthy = m.healthy
     m.close()
+    require_ok(m, 'mcp-transport.rw', 'hop mcp answered every request of the main session')
 
     # Denied names: never in an answer where the request did not type them.
-    leaks = [raw[:160] for typed, raw in texts if not no_denied(raw, typed)]
+    leaks = [L.cut(raw, 160) for typed, raw in texts if not no_denied(raw, typed)]
     if healthy and texts:
         c('deny.invisible', 'the denied host name, alias and description appear in no answer except as typed', not leaks, 'leaks: %s' % leaks[:3])
     else:
@@ -184,11 +185,12 @@ def main():
     tools, _ = ro.tools()
     c('ro.tools', '--read-only offers no exec or run_snippet', 'exec' not in tools and 'run_snippet' not in tools and 'list_hosts' in tools, 'tools %s' % tools)
     err, st, text = ro.call('exec', {'hosts': 'm1', 'command': 'echo SHOULD-NOT-RUN'})
-    c('ro.exec', '--read-only refuses an exec call', ro.healthy and err and 'SHOULD-NOT-RUN' not in text, text[:200])
+    c('ro.exec', '--read-only refuses an exec call', ro.healthy and err and 'SHOULD-NOT-RUN' not in text, L.cut(text, 200))
     err, st, text = ro.call('check_host', {'host': 'm1'})
     auth = [s for s in (st or {}).get('steps', []) if s.get('name') == 'auth_ok']
-    c('ro.check', '--read-only check_host skips the login step', bool(auth) and auth[0].get('status') == 'skipped', json.dumps(auth)[:200])
+    c('ro.check', '--read-only check_host skips the login step', bool(auth) and auth[0].get('status') == 'skipped', L.cut(json.dumps(auth), 200))
     ro.close()
+    require_ok(ro, 'mcp-transport.ro', 'hop mcp --read-only answered every request')
 
     # With the auth secrets in its env, hop mcp scrubs them from output.
     sk, rk = L.kit()
@@ -199,6 +201,7 @@ def main():
     c('scrub.env-secrets', 'with HOP_PASSWORD and HOP_SECRET_KEY in its env, all three values are redacted',
       L.sec_read('masterpw') not in out and sk not in out and L.sec_read('devpass') not in out and 'redacted' in out, '')
     pm.close()
+    require_ok(pm, 'mcp-transport.pw', 'hop mcp with the auth secrets in its env answered every request')
 
     # Audit log.
     try:
@@ -208,7 +211,7 @@ def main():
         mode, audit = None, ''
     c('audit.mode', 'the audit log is mode 0600', mode == 0o600, 'mode %s' % (oct(mode) if mode is not None else 'missing'))
     snip_lines = [json.loads(l) for l in audit.splitlines() if '"run_snippet"' in l]
-    c('audit.snippet', 'run_snippet audit lines carry parameter names', any('name' in json.dumps(x.get('params', '')) for x in snip_lines), json.dumps(snip_lines[:1])[:300])
+    c('audit.snippet', 'run_snippet audit lines carry parameter names', any('name' in json.dumps(x.get('params', '')) for x in snip_lines), L.cut(json.dumps(snip_lines[:1]), 300))
     vals = ['world', 'pwned1', 'pwned2', 'pwned3', 'pwned4', 'A1', 'B1', 'hello world', 'mcp-42']
     hits = [v for v in vals if v in audit]
     c('audit.no-values', 'the audit log holds no parameter values and no output', bool(snip_lines) and not hits,
@@ -266,9 +269,10 @@ def main():
     r = hop('unlock')
     err2, st2, text2 = lm.call('exec', {'hosts': 'm1', 'command': 'echo after-unlock'})
     lm.close()
-    c('locked.hint', 'hop mcp starts a locked daemon on a sealed device and the tools say to run hop unlock', said_unlock, text[:200])
+    require_ok(lm, 'mcp-transport.locked', 'hop mcp on a locked daemon answered every request')
+    c('locked.hint', 'hop mcp starts a locked daemon on a sealed device and the tools say to run hop unlock', said_unlock, L.cut(text, 200))
     c('locked.unlock', 'the hop unlock the tools ask for unlocks that daemon', r.rc == 0 and 'after-unlock' in json.dumps(st2),
-      'hop unlock: rc=%d %s' % (r.rc, r.all.strip()[:200]), '', 'r1-P2-1')
+      'hop unlock: rc=%d %s' % (r.rc, L.cut(r.all.strip(), 200)), '', 'r1-P2-1')
     hop('daemon', 'stop')
     time.sleep(1)
     hop('ls')
