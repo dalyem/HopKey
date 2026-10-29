@@ -397,25 +397,51 @@ func pendingInvites(tx Tx, norm string, now time.Time) ([]*Invite, error) {
 	return out, nil
 }
 
-// selectInvites returns the pending invites sel names: an email (every
-// pending invite for it) or an invite ID or a prefix of one. It refuses
-// when sel names nothing pending.
-func selectInvites(tx Tx, sel string, now time.Time) ([]*Invite, error) {
+// inviteSelector is what invites revoke was given: an email, or the start
+// of an invite ID.
+type inviteSelector struct {
+	email  string // normalized, when by email
+	prefix string // lower-case hex, when by invite ID
+}
+
+// parseInviteSelector reads an email (it holds an @) or an invite ID or a
+// prefix of one of at least 8 hex digits.
+func parseInviteSelector(sel string) (inviteSelector, error) {
 	if strings.Contains(sel, "@") {
 		norm, err := email.Normalize(sel)
 		if err != nil {
-			return nil, adminErr("invalid", "not an email or an invite ID")
+			return inviteSelector{}, adminErr("invalid", "not an email or an invite ID")
 		}
-		out, err := pendingInvites(tx, norm, now)
-		if err == nil && len(out) == 0 {
-			err = adminErr("not_found", "no pending invite for %s", norm)
-		}
-		return out, err
+		return inviteSelector{email: norm}, nil
 	}
 	prefix := strings.ToLower(sel)
 	notHex := func(c rune) bool { return !strings.ContainsRune("0123456789abcdef", c) }
 	if len(prefix) < minInvitePrefix || len(prefix) > 2*len(crypto.Hash{}) || strings.ContainsFunc(prefix, notHex) {
-		return nil, adminErr("invalid", "not an email or an invite ID (at least %d hex digits)", minInvitePrefix)
+		return inviteSelector{}, adminErr("invalid", "not an email or an invite ID (at least %d hex digits)", minInvitePrefix)
+	}
+	return inviteSelector{prefix: prefix}, nil
+}
+
+// idText is an invite ID prefix as messages show it: at most the 12 digits
+// of an invite ID, so a longer prefix of the capability hash is never
+// printed.
+func idText(prefix string) string {
+	if len(prefix) > inviteIDLen {
+		return prefix[:inviteIDLen] + "..."
+	}
+	return prefix
+}
+
+// selectInvites returns the pending invites s names: every pending invite
+// for its email, or the one invite its prefix names. It refuses when s
+// names nothing pending.
+func selectInvites(tx Tx, s inviteSelector, now time.Time) ([]*Invite, error) {
+	if s.email != "" {
+		out, err := pendingInvites(tx, s.email, now)
+		if err == nil && len(out) == 0 {
+			err = adminErr("not_found", "no pending invite for %s", s.email)
+		}
+		return out, err
 	}
 	regs, err := tx.Registrations("")
 	if err != nil {
@@ -423,15 +449,15 @@ func selectInvites(tx Tx, sel string, now time.Time) ([]*Invite, error) {
 	}
 	var match []*Invite
 	for _, r := range regs {
-		if strings.HasPrefix(hex.EncodeToString(r.CapHash[:]), prefix) {
+		if strings.HasPrefix(hex.EncodeToString(r.CapHash[:]), s.prefix) {
 			match = append(match, inviteOf(r))
 		}
 	}
 	switch {
 	case len(match) == 0:
-		return nil, adminErr("not_found", "no invite %s", prefix)
+		return nil, adminErr("not_found", "no invite %s", idText(s.prefix))
 	case len(match) > 1:
-		return nil, adminErr("ambiguous", "%d invites start with %s; give more digits", len(match), prefix)
+		return nil, adminErr("ambiguous", "%d invites start with %s; give more digits", len(match), idText(s.prefix))
 	}
 	switch inv := match[0]; inv.State(now) {
 	case InviteUsed:
@@ -446,10 +472,14 @@ func selectInvites(tx Tx, sel string, now time.Time) ([]*Invite, error) {
 // email (every pending invite for it) or an invite ID or a prefix of one of
 // at least 8 hex digits. It changes nothing.
 func PlanRevokeInvites(ctx context.Context, st Store, sel string, now time.Time) ([]*Invite, error) {
+	s, err := parseInviteSelector(sel)
+	if err != nil {
+		return nil, err
+	}
 	var out []*Invite
-	err := st.View(ctx, func(tx Tx) error {
+	err = st.View(ctx, func(tx Tx) error {
 		var err error
-		out, err = selectInvites(tx, sel, now)
+		out, err = selectInvites(tx, s, now)
 		return err
 	})
 	return out, err
@@ -474,19 +504,42 @@ func expireInvites(tx Tx, got, want []*Invite, now time.Time) error {
 	return nil
 }
 
-type revokeParams struct {
-	Selector string   `json:"selector"`
-	Invites  []string `json:"invites"`
+// The audit params of invites revoke name the selector by kind and email,
+// never by the digits given: a selector can be the whole capability hash,
+// and the trail keeps no more of it than the 12-digit IDs of the invites
+// it resolved to.
+type revokeByEmail struct {
+	By      string   `json:"by"` // "email"
+	Email   string   `json:"email"`
+	Invites []string `json:"invites"`
+}
+
+type revokeByID struct {
+	By      string   `json:"by"` // "id"
+	Invites []string `json:"invites"`
 }
 
 // RevokeInvites makes the invites PlanRevokeInvites listed as want expire
-// now, and writes the audit row. It refuses when sel no longer selects
-// exactly those invites. A used invite is never touched: it serves the
-// signup acknowledgment retry (R3).
+// now, and writes the audit row. It refuses with "changed" when sel no
+// longer selects exactly those invites, also when it now selects none, a
+// used or expired one, or several. A used invite is never touched: it
+// serves the signup acknowledgment retry (R3). A selector that cannot be
+// read is refused before anything is written, as planning refuses it.
 func RevokeInvites(ctx context.Context, st Store, op Operator, sel string, want []*Invite) (*AuditEntry, error) {
-	params := &revokeParams{Selector: sel, Invites: inviteIDs(want)}
+	s, err := parseInviteSelector(sel)
+	if err != nil {
+		return nil, err
+	}
+	var params any = &revokeByID{By: "id", Invites: inviteIDs(want)}
+	if s.email != "" {
+		params = &revokeByEmail{By: "email", Email: s.email, Invites: inviteIDs(want)}
+	}
 	return op.change(ctx, st, ActionInviteRevoke, nil, params, func(tx Tx) (*model.ID, error) {
-		got, err := selectInvites(tx, sel, op.Now)
+		got, err := selectInvites(tx, s, op.Now)
+		var ae *AdminError
+		if len(want) > 0 && errors.As(err, &ae) {
+			return nil, adminErr("changed", "the invites changed since they were listed (%s); run the command again", ae.Msg)
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -457,10 +457,13 @@ func TestInvitesCommands(t *testing.T) {
 	// encoding/json turns the invalid byte into U+FFFD; the rest is kept.
 	isHostile := func(e string) bool { return strings.HasPrefix(e, "evil\x1b[2J\u202e\nx") }
 	states := map[string]string{}
-	var hostileID string
+	var hostileID, yID string
 	for _, inv := range ls.Invites {
 		if isHostile(inv.Email) {
 			inv.Email, hostileID = "hostile", inv.Invite
+		}
+		if inv.Email == "y@example.com" {
+			yID = inv.Invite
 		}
 		states[inv.Email] = inv.State
 		if inv.Code != "" {
@@ -494,6 +497,34 @@ func TestInvitesCommands(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cancelled") || !strings.Contains(prompt.String(), "Revoke 2 invites? [y/N]") {
 		t.Errorf("answering no: %v, prompt %q", err, prompt.String())
 	}
+	// With --json the question comes after the plan, escaped, on stderr;
+	// stdout stays empty for the final JSON.
+	for _, c := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"invites", "revoke", hostileID, "--json", "--data", dir},
+			[]string{"would revoke 1 invite:", hostileID, esc(hostileEmail), "Revoke 1 invite? [y/N]"}},
+		{[]string{"invites", "reissue", "y@example.com", "--json", "--data", dir},
+			[]string{"would revoke 1 pending invite:", yID, "y@example.com", "would issue a new invite for y@example.com, valid until",
+				"Revoke 1 invite and issue a new invite for y@example.com? [y/N]"}},
+	} {
+		stubTerminal(t, "n\n")
+		var stdout, stderr bytes.Buffer
+		err := run(c.args, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "cancelled") || stdout.Len() != 0 {
+			t.Errorf("%v answered no: %v, stdout %q", c.args, err, stdout.String())
+		}
+		assertTerminalSafe(t, "the --json plan", stderr.String())
+		for _, w := range c.want {
+			if !strings.Contains(stderr.String(), w) {
+				t.Errorf("%v: the plan on stderr lacks %q:\n%s", c.args, w, stderr.String())
+			}
+		}
+		if q := strings.LastIndex(stderr.String(), "[y/N]"); q < strings.LastIndex(stderr.String(), "would ") {
+			t.Errorf("%v: the question comes before the plan:\n%s", c.args, stderr.String())
+		}
+	}
 	if after := dump(t, dir); after != before {
 		t.Errorf("a dry run or a refusal changed the database:\n%s\nthen\n%s", before, after)
 	}
@@ -512,10 +543,18 @@ func TestInvitesCommands(t *testing.T) {
 		t.Errorf("a revoked code: %d", c)
 	}
 
-	// --yes without a terminal, by invite ID, with JSON.
+	// --yes without a terminal, by the whole capability hash, with JSON.
+	// The output and the audit row keep only the 12-digit invite ID.
 	stubTerminal(t, "")
-	out, stderr = mustRun(t, "invites", "revoke", hostileID[:8], "--yes", "--json", "--data", dir)
+	hostileHash := strings.Repeat("ab", 32)
+	out, stderr = mustRun(t, "invites", "revoke", hostileHash, "--yes", "--json", "--data", dir)
 	assertTerminalSafe(t, "revoke --json", out+stderr)
+	if strings.Contains(out+stderr, hostileHash[:13]) {
+		t.Errorf("revoke by hash prints more than the invite ID:\n%s\n%s", out, stderr)
+	}
+	if p := string(parseAuditLine(t, stderr).Audit.Params); p != `{"by":"id","invites":["`+hostileID+`"]}` {
+		t.Errorf("revoke by hash audit params %s", p)
+	}
 	var rv struct {
 		Revoked []struct {
 			Invite string `json:"invite"`
@@ -530,6 +569,11 @@ func TestInvitesCommands(t *testing.T) {
 	err = run([]string{"invites", "revoke", "x@example.com", "--yes", "--data", dir}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "no pending invite") {
 		t.Errorf("revoking again: %v", err)
+	}
+	unknown := strings.Repeat("cd", 32)
+	err = run([]string{"invites", "revoke", unknown, "--yes", "--data", dir}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "no invite "+unknown[:12]) || strings.Contains(err.Error(), unknown[:13]) {
+		t.Errorf("revoking an unknown hash: %v", err)
 	}
 
 	// reissue: the old code stops working, the new one works, and the

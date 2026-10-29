@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"math"
 	"os"
@@ -296,6 +297,9 @@ func TestAdminInvites(t *testing.T) {
 			t.Errorf("the audit row %s does not name invite %s", entry.Params, idOf(code))
 		}
 	}
+	if want := `{"by":"email","email":"x@example.com","invites":["` + strings.Join(inviteIDs(plan), `","`) + `"]}`; string(entry.Params) != want {
+		t.Errorf("revoke audit params %s, want %s", entry.Params, want)
+	}
 	_, err = RevokeInvites(ctx, e.st, op, "x@example.com", nil)
 	wantAdminCode(t, err, "not_found", "revoking again")
 
@@ -358,6 +362,134 @@ func TestAdminInvites(t *testing.T) {
 	}
 	if entry == nil || entry.ID != rows[len(rows)-1].ID {
 		t.Errorf("the stale reissue's row %+v", entry)
+	}
+}
+
+// A selector longer than an invite ID, up to the whole capability hash,
+// reaches neither the audit trail nor a message: a row names the selector
+// by kind and the invites by their 12-digit IDs, on success and failure.
+func TestAdminRevokeKeepsOnlyInviteIDs(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	now := e.clock.now()
+	op := Operator{Actor: "tester (uid 1000)", Now: now}
+	var full []string
+	for _, addr := range []string{"a@example.com", "b@example.com"} {
+		h, _ := secretHash(e.invite(addr))
+		full = append(full, hex.EncodeToString(h[:]))
+	}
+	unknown := strings.Repeat("5a", len(crypto.Hash{}))
+	secrets := []string{full[0][:inviteIDLen+1], full[1][:inviteIDLen+1], unknown[:inviteIDLen+1]}
+	leaks := func(what, s string) {
+		t.Helper()
+		for _, x := range secrets {
+			if strings.Contains(s, x) {
+				t.Errorf("%s holds more than 12 digits of a selector: %s", what, s)
+			}
+		}
+	}
+
+	planA, err := PlanRevokeInvites(ctx, e.st, strings.ToUpper(full[0]), now)
+	if err != nil || len(planA) != 1 {
+		t.Fatalf("plan by the whole hash: %+v, %v", planA, err)
+	}
+	if _, err := RevokeInvites(ctx, e.st, op, strings.ToUpper(full[0]), planA); err != nil {
+		t.Fatal(err)
+	}
+	planB, err := PlanRevokeInvites(ctx, e.st, full[1][:20], now)
+	if err != nil || len(planB) != 1 {
+		t.Fatalf("plan by a 20-digit prefix: %+v, %v", planB, err)
+	}
+	if _, err := RevokeInvites(ctx, e.st, op, full[1][:20], planB); err != nil {
+		t.Fatal(err)
+	}
+	// Failures: a confirmed invite that expired since, and an unknown
+	// hash, whole or in part.
+	_, err = RevokeInvites(ctx, e.st, op, full[0], planA)
+	wantAdminCode(t, err, "changed", "revoking an invite that expired since the plan")
+	leaks("the error", err.Error())
+	for _, sel := range []string{unknown, unknown[:30]} {
+		_, err = RevokeInvites(ctx, e.st, op, sel, nil)
+		wantAdminCode(t, err, "not_found", "an unknown hash")
+		leaks("the error", err.Error())
+		_, err = PlanRevokeInvites(ctx, e.st, sel, now)
+		wantAdminCode(t, err, "not_found", "planning an unknown hash")
+		leaks("the plan error", err.Error())
+	}
+	_, err = PlanRevokeInvites(ctx, e.st, full[0], now)
+	wantAdminCode(t, err, "expired", "planning a revoked invite")
+	leaks("the plan error", err.Error())
+
+	rows := auditRows(t, e, AuditFilter{})
+	idsA, idsB := `{"by":"id","invites":["`+planA[0].ID+`"]}`, `{"by":"id","invites":["`+planB[0].ID+`"]}`
+	want := []string{"ok " + idsA, "ok " + idsB, "changed " + idsA, `not_found {"by":"id","invites":[]}`, `not_found {"by":"id","invites":[]}`}
+	var got []string
+	for _, r := range rows {
+		got = append(got, r.Result+" "+string(r.Params))
+		leaks("an audit row", string(r.Params))
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("audit rows\n%v\nwant\n%v", got, want)
+	}
+}
+
+// Once the operator confirmed a plan, any change in what the selector
+// picks is refused as "changed", with the reason in the message: the
+// invite was used or expired, the prefix became ambiguous, or the email
+// has nothing pending any more. Nothing is revoked.
+func TestAdminRevokeChangedSincePlan(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	now := e.clock.now()
+	op := Operator{Actor: "tester (uid 1000)", Now: now}
+	later := Operator{Actor: op.Actor, Now: now.Add(8 * 24 * time.Hour)} // past every 7-day invite
+	idOf := func(code string) string {
+		h, _ := secretHash(code)
+		return InviteID(h)
+	}
+	plan := func(sel string) []*Invite {
+		t.Helper()
+		p, err := PlanRevokeInvites(ctx, e.st, sel, now)
+		if err != nil || len(p) == 0 {
+			t.Fatalf("plan %s: %+v, %v", sel, p, err)
+		}
+		return p
+	}
+	refused := func(what string, o Operator, sel string, want []*Invite, reason string) {
+		t.Helper()
+		entry, err := RevokeInvites(ctx, e.st, o, sel, want)
+		wantAdminCode(t, err, "changed", what)
+		if err != nil && !strings.Contains(err.Error(), reason) {
+			t.Errorf("%s: %v does not give the reason %q", what, err, reason)
+		}
+		if entry == nil || entry.Result != "changed" || entry.ID == 0 {
+			t.Errorf("%s: audit row %+v", what, entry)
+		}
+	}
+
+	// Used: the invite signs an account up after the plan.
+	v := newVault(t, "used@example.com")
+	code := e.invite(v.email)
+	planUsed := plan(idOf(code))
+	chal := e.signupChallenge(v.email, code)
+	e.must(e.do("POST", "/v1/signup", "", e.signupReq(v, code, chal, 0, nil, testOrigin)), 200, nil)
+	refused("an invite used since the plan", op, idOf(code), planUsed, "was used")
+
+	// Expired, by ID and by email (the email then has nothing pending).
+	exp := e.invite("exp@example.com")
+	refused("an invite expired since the plan", later, idOf(exp), plan(idOf(exp)), "has already expired")
+	refused("an email with nothing pending since the plan", later, "exp@example.com", plan("exp@example.com"), "no pending invite")
+
+	// Ambiguous: another invite now shares the prefix.
+	var h1, h2 crypto.Hash
+	h1[0], h1[1], h1[6], h2[0], h2[1], h2[6] = 0xab, 0xcd, 1, 0xab, 0xcd, 2
+	insertReg(t, e, h1, "p@example.com", time.Hour)
+	planAmb := plan("abcd0000")
+	insertReg(t, e, h2, "q@example.com", time.Hour)
+	refused("a prefix that became ambiguous", op, "abcd0000", planAmb, "2 invites start with abcd0000")
+
+	if pending, err := ListInvites(ctx, e.st, false, now); err != nil || len(pending) != 3 {
+		t.Errorf("after the refusals %d invites are pending, want exp, p and q: %+v, %v", len(pending), pending, err)
 	}
 }
 
@@ -588,6 +720,72 @@ func TestMigrateV2WithoutDeviceSeen(t *testing.T) {
 	}
 	if _, err := ShowAccount(context.Background(), st, v.email, e.clock.now()); err != nil {
 		t.Errorf("ShowAccount: %v", err)
+	}
+}
+
+// An admin command opening a version 2 database while another connection
+// (the running server) holds a write transaction fails without migrating
+// anything, and the database opens and migrates once the writer is done.
+// On a WAL database, as the server leaves it, the open first waits out
+// the busy timeout. A rollback-journal file (VACUUM INTO writes one, so a
+// restored backup is one until a server opens it) fails at once: the
+// switch to WAL needs a lock the writer holds.
+func TestOpenWhileAnotherWriterHoldsTheLock(t *testing.T) {
+	for _, wal := range []bool{true, false} {
+		t.Run(map[bool]string{true: "wal", false: "rollback journal"}[wal], func(t *testing.T) {
+			e := newEnv(t)
+			ctx := context.Background()
+			e.invite("pending@example.com")
+			path := v2DB(t, e)
+			raw := openRaw(t, path)
+			if wal {
+				if _, err := raw.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := tableCounts(t, raw)
+			conn, err := raw.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+				t.Fatal(err)
+			}
+
+			start := time.Now()
+			st, err := OpenSQLite(path)
+			waited := time.Since(start)
+			if err == nil {
+				st.Close()
+				t.Fatal("opened a database another connection is writing")
+			}
+			t.Logf("failed after %v: %v", waited, err)
+			if wal && waited < 9*time.Second {
+				t.Errorf("gave up after %v, before the 10 s busy timeout: %v", waited, err)
+			}
+			if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+				t.Fatal(err)
+			}
+			if v := schemaVersionOf(t, raw); v != "2" {
+				t.Errorf("schema version %q after a failed open", v)
+			}
+			if slices.ContainsFunc(schemaOf(t, raw), func(o sqlObject) bool { return o.Name == "admin_audit" }) {
+				t.Error("a failed open created admin_audit")
+			}
+			if after := tableCounts(t, raw); !mapsEqual(before, after) {
+				t.Errorf("rows changed: %v, then %v", before, after)
+			}
+
+			st, err = OpenSQLite(path)
+			if err != nil {
+				t.Fatalf("opening once the writer is done: %v", err)
+			}
+			st.Close()
+			if v := schemaVersionOf(t, raw); v != "3" {
+				t.Errorf("schema version %q after the writer finished", v)
+			}
+		})
 	}
 }
 

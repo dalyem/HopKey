@@ -543,6 +543,19 @@ func newChangeFlags(fs *flag.FlagSet) changeFlags {
 	}
 }
 
+// planOut is where a change command shows what it will change: stdout, or
+// with --json stderr before a question on a terminal, so stdout holds only
+// the final JSON. It is nil when there is nothing to show it for.
+func (f changeFlags) planOut(stdout, stderr io.Writer) io.Writer {
+	switch {
+	case !*f.asJSON:
+		return stdout
+	case !*f.yes && stdinIsTTY():
+		return stderr
+	}
+	return nil
+}
+
 func invitesRevoke(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("invites revoke", flag.ContinueOnError)
 	f := newChangeFlags(fs)
@@ -570,13 +583,13 @@ func invitesRevoke(args []string, stdout, stderr io.Writer) error {
 			Revoke []inviteJSON `json:"revoke"`
 		}{true, invitesJSON(plan, now)})
 	}
-	if !*f.asJSON {
-		fmt.Fprintf(stdout, "would revoke %s:\n", plural(len(plan), "invite", "invites"))
-		if err := printInvites(stdout, plan, now); err != nil {
+	if w := f.planOut(stdout, stderr); w != nil {
+		fmt.Fprintf(w, "would revoke %s:\n", plural(len(plan), "invite", "invites"))
+		if err := printInvites(w, plan, now); err != nil {
 			return err
 		}
 		if *f.dryRun {
-			fmt.Fprintln(stdout, "dry run: nothing changed")
+			fmt.Fprintln(w, "dry run: nothing changed")
 			return nil
 		}
 	}
@@ -636,16 +649,16 @@ func invitesReissue(args []string, stdout, stderr io.Writer) error {
 			ExpiresAt time.Time    `json:"expires_at"`
 		}{true, invitesJSON(plan, now), norm, now.Add(ttl)})
 	}
-	if !*f.asJSON {
+	if w := f.planOut(stdout, stderr); w != nil {
 		if len(plan) > 0 {
-			fmt.Fprintf(stdout, "would revoke %s:\n", plural(len(plan), "pending invite", "pending invites"))
-			if err := printInvites(stdout, plan, now); err != nil {
+			fmt.Fprintf(w, "would revoke %s:\n", plural(len(plan), "pending invite", "pending invites"))
+			if err := printInvites(w, plan, now); err != nil {
 				return err
 			}
 		}
-		fmt.Fprintf(stdout, "would issue a new invite for %s, valid until %s\n", esc(norm), when(now.Add(ttl)))
+		fmt.Fprintf(w, "would issue a new invite for %s, valid until %s\n", esc(norm), when(now.Add(ttl)))
 		if *f.dryRun {
-			fmt.Fprintln(stdout, "dry run: nothing changed")
+			fmt.Fprintln(w, "dry run: nothing changed")
 			return nil
 		}
 	}
