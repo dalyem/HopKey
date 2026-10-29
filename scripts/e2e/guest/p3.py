@@ -265,11 +265,17 @@ def step_conflict_check():
             L.log('no daemon.log on B: %s' % e)
         outs = {'hop status': rs.all, 'hop sync': rsy.all, 'daemon.log': dlog}
         found = {k: cf3_notice(v) for k, v in outs.items()}
-        leaks = {k: [x for x in ('fromA', 'fromB') if x in v] for k, v in outs.items()}
+        # The values must not appear in any replaced-edit notice or any line naming cf3. Other
+        # lines (an unrelated log message, say) are not the notice and are not judged.
+        def notice_lines(text):
+            return '\n'.join(ln for ln in (text or '').splitlines() if 'replaced' in ln or 'cf3' in ln)
+        leaks = {k: [x for x in ('fromA', 'fromB') if x in notice_lines(v)] for k, v in outs.items()}
         leaks = {k: v for k, v in leaks.items() if v}
         missing = [k for k, v in found.items() if not v]
+        # The queue drained and the server answers, so both commands must succeed: hop sync
+        # prints its status, notes included, even when the sync itself fails.
         c('B.conflict-notice-shown', 'B, whose description edit won, names cf3 and the field in hop status, hop sync and its daemon log, '
-          'never the values', not missing and not leaks,
+          'never the values', not missing and not leaks and rs.rc == 0 and rsy.rc == 0,
           'missing from: %s; values present in: %s; hop status rc %d, hop sync rc %d' % (missing or 'none', leaks or 'none', rs.rc, rsy.rc),
           ' | '.join('%s: %s' % (k, L.cut(v or '(none)', 300)) for k, v in found.items()), 'r1-P3-1')
     else:
