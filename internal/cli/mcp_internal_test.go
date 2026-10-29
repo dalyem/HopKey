@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/redact"
 	"github.com/dalyem/hopkey/internal/resolve"
 )
 
@@ -227,5 +229,50 @@ func TestMCPPanicOnStderrIsRedacted(t *testing.T) {
 	got := stderr.String()
 	if strings.Contains(got, secret) || strings.Contains(got, "\x1b") || !strings.Contains(got, "boom panicked: it was [redacted by hop]\\x1b[31m") {
 		t.Errorf("stderr = %q", got)
+	}
+}
+
+// The daemon's hits, the patterns' and hop's own secrets are found in one
+// text and replaced in one pass: overlapping ones go as one stretch, named
+// for the kind that ranks first, and a hit counts on the text with the
+// typed-text marks out, so a secret that runs into a typed echo goes whole
+// and the typed text beside one is still not masked.
+func TestRedactSpansOnePass(t *testing.T) {
+	vault := func(text, v string) []redact.Hit {
+		return redact.Literals(text, []redact.Secret{{Kind: redact.KindVaultPassword, Value: v}})
+	}
+	m := masker{names: []string{"db"}, secrets: []string{"2y z"}}
+	for _, c := range []struct {
+		name, text, want string
+		counts           map[string]int
+	}{
+		// The pattern's value runs past the vault password at both ends,
+		// and hop's own secret past the pattern's end.
+		{"overlap", "API_KEY=xhunter2y zz", "API_KEY=[redacted by hop: vault-password]z", map[string]int{redact.KindVaultPassword: 1}},
+		// A vault password right after a typed echo of a denied name: the
+		// echo stays as typed, the name in hop's text is hidden.
+		{"beside a mark", typed("db") + "pw:hunter2 db", "dbpw:[redacted by hop: vault-password] <hidden host>", map[string]int{redact.KindVaultPassword: 1}},
+		// A vault password that starts inside the typed echo.
+		{"across a mark", "x " + typed("hun") + "ter2 y", "x [redacted by hop: vault-password] y", map[string]int{redact.KindVaultPassword: 1}},
+		// A token beside a key block: each is its own marker.
+		{"token and key", "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 -----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----",
+			"[redacted by hop: github-token] " + keyRedacted, map[string]int{redact.KindGitHubToken: 1, redact.KindPrivateKey: 1}},
+	} {
+		ss := typedSpans(c.text)
+		joined := joinSpans(ss)
+		more := append(vault(joined, "hunter2"), redact.Patterns(joined)...)
+		out := redactSpans(ss, m.secrets, more)
+		if got := m.hideSpans(out); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+		counts := map[string]int{}
+		countMarkers(counts, out)
+		if !maps.Equal(counts, c.counts) {
+			t.Errorf("%s: counts %v, want %v", c.name, counts, c.counts)
+		}
+	}
+	// A hit past the end of the text, from a confused caller, is cut to it.
+	if got := joinSpans(redactSpans([]span{{text: "abc"}}, nil, []redact.Hit{{Lo: 1, Hi: 99, Kind: redact.KindVaultPassword}})); got != "a[redacted by hop: vault-password]" {
+		t.Errorf("clamped hit: %q", got)
 	}
 }

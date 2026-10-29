@@ -454,6 +454,13 @@ func TestTwoMachinesEndToEnd(t *testing.T) {
 
 	// Machine 2 gets the host with no sync command.
 	waitFor(t, 20*time.Second, "web on m2", func() bool { _, ok := m2.hosts(t)["web"]; return ok })
+	// A host's agent_output policy is a vault field, and syncs.
+	m1.must(t, nil, "edit", "web", "--agent-output", "none")
+	waitFor(t, 20*time.Second, "web's agent_output on m2", func() bool {
+		var info map[string]any
+		decodeJSON(t, m2.must(t, nil, "info", "web", "--json"), &info)
+		return info["agent_output"] == "none"
+	})
 	m2.must(t, nil, "add", "db", "--address", "203.0.113.11")
 	waitFor(t, 20*time.Second, "db on m1", func() bool { _, ok := m1.hosts(t)["db"]; return ok })
 

@@ -217,9 +217,9 @@ func (e *e2e) addHost(t *testing.T, name string, mod func(*model.Host)) model.Ho
 	return saved
 }
 
-func execResults(t *testing.T, out cli.MCPExec) map[string]cli.ExecResult {
+func execResults(t *testing.T, out cli.MCPExec) map[string]cli.MCPExecResult {
 	t.Helper()
-	m := map[string]cli.ExecResult{}
+	m := map[string]cli.MCPExecResult{}
 	for _, r := range out.Results {
 		if _, dup := m[r.Host]; dup {
 			t.Errorf("host %s has two results", r.Host)

@@ -254,25 +254,47 @@ type ExecResult struct {
 	Error string `json:"error,omitempty"`
 	// Warning is set when the command ran but its output may be incomplete.
 	Warning string `json:"warning,omitempty"`
+
+	// The size of the whole of stdout and stderr, kept or not, for hop
+	// mcp to report when it withholds them. They are not in the JSON.
+	stdoutBytes, stdoutLines int64
+	stderrBytes, stderrLines int64
 }
 
 // tailLimit is how much of each output stream --json keeps: the last 64 KB.
 const tailLimit = 64 << 10
 
-// tailBuffer keeps the last max bytes written to it.
+// tailBuffer keeps the last max bytes written to it, and counts them all.
 type tailBuffer struct {
 	max     int
 	buf     []byte
 	dropped bool
+
+	total, newlines int64
+	last            byte
 }
 
 func (t *tailBuffer) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		t.total += int64(len(p))
+		t.newlines += int64(bytes.Count(p, []byte{'\n'}))
+		t.last = p[len(p)-1]
+	}
 	t.buf = append(t.buf, p...)
 	if len(t.buf) > 2*t.max {
 		t.buf = append([]byte(nil), t.buf[len(t.buf)-t.max:]...)
 		t.dropped = true
 	}
 	return len(p), nil
+}
+
+// lines is how many lines were written: one more than the line breaks
+// when the last line has none.
+func (t *tailBuffer) lines() int64 {
+	if t.total > 0 && t.last != '\n' {
+		return t.newlines + 1
+	}
+	return t.newlines
 }
 
 func (t *tailBuffer) Bytes() []byte {
@@ -451,9 +473,11 @@ func (e *Env) runRemote(ctx context.Context, t *target, addr string, r remoteRun
 	}
 	if r.stdout == nil {
 		res.Stdout = string(outTail.Bytes())
+		res.stdoutBytes, res.stdoutLines = outTail.total, outTail.lines()
 	}
 	if r.stderr == nil {
 		res.Stderr = string(errTail.Bytes())
+		res.stderrBytes, res.stderrLines = errTail.total, errTail.lines()
 	}
 	res.Truncated = outTail.dropped || errTail.dropped || res.Warning != ""
 	return res, nil

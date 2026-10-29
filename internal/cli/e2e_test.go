@@ -990,8 +990,9 @@ func (s *sshServer) serve(c net.Conn, cfg *ssh.ServerConfig) {
 
 // session answers exec requests. Commands: "echo ok", "true", "exit N", "cat"
 // (echoes stdin), "stderr" (writes to stderr, exits 1), "big" (writes more than
-// 64 KB, ending in END), "sleep" (waits), "leak" (prints s.leak). Anything else
-// is recorded and exits 0. hop mcp's mcpEnvPrefix is recorded, then ignored.
+// 64 KB, ending in END), "sleep" (waits), "leak" (prints s.leak) and "leakerr"
+// (prints s.leak to stderr). Anything else is recorded and exits 0. hop mcp's
+// mcpEnvPrefix is recorded, then ignored.
 func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 	for req := range reqs {
@@ -1016,6 +1017,8 @@ func (s *sshServer) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
 		switch {
 		case p.Command == "leak":
 			ch.Write([]byte(leak))
+		case p.Command == "leakerr":
+			ch.Stderr().Write([]byte(leak))
 		case p.Command == "echo ok":
 			ch.Write([]byte("ok\n"))
 		case p.Command == "cat":

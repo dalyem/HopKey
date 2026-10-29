@@ -18,8 +18,11 @@ import (
 // with each host's exit code after. It records what ran where and for which
 // client, never the output: for exec the command the agent sent, for
 // run_snippet the snippet's name and the names of the parameters it was
-// given, never their values. Every string is redacted and escaped
-// (auditText). The file is never rotated or truncated by hop.
+// given, never their values. Of the output it records per host the
+// agent_output policy that applied, how many secrets of each kind were
+// redacted from it, and whether it was withheld; never what they were.
+// Every string is redacted and escaped (auditText). The file is never
+// rotated or truncated by hop.
 type auditLog struct {
 	mu   sync.Mutex
 	path string
@@ -46,10 +49,13 @@ type auditEntry struct {
 }
 
 type auditResult struct {
-	Host       string `json:"host"`
-	ExitCode   int    `json:"exit_code"`
-	Error      string `json:"error,omitempty"`
-	DurationMS int64  `json:"duration_ms"`
+	Host        string         `json:"host"`
+	ExitCode    int            `json:"exit_code"`
+	Error       string         `json:"error,omitempty"`
+	DurationMS  int64          `json:"duration_ms"`
+	AgentOutput string         `json:"agent_output,omitempty"`
+	Redactions  map[string]int `json:"redactions,omitempty"` // by kind: counts, never values
+	Withheld    bool           `json:"withheld,omitempty"`
 }
 
 func (a *auditLog) start(entry *auditEntry) error {
@@ -60,12 +66,13 @@ func (a *auditLog) start(entry *auditEntry) error {
 }
 
 // end logs the results: exit codes and hop's own errors, through clean
-// (auditText). Output is not logged.
-func (a *auditLog) end(entry *auditEntry, results []ExecResult, clean func(string) string) error {
+// (auditText), and what the agent_output policy did. Output is not logged.
+func (a *auditLog) end(entry *auditEntry, results []MCPExecResult, clean func(string) string) error {
 	end := *entry
 	end.Event = "end"
 	for _, r := range results {
-		end.Results = append(end.Results, auditResult{Host: clean(r.Host), ExitCode: r.ExitCode, Error: clean(r.Error), DurationMS: r.DurationMS})
+		end.Results = append(end.Results, auditResult{Host: clean(r.Host), ExitCode: r.ExitCode, Error: clean(r.Error), DurationMS: r.DurationMS,
+			AgentOutput: r.AgentOutput, Redactions: r.Redactions, Withheld: r.Withheld != nil})
 	}
 	return a.append(end)
 }

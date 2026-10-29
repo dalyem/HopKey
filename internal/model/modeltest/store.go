@@ -207,6 +207,8 @@ func validateHost(h model.Host) error {
 		return fmt.Errorf("modeltest: host %q: invalid route %q", h.Name, h.Route)
 	case h.AgentAccess != "allow" && h.AgentAccess != "deny":
 		return fmt.Errorf("modeltest: host %q: invalid agent_access %q", h.Name, h.AgentAccess)
+	case h.AgentOutput != "" && h.AgentOutput != model.AgentOutputFull && h.AgentOutput != model.AgentOutputNone:
+		return fmt.Errorf("modeltest: host %q: invalid agent_output %q", h.Name, h.AgentOutput)
 	}
 	if t := h.Tailscale; t != nil && t.SSH != "yes" && t.SSH != "no" && t.SSH != "unknown" {
 		return fmt.Errorf("modeltest: host %q: invalid tailscale.ssh %q", h.Name, t.SSH)

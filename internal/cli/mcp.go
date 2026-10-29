@@ -20,6 +20,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/redact"
 	"github.com/dalyem/hopkey/internal/resolve"
 	"github.com/dalyem/hopkey/internal/shellcmd"
 	"github.com/dalyem/hopkey/internal/store"
@@ -42,8 +43,13 @@ import (
 //     process's environment, so neither ssh nor a daemon it starts gets
 //     them;
 //   - no answer carries a vault secret field: the daemon sends none.
-//     Command output is the remote's, scrubbed best-effort of private key
-//     blocks and of the secret values this process was started with;
+//     Command output is the remote's, scrubbed best-effort (agentView) of
+//     private key blocks, of the secret values this process was started
+//     with, of the vault's secrets, which the daemon finds (daemon.OpRedact)
+//     without sending them, and, unless the host's agent_output is full,
+//     of well-known token formats (redact.Patterns); a host's agent_output
+//     none withholds its output altogether. What a person runs (hop exec,
+//     hop <target>, ssh) is never filtered;
 //   - a denied host used as a jump host is named in no answer: its names
 //     and addresses are masked in diagnostics (hide).
 //
@@ -67,7 +73,7 @@ Find hosts with list_hosts or resolve_host; a target that is not an exact name, 
 exec runs a non-interactive command: no terminal, stdin closed, a timeout per host. Use sudo -n, never plain sudo.
 exec refuses a host with no pinned host key; the user pins one from a terminal with hop trust <host>.
 Output keeps the last 64 KiB of stdout and of stderr per host.
-hop never returns the vault's secret fields (private keys, credential passwords, the Secret Key, auth values). Command output is what the remote printed; hop removes private key blocks and its own auth values from it on a best-effort basis, so it can still hold secrets the remote prints. Snippet commands are shown to agents as they are.`
+hop never returns the vault's secret fields (private keys, credential passwords, the Secret Key, auth values). Command output is what the remote printed, filtered by each host's agent_output policy: redacted (the default) replaces private key blocks, hop's own auth values, the vault's secrets and well-known token formats with [redacted by hop: <kind>]; full replaces only hop's and the vault's secrets; none returns no output, only its size and the exit code. This is best-effort: output can still hold a secret in a form hop does not recognise. Snippet commands are shown to agents as they are.`
 
 func runMCP(ctx context.Context, e *Env, args []string) error {
 	if len(args) > 0 && args[0] == "install" {
@@ -158,7 +164,8 @@ func newMCPServer(e *Env, readOnly bool, secrets []string) (*mcp.Server, *mcpSer
 		&mcp.ServerOptions{Instructions: mcpInstructions})
 	reads := &mcp.ToolAnnotations{ReadOnlyHint: true}
 	addMCPTool(s, srv, &mcp.Tool{Name: "list_hosts", Annotations: reads, Description: "List the vault's hosts: names, aliases, addresses, user, port, tags, " +
-		"description, how hop logs in (key, credential or agent-only), Tailscale status and whether a host key is pinned. Never secrets."}, s.listHosts)
+		"description, how hop logs in (key, credential or agent-only), Tailscale status, whether a host key is pinned, " +
+		"and agent_output: what of a command's output exec returns from it (redacted, full or none). Never secrets."}, s.listHosts)
 	addMCPTool(s, srv, &mcp.Tool{Name: "resolve_host", Annotations: reads, Description: "Resolve a target (name, alias, address or Tailscale name, " +
 		"optionally user@target) to one host, as hop which --json does. Anything that is not an exact match comes back as candidates; nothing is guessed."}, s.resolveHost)
 	checkDesc := "Diagnose the connection to one host step by step, as hop check does: resolution, route, TCP, pinned host key, the server's key, and login."
@@ -175,7 +182,8 @@ func newMCPServer(e *Env, readOnly bool, secrets []string) (*mcp.Server, *mcpSer
 	addMCPTool(s, srv, &mcp.Tool{Name: "exec", InputSchema: json.RawMessage(mcpExecSchema), Description: "Run a shell command on one or more hosts " +
 		"over ssh, at most 8 at a time. No terminal, stdin closed, PAGER=cat, and a timeout per host: a prompt fails instead of waiting, so use sudo -n. " +
 		"Returns per host exit_code, stdout and stderr (each the last 64 KiB) and truncated, an error when hop could not run the command, " +
-		"and a warning when the output may be incomplete. " +
+		"and a warning when the output may be incomplete. Output is filtered by the host's agent_output policy (see list_hosts); " +
+		"each result says which applied, counts the redactions by kind, and has withheld (sizes and a note) when the output is held back. " +
 		"Hosts with no pinned host key are refused."}, s.exec)
 	addMCPTool(s, srv, &mcp.Tool{Name: "run_snippet", InputSchema: json.RawMessage(mcpRunSnippetSchema), Description: "Run a saved snippet on one " +
 		"or more hosts, as exec does. Each parameter value is passed in a shell variable and arrives as one word; a value never becomes shell source text. " +
@@ -251,9 +259,9 @@ const redacted = "[redacted by hop]"
 // value also masks the same text where it is not a secret), all of them
 // found before any is replaced (redactSpans). It cannot catch a secret the
 // remote prints in another form. The marks of text the agent typed (typed)
-// are removed with it.
+// are removed with it. Command output gets more (agentView).
 func (s *mcpServer) redact(text string) string {
-	return joinSpans(redactSpans([]span{{text: unmark.Replace(text)}}, s.secrets))
+	return joinSpans(redactSpans([]span{{text: unmark.Replace(text)}}, s.secrets, nil))
 }
 
 // keyRedacted stands where a private key block was.
@@ -264,6 +272,7 @@ const keyRedacted = "[private key " + redacted + "]"
 type span struct {
 	text string
 	kind spanKind
+	what string // a marker's: the kind of secret it stands for (redact.Hit)
 }
 
 type spanKind int
@@ -274,59 +283,77 @@ const (
 	markerText
 )
 
-// redactSpans redacts the text of ss as one string. Every key block and
-// every secret is looked for in that same text before any is replaced, so
-// that neither breaks up the other (a secret "-" replaced in a block's
-// -----BEGIN line would leave its body unrecognised), and one that runs
-// across two spans, or over a block's edge, goes whole. Each stretch they
-// cover becomes a marker span.
-func redactSpans(ss []span, secrets []string) []span {
+// redactSpans redacts the text of ss as one string. Every key block, every
+// secret and every stretch in more (offsets into that string: what the
+// daemon and redact.Patterns found) is looked for in that same text before
+// any is replaced, so that none breaks up another (a secret "-" replaced in
+// a block's -----BEGIN line would leave its body unrecognised), and one
+// that runs across two spans, or over a block's edge, goes whole.
+// Overlapping stretches become one marker span, named for the kind that
+// ranks first (redact.Rank).
+func redactSpans(ss []span, secrets []string, more []redact.Hit) []span {
 	t := joinSpans(ss)
-	type hit struct {
-		lo, hi int
-		key    bool
-	}
-	var hits []hit
+	var hits []redact.Hit
 	blocks := pemBlockRe.FindAllStringIndex(t, -1)
 	for _, b := range blocks {
-		hits = append(hits, hit{b[0], b[1], true})
+		hits = append(hits, redact.Hit{Lo: b[0], Hi: b[1], Kind: redact.KindPrivateKey})
 	}
 	// A block the tail cut short at its start runs from the start of the
 	// text to the first END line that ends no whole block.
 	for _, e := range pemEndRe.FindAllStringIndex(t, -1) {
 		if !slices.ContainsFunc(blocks, func(b []int) bool { return b[0] <= e[0] && e[1] <= b[1] }) {
-			hits = append(hits, hit{0, e[1], true})
+			hits = append(hits, redact.Hit{Lo: 0, Hi: e[1], Kind: redact.KindPrivateKey})
 			break
 		}
 	}
 	// t has had the marks of typed text taken out (unmark), so a secret
-	// holding a mark rune is looked for as it stands there too.
-	for _, v := range secrets {
-		for _, v := range slices.Compact([]string{v, unmark.Replace(v)}) {
-			if v == "" {
-				continue
-			}
-			for _, m := range indexAll(t, v) {
-				hits = append(hits, hit{m[0], m[1], false})
-			}
+	// holding a mark rune is looked for as it stands there too (Literals).
+	own := make([]redact.Secret, len(secrets))
+	for i, v := range secrets {
+		own[i] = redact.Secret{Kind: redact.KindHopSecret, Value: v}
+	}
+	hits = append(hits, redact.Literals(t, own)...)
+	for _, h := range more {
+		if h.Lo, h.Hi = max(h.Lo, 0), min(h.Hi, len(t)); h.Lo < h.Hi {
+			hits = append(hits, h)
 		}
 	}
-	slices.SortFunc(hits, func(a, b hit) int { return a.lo - b.lo })
+	slices.SortFunc(hits, func(a, b redact.Hit) int { return a.Lo - b.Lo })
 	var out []span
 	last := 0
 	for i := 0; i < len(hits); {
-		lo, hi, key := hits[i].lo, hits[i].hi, hits[i].key
-		for i++; i < len(hits) && hits[i].lo < hi; i++ {
-			hi, key = max(hi, hits[i].hi), key || hits[i].key
+		lo, hi, kind := hits[i].Lo, hits[i].Hi, hits[i].Kind
+		for i++; i < len(hits) && hits[i].Lo < hi; i++ {
+			hi = max(hi, hits[i].Hi)
+			if redact.Rank(hits[i].Kind) < redact.Rank(kind) {
+				kind = hits[i].Kind
+			}
 		}
-		with := redacted
-		if key {
-			with = keyRedacted
-		}
-		out = append(cutSpans(out, ss, last, lo), span{text: with, kind: markerText})
+		out = append(cutSpans(out, ss, last, lo), span{text: markerFor(kind), kind: markerText, what: kind})
 		last = hi
 	}
 	return cutSpans(out, ss, last, len(t))
+}
+
+// markerFor is what stands where a secret of kind was: hop's own values
+// and key blocks keep the markers they always had.
+func markerFor(kind string) string {
+	switch kind {
+	case redact.KindPrivateKey:
+		return keyRedacted
+	case redact.KindHopSecret:
+		return redacted
+	}
+	return redact.Marker(kind)
+}
+
+// countMarkers adds the marker spans of ss to counts, by kind.
+func countMarkers(counts map[string]int, ss []span) {
+	for _, sp := range ss {
+		if sp.kind == markerText {
+			counts[sp.what]++
+		}
+	}
 }
 
 // cutSpans appends to out the bytes from to to of run's text, each piece
@@ -357,21 +384,6 @@ func joinSpans(ss []span) string {
 		b.WriteString(sp.text)
 	}
 	return b.String()
-}
-
-// indexAll is every place v stands in t, left to right, overlapping ones
-// included: in "abababa" the secret "ababa" stands at 0 and at 2, and
-// redactSpans joins the two, where taking only the first would leave "ba".
-func indexAll(t, v string) [][]int {
-	var out [][]int
-	for i := 0; ; {
-		j := strings.Index(t[i:], v)
-		if j < 0 {
-			return out
-		}
-		out = append(out, []int{i + j, i + j + len(v)})
-		i += j + 1
-	}
 }
 
 // redactValue applies redact to every string in v.
@@ -614,8 +626,14 @@ func (s *mcpServer) masker(l *daemon.ListResult) masker {
 // included, but for the user the agent gave where ssh names it on its own
 // login to the target (markSSHUser).
 func (m masker) hide(text string) string {
+	return m.hideSpans(redactSpans(typedSpans(text), m.secrets, nil))
+}
+
+// hideSpans joins ss, the spans of a text redactSpans has redacted, with
+// each hidden name replaced in hop's own text, as hide does.
+func (m masker) hideSpans(ss []span) string {
 	var b strings.Builder
-	for _, sp := range redactSpans(typedSpans(text), m.secrets) {
+	for _, sp := range ss {
 		if sp.kind == hopText {
 			for _, n := range m.names {
 				sp.text = replaceWord(sp.text, n, hiddenHost)
@@ -630,11 +648,11 @@ func (m masker) hide(text string) string {
 // (typed); they are removed from what the daemon answers (unmarkValue),
 // from command output, and from what typed marks.
 const (
-	markOpen  = "\ue000"
-	markClose = "\ue001"
+	markOpen  = redact.MarkOpen
+	markClose = redact.MarkClose
 )
 
-var unmark = strings.NewReplacer(markOpen, "", markClose, "")
+var unmark = redact.Unmark
 
 // typed marks s as text the agent typed, for hide. It goes where a message
 // echoes the agent's own input: a target, the host or user parsed from it,
@@ -786,6 +804,9 @@ type AgentHost struct {
 	SSHAlias      string     `json:"ssh_alias,omitempty"`
 	SSHProblem    string     `json:"ssh_problem,omitempty"`
 	Sync          model.Mark `json:"sync,omitempty"` // pending or held
+	// AgentOutput is what of a command's output on the host exec hands
+	// back: redacted, full or none (model.Host.AgentOutput).
+	AgentOutput string `json:"agent_output"`
 }
 
 // AgentTailscale is a host's tailnet link.
@@ -813,6 +834,7 @@ func agentHost(h model.Host, l *daemon.ListResult, m masker) AgentHost {
 		Name: v.Name, Aliases: v.Aliases, Addresses: v.Addresses, User: v.User, Port: v.Port, Tags: v.Tags,
 		Description: v.Description, Auth: authType(h), Route: v.Route, HostKeyPinned: len(v.HostKeys) > 0,
 		HostKeys: v.HostKeys, SSHAlias: v.SSHAlias, SSHProblem: m.hide(v.SSHProblem), Sync: v.Mark,
+		AgentOutput: model.AgentOutputPolicy(h),
 	}
 	if v.Key != nil {
 		a.Key = v.Key.Name
@@ -938,10 +960,36 @@ func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mc
 		return CheckResult{}, err
 	}
 	out := CheckResult{Target: in.Host, Host: rr.Result.HostName}
-	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly, mcpEcho)
+	// The login step quotes ssh's stderr, which carries what the remote
+	// prints too (a banner, a shell's startup files): it is filtered as
+	// exec's output is, by the host's agent_output policy.
+	policy := model.AgentOutputRedacted
+	if rr.Host != nil {
+		policy = model.AgentOutputPolicy(*rr.Host)
+	}
+	ec := mcpEcho
+	if policy == model.AgentOutputNone {
+		ec.login = func(_ *target, _, stderr string) string {
+			if strings.TrimSpace(stderr) == "" {
+				return ""
+			}
+			return "(ssh's messages are withheld: the host's agent_output policy is none)"
+		}
+	}
+	out.Steps, out.OK = s.e.diagnose(ctx, rr, !s.readOnly, ec)
 	m := s.masker(l)
-	for i := range out.Steps {
-		out.Steps[i].Detail = m.hide(out.Steps[i].Detail)
+	for i, st := range out.Steps {
+		ss := typedSpans(st.Detail)
+		var more []redact.Hit
+		if st.Name == "auth_ok" && st.Status == stepFail {
+			found, err := s.findSecrets(ctx, []string{joinSpans(ss)}, policy == model.AgentOutputRedacted)
+			if err != nil {
+				out.Steps[i].Detail = "ssh did not log in; its messages are withheld, since hop could not check them for the vault's secrets: " + m.hide(err.Error())
+				continue
+			}
+			more = found[0]
+		}
+		out.Steps[i].Detail = m.hideSpans(redactSpans(ss, m.secrets, more))
 	}
 	return out, nil
 }
@@ -1021,11 +1069,36 @@ type mcpRunSnippetIn struct {
 // run_snippet names the snippet, and never shows the command with the
 // parameters filled in.
 type MCPExec struct {
-	Command string       `json:"command,omitempty"`
-	Snippet string       `json:"snippet,omitempty"`
-	Results []ExecResult `json:"results"`
+	Command string          `json:"command,omitempty"`
+	Snippet string          `json:"snippet,omitempty"`
+	Results []MCPExecResult `json:"results"`
 	// Warning is set when the command ran but its end could not be logged.
 	Warning string `json:"warning,omitempty"`
+}
+
+// MCPExecResult is one host's result as an agent gets it (agentView): hop
+// exec --json's, filtered by the host's agent_output policy.
+type MCPExecResult struct {
+	ExecResult
+	// AgentOutput is the policy that applied: redacted, full or none.
+	// It is empty for a host the command did not run on.
+	AgentOutput string `json:"agent_output,omitempty"`
+	// Redactions counts the secrets replaced in stdout and stderr, by
+	// kind (redact.Hit).
+	Redactions map[string]int `json:"redactions,omitempty"`
+	// Withheld is set when no output is returned: the policy is none, or
+	// hop could not check the output for the vault's secrets.
+	Withheld *WithheldOutput `json:"withheld,omitempty"`
+}
+
+// WithheldOutput is what an agent learns of output it does not get: its
+// size, and why. Truncated, beside it, says the tail limit cut the output.
+type WithheldOutput struct {
+	StdoutBytes int64  `json:"stdout_bytes"`
+	StdoutLines int64  `json:"stdout_lines"`
+	StderrBytes int64  `json:"stderr_bytes"`
+	StderrLines int64  `json:"stderr_lines"`
+	Note        string `json:"note"`
 }
 
 func hostsArg(v any) ([]string, error) {
@@ -1236,13 +1309,13 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 		return MCPExec{}, failf("nothing was run: the audit log could not be written (%v), and hop mcp runs nothing it cannot log", err)
 	}
 
-	out := MCPExec{Results: make([]ExecResult, len(steps))}
+	out := MCPExec{Results: make([]MCPExecResult, len(steps))}
 	sem := make(chan struct{}, mcpParallel)
 	var wg sync.WaitGroup
 	m := s.masker(l)
 	for i, st := range steps {
 		if st.err != nil {
-			out.Results[i] = ExecResult{Host: st.host, ExitCode: ExitFailure, Error: m.hide(st.err.Error())}
+			out.Results[i] = MCPExecResult{ExecResult: ExecResult{Host: st.host, ExitCode: ExitFailure, Error: m.hide(st.err.Error())}}
 			continue
 		}
 		wg.Add(1)
@@ -1250,11 +1323,9 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r := s.runOne(ctx, st.t, script, timeout)
-			// stderr has ssh's own messages, which name a jump host that
-			// failed; stdout is the command's alone.
-			r.Error, r.Stderr = m.hide(unmark.Replace(r.Error)), m.hide(r.Stderr)
-			out.Results[i] = r
+			// Each host's own policy applies, so one call can return the
+			// output of one host and withhold another's.
+			out.Results[i] = s.agentView(ctx, *st.t.rr.Host, s.runOne(ctx, st.t, script, timeout), m)
 		}()
 	}
 	wg.Wait()
@@ -1262,6 +1333,85 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 	if err := s.audit.end(&entry, out.Results, s.auditText); err != nil {
 		out.Warning = safef("the command ran, but the end of the run could not be written to the audit log: %v", err)
 		s.logf("warning: %s", out.Warning)
+	}
+	return out, nil
+}
+
+// agentView is r, the result of a command on h, as an agent gets it under
+// h's agent_output policy (model.AgentOutputPolicy):
+//
+//   - redacted: what redact removes, the vault's secrets (the daemon finds
+//     them, daemon.OpRedact) and well-known token formats
+//     (redact.Patterns) are replaced, all of them found in one pass over
+//     each stream (redactSpans);
+//   - full: the same without the token formats: hop's and the vault's
+//     secrets go whatever the policy;
+//   - none: no output at all, only its size (withhold).
+//
+// Output that cannot be checked for the vault's secrets (the vault locked
+// since, or a daemon without OpRedact) is withheld too. stderr has ssh's
+// own messages as well, which name a jump host that failed, so the denied
+// hosts are hidden in it (hide); stdout is the command's alone.
+func (s *mcpServer) agentView(ctx context.Context, h model.Host, r ExecResult, m masker) MCPExecResult {
+	out := MCPExecResult{ExecResult: r, AgentOutput: model.AgentOutputPolicy(h)}
+	out.Error = m.hide(unmark.Replace(r.Error))
+	if out.AgentOutput == model.AgentOutputNone {
+		return withhold(out, "the host's agent_output policy is none, so hop returns none of its output to agents, only its size")
+	}
+	stdout, stderr := []span{{text: unmark.Replace(r.Stdout)}}, typedSpans(r.Stderr)
+	more, err := s.findSecrets(ctx, []string{joinSpans(stdout), joinSpans(stderr)}, out.AgentOutput == model.AgentOutputRedacted)
+	if err != nil {
+		return withhold(out, "hop could not check the output for the vault's secrets, so it is withheld: "+m.hide(err.Error()))
+	}
+	so, se := redactSpans(stdout, s.secrets, more[0]), redactSpans(stderr, m.secrets, more[1])
+	out.Stdout, out.Stderr = joinSpans(so), m.hideSpans(se)
+	counts := map[string]int{}
+	countMarkers(counts, so)
+	countMarkers(counts, se)
+	if len(counts) > 0 {
+		out.Redactions = counts
+	}
+	return out
+}
+
+// withhold empties r's output, and says how much there was and why.
+func withhold(r MCPExecResult, why string) MCPExecResult {
+	r.Withheld = &WithheldOutput{StdoutBytes: r.stdoutBytes, StdoutLines: r.stdoutLines,
+		StderrBytes: r.stderrBytes, StderrLines: r.stderrLines, Note: why}
+	r.Stdout, r.Stderr = "", ""
+	return r
+}
+
+// findSecrets asks the daemon where the vault's secrets stand in each of
+// texts, and adds, with patterns, the well-known token formats. Every
+// offset is checked against its text: an answer that does not fit is an
+// error, so that nothing goes out half-checked.
+func (s *mcpServer) findSecrets(ctx context.Context, texts []string, patterns bool) ([][]redact.Hit, error) {
+	out := make([][]redact.Hit, len(texts))
+	if !slices.ContainsFunc(texts, func(t string) bool { return t != "" }) {
+		return out, nil
+	}
+	p := daemon.RedactParams{Texts: make([][]byte, len(texts))}
+	for i, t := range texts {
+		p.Texts[i] = []byte(t)
+	}
+	var res daemon.RedactResult
+	if err := call(ctx, s.e, daemon.OpRedact, p, &res); err != nil {
+		return nil, s.daemonError(err)
+	}
+	if len(res.Hits) != len(texts) {
+		return nil, failf("the daemon answered for %d texts of %d", len(res.Hits), len(texts))
+	}
+	for i, hits := range res.Hits {
+		for _, h := range hits {
+			if h.Lo < 0 || h.Hi > len(texts[i]) || h.Lo >= h.Hi || !strings.HasPrefix(h.Kind, "vault-") {
+				return nil, failf("the daemon's answer does not fit the output")
+			}
+		}
+		out[i] = hits
+		if patterns {
+			out[i] = append(out[i], redact.Patterns(texts[i])...)
+		}
 	}
 	return out, nil
 }

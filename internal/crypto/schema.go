@@ -151,7 +151,14 @@ func ValidateHost(h *model.Host) error {
 			return err
 		}
 	}
-	return checkEnum("agent_access", h.AgentAccess, "allow", "deny")
+	if err := checkEnum("agent_access", h.AgentAccess, "allow", "deny"); err != nil {
+		return err
+	}
+	// agent_output is absent for the default, redacted (model.Host).
+	if h.AgentOutput == "" {
+		return nil
+	}
+	return checkEnum("agent_output", h.AgentOutput, model.AgentOutputFull, model.AgentOutputNone)
 }
 
 // ValidateKey checks a key plaintext against §6.5. public_key is an
