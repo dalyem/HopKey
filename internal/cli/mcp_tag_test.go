@@ -346,3 +346,43 @@ func TestMCPInstallMissingClientPointsToTheSameServer(t *testing.T) {
 		t.Errorf("missing claude, --json: %d stdout %q stderr %q, want stderr to contain %q", code, so.String(), se.String(), want)
 	}
 }
+
+// The scope is matched against a host's tags as stored. A tag with the
+// private-use characters hop mcp takes out of the daemon's text is in
+// scope only for that exact tag, not for the tag they leave behind.
+func TestMCPTagMatchesTheStoredTagNotItsDisplay(t *testing.T) {
+	marked := model.Host{Header: model.Header{ItemID: model.ID{1}}, Name: "marked", Tags: []string{"work"}, AgentAccess: "allow", Addresses: []string{"192.0.2.1"}}
+	plain := model.Host{Header: model.Header{ItemID: model.ID{2}}, Name: "plain", Tags: []string{"work"}, AgentAccess: "allow", Addresses: []string{"192.0.2.2"}}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpList, daemon.ListResult{Hosts: []model.Host{marked, plain}})
+	names := func(args ...string) []string {
+		t.Helper()
+		return hostNames(mcpCall[cli.MCPHosts](startMCP(t, f.env(t, nil, nil, nil), args...), "list_hosts", nil).Hosts)
+	}
+	if got := names("--tag", "work"); !slices.Equal(got, []string{"plain"}) {
+		t.Errorf("--tag work lists %v, want only plain", got)
+	}
+	if got := names("--tag", "work"); !slices.Equal(got, []string{"marked"}) {
+		t.Errorf("--tag work<U+E000> lists %v, want only marked", got)
+	}
+}
+
+// A tag the error message can't show as it is (a zero-width space) is not
+// put in the recovery command with a stand-in, which would register
+// another scope: the message names the flags instead.
+func TestMCPInstallMissingClientNeverAltersATag(t *testing.T) {
+	var so, se bytes.Buffer
+	env := &cli.Env{
+		Stdout: &so, Stderr: &se, Getenv: func(string) string { return "" }, Executable: filepath.Join(t.TempDir(), "hop"),
+		RunCommand: func(_ context.Context, name string, _ ...string) ([]byte, error) {
+			return nil, errors.Join(errors.New("lookup "+name), exec.ErrNotFound)
+		},
+	}
+	code := cli.Run(context.Background(), []string{"mcp", "install", "--client", "claude", "--json", "--tag", "work​"}, env)
+	if code != 255 || so.Len() != 0 {
+		t.Fatalf("missing claude, --json: %d stdout %q stderr %q", code, so.String(), se.String())
+	}
+	if msg := se.String(); strings.Contains(msg, "--tag work") || !strings.Contains(msg, "the same --read-only and --tag flags") {
+		t.Errorf("recovery message %q", msg)
+	}
+}

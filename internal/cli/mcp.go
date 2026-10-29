@@ -870,8 +870,10 @@ func (s *mcpServer) list(ctx context.Context) (*daemon.ListResult, error) {
 	if err != nil {
 		return nil, s.daemonError(err)
 	}
-	unmarkValue(l)
+	// The scope is matched against the tags as stored, as the daemon
+	// matches them, before the marks of typed text are taken out.
 	s.agentScope(l)
+	unmarkValue(l)
 	return l, nil
 }
 

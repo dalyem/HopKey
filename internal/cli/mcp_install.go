@@ -144,7 +144,13 @@ func runClientCLI(ctx context.Context, e *Env, asJSON bool, name, client string,
 			// The config is not printed with --json, so point to the
 			// command that gives it as JSON: the same server, so the
 			// same --read-only and --tag.
-			return failf("%s is not on PATH; add hop to %s by hand with the config from: %s", argv[0], name, quoteArgv(append([]string{"hop", "mcp", "install", "--client", "print", "--json"}, server[2:]...)))
+			cmd := quoteArgv(append([]string{"hop", "mcp", "install", "--client", "print", "--json"}, server[2:]...))
+			if safef("%s", cmd) != cmd {
+				// A tag this message can't show as it is: a command with
+				// it replaced would register another scope.
+				return failf("%s is not on PATH; add hop to %s by hand with the config from hop mcp install --client print --json, given the same --read-only and --tag flags", argv[0], name)
+			}
+			return failf("%s is not on PATH; add hop to %s by hand with the config from: %s", argv[0], name, cmd)
 		}
 		printMCPConfig(e, server)
 		return failf("%s is not on PATH; add hop to %s by hand with the config above", argv[0], name)
