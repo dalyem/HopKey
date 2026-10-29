@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -140,5 +141,73 @@ func TestExplicitSyncTakesOverASlowBackgroundPush(t *testing.T) {
 	st := x.n1.status()
 	if st.Pending != 0 || st.Held != 0 {
 		t.Errorf("the change is still queued: pending %d, held %d", st.Pending, st.Held)
+	}
+}
+
+// A session the server refuses an explicit sync's pull is the answer hop
+// sync gives, even when the check that follows (sessionEnded) waits on a
+// server that stopped answering for longer than the sync's budget: the
+// refusal was received, so the server did answer. The check still runs to
+// its own end and locks the vault as unconfirmed, as it does when it gets
+// a 503 (TestRefusedSessionLocksWhenTheRecheckIsUnreachable).
+func TestExplicitSyncReportsARefusalWhileItsCheckIsSlow(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n2, x.n2.st, SyncOptions{noPoll: true})
+	if k := x.n2.agentKeys(); k != 1 {
+		t.Fatalf("setup: the agent serves %d key(s)", k)
+	}
+	const (
+		serve = iota
+		refuse
+		silent
+	)
+	var phase atomic.Int32
+	var refused, unanswered atomic.Int32
+	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		switch phase.Load() {
+		case refuse:
+			if req.URL.Path == "/v1/auth/challenge" {
+				phase.Store(silent)
+			}
+			refused.Add(1)
+			return unauthorized(rw)
+		case silent:
+			// The check after the refusal gets no answer until it gives up.
+			io.Copy(io.Discard, req.Body)
+			unanswered.Add(1)
+			<-req.Context().Done()
+			return true
+		}
+		return false
+	})
+	t.Cleanup(func() { x.w.intercept.Store(nil) })
+
+	phase.Store(refuse)
+	start := time.Now()
+	err := x.n2.call(OpSyncNow, nil, nil)
+	took := time.Since(start)
+	if refused.Load() == 0 {
+		t.Fatal("setup: nothing was refused")
+	}
+	if !IsCode(err, CodeRevoked) {
+		t.Errorf("sync.now error = %v, want the refused session (%s)", err, CodeRevoked)
+	}
+	if took > syncNowLimit {
+		t.Errorf("sync.now took %s to answer, want under %s", took, syncNowLimit)
+	}
+
+	// The check runs to its own deadline and locks the vault.
+	eventually(t, sessionCheckTimeout+10*time.Second, "the check after the refused session", func() bool {
+		return unanswered.Load() > 0 && x.n2.agentKeys() == 0
+	})
+	if info := x.n2.st.Info(); !info.Locked || !info.ServerUnconfirmed {
+		t.Errorf("the vault is not locked as unconfirmed: %+v", info)
+	}
+	data := x.n2.cfg.DataDir
+	if exists(t, filepath.Join(data, "vault", "server-revoked.json")) {
+		t.Error("a report was recorded")
+	}
+	if !exists(t, filepath.Join(data, "device.json")) || !exists(t, filepath.Join(data, "vault", "state.json")) {
+		t.Fatal("the vault was deleted")
 	}
 }

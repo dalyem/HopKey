@@ -147,6 +147,10 @@ type syncReq struct {
 	caller context.Context
 	kind   int
 	done   chan error
+	// answer is the error serve got from the server, sent before serve
+	// acts on it: the check after a refusal may outlast the budget, and
+	// the refusal is still the answer.
+	answer chan error
 }
 
 // syncer is the sync engine.
@@ -957,7 +961,7 @@ func (e *syncer) devicesSeen(ctx context.Context) map[model.ID]time.Time {
 // sync.now has syncNowTimeout from here, whatever the loop is doing, and
 // ends the background push or long-poll in flight rather than wait for it.
 func (e *syncer) request(ctx context.Context, kind int) error {
-	r := &syncReq{ctx: ctx, caller: ctx, kind: kind, done: make(chan error, 1)}
+	r := &syncReq{ctx: ctx, caller: ctx, kind: kind, done: make(chan error, 1), answer: make(chan error, 1)}
 	if kind == reqSyncNow {
 		var cancel context.CancelFunc
 		r.ctx, cancel = context.WithTimeout(ctx, syncNowTimeout)
@@ -984,9 +988,14 @@ func (e *syncer) request(ctx context.Context, kind int) error {
 	case <-r.ctx.Done():
 	}
 	// The loop's answer, if it came at the same moment, goes first: it may
-	// be the server's.
+	// be the server's. So does one the loop still acts on.
 	select {
 	case err := <-r.done:
+		return err
+	default:
+	}
+	select {
+	case err := <-r.answer:
 		return err
 	default:
 	}
@@ -1062,6 +1071,7 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 		err = syncNowError(err, req.ctx, req.caller)
 	}
 	if err != nil {
+		req.answer <- err
 		e.reconcile(ctx, gen, before)
 		var eq *vaultlog.EquivocationError
 		switch {
