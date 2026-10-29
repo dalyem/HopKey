@@ -157,8 +157,9 @@ func (p *rotPlan) runnable() []*rotHost {
 	return out
 }
 
-// rotateStepTimeout bounds each ssh run of a rotation.
-const rotateStepTimeout = 30 * time.Second
+// rotateStepTimeout bounds each ssh run of a rotation. A variable, so a
+// test can shorten it.
+var rotateStepTimeout = 30 * time.Second
 
 func runKeyRotate(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "key rotate", "hop key rotate <key> | --all [--hosts h1,h2] [--type ed25519|ecdsa|rsa] [--new-key K] [--dry-run] [--yes] [--keep-old] [--json]")
@@ -969,7 +970,8 @@ func (w *rotWays) removeOld(ctx context.Context, h *rotHost, k *rotKeys) string 
 // shown to refuse it, what it saw instead. The proof is the ssh client's
 // own debug log, in a file of its own: the ProxyCommand's ssh writes to
 // stderr, so a jump host's "Permission denied" can't pass for the
-// server's.
+// server's. The log counts only once ssh has exited on its own with
+// sshAuthFailed, having written its own last line.
 func (w *rotWays) oldRefused(ctx context.Context) string {
 	f, err := os.CreateTemp(w.oldCheck.dir, "oldcheck-*.log")
 	if err != nil {
@@ -980,10 +982,14 @@ func (w *rotWays) oldRefused(ctx context.Context) string {
 	defer os.Remove(logFile)
 	res, err := w.oldCheck.runOpts(ctx, []string{"-vv", "-E", logFile}, "true", nil, nil)
 	switch {
-	case err != nil:
-		return "hop could not confirm that the old key is refused (" + sshFailure(res, err) + ")"
 	case sshOK(res, err):
 		return "the old key still logs in: the server accepts it from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
+	case err != nil || !res.exited:
+		// Cut off or killed, ssh never wrote its own last line: the log may
+		// end with one the server sent.
+		return "hop could not confirm that the old key is refused (" + sshFailure(res, err) + ")"
+	case res.ExitCode != sshAuthFailed:
+		return "hop could not confirm that the old key is refused (" + sshFailure(res, nil) + ")"
 	}
 	log, cut, rerr := readCapped(logFile, sshLogMax)
 	if rerr != nil {
@@ -998,7 +1004,7 @@ func (w *rotWays) oldRefused(ctx context.Context) string {
 	}
 	// stderr has the ProxyCommand's errors and the remote's; ssh's own
 	// are in the log.
-	if strings.TrimSpace(res.Stderr) != "" || res.Error != "" {
+	if strings.TrimSpace(res.Stderr) != "" {
 		why += " (" + sshFailure(res, nil) + ")"
 	}
 	return "hop could not confirm that the old key is refused: " + why
@@ -1322,12 +1328,29 @@ func (w *rotWays) readAny(ctx context.Context) ([]byte, *rotSSH) {
 	return nil, nil
 }
 
-func sshOK(res ExecResult, err error) bool { return err == nil && res.ExitCode == 0 && res.Error == "" }
+// rotResult is how one ssh run of a rotation ended.
+type rotResult struct {
+	ExecResult
+	// exited says ssh exited on its own, and ExitCode is its exit status.
+	// When it did not (cut off at rotateStepTimeout, or killed by a
+	// signal), Error says why, and nothing ssh wrote is its answer: its
+	// last words may be the server's.
+	exited bool
+}
+
+// sshAuthFailed is the exit status ssh exits with on its own when it
+// fails, a login the server refused among them.
+const sshAuthFailed = 255
+
+func sshOK(res rotResult, err error) bool { return err == nil && res.exited && res.ExitCode == 0 }
 
 // sshFailure describes a failed ssh run in a few safe words.
-func sshFailure(res ExecResult, err error) string {
+func sshFailure(res rotResult, err error) string {
 	if err != nil {
 		return err.Error() // composed by failf: already display-safe
+	}
+	if !res.exited {
+		return res.Error
 	}
 	// When only the new key is offered, ssh may also say that a key file
 	// has no private half ("no such identity"), which is the point and not
@@ -1339,9 +1362,6 @@ func sshFailure(res ExecResult, err error) string {
 		}
 	}
 	msg := strings.TrimSpace(strings.Join(lines, "\n"))
-	if msg == "" {
-		msg = res.Error
-	}
 	if msg == "" {
 		msg = fmt.Sprintf("exit status %d", res.ExitCode)
 	}
@@ -1363,12 +1383,12 @@ type rotSSH struct {
 // rotCheckAlias is the one Host block of a check's config.
 const rotCheckAlias = "hop-rotate-check"
 
-func (r rotSSH) run(ctx context.Context, command string, stdin []byte, stdout io.Writer) (ExecResult, error) {
+func (r rotSSH) run(ctx context.Context, command string, stdin []byte, stdout io.Writer) (rotResult, error) {
 	return r.runOpts(ctx, nil, command, stdin, stdout)
 }
 
 // runOpts is run with extra ssh options.
-func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, stdin []byte, stdout io.Writer) (ExecResult, error) {
+func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, stdin []byte, stdout io.Writer) (rotResult, error) {
 	opts := append([]string{"-T", "-o", "ConnectTimeout=10"}, extra...)
 	if stdin == nil {
 		opts = append(opts, "-n")
@@ -1395,15 +1415,21 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 		cmd.Stdout = io.Discard
 	}
 	runErr := cmd.Run()
-	res := ExecResult{Host: r.t.rr.Result.HostName}
+	res := rotResult{ExecResult: ExecResult{Host: r.t.rr.Result.HostName}}
 	var ee *exec.ExitError
 	switch {
-	case runErr == nil:
-	case errors.Is(runErr, exec.ErrWaitDelay):
+	case runErr == nil, errors.Is(runErr, exec.ErrWaitDelay):
+		// ssh exited 0; with ErrWaitDelay something it started still held
+		// stderr open.
+		res.exited = true
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
+		// Even if ssh exited just before the deadline, hop cannot tell.
 		res.ExitCode, res.Error = ExitFailure, fmt.Sprintf("timed out after %s", rotateStepTimeout)
 	case errors.As(runErr, &ee):
-		res.ExitCode = exitCode(ee)
+		res.ExitCode, res.exited = exitCode(ee)
+		if !res.exited {
+			res.Error = "ssh was stopped (" + ee.Error() + ")"
+		}
 	default:
 		return res, failf("cannot run ssh: %v", runErr)
 	}
@@ -1420,7 +1446,7 @@ func (r rotSSH) readAK(ctx context.Context) (content []byte, why string, noLogin
 	out := &capBuffer{max: akMaxSize}
 	res, err := r.run(ctx, sh(akReadScript), nil, out)
 	switch {
-	case err != nil || res.ExitCode == ExitFailure || res.Error != "":
+	case err != nil || !res.exited || res.ExitCode == sshAuthFailed:
 		return nil, "could not log in to read " + akFile + " (" + sshFailure(res, err) + ")", true
 	case res.ExitCode == akExitMissing:
 		return nil, akFile + " does not exist; the server may read authorized keys from somewhere else (AuthorizedKeysFile)", false
@@ -1446,9 +1472,9 @@ const (
 func (r rotSSH) writeAK(ctx context.Context, from, to []byte) (akOutcome, string, int) {
 	res, err := r.run(ctx, sh(akWriteScript(cksum(from), cksum(to))), to, nil)
 	switch {
-	case err == nil && res.Error == "" && res.ExitCode == 0:
+	case sshOK(res, err):
 		return akDone, "", 0
-	case err == nil && res.Error == "" && akRefused(res.ExitCode):
+	case err == nil && res.exited && akRefused(res.ExitCode):
 		return akNotDone, "could not write " + akFile + " (" + sshFailure(res, err) + ")", res.ExitCode
 	}
 	return akUnknown, "lost the connection while writing " + akFile + " (" + sshFailure(res, err) + ")", res.ExitCode

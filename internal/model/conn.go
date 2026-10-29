@@ -19,7 +19,7 @@ func ConnString(h Host) string {
 }
 
 // ConnDigest digests ConnString(h) and, when withKey, the key h names: what
-// a conditional write of a host's key (store.PutHostIfChain) requires of
+// a conditional write of a host's key (store.SetHostKeyIfChain) requires of
 // the host itself (withKey) and of each jump host on its way.
 func ConnDigest(h Host, withKey bool) string {
 	s := ConnString(h)

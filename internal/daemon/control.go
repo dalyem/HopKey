@@ -642,10 +642,12 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 	// host after the snapshot, nor a held edit resolved in place, which
 	// changes an item at the same overlay version: the encrypted store
 	// checks the versions and connections again in the write's own
-	// transaction. Every other store has no writer outside d.mu.
+	// transaction, and changes only the key of the host as it reads it
+	// there, so a description or tags changed since the snapshot stay.
+	// Every other store has no writer outside d.mu.
 	var saved model.Host
 	if cs, ok := d.store.(conditionalHostStore); ok {
-		saved, err = cs.PutHostIfChain(ctx, h, expect)
+		saved, err = cs.SetHostKeyIfChain(ctx, hostID, keyID, expect)
 	} else {
 		saved, err = d.store.PutHost(ctx, h)
 	}
@@ -669,7 +671,7 @@ func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.H
 // conditionalHostStore is a store that checks a write's preconditions in
 // the write's own transaction (*store.Store).
 type conditionalHostStore interface {
-	PutHostIfChain(ctx context.Context, h model.Host, expect map[model.ID]store.HostExpect) (model.Host, error)
+	SetHostKeyIfChain(ctx context.Context, id, keyID model.ID, expect map[model.ID]store.HostExpect) (model.Host, error)
 }
 
 func (d *Daemon) opPutKey(ctx context.Context, p PutKeyParams) (*KeyInfo, error) {

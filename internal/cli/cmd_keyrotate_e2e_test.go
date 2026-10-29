@@ -56,6 +56,9 @@ type akServer struct {
 	// have the connection dropped once the command has run, before its exit
 	// status is sent: the client cannot tell whether it ran.
 	onExec func(command string) (drop bool)
+	// onAuth, if set, sees each key a client offers before the server
+	// decides on it.
+	onAuth func(c ssh.ConnMetadata, k ssh.PublicKey)
 }
 
 func startAKServer(t *testing.T, home string) *akServer {
@@ -96,11 +99,23 @@ func (s *akServer) setOnExec(f func(command string) bool) {
 	s.onExec = f
 }
 
+func (s *akServer) setOnAuth(f func(c ssh.ConnMetadata, k ssh.PublicKey)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onAuth = f
+}
+
 // isAKWrite reports whether a command hop runs is one of its
 // authorized_keys edits: the script that writes a temp file and renames it.
 func isAKWrite(command string) bool { return strings.Contains(command, "authorized_keys.hop-") }
 
 func (s *akServer) authorize(c ssh.ConnMetadata, k ssh.PublicKey) (*ssh.Permissions, error) {
+	s.mu.Lock()
+	hook := s.onAuth
+	s.mu.Unlock()
+	if hook != nil {
+		hook(c, k)
+	}
 	data, err := os.ReadFile(filepath.Join(s.home, ".ssh", "authorized_keys"))
 	if err != nil {
 		return nil, err
