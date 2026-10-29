@@ -181,10 +181,15 @@ func (d *Daemon) unconfirmedLocked(err error) error {
 	if !ok {
 		return err
 	}
+	refused := errors.Is(err, store.ErrSessionRefused)
 	if !errors.Is(err, store.ErrServerUnconfirmed) {
 		err = fmt.Errorf("%w (%v)", store.ErrServerUnconfirmed, err)
 	}
 	rs.LockFor(err)
+	if refused {
+		// The server's refusal is how a revoked device learns it.
+		d.endSessions(whyRefused)
+	}
 	d.dropKeysLocked(false)
 	why := err.Error()
 	e.set(func() { e.unconfirmed, e.checkSkipped = why, "" })
@@ -274,6 +279,7 @@ func (d *Daemon) reportedLocked(rep *store.ServerReport, passphrase []byte) {
 			e.retired = &ServerRetirement{How: rep.How, Seq: rep.Seq, Unverified: true}
 		}
 	})
+	d.endSessions(whyRevoked)
 	d.dropKeysLocked(true)
 	d.logf("sync stopped: %s", why)
 	d.prove(passphrase)
@@ -339,6 +345,7 @@ func (d *Daemon) wiped(why error) {
 		e.retired = r
 	})
 	d.mu.Lock()
+	d.endSessions(whyRevoked)
 	d.dropKeysLocked(true)
 	pending := d.pendingClear()
 	d.mu.Unlock()
@@ -385,7 +392,11 @@ func (d *Daemon) preflight(ctx context.Context) {
 	gen := e.st.Generation()
 	info := e.st.Info()
 	if info.Revoked {
-		d.wipeVerified()
+		if !d.wipeVerified() {
+			// Not wiped yet, but revoked all the same (wiped ends them
+			// when it is).
+			d.endSessions(whyRevoked)
+		}
 		return
 	}
 	if info.Locked && info.ServerReport == nil {
@@ -408,6 +419,7 @@ func (d *Daemon) preflight(ctx context.Context) {
 			e.phase = SyncRevoked
 			e.retired = &ServerRetirement{How: info.ServerReport.How, Seq: info.ServerReport.Seq, Unverified: true}
 		})
+		d.endSessions(whyRevoked)
 		return
 	case err != nil && !unreachable(err):
 		d.unconfirmedLocked(err)
@@ -456,6 +468,7 @@ func (d *Daemon) enforceOfflineLocked(ctx context.Context) error {
 	}
 	err = fmt.Errorf("%w (%s)", store.ErrOfflineTooLong, why)
 	rs.LockFor(err)
+	d.endSessions(whyOffline)
 	d.dropKeysLocked(false)
 	e.set(func() { e.offline = why })
 	d.sync.wake()

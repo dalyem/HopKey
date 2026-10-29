@@ -298,6 +298,11 @@ func (d *Daemon) apply(ctx context.Context, snap model.Snapshot, gen uint64) (*s
 	}
 	old := d.live.swap(kr, gen)
 	old.RemoveAll() // best effort: drop the old key material
+	if !d.live.stale() {
+		// The vault is open again: a revocation or max-offline lock that
+		// ended sessions no longer ends new ones (sessions.go).
+		d.sessions.reopen()
+	}
 
 	err := d.writeConfig(sshconfig.Options{Dir: d.opts.Paths.ConfigDir, AgentSocket: d.agent.Path()}, hosts)
 	if err != nil {

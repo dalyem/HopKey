@@ -1402,22 +1402,22 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 	}
 	runCtx, cancel := context.WithTimeout(ctx, rotateStepTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, r.e.sshBinary(), args...)
-	cmd.Env = r.e.sshEnviron()
-	cmd.Dir = r.dir
+	sc := &sshCmd{path: r.e.sshBinary(), args: append([]string{r.e.sshBinary()}, args...), env: r.e.sshEnviron(), dir: r.dir, waitDelay: time.Second}
 	if stdin != nil {
-		cmd.Stdin = bytes.NewReader(stdin)
+		sc.stdin = bytes.NewReader(stdin)
 	}
-	cmd.WaitDelay = time.Second
 	errTail := &tailBuffer{max: tailLimit}
-	cmd.Stdout, cmd.Stderr = stdout, errTail
+	sc.stdout, sc.stderr = stdout, errTail
 	if stdout == nil {
-		cmd.Stdout = io.Discard
+		sc.stdout = io.Discard
 	}
-	runErr := cmd.Run()
+	// The daemon ends it on a revocation, as any ssh hop starts (runSSH).
+	endedWhy, runErr := r.e.runSSH(runCtx, sc, r.t.alias)
 	res := rotResult{ExecResult: ExecResult{Host: r.t.rr.Result.HostName}}
-	var ee *exec.ExitError
+	var ee *sshExitError
 	switch {
+	case errors.Is(runErr, errEndedFirst):
+		res.ExitCode = 255
 	case runErr == nil, errors.Is(runErr, exec.ErrWaitDelay):
 		// ssh exited 0; with ErrWaitDelay something it started still held
 		// stderr open.
@@ -1426,12 +1426,15 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 		// Even if ssh exited just before the deadline, hop cannot tell.
 		res.ExitCode, res.Error = ExitFailure, fmt.Sprintf("timed out after %s", rotateStepTimeout)
 	case errors.As(runErr, &ee):
-		res.ExitCode, res.exited = exitCode(ee)
+		res.ExitCode, res.exited = ee.exited()
 		if !res.exited {
 			res.Error = "ssh was stopped (" + ee.Error() + ")"
 		}
 	default:
 		return res, failf("cannot run ssh: %v", runErr)
+	}
+	if endedWhy != "" && runErr != nil {
+		res.Error = endedError(endedWhy)
 	}
 	res.Stderr = string(errTail.Bytes())
 	return res, nil

@@ -40,6 +40,19 @@ type Vault interface {
 	AckKit() error
 }
 
+// LockParams is the request for OpLock. EndSessions also ends the ssh
+// sessions hop started (sessions.go), which a lock by itself leaves
+// running.
+type LockParams struct {
+	EndSessions bool `json:"end_sessions,omitempty"`
+}
+
+// LockResult answers OpLock: the sessions it told to end, with
+// EndSessions.
+type LockResult struct {
+	EndedSessions []EndedSession `json:"ended_sessions,omitempty"`
+}
+
 // UnlockParams is the request for OpUnlock. With no password, the device
 // key unlocks; with one, pw_blob does (hop unlock --password), using
 // SecretKey when the device has none stored. DevicePassphrase opens a
@@ -94,8 +107,17 @@ func (d *Daemon) dispatchVault(ctx context.Context, req Request, decode func(any
 	}
 	switch req.Op {
 	case OpLock:
-		d.lockVault(v)
-		return nil, true, nil
+		var p LockParams
+		if len(req.Params) > 0 && string(req.Params) != "null" {
+			if err := decode(&p); err != nil {
+				return nil, true, err
+			}
+		}
+		ended := d.lockVault(v, p.EndSessions)
+		if !p.EndSessions {
+			return nil, true, nil
+		}
+		return &LockResult{EndedSessions: ended}, true, nil
 	case OpUnlock:
 		var p UnlockParams
 		if len(req.Params) > 0 {
@@ -128,14 +150,20 @@ func (d *Daemon) dispatchVault(ctx context.Context, req Request, decode func(any
 }
 
 // lockVault drops the store's secrets, empties the agent and forgets the
-// last snapshot.
-func (d *Daemon) lockVault(v Vault) {
+// last snapshot. With endSessions it also ends the ssh sessions hop
+// started, and returns them.
+func (d *Daemon) lockVault(v Vault, endSessions bool) []EndedSession {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	v.Lock()
+	var ended []EndedSession
+	if endSessions {
+		ended = d.endSessions(whyLock)
+	}
 	d.dropKeysLocked(false)
 	d.sync.wake() // so sync.status says locked at once
 	d.logf("vault locked")
+	return ended
 }
 
 // dropKeysLocked empties the agent and forgets the last snapshot, as a lock
@@ -178,6 +206,9 @@ func (d *Daemon) followStore(err error) {
 	revoked := errors.Is(herr, store.ErrDeviceRevoked) || errors.Is(herr, store.ErrServerRevoked)
 	if cur := d.state.Load(); cur != nil && cur.locked && (cur.revoked || !revoked) {
 		return
+	}
+	if revoked {
+		d.endSessions(whyRevoked)
 	}
 	d.dropKeysLocked(revoked)
 	if revoked {

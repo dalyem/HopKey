@@ -13,12 +13,18 @@ type LockResult struct {
 	Locked bool `json:"locked"`
 	// Password says hop unlock --password replaced the device key.
 	Password bool `json:"password,omitempty"`
+	// EndedSessions are the ssh sessions hop lock --end-sessions ended:
+	// the hop processes running them, which each end their own ssh.
+	EndedSessions []daemon.EndedSession `json:"ended_sessions,omitempty"`
 }
 
 // runLock is `hop lock`: the daemon drops every secret and the agent holds
-// no keys until hop unlock.
+// no keys until hop unlock. Open ssh sessions keep running, unless
+// --end-sessions ends the ones hop started, as a revocation does
+// (sessions.go).
 func runLock(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "lock", commands["lock"].usage)
+	endSessions := fs.Bool("end-sessions", false, "also end the ssh sessions hop started (hop <target>, hop exec, hop mcp), as a revocation does")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
@@ -27,13 +33,29 @@ func runLock(ctx context.Context, e *Env, args []string) error {
 	if len(pos) != 0 {
 		return failf("usage: %s", commands["lock"].usage)
 	}
-	if err := call(ctx, e, daemon.OpLock, nil, nil); err != nil {
+	var params any
+	var res daemon.LockResult
+	if *endSessions {
+		params = daemon.LockParams{EndSessions: true}
+	}
+	if err := call(ctx, e, daemon.OpLock, params, &res); err != nil {
 		return err
 	}
 	if *asJSON {
-		return printJSON(e, LockResult{Locked: true})
+		return printJSON(e, LockResult{Locked: true, EndedSessions: res.EndedSessions})
 	}
 	e.printf("vault locked; the agent holds no keys\n")
+	if *endSessions {
+		n := len(res.EndedSessions)
+		switch n {
+		case 0:
+			e.printf("no ssh sessions to end\n")
+		case 1:
+			e.printf("sent a termination request to 1 ssh session hop started\n")
+		default:
+			e.printf("sent termination requests to %d ssh sessions hop started\n", n)
+		}
+	}
 	return nil
 }
 

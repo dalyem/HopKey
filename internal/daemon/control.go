@@ -82,6 +82,11 @@ func (d *Daemon) serveConn(c net.Conn) {
 		var resp Response
 		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
 			resp = errorResponse(invalidf("malformed request: %v", err))
+		} else if req.Op == OpSessionWatch {
+			// The connection is the subscription, until it ends
+			// (sessions.go).
+			d.serveWatch(c, enc, req)
+			return
 		} else {
 			resp = d.handle(req)
 		}
@@ -288,6 +293,7 @@ func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 	if d.sync != nil {
 		out.Sync = d.syncStatus(false)
 	}
+	out.EndedSessions = d.endedSessions()
 	out.Tailscale.Available, out.Tailscale.Reason = ts.Available, ts.Reason
 	return out, nil
 }

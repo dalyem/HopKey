@@ -138,6 +138,10 @@ type Daemon struct {
 	// proving is set while a revocation proof is fetched (prove).
 	proving atomic.Bool
 
+	// sessions are the hop processes running ssh that a revocation tells
+	// to end it (sessions.go).
+	sessions *sessions
+
 	tsMu     sync.Mutex
 	tsCached *tailscale.Status
 	tsAt     time.Time
@@ -202,6 +206,7 @@ func Start(opts Options) (*Daemon, error) {
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		writeConfig: opts.writeConfig, wipeConfig: opts.wipeConfig,
 		redactSlots: make(chan struct{}, redactSlots),
+		sessions:    newSessions(),
 	}
 	if d.writeConfig == nil {
 		d.writeConfig = sshconfig.Write

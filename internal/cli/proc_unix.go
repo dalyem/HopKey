@@ -16,11 +16,6 @@ func detach(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }
 
-// execReplace replaces the current process with path.
-func execReplace(path string, argv, environ []string) error {
-	return syscall.Exec(path, argv, environ)
-}
-
 // processAlive reports whether a process with this pid exists (one of
 // another user's counts too).
 func processAlive(pid int) bool {

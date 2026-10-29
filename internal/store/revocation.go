@@ -91,6 +91,9 @@ var (
 	// model.ErrLocked.
 	ErrServerUnconfirmed = fmt.Errorf("%w: the server did not confirm that this device is still in the account; "+
 		"it stays locked until the server accepts it again (hop unlock asks)", model.ErrLocked)
+	// ErrSessionRefused is in an ErrServerUnconfirmed that follows the
+	// server refusing this device a session, as it refuses a revoked one.
+	ErrSessionRefused = errors.New("the server refused this device a session")
 	// ErrWipeIncomplete means a revocation was proven (ErrDeviceRevoked
 	// matches too) but wiping this device's copy of the vault did not
 	// finish; the next start finishes it.
@@ -534,7 +537,7 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 	if err != nil {
 		// The server's answer, but no report to record: locked in memory,
 		// until it accepts the device again.
-		why := fmt.Errorf("%w (the server refused this device a session; %v)", ErrServerUnconfirmed, err)
+		why := fmt.Errorf("%w (%w; %v)", ErrServerUnconfirmed, ErrSessionRefused, err)
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.gen.Load() == gen {

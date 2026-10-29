@@ -12,8 +12,14 @@ What the README ("What revocation does") documents is asserted as documented:
   the max-offline policy off, its default. That is a documented limit, not a
   failure: s3 asserts that it works while offline, and is cut off within 120 s
   after it reconnects, for good.
-- Open sessions keep running after a revoke: a documented limit (r2-gap4),
-  recorded with status limit.
+- Open sessions that hop started end once the device learns it was revoked:
+  the README says within seconds. s2 asserts that hop exec and hop <target>
+  (hop t1, its shell reading a script from stdin) each end within
+  SESSION_END_LIMIT seconds of B's agent emptying, say why, and that B's
+  daemon names their hop processes among the sessions it ended (hop status
+  --json, ended_sessions) (r2-gap4 tags a failure).
+- A plain ssh to a hop alias is not hop's to end: a documented limit. s2
+  asserts it runs to its end, recorded with status limit.
 
 Steps: localb-setup | ensure-t1 | revoke <device> <n> | access <tag> <work|cut> |
        watch <tag> <secs> | cutoff <tag> <t0> <limit> <offset> <revoke|reconnect> |
@@ -36,7 +42,12 @@ from mcpc import MCP, refusal, results
 M = L.MACHINE
 URL, SIP = L.env_get('HK_SERVER_URL'), L.env_get('HK_SERVER_IP')
 BUGS = {'unlock': 'r2-P1-1', 'window': 'r2-P2-2'}
-REF_SESSIONS = 'README, What revocation does: "Open sessions that the revoked device already had keep running"'
+REF_SESSIONS = ('README, What revocation does: "Open sessions that hop started end within seconds of the device learning '
+                'it was revoked ... hop <target>, hop exec"')
+REF_PLAIN = ('README, What revocation does: "Not ended: plain ssh <alias> ... hop did not start them ... Connect with '
+             'hop <host> for sessions that a revocation ends"')
+# How long after B learns of the revoke (its agent empties) an open session may last.
+SESSION_END_LIMIT = 10
 
 
 
@@ -554,40 +565,104 @@ def step_policy_clear(secs):
       'after %.0fs: %d agent keys' % (time.time() - t0, k), (last.ev('hop unlock') if last else '') + '\n' + r.ev('exec t1'))
 
 
-SESSIONS = ('open-hopexec', 'open-plain')
+# The sessions hop starts, which must end, and the plain ssh, which is not hop's to end.
+SESSIONS = ('open-hopexec', 'open-hopconnect')
+PLAIN = 'open-plain'
+ENDED_MSG = 'the hop daemon ended this ssh session when '
+
+
+# Appended by the wrapper once the session's command ends: its exit status and B's clock.
+END_LINE = re.compile(r'^hk-end rc=(\d+) t=([0-9.]+)$', re.M)
 
 
 def step_sessions_start():
     env = L.user_env('tester')
     cmd = 'for i in $(seq 1 45); do echo "tick $i"; sleep 1; done'
-    for name, argv in (('open-hopexec', ['hop', 'exec', 't1', '--', 'sh', '-c', cmd]),
-                       ('open-plain', ['ssh', '-o', 'BatchMode=yes', 't1', cmd])):
+    # The wrapper is sh, not ssh or hop, so ending the sessions leaves it to record when they ended.
+    end = 'echo "hk-end rc=$? t=$(date +%s.%N)"'
+    wraps = {
+        'open-hopexec': ['sh', '-c', '"$@"; ' + end, 'sh', 'hop', 'exec', 't1', '--', 'sh', '-c', cmd],
+        # hop t1 has no remote command: its shell reads the loop from stdin (no terminal, so no pty).
+        'open-hopconnect': ['sh', '-c', 'printf "%s\\nexit\\n" "$1" | hop t1; ' + end, 'sh', cmd],
+        PLAIN: ['sh', '-c', '"$@"; ' + end, 'sh', 'ssh', '-o', 'BatchMode=yes', 't1', cmd],
+    }
+    sids = {}
+    for name, argv in wraps.items():
         f = open('/var/e2e/state/%s.out' % name, 'w')
-        subprocess.Popen(L.user_argv('tester', argv, 120), env=env, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                         start_new_session=True)
+        sids[name] = subprocess.Popen(L.user_argv('tester', argv, 120), env=env, stdout=f, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL, start_new_session=True).pid
+    names = SESSIONS + (PLAIN,)
 
     def connected():
-        got = [n for n in SESSIONS if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
-        return got if len(got) == len(SESSIONS) else None
+        got = [n for n in names if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
+        return got if len(got) == len(names) else None
     got, secs = L.wait_for(connected, 20, 0.5)
-    got = got or [n for n in SESSIONS if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
-    L.state_put('sessions-start', {'connected': got, 't': time.time()})
-    if len(got) != len(SESSIONS):
-        L.harness('B.sessions-start', 'both sessions are connected and running before the revoke', 'connected: %s' % got)
+    got = got or [n for n in names if 'tick 1' in open('/var/e2e/state/%s.out' % n).read()]
+    # The hop process of each session (its own session ID): the ones B's daemon must say it ended.
+    pids = {n: [] for n in names}
+    for line in root('ps -e -o pid=,sid=,comm=').out.splitlines():
+        f = line.split()
+        for n, sid in sids.items():
+            if len(f) == 3 and f[1] == str(sid) and f[2] == 'hop':
+                pids[n].append(int(f[0]))
+    L.state_put('sessions-start', {'connected': got, 't': time.time(), 'pids': pids})
+    if len(got) != len(names):
+        L.harness('B.sessions-start', 'every session is connected and running before the revoke', 'connected: %s' % got)
 
 
 def step_sessions_end(tag):
-    L.wait_for(lambda: not root('pgrep -u tester -f "seq 1 45"').out.strip(), 70, 2)
-    o = {n: open('/var/e2e/state/%s.out' % n).read() for n in SESSIONS}
-    cid, label = 'B.%s.open-sessions' % tag, '%s: sessions open at the revoke keep running to their end (hop exec and plain ssh), as documented' % tag
+    names = SESSIONS + (PLAIN,)
+    L.wait_for(lambda: all(END_LINE.search(open('/var/e2e/state/%s.out' % n).read()) for n in names), 70, 1)
+    o = {n: open('/var/e2e/state/%s.out' % n).read() for n in names}
+    cid = 'B.%s.open-sessions' % tag
+    label = '%s: sessions hop started (hop exec, hop t1) end within %ds of B learning of the revoke, and say why' % (tag, SESSION_END_LIMIT)
     _, pre = L.state_read('sessions-start')
     connected = (pre or {}).get('connected') or []
-    if sorted(connected) != sorted(SESSIONS):
-        return L.harness(cid, label, 'prerequisite: not every session was running before the revoke (connected: %s)' % connected,
-                         '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items()))
-    survived = [n for n, s in o.items() if 'tick 45' in s]
-    L.limit(cid, label, sorted(survived) == sorted(SESSIONS), 'ran to the end: %s' % survived,
-            '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items()), 'r2-gap4', REF_SESSIONS)
+    ticks = '; '.join('%s: %d ticks' % (n, s.count('tick')) for n, s in o.items())
+    if sorted(connected) != sorted(names):
+        return L.harness(cid, label, 'prerequisite: not every session was running before the revoke (connected: %s)' % connected, ticks)
+    # B learns of the revoke when its agent empties: the cutoff's own moment (watch5).
+    st, tl = L.state_read('watch5-%s' % tag)
+    cut = first_cut(tl, float(pre.get('t', 0))) if st == 'ok' else None
+    if cut is None:
+        return L.harness(cid, label, 'prerequisite: B was never cut off during the watch (watch state %s)' % st, ticks)
+    ends, bad = {}, []
+    for n in SESSIONS:
+        s = o[n]
+        m = END_LINE.search(s)
+        if not m:
+            bad.append('%s still running' % n)
+            continue
+        dt = float(m.group(2)) - cut
+        ends[n] = 'rc %s at %+.1fs' % (m.group(1), dt)
+        if 'tick 45' in s:
+            bad.append('%s ran to its end' % n)
+        elif dt < -1:
+            bad.append('%s ended %.1fs before B was cut off' % (n, -dt))
+        elif dt > SESSION_END_LIMIT:
+            bad.append('%s ended %.1fs after B was cut off' % (n, dt))
+        elif ENDED_MSG not in s:
+            bad.append('%s does not say the hop daemon ended it' % n)
+    # Each hop process ended its ssh because B's daemon told it to: status names those hop processes.
+    j = L.status_json() or {}
+    es = j.get('ended_sessions') or {}
+    ended_pids = [x.get('pid') for x in es.get('sessions') or []]
+    ends['daemon'] = 'ended %s when %s' % (ended_pids, es.get('why'))
+    for n in SESSIONS:
+        mine = (pre.get('pids') or {}).get(n) or []
+        if not mine:
+            bad.append('%s: no hop process was recorded at the start' % n)
+        elif not set(mine) & set(ended_pids):
+            bad.append('%s: hop %s is not among the sessions B\'s daemon ended %s' % (n, mine, ended_pids))
+    c(cid, label, not bad, '; '.join(bad) or 'ended, relative to the cutoff: %s' % ends, ticks + ' | ' + str(ends),
+      'r2-gap4' if bad else None, ref=REF_SESSIONS)
+
+    # The plain ssh to t1 is not hop's to end: it runs to the end of its loop, as documented.
+    s = o[PLAIN]
+    m = END_LINE.search(s)
+    plain = 'rc %s, %d ticks' % (m.group(1) if m else '?', s.count('tick'))
+    L.limit('B.%s.open-plain-ssh' % tag, '%s: a plain ssh t1 open at the revoke runs to its end (hop did not start it)' % tag,
+            bool(m) and m.group(1) == '0' and 'tick 45' in s, plain, s[-400:], 'r2-gap4', REF_PLAIN)
 
 
 def step_block(on):
