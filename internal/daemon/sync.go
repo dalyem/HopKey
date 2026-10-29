@@ -683,20 +683,23 @@ func (e *syncer) revoked(err error) {
 // entries are not served to it any more, so the revocation can't be
 // verified from the log; CheckServer asks again and, if the server says it
 // left, records the report and locks the vault (reportedLocked), and the
-// proof is asked for. An answer that does not confirm the device locks the
-// vault until one does (unconfirmedLocked). It reports whether sync
-// stopped.
+// proof is asked for. Any other outcome but the server accepting the
+// device, a server that can't be asked again included, locks the vault
+// until it does (unconfirmedLocked): the refusal was the server's answer.
+// It reports whether sync stopped.
 func (e *syncer) sessionEnded(ctx context.Context) bool {
 	gen := e.st.Generation()
-	res, err := e.d.checkServer(ctx, sessionCheckTimeout, nil)
+	res, err := e.d.checkServer(ctx, sessionCheckTimeout, nil, gen)
 	switch {
 	case err == nil && res.Report != nil:
 		e.d.mu.Lock()
 		defer e.d.mu.Unlock()
 		e.d.reportedLocked(res.Report, nil)
 		return true
-	case err == nil, unreachable(err):
+	case err == nil:
 		return false
+	case unreachable(err):
+		err = fmt.Errorf("the server refused this device a session, and could not be asked again: %w", err)
 	}
 	e.d.mu.Lock()
 	defer e.d.mu.Unlock()
@@ -999,6 +1002,8 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 			e.revoked(err)
 		case errors.As(err, &eq), errors.Is(err, store.ErrSyncHalted):
 			e.noteHalt(err.Error(), eq != nil)
+		case errors.Is(err, store.ErrSessionEnded):
+			e.sessionEnded(ctx)
 		}
 		if req.kind == reqSyncNow {
 			e.set(func() { e.lastErr, e.lastErrAt = err.Error(), time.Now() })

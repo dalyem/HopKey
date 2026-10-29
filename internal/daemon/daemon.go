@@ -92,6 +92,11 @@ type Options struct {
 	// time.Now for the max-offline policy.
 	offlineEvery time.Duration
 	now          func() time.Time
+	// unconfirmedRead runs once retryUnconfirmed has read that the vault
+	// is locked as unconfirmed, and beforeCheck just before checkServer
+	// asks the store (CheckServer).
+	unconfirmedRead func()
+	beforeCheck     func()
 }
 
 // Daemon is a running daemon.

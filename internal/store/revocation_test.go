@@ -119,7 +119,7 @@ func newRevokedChain(t *testing.T) *revokedChain {
 
 	// b learns of it as a device does: refused a session, it asks
 	// retire-status and records the server's report.
-	res, err := b.s.CheckServer(ctx, x.serve(x.entries, x.rc, 0), nil)
+	res, err := b.s.CheckServer(ctx, x.serve(x.entries, x.rc, 0), nil, b.s.Generation())
 	if err != nil || res.Report == nil {
 		t.Fatalf("CheckServer: %+v, %v", res, err)
 	}
@@ -380,7 +380,7 @@ func TestTamperedServerReportStaysLockedAndSaysCorrupt(t *testing.T) {
 		t.Helper()
 		x.f.down = errDown
 		defer func() { x.f.down = nil }()
-		if _, err := x.b.s.CheckServer(ctx, down, nil); !errors.Is(err, errDown) {
+		if _, err := x.b.s.CheckServer(ctx, down, nil, x.b.s.Generation()); !errors.Is(err, errDown) {
 			t.Fatalf("CheckServer with the server down: %v", err)
 		}
 	}

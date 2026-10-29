@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -686,10 +687,15 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		// one for.
 		if ok, err := store.Exists(e.storeConfig().DataDir); err == nil && !ok {
 			rev, _ := store.ReadRevocation(e.storeConfig().DataDir)
+			pending := rev != nil && sshCleanupPending(e)
 			if o.asJSON {
-				return printJSON(e, AuthStatus{Revoked: rev != nil, Wiped: rev != nil, Revocation: rev})
+				return printJSON(e, AuthStatus{Revoked: rev != nil, Wiped: rev != nil && !pending, WipePending: pending, Revocation: rev})
 			}
-			if rev != nil {
+			switch {
+			case pending:
+				printWipePending(e, rev)
+				return nil
+			case rev != nil:
 				printWipedRevocation(e, rev)
 				return nil
 			}
@@ -706,6 +712,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		return failf("%v", err)
 	}
 	a := AuthStatus{Vault: true, Sync: st.Sync}
+	sshPending := false
 	if v := st.Vault; v != nil {
 		a.DeviceID, a.DeviceKeyStore, a.Locked, a.KitPending, a.AccountID = v.DeviceID, v.DeviceStore, v.Locked, v.KitPending, v.AccountID
 		a.SecretKeyStale = v.SecretKeyStale
@@ -719,6 +726,9 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		if a.Wiped {
 			a.Vault = false
 			a.Revocation, _ = store.ReadRevocation(e.storeConfig().DataDir)
+			if sshCleanupPending(e) {
+				a.Wiped, a.WipePending, sshPending = false, true, true
+			}
 		}
 		a.SignedIn = !a.Revoked
 		a.Server, a.Email, a.VaultID = s.Server, s.Email, s.VaultID
@@ -750,6 +760,9 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 	case a.Wiped:
 		e.printf("signed in:    no; this device was revoked from the account, the revocation verified, and this device's copy of the vault, " +
 			"its device key and the ssh files hop wrote were wiped (hop auth login signs in again)\n")
+		return nil
+	case sshPending:
+		printWipePending(e, a.Revocation)
 		return nil
 	case a.WipePending:
 		r := a.Sync.ServerRetirement
@@ -1392,6 +1405,51 @@ func printWipedRevocation(e *Env, r *store.RevocationRecord) {
 	e.printf("wiped:        this device's copy of the vault, its device key and the ssh files hop wrote\n")
 	e.printf("kept:         SSH key files you imported yourself; the vault's SSH keys stay valid on your hosts until rotated (hop key rotate)\n")
 	e.printf("next:         hop auth login signs in again as a new device\n")
+}
+
+// printWipePending is printWipedRevocation for a device whose copy of the
+// vault is wiped, but whose ssh files may not be (sshCleanupPending). r may
+// be nil.
+func printWipePending(e *Env, r *store.RevocationRecord) {
+	e.printf("signed in:    no; this device was ")
+	if r == nil {
+		e.printf("revoked from the account")
+	} else {
+		e.printf("%s from the account", oneLine(r.How))
+		if r.Email != "" {
+			e.printf(" %s", oneLine(r.Email))
+		}
+		if r.Seq != 0 {
+			e.printf(" by the entry at seq %d", r.Seq)
+		}
+	}
+	e.printf(", verified; wipe pending (ssh files remain under %s; any hop command or the daemon retries)\n", oneLine(homePath(e, e.Paths.ConfigDir)))
+	e.printf("wiped so far: this device's copy of the vault and its device key\n")
+	e.printf("next:         hop auth login signs in again as a new device, once the ssh files are gone\n")
+}
+
+// sshCleanupPending reports whether the ssh files hop wrote may still be
+// there on a device whose vault was wiped: the mark of the cleanup a
+// logout or a revocation owes is still there (store.LogoutCleanupPending),
+// or the hop ssh directory still holds what the vault decrypted
+// (sshconfig.Generated). One that can't be read counts as pending.
+func sshCleanupPending(e *Env) bool {
+	if pending, err := store.LogoutCleanupPending(e.storeConfig().DataDir); pending || err != nil {
+		return true
+	}
+	left, err := sshconfig.Generated(sshconfig.Options{Dir: e.Paths.ConfigDir, AgentSocket: e.Paths.AgentSocket()})
+	return left || err != nil
+}
+
+// homePath writes p under the home directory as ~/....
+func homePath(e *Env, p string) string {
+	if e.Home == "" {
+		return p
+	}
+	if rel, err := filepath.Rel(e.Home, p); err == nil && rel != "." && !strings.HasPrefix(rel, "..") {
+		return "~/" + filepath.ToSlash(rel)
+	}
+	return p
 }
 
 // fmtSeconds writes a duration of n seconds in days, hours or minutes.

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"crypto/rand"
 	"testing"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
@@ -87,7 +89,39 @@ func TestRetireProof(t *testing.T) {
 	// Correctly used once, and once only.
 	wantStatus(t, e.retireProofWith(v, B, rc, sig, from), 200, "the challenge, correctly used")
 	wantCode(t, e.retireProofWith(v, B, rc, sig, from), 401, "unauthorized", "the same challenge again")
-	// A device the account never had.
+
+	// A device the account never had. The challenge endpoint issues it
+	// none, so the challenge is planted, with every binding the endpoint
+	// checks right; the same planted challenge for B is the control.
+	planted := e.plantChallenge(v, B, rs)
+	wantStatus(t, e.retireProofWith(v, B, planted, e.signAuth(v, B, rs, testOrigin, planted), from), 200, "a planted challenge for B")
 	stranger := randID(t)
-	wantCode(t, e.retireProofWith(v, stranger, rc, sig, from), 401, "unauthorized", "a device the account never had")
+	planted = e.plantChallenge(v, stranger, rs)
+	strangerSig, err := crypto.SignDeviceAuth(v.devs[B].Sig, &crypto.DeviceAuth{
+		V: 1, Origin: testOrigin, AccountID: v.accountID(), DeviceID: stranger, Operation: rs, Challenge: planted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, e.retireProofWith(v, stranger, planted, strangerSig, from), 401, "unauthorized", "a device the account never had")
+}
+
+// plantChallenge stores a live retire-status or session challenge for dev
+// as the challenge endpoint would, whether or not the account has dev.
+func (e *env) plantChallenge(v *tvault, dev model.ID, op string) []byte {
+	e.t.Helper()
+	chal := make([]byte, crypto.ChallengeSize)
+	if _, err := rand.Read(chal); err != nil {
+		e.t.Fatal(err)
+	}
+	err := e.st.Update(context.Background(), func(tx Tx) error {
+		return tx.InsertChallenge(&Challenge{
+			Hash: crypto.SHA256(chal), Kind: ChallengeDevice, Origin: testOrigin, AccountID: v.accountID(),
+			DeviceID: dev, Operation: op, ExpiresAt: e.clock.now().Add(ChallengeTTL),
+		})
+	})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return chal
 }

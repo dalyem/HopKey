@@ -88,7 +88,8 @@ func (c *unlockCheck) done() {
 // revocationStore is the revocation side of the encrypted store
 // (*store.Store).
 type revocationStore interface {
-	CheckServer(ctx context.Context, r store.ServerChecker, passphrase []byte) (store.ServerCheck, error)
+	CheckServer(ctx context.Context, r store.ServerChecker, passphrase []byte, gen uint64) (store.ServerCheck, error)
+	UnconfirmedLock() (uint64, bool)
 	ProveRevocation(ctx context.Context, r store.ServerChecker, passphrase []byte) error
 	WipeRevoked() error
 	LastContact() (time.Time, bool, error)
@@ -128,10 +129,11 @@ func (e *syncer) checker() (store.ServerChecker, error) {
 // status. A long-poll in flight is ended first, and none starts until the
 // answer is in, so the question does not wait for one. An unanswered
 // question is returned as the error; unreachable says whether that lets
-// keys load. It does not take d.mu, but a report found, or an answer that
-// does not confirm the device, is acted on by the caller (reportedLocked,
-// unconfirmedLocked).
-func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphrase []byte) (store.ServerCheck, error) {
+// keys load. gen is the store's generation the caller decided to ask in:
+// the store locks for a refusal only while it is still in it. It does not
+// take d.mu, but a report found, or an answer that does not confirm the
+// device, is acted on by the caller (reportedLocked, unconfirmedLocked).
+func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphrase []byte, gen uint64) (store.ServerCheck, error) {
 	rs, e, ok := d.revocations()
 	if !ok {
 		return store.ServerCheck{}, store.ErrNotServerBacked
@@ -143,7 +145,10 @@ func (d *Daemon) checkServer(ctx context.Context, timeout time.Duration, passphr
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	defer e.holdPolls()()
-	res, err := rs.CheckServer(ctx, r, passphrase)
+	if d.opts.beforeCheck != nil {
+		d.opts.beforeCheck()
+	}
+	res, err := rs.CheckServer(ctx, r, passphrase, gen)
 	switch {
 	case err != nil && unreachable(err):
 		why := err.Error()
@@ -189,28 +194,43 @@ func (d *Daemon) unconfirmedLocked(err error) error {
 
 // stillUnconfirmed reports whether err, the answer to a check that the
 // sync loop started in generation gen, is still to be acted on by
-// unconfirmedLocked: the store locked itself for it (CheckServer), or, for
-// any other answer, nothing locked or unlocked the vault meanwhile (hop
-// lock, say, whose cancellation is no answer). The caller holds d.mu.
+// unconfirmedLocked: the store locked itself for it (CheckServer), and
+// nothing locked or unlocked the vault since, or, for any other answer,
+// nothing locked or unlocked the vault meanwhile (hop lock, say, whose
+// cancellation is no answer). The caller holds d.mu.
 func (d *Daemon) stillUnconfirmed(err error, gen uint64) bool {
 	if errors.Is(err, store.ErrServerUnconfirmed) {
-		info := d.sync.st.Info()
-		return info.Locked && info.ServerUnconfirmed
+		rs, _, ok := d.revocations()
+		if !ok {
+			return false
+		}
+		_, ok = rs.UnconfirmedLock()
+		return ok
 	}
 	return d.sync.st.Generation() == gen
 }
 
 // retryUnconfirmed asks the server again about a vault unconfirmedLocked
 // locked, and once it accepts the device, unlocks the vault with the
-// device key and loads the agent, as hop unlock would. It reports whether
-// the vault unlocked.
+// device key and loads the agent, as hop unlock would. Only that lock
+// unlocks: the store's UnconfirmedLock names it by its generation, and it
+// must still be the vault's lock, under d.mu, when the vault unlocks. Any
+// other lock since (hop lock, the max-offline policy, a report) is a new
+// generation and stays. It reports whether the vault unlocked.
 func (d *Daemon) retryUnconfirmed(ctx context.Context) bool {
 	v, ok := d.store.(Vault)
-	if !ok || d.sync == nil {
+	rs, _, okR := d.revocations()
+	if !ok || !okR {
 		return false
 	}
-	gen := d.sync.st.Generation()
-	res, err := d.checkServer(ctx, sessionCheckTimeout, nil)
+	gen, ok := rs.UnconfirmedLock()
+	if !ok {
+		return false
+	}
+	if d.opts.unconfirmedRead != nil {
+		d.opts.unconfirmedRead()
+	}
+	res, err := d.checkServer(ctx, sessionCheckTimeout, nil, gen)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
@@ -220,8 +240,11 @@ func (d *Daemon) retryUnconfirmed(ctx context.Context) bool {
 	case err != nil && !unreachable(err) && d.stillUnconfirmed(err, gen):
 		d.unconfirmedLocked(err)
 		return false
-	case err != nil || d.sync.st.Generation() != gen:
-		// Unanswered, or the vault was locked or unlocked meanwhile.
+	case err != nil:
+		return false
+	}
+	if cur, ok := rs.UnconfirmedLock(); !ok || cur != gen {
+		// Locked or unlocked meanwhile: not the lock the server left.
 		return false
 	}
 	if err := v.Unlock(ctx); err != nil {
@@ -359,6 +382,7 @@ func (d *Daemon) preflight(ctx context.Context) {
 		return
 	}
 	v, _ := d.store.(Vault)
+	gen := e.st.Generation()
 	info := e.st.Info()
 	if info.Revoked {
 		d.wipeVerified()
@@ -368,7 +392,7 @@ func (d *Daemon) preflight(ctx context.Context) {
 		// Nothing to protect; hop unlock asks.
 		return
 	}
-	res, err := d.checkServer(ctx, checkTimeout, nil)
+	res, err := d.checkServer(ctx, checkTimeout, nil, gen)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
@@ -484,11 +508,12 @@ func (d *Daemon) watchOffline() {
 // only an unreachable server lets it through unasked. The caller holds
 // d.mu.
 func (d *Daemon) checkBeforeKeysLocked(c *unlockCheck, passphrase []byte) error {
-	if _, _, ok := d.revocations(); !ok {
+	_, e, ok := d.revocations()
+	if !ok {
 		return nil
 	}
 	if !c.accepted {
-		res, err := d.checkServer(c.context(), checkTimeout, nil)
+		res, err := d.checkServer(c.context(), checkTimeout, nil, e.st.Generation())
 		switch {
 		case err == nil && res.Report != nil:
 			d.reportedLocked(res.Report, passphrase)
@@ -507,7 +532,7 @@ func (d *Daemon) checkBeforeKeysLocked(c *unlockCheck, passphrase []byte) error 
 // returned as is (store.ErrDeviceKey), so hop unlock asks for it and tries
 // again. The caller holds d.mu.
 func (d *Daemon) recheckReportLocked(c *unlockCheck, passphrase []byte) error {
-	res, err := d.checkServer(c.context(), checkTimeout, passphrase)
+	res, err := d.checkServer(c.context(), checkTimeout, passphrase, d.sync.st.Generation())
 	switch {
 	case errors.Is(err, store.ErrDeviceKey):
 		return fmt.Errorf("the server must accept this device again before the vault unlocks, and asking it needs the device key: %w", err)

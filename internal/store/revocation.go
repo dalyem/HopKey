@@ -474,12 +474,19 @@ func (s *Store) checkKeyLocked(passphrase []byte) (*checkKey, error) {
 // failure (the server unreachable, a response that does not parse)
 // changes nothing and is returned; the caller decides what it means.
 //
+// gen is the generation the caller decided to ask in (Generation). A
+// refusal locks the vault, or labels its lock unconfirmed, only while the
+// store is still in gen: a lock or an unlock that came before the request
+// registered is not taken for the one the caller saw. A report recorded on
+// a locked vault is a new lock (it moves the generation), so it ends the
+// permission an unconfirmed lock gave (UnconfirmedLock).
+//
 // It waits for a sync in progress (syncMu) only until ctx ends, and then
 // returns an error wrapping ctx's, without asking. A lock or Close cancels
 // it. passphrase is for a locked vault's sealed device key file
 // (checkKeyLocked); nil uses HOP_DEVICE_PASSPHRASE, and without one the
 // error matches ErrDeviceKey.
-func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []byte) (ServerCheck, error) {
+func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []byte, gen uint64) (ServerCheck, error) {
 	if err := s.lockSyncCtx(ctx); err != nil {
 		return ServerCheck{}, err
 	}
@@ -492,8 +499,7 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 	}
 	defer k.close()
 	s.verifyReport(k.rec)
-	ctx, gen, untrack := s.trackRequest(ctx)
-	unlocked := s.state != nil
+	ctx, _, untrack := s.trackRequest(ctx)
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -531,7 +537,7 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 			if s.state != nil {
 				s.dropLocked(why)
 			} else {
-				s.lockErr = why
+				s.lockErr, s.unconfirmedGen = why, gen
 			}
 		}
 		return ServerCheck{}, why
@@ -540,8 +546,13 @@ func (s *Store) CheckServer(ctx context.Context, r ServerChecker, passphrase []b
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	werr := s.writeReport(k.rec, rep)
-	if unlocked && s.gen.Load() == gen && s.state != nil {
+	switch {
+	case s.gen.Load() == gen && s.state != nil:
 		s.dropLocked(ErrServerRevoked)
+	case s.state == nil:
+		// A new lock, as dropLocked would make it.
+		s.gen.Add(1)
+		s.unconfirmedGen = 0
 	}
 	if werr != nil {
 		return ServerCheck{Report: &rep}, fmt.Errorf("store: the server's report could not be recorded on disk: %w", werr)
@@ -674,11 +685,26 @@ func verifyRevocation(ctx context.Context, r ServerChecker, auth DeviceAuth, st 
 }
 
 // LockFor locks the vault, as Lock does, and records why: until the next
-// unlock, every use fails with reason when it is ErrOfflineTooLong.
+// unlock, every use fails with reason when it is ErrOfflineTooLong or
+// ErrServerUnconfirmed.
 func (s *Store) LockFor(reason error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dropLocked(reason)
+}
+
+// UnconfirmedLock returns the generation of the vault's lock and true
+// while that lock is one made because the server answered without
+// confirming this device (ErrServerUnconfirmed: LockFor, CheckServer) and
+// nothing has locked or unlocked the vault since. That is the only lock
+// the daemon may undo by itself once the server accepts the device: any
+// other lock (hop lock, the max-offline policy, a report) moves the
+// generation, which ends it.
+func (s *Store) UnconfirmedLock() (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gen := s.gen.Load()
+	return gen, s.state == nil && s.unconfirmedGen != 0 && s.unconfirmedGen == gen
 }
 
 // WipeRevoked wipes this device's copy of the vault once a verified

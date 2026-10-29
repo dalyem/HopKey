@@ -264,6 +264,10 @@ type Store struct {
 	gen      atomic.Uint64
 	cancels  map[uint64]context.CancelFunc
 	cancelID uint64
+
+	// unconfirmedGen is the generation of the lock made because the server
+	// did not confirm this device (UnconfirmedLock), or 0.
+	unconfirmedGen uint64
 	// syncHalt is the error that stopped syncing (an equivocation or a
 	// rule violation in a server entry).
 	syncHalt error
@@ -511,6 +515,10 @@ func (s *Store) dropLocked(reason error) {
 	s.kitOrphaned, s.skErr, s.kitSKDurable, s.repaired = false, nil, false, ""
 	s.kitServer, s.kitKind = false, ""
 	s.lockErr = reason
+	s.unconfirmedGen = 0
+	if errors.Is(reason, ErrServerUnconfirmed) {
+		s.unconfirmedGen = s.gen.Load()
+	}
 	// §11.2: locking stops pulls and pushes. In-flight requests are
 	// cancelled, and their responses are discarded by generation.
 	for id, cancel := range s.cancels {
