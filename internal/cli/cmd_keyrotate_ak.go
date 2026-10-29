@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,14 +14,14 @@ import (
 
 // The authorized_keys edits of hop key rotate. hop reads the file over ssh,
 // works out the new content here, and has one small POSIX sh script on the
-// host swap it in. The script takes a lock that other hop runs respect (a
-// directory in ~/.ssh), checks that the file is still byte for byte what
-// hop read (cksum and size), writes a temp file in ~/.ssh with the old
-// file's mode and owner (cp -p) and the new content, checks the file once
-// more, and renames the temp file over it. A mismatch anywhere stops it
-// with nothing changed. Other hop runs are kept out by the lock, but a
-// writer that does not take it (an editor, configuration management) can
-// still change the file between the last check and the rename.
+// host swap it in. The script takes a lock that other hop runs respect
+// (see akLockFile), checks that the file is still byte for byte what hop
+// read (cksum and size), writes a temp file in ~/.ssh with the old file's
+// mode and owner (cp -p) and the new content, checks the file once more,
+// and renames the temp file over it. A mismatch anywhere stops it with
+// nothing changed. Other hop runs are kept out by the lock, but a writer
+// that does not take it (an editor, configuration management) can still
+// change the file between the last check and the rename.
 
 // akFile is the file hop edits. A server whose AuthorizedKeysFile points
 // elsewhere shows up as a missing file, a missing old key, or a new key
@@ -39,13 +41,26 @@ const (
 // akMaxSize bounds the authorized_keys file hop will edit.
 const akMaxSize = 1 << 20
 
-// The lock of the write script: a directory, which mkdir makes or fails
-// to make in one step. A lock older than akLockStale minutes was left by a
-// run that died (an edit takes well under a second, and every ssh run of
-// hop key rotate is cut off after rotateStepTimeout), and is removed.
+// The lock of the write script, in ~/.ssh. Where flock(1) is installed
+// (util-linux, so most Linux), the script holds an exclusive flock on the
+// file akLockFile for as long as it runs. The kernel lets go of it when the
+// script's processes exit, however they end, so a lock is never left
+// behind and nothing is ever reclaimed. The file itself stays: removing it
+// would let a run that opens the path afresh lock a new file beside one
+// still locked.
+//
+// Without flock, the lock is the directory akLockDir, which mkdir makes or
+// fails to make in one step, with a file "owner" in it that holds a token
+// of this run. The script removes the directory on the way out only if it
+// still holds its token, so it never removes another run's lock. hop never
+// takes a lock over because of its age: a remote script can outlive the
+// ssh that started it, so an old lock does not prove its run has stopped.
+// A lock that stays for akLockWait seconds stops the edit with nothing
+// changed (akExitLocked), and the message names the directory to remove if
+// no hop rotation is running.
 const (
-	akLockDir   = ".hop-authorized_keys.lock"
-	akLockStale = 2
+	akLockFile = ".hop-authorized_keys.lock"
+	akLockDir  = ".hop-authorized_keys.lock.d"
 )
 
 // akLockWait is how many seconds the write script waits for the lock.
@@ -64,16 +79,25 @@ func akWriteScript(from, to string) string {
 	check := func(file, want string, code int, msg string) string {
 		return fmt.Sprintf(`c=$(cksum < "%s") || exit 84; set -- $c; if [ "$1 $2" = "%s" ]; then :; else echo "%s" >&2; exit %d; fi; `, file, want, msg, code)
 	}
-	return `f="$HOME/.ssh/authorized_keys"; t="$HOME/.ssh/.authorized_keys.hop-$$"; l="$HOME/.ssh/` + akLockDir + `"; ` +
+	tok := make([]byte, 16)
+	rand.Read(tok)
+	token := hex.EncodeToString(tok)
+	return `umask 077; f="$HOME/.ssh/authorized_keys"; t="$HOME/.ssh/.authorized_keys.hop-$$"; ` +
+		`l="$HOME/.ssh/` + akLockFile + `"; d="$HOME/.ssh/` + akLockDir + `"; ` +
 		`if [ -L "$f" ]; then echo "~/.ssh/authorized_keys is a symbolic link; hop does not edit it" >&2; exit 81; fi; ` +
 		`if [ -f "$f" ]; then :; else echo "~/.ssh/authorized_keys does not exist" >&2; exit 82; fi; ` +
-		fmt.Sprintf(`n=0; until mkdir "$l" 2>/dev/null; do n=$((n+1)); `+
-			`if [ $n -gt %d ]; then echo "~/.ssh/authorized_keys is being edited by another hop run (%s exists)" >&2; exit 85; fi; `+
-			`if [ -n "$(find "$l" -prune -mmin +%d 2>/dev/null)" ]; then rmdir "$l" 2>/dev/null; else sleep 1; fi; done; `,
-			akLockWait, "~/.ssh/"+akLockDir, akLockStale) +
 		// From here the exit status of a signal is not one of the above:
-		// the rename may have happened.
-		`trap 'rm -f "$t"; rmdir "$l" 2>/dev/null' EXIT; trap 'exit 86' HUP INT TERM PIPE; ` +
+		// the rename may have happened. The EXIT trap removes the mkdir
+		// lock only while it holds this run's token.
+		`trap 'rm -f "$t"; if [ "$(cat "$d/owner" 2>/dev/null)" = "` + token + `" ]; then rm -f "$d/owner"; rmdir "$d"; fi' EXIT; trap 'exit 86' HUP INT TERM PIPE; ` +
+		fmt.Sprintf(`if command -v flock >/dev/null 2>&1; then `+
+			`if (: >> "$l") 2>/dev/null; then :; else echo "cannot open the lock file %[2]s" >&2; exit 84; fi; exec 9>>"$l"; `+
+			`n=0; until flock -x -n 9; do n=$((n+1)); `+
+			`if [ $n -gt %[1]d ]; then echo "~/.ssh/authorized_keys is being edited by another hop run (it holds a lock on %[2]s)" >&2; exit 85; fi; sleep 1; done; `+
+			`else n=0; until mkdir "$d" 2>/dev/null; do n=$((n+1)); `+
+			`if [ $n -gt %[1]d ]; then echo "%[3]s exists: another hop run is editing ~/.ssh/authorized_keys, or one was cut off; if no hop key rotate is running for this account, remove it (rm -r %[3]s)" >&2; exit 85; fi; sleep 1; done; `+
+			`if (echo "%[4]s" > "$d/owner") 2>/dev/null; then :; else rmdir "$d"; echo "cannot write the lock %[3]s" >&2; exit 84; fi; fi; `,
+			akLockWait, "~/.ssh/"+akLockFile, "~/.ssh/"+akLockDir, token) +
 		check("$f", from, akExitChanged, "~/.ssh/authorized_keys changed while hop was editing it") +
 		`(set -C; : > "$t") 2>/dev/null || { echo "cannot create a temporary file in ~/.ssh" >&2; exit 84; }; ` +
 		`cp -p "$f" "$t" || exit 84; cat >| "$t" || exit 84; ` +
@@ -313,6 +337,25 @@ func planAKEdit(orig []byte, oldPub, newPub ssh.PublicKey, comment string) (*akE
 	return ed, nil
 }
 
+// withoutKey is content without the lines that log in with pub (a
+// cert-authority line does not), and how many lines it dropped.
+func withoutKey(content []byte, pub ssh.PublicKey) ([]byte, int) {
+	blob := pub.Marshal()
+	var keep []string
+	n := 0
+	for _, l := range splitAK(content) {
+		if k, ok := parseAKLine(l); ok && !k.certCA && bytes.Equal(k.pub.Marshal(), blob) {
+			n++
+			continue
+		}
+		keep = append(keep, l)
+	}
+	if n == 0 {
+		return content, 0
+	}
+	return joinAK(keep), n
+}
+
 func containsInt(s []int, v int) bool {
 	for _, x := range s {
 		if x == v {
@@ -346,6 +389,12 @@ func rollbackAK(cur []byte, ed *akEdit) (out []byte, changed bool) {
 		return cur, false
 	}
 	return joinAK(keep), true
+}
+
+// oldLinesOnly is the part of ed that rollbackAK undoes to bring the old
+// key's lines back while keeping the new key's.
+func (ed *akEdit) oldLinesOnly() *akEdit {
+	return &akEdit{oldPub: ed.oldPub, newPub: ed.newPub, removed: ed.removed}
 }
 
 // containsLine compares lines without a trailing carriage return.

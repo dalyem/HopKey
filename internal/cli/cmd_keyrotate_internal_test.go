@@ -262,10 +262,12 @@ func TestAKScriptsWithSh(t *testing.T) {
 	if got, _ := os.ReadFile(f); !bytes.Equal(got, next) {
 		t.Errorf("a refused write changed the file: %q", got)
 	}
-	// No temp file is left behind.
+	// No temp file is left behind; the flock lock file stays, by design.
 	entries, _ := os.ReadDir(dir)
-	if len(entries) != 1 {
-		t.Errorf("~/.ssh holds %d entries, want only authorized_keys", len(entries))
+	for _, e := range entries {
+		if e.Name() != "authorized_keys" && e.Name() != ".hop-authorized_keys.lock" {
+			t.Errorf("left in ~/.ssh: %s", e.Name())
+		}
 	}
 
 	// A symlink is not edited.
@@ -324,52 +326,6 @@ func TestParseAKLineQuotedOptions(t *testing.T) {
 	}
 	if want := []string{`environment="OLD=` + blob + `",restrict ` + akText(newK) + " n"}; strings.Join(ed.added, "\n") != want[0] {
 		t.Errorf("added %q, want %q", ed.added, want)
-	}
-}
-
-// The write script waits for another hop's lock, gives up with nothing
-// changed when it stays, and takes over one left by a run that died.
-func TestAKWriteScriptLock(t *testing.T) {
-	defer func(w int) { akLockWait = w }(akLockWait)
-	akLockWait = 1
-	home := t.TempDir()
-	dir := filepath.Join(home, ".ssh")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	f := filepath.Join(dir, "authorized_keys")
-	orig, next := []byte("a\n"), []byte("a\nb\n")
-	if err := os.WriteFile(f, orig, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	lock := filepath.Join(dir, akLockDir)
-	if err := os.Mkdir(lock, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	code, _, stderr := runAKScript(t, home, akWriteScript(cksum(orig), cksum(next)), next)
-	if code != akExitLocked || !strings.Contains(stderr, "another hop run") {
-		t.Errorf("held lock: %d %q", code, stderr)
-	}
-	if got, _ := os.ReadFile(f); !bytes.Equal(got, orig) {
-		t.Errorf("written under another's lock: %q", got)
-	}
-	if _, err := os.Stat(lock); err != nil {
-		t.Errorf("the other run's lock was removed: %v", err)
-	}
-
-	// Three minutes old: stale.
-	old := time.Now().Add(-3 * time.Minute)
-	if err := os.Chtimes(lock, old, old); err != nil {
-		t.Fatal(err)
-	}
-	if code, _, stderr := runAKScript(t, home, akWriteScript(cksum(orig), cksum(next)), next); code != 0 {
-		t.Fatalf("stale lock: %d %q", code, stderr)
-	}
-	if got, _ := os.ReadFile(f); !bytes.Equal(got, next) {
-		t.Errorf("after taking a stale lock: %q", got)
-	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
-		t.Errorf("~/.ssh holds %d entries, want only authorized_keys", len(entries))
 	}
 }
 

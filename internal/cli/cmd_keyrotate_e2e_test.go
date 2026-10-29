@@ -540,9 +540,12 @@ func TestKeyRotateTwoHosts(t *testing.T) {
 		if err := login(s, newSignerKey); err != nil {
 			t.Errorf("server %d refuses the new key: %v", i+1, err)
 		}
+		// No temp file is left; the flock lock file stays, by design.
 		entries, _ := os.ReadDir(filepath.Join(s.home, ".ssh"))
-		if len(entries) != 1 {
-			t.Errorf("server %d ~/.ssh has %d entries, want only authorized_keys", i+1, len(entries))
+		for _, e := range entries {
+			if e.Name() != "authorized_keys" && e.Name() != ".hop-authorized_keys.lock" {
+				t.Errorf("server %d: left in ~/.ssh: %s", i+1, e.Name())
+			}
 		}
 	}
 	// And hop itself now logs in with the new key.
@@ -915,14 +918,18 @@ func TestKeyRotateConflictDoesNotRepointAMovedHost(t *testing.T) {
 	}
 }
 
-// Another hop run holds the authorized_keys lock and edits the file while
-// it does. hop waits for the lock, finds the file changed from what it
-// read, and changes nothing.
+// Another hop run holds the authorized_keys lock (an flock, as on any
+// server with util-linux) and edits the file while it does. hop waits for
+// the lock, finds the file changed from what it read, and changes nothing.
 func TestKeyRotateWaitsForTheAuthorizedKeysLock(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock(1) is not installed")
+	}
 	w := newRotWorld(t, rotWorldOpts{})
 	s := w.srv[0]
 	f := filepath.Join(s.home, ".ssh", "authorized_keys")
 	lock := filepath.Join(s.home, ".ssh", ".hop-authorized_keys.lock")
+	held := filepath.Join(w.base, "held")
 	const theirs = "# added by another hop\n"
 	var once sync.Once
 	other := make(chan string, 1) // what went wrong while the other writer held the lock
@@ -931,21 +938,26 @@ func TestKeyRotateWaitsForTheAuthorizedKeysLock(t *testing.T) {
 			return false
 		}
 		once.Do(func() {
-			if err := os.Mkdir(lock, 0o700); err != nil {
-				other <- err.Error()
-				return
-			}
+			// It prints the file as it found it after holding the lock a
+			// while, and then adds a line.
+			c := exec.Command("flock", lock, "sh", "-c", `: > "$3"; sleep 1.5; cat "$1"; printf '%s' "$2" >> "$1"`, "sh", f, theirs, held)
 			go func() {
-				time.Sleep(1500 * time.Millisecond)
-				b, _ := os.ReadFile(f)
-				msg := ""
-				if string(b) != w.orig[0] {
-					msg = "authorized_keys changed while another writer held the lock:\n" + string(b)
+				out, err := c.Output()
+				switch {
+				case err != nil:
+					other <- "the other writer: " + err.Error()
+				case string(out) != w.orig[0]:
+					other <- "authorized_keys changed while another writer held the lock:\n" + string(out)
+				default:
+					other <- ""
 				}
-				os.WriteFile(f, append(b, theirs...), 0o640)
-				os.Remove(lock)
-				other <- msg
 			}()
+			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+				if _, err := os.Stat(held); err == nil {
+					return
+				}
+			}
+			other <- "the other writer never took the lock"
 		})
 		return false
 	})
@@ -965,8 +977,8 @@ func TestKeyRotateWaitsForTheAuthorizedKeysLock(t *testing.T) {
 	if got, _ := w.authorizedKeys(t, 0); got != w.orig[0]+theirs {
 		t.Errorf("authorized_keys:\n%s\nwant the original plus the other writer's line", got)
 	}
-	if _, err := os.Stat(lock); err == nil {
-		t.Error("the lock was left behind")
+	if err := exec.Command("flock", "-n", lock, "true").Run(); err != nil {
+		t.Errorf("the lock is still held after the run: %v", err)
 	}
 	if w.hostKeyID(t, "web-1") != w.keyID {
 		t.Error("web-1 moved to the new key")

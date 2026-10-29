@@ -122,8 +122,12 @@ type rotHost struct {
 	t    *target // nil when skipped
 	// jump is the ssh alias of the host's jump host, "" for none.
 	jump string
-	// ident is the record's connection as planned (connIdentity).
+	// ident is the record's connection as planned (connIdentity), and
+	// chain the versions of the record and of each jump host on its way
+	// (hostChain): hop points the host at the new key only while they
+	// still hold.
 	ident string
+	chain []daemon.ItemVersion
 	out   *RotateHost
 	// state is where the host's authorized_keys stands (remUnchanged and
 	// so on) once hop has started on it, and "" before.
@@ -376,7 +380,10 @@ func (e *Env) planRotation(ctx context.Context, l *daemon.ListResult, pos []stri
 		if found == nil {
 			return nil, failf("no host named %q in the vault", name)
 		}
-		if !slices.ContainsFunc(keys, func(k daemon.KeyInfo) bool { return k.ID == found.KeyID.String() }) {
+		// With --new-key, a host already on that key is finished: hop checks
+		// that the old key is gone from it.
+		onNew := reuse != nil && found.KeyID.String() == reuse.ID
+		if !onNew && !slices.ContainsFunc(keys, func(k daemon.KeyInfo) bool { return k.ID == found.KeyID.String() }) {
 			if o.all {
 				return nil, failf("host %s does not log in with a key", found.Name)
 			}
@@ -399,7 +406,8 @@ func (e *Env) planRotation(ctx context.Context, l *daemon.ListResult, pos []stri
 		p.out = &RotateKey{Key: k.Name, KeyID: k.ID, Fingerprint: k.Fingerprint, Hosts: []RotateHost{}}
 		plans = append(plans, p)
 		for _, h := range l.Hosts {
-			if h.KeyID == id && (len(only) == 0 || only[h.ItemID]) {
+			onNew := reuse != nil && h.KeyID.String() == reuse.ID && only[h.ItemID]
+			if (h.KeyID == id || onNew) && (len(only) == 0 || only[h.ItemID]) {
 				p.hosts = append(p.hosts, &rotHost{host: h, out: &RotateHost{Host: h.Name, HostID: h.ItemID.String()}})
 			}
 		}
@@ -445,7 +453,8 @@ func (e *Env) planRotation(ctx context.Context, l *daemon.ListResult, pos []stri
 				h.out.Status, h.out.Reason = rotSkipped, why
 				continue
 			}
-			h.t, h.jump, h.ident, h.out.Status = t, jump, connIdentity(h.host, l.Hosts), rotPlanned
+			h.t, h.jump, h.out.Status = t, jump, rotPlanned
+			h.ident, h.chain = connIdentity(h.host, l.Hosts), hostChain(h.host, l.Hosts)
 		}
 		p.out.Hosts = hostResults(p.hosts)
 	}
@@ -573,7 +582,9 @@ func printRotateResult(e *Env, res *RotateResult) {
 					detail += "; warning: " + h.Warning
 				}
 			case rotAttention:
-				detail += "; to finish, run: " + h.Fix
+				if h.Fix != "" {
+					detail += "; to finish, run: " + h.Fix
+				}
 			}
 			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", oneLine(k.Key), oneLine(h.Host), h.Status, dash(oneLine(detail)))
 		}
@@ -763,18 +774,57 @@ func (h *rotHost) fail(why string) { h.out.Status, h.out.Reason = rotFailed, why
 var remText = map[string]string{
 	remUnchanged:  "the server takes the old key, as before",
 	remAdded:      "the server takes both keys",
-	remOldRemoved: "the server takes only the new key, while the vault still points the host at the old one",
+	remOldRemoved: "the server takes only the new key in " + akFile,
 	remUnknown:    "hop cannot tell which of the two keys the server takes now",
 }
 
-// attention reports a host hop could not finish or put back, or whose
-// record it would not touch. Both keys stay in the vault, and Fix is the
-// command that finishes the job: it reuses the new key, finds out which
-// key the server takes, and carries on from there.
+// attention reports a host hop could not finish or put back. Both keys
+// stay in the vault, and Fix is the command that finishes the job: it
+// reuses the new key, finds out which key the server takes, and carries on
+// from there, whether the record still names the old key or already the
+// new one.
 func (h *rotHost) attention(k *rotKeys, why string) {
 	h.out.Status = rotAttention
 	h.out.Reason = why + "; " + remText[h.state] + safef("; both keys stay in the vault: %s (old) and %s (new)", k.oldName, k.newName)
-	h.out.Fix = "hop key rotate " + shellcmd.Quote(k.oldName) + " --hosts " + shellcmd.Quote(h.host.Name) + " --new-key " + shellcmd.Quote(k.newName)
+	h.out.Fix = rotateFix(k, h.host.Name)
+}
+
+func rotateFix(k *rotKeys, host string) string {
+	return "hop key rotate " + shellcmd.Quote(k.oldName) + " --hosts " + shellcmd.Quote(host) + " --new-key " + shellcmd.Quote(k.newName)
+}
+
+// movedText is remText for the server hop changed, once the record no
+// longer reaches it.
+var movedText = map[string]string{
+	remUnchanged:  "takes the old key, as before",
+	remAdded:      "takes both keys",
+	remOldRemoved: "takes only the new key",
+	remUnknown:    "may take either key: hop cannot tell",
+}
+
+// moved reports a host whose record changed while its key was rotated, so
+// that it may no longer reach the server hop changed. hop leaves the record
+// alone, and the way to finish fits the record as it is now.
+func (h *rotHost) moved(k *rotKeys, m *hostMovedError) {
+	h.out.Status = rotAttention
+	h.out.Reason = "the host's record changed while its key was rotated (on another device, or by another command), so hop left the record alone" +
+		safef("; the server hop checked (%s@%s port %d, as the record was then) %s", h.host.User, strings.Join(h.host.Addresses, ","), h.host.Port, movedText[h.state])
+	h.out.Fix = ""
+	switch {
+	case m.fresh == nil:
+		h.out.Reason += "; the record was deleted"
+	case m.fresh.KeyID == k.newID:
+		// --new-key takes a host already on the new key, and only checks
+		// that the old key is gone from the server the record reaches now.
+		h.out.Reason += "; the record already names the new key"
+		h.out.Fix = rotateFix(k, m.fresh.Name)
+	case m.fresh.KeyID == h.host.KeyID:
+		h.out.Reason += "; the record still names the old key"
+		h.out.Fix = rotateFix(k, m.fresh.Name)
+	default:
+		h.out.Reason += "; the record no longer uses either key"
+	}
+	h.out.Reason += safef("; both keys stay in the vault: %s (old) and %s (new)", k.oldName, k.newName)
 }
 
 // rotateHost rotates one host and records the result in h.out, and where
@@ -789,14 +839,20 @@ func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp stri
 	}
 	h.state = remUnchanged
 
+	// A host the vault points at the new key already (--new-key, after a
+	// host that needed attention): what is left is the old key's lines.
+	if h.host.KeyID == k.newID {
+		e.finishOnNewKey(ctx, h, k, w, false, asJSON)
+		return
+	}
+
 	// 1. Read authorized_keys with the old key.
 	orig, why, noLogin := w.old.readAK(ctx)
 	if why != "" {
-		// Another record for the same account may have been rotated
-		// first: then the account takes the new key, and not the old one.
+		// The server may take the new key already: another record for the
+		// same account was rotated first, or an earlier run got that far.
 		if noLogin && sshOK(w.new.run(ctx, "true", nil, nil)) {
-			h.state = remOldRemoved
-			e.repoint(ctx, h, k, w, nil, asJSON)
+			e.finishOnNewKey(ctx, h, k, w, true, asJSON)
 			return
 		}
 		h.fail(why + "; nothing was changed")
@@ -841,16 +897,74 @@ func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp stri
 	h.state = remOldRemoved
 
 	// 5. The old key should now be refused.
-	switch res, err := w.oldCheck.run(ctx, "true", nil, nil); {
-	case sshOK(res, err):
-		h.out.Warning = "the old key still logs in: the server accepts it from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
-	case err == nil && strings.Contains(res.Stderr, "Permission denied"):
-	default:
-		h.out.Warning = "could not confirm that the old key is refused (" + sshFailure(res, err) + ")"
-	}
+	h.out.Warning = w.oldRefused(ctx)
 
 	// 6. Point the host at the new key.
-	e.repoint(ctx, h, k, w, ed, asJSON)
+	if e.repoint(ctx, h, k, w, ed, asJSON) {
+		h.out.Status, h.out.Reason = rotRotated, ""
+	}
+}
+
+// finishOnNewKey finishes a host whose server takes the new key already.
+// Over the new key alone it removes any line of the old key still in
+// authorized_keys, with the same guarded edit, and checks that the old key
+// is refused; with repoint it then points the record at the new key, which
+// is known to log in. The host is already-rotated only once the old key is
+// shown to be refused. Otherwise it needs attention, and the old key stays
+// in the vault.
+func (e *Env) finishOnNewKey(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, repoint, asJSON bool) {
+	h.state = remUnknown
+	problem := w.removeOld(ctx, h, k)
+	if problem == "" {
+		problem = w.oldRefused(ctx)
+	}
+	if repoint && !e.repoint(ctx, h, k, w, nil, asJSON) {
+		return
+	}
+	if problem != "" {
+		h.attention(k, "the server takes the new key, but "+problem)
+		return
+	}
+	h.out.Status, h.out.Reason = rotAlready, "the server already took the new key, and refuses the old one: another host record for the same account, or an earlier run, got that far"
+	if !repoint {
+		h.out.Reason = "the host was on the new key already, and the server refuses the old one"
+	}
+}
+
+// removeOld removes the old key's lines from authorized_keys, over the new
+// key alone, and says why it could not, or "". It keeps h.state.
+func (w *rotWays) removeOld(ctx context.Context, h *rotHost, k *rotKeys) string {
+	cur, why, _ := w.new.readAK(ctx)
+	if why != "" {
+		return "hop could not read " + akFile + " with the new key (" + why + ")"
+	}
+	h.state = akState(cur, k.oldPub, k.newPub)
+	next, removed := withoutKey(cur, k.oldPub)
+	if removed == 0 {
+		return ""
+	}
+	switch out, why, _ := w.new.writeAK(ctx, cur, next); out {
+	case akNotDone:
+		return "hop could not remove the old key's lines: " + why
+	case akUnknown:
+		h.state = remUnknown
+		return "hop could not remove the old key's lines: " + why
+	}
+	h.state = akState(next, k.oldPub, k.newPub)
+	return ""
+}
+
+// oldRefused offers the old key alone and says, unless the server refuses
+// it, what it saw instead.
+func (w *rotWays) oldRefused(ctx context.Context) string {
+	switch res, err := w.oldCheck.run(ctx, "true", nil, nil); {
+	case sshOK(res, err):
+		return "the old key still logs in: the server accepts it from somewhere other than " + akFile + " (AuthorizedKeysFile, authorized_keys2)"
+	case err == nil && strings.Contains(res.Stderr, "Permission denied"):
+		return ""
+	default:
+		return "hop could not confirm that the old key is refused (" + sshFailure(res, err) + ")"
+	}
 }
 
 // putBack undoes ed on the host after why, and reports the host as failed
@@ -865,75 +979,123 @@ func (e *Env) putBack(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, e
 }
 
 // repoint points the host's record at the new key once the server takes
-// it. ed is the edit hop made, or nil when the server took the new key
-// before (through another record).
-func (e *Env) repoint(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, ed *akEdit, asJSON bool) {
-	err := e.repointHost(ctx, h, k.newID, asJSON)
+// it, and says whether it did. If not, h.out says why. ed is the edit hop
+// made, or nil for none. It is undone when the record does not name the
+// new key. When the record names the new key now, or hop cannot tell, the
+// old key's lines come back beside the new ones instead, so that the key
+// the record names logs in.
+func (e *Env) repoint(ctx context.Context, h *rotHost, k *rotKeys, w *rotWays, ed *akEdit, asJSON bool) bool {
+	err := e.repointHost(ctx, h, k, asJSON)
 	if err == nil {
-		h.out.Status, h.out.Reason = rotRotated, ""
-		if ed == nil {
-			h.out.Status, h.out.Reason = rotAlready, "the server already takes the new key and refuses the old one: another host record for the same account was rotated first"
+		return true
+	}
+	var mv *hostMovedError
+	switch {
+	case errors.As(err, &mv):
+		if ed != nil {
+			undo := ed
+			if mv.fresh != nil && mv.fresh.KeyID == k.newID {
+				undo = ed.oldLinesOnly()
+			}
+			h.state = w.rollback(ctx, undo, h.state)
 		}
-		return
+		h.moved(k, mv)
+	case errors.Is(err, errRepointUnknown):
+		if ed != nil {
+			h.state = w.rollback(ctx, ed.oldLinesOnly(), h.state)
+		}
+		h.attention(k, safef("the new key works, but hop could not tell whether the vault points the host at it (%v)", err))
+	default:
+		why := safef("the new key works, but the vault could not point the host at it (%v)", err)
+		if ed != nil {
+			h.state = w.rollback(ctx, ed, h.state)
+		}
+		if h.state == remUnchanged {
+			h.fail(why + "; put back as it was, and it keeps the old key")
+		} else {
+			h.attention(k, why)
+		}
 	}
-	moved := errors.Is(err, errHostMoved)
-	why := safef("the new key works, but the vault could not point the host at it (%v)", err)
-	if moved {
-		why = "the host's record changed while its key was rotated (on another device, or by another command), so hop left the record alone"
-	}
-	if ed != nil {
-		h.state = w.rollback(ctx, ed, h.state)
-	}
-	if h.state == remUnchanged && !moved {
-		h.fail(why + "; put back as it was, and it keeps the old key")
-		return
-	}
-	h.attention(k, why)
+	return false
 }
 
-// errHostMoved: the host's record no longer reaches the server hop
-// checked, or no longer names the old key.
-var errHostMoved = errors.New("the host's record changed")
+// hostMovedError: the host's record no longer reaches the server hop
+// checked. fresh is the record now, nil when it was deleted.
+type hostMovedError struct{ fresh *model.Host }
 
-// repointHost sets the host's key to id. If the write fails because the
-// record changed meanwhile (a sync, say), it is retried once on the fresh
-// record, but only when that still reaches the server hop checked and
-// still names the old key; otherwise errHostMoved.
-func (e *Env) repointHost(ctx context.Context, h *rotHost, id model.ID, asJSON bool) error {
-	rec := h.host
-	rec.KeyID = id
-	_, err := putHost(ctx, e, asJSON, rec)
-	if err == nil {
-		return nil
+func (*hostMovedError) Error() string { return "the host's record changed" }
+
+// errRepointUnknown: the write failed, and hop could not read the record
+// back to see whether it took effect.
+var errRepointUnknown = errors.New("the vault did not answer")
+
+// setHostKey is the daemon's conditional write of a host's key
+// (daemon.OpSetHostKey). A variable, so a test can lose its answer.
+var setHostKey = func(ctx context.Context, e *Env, asJSON bool, p daemon.SetHostKeyParams) error {
+	return callChange(ctx, e, asJSON, daemon.OpSetHostKey, p, nil)
+}
+
+// repointHost sets the host's key to the new key in one conditional write:
+// the daemon makes it only while the record and every jump host on its way
+// are at the versions hop planned with (h.chain), so nothing that changes
+// where ssh connects can slip in between. When the write fails hop reads
+// the record back:
+//   - it names the new key and still reaches the server hop checked
+//     (connIdentity): the write went through and only its answer was lost,
+//     or another device made the same change. Done.
+//   - it no longer reaches that server, or names another key: a
+//     *hostMovedError.
+//   - it still names the old key and reaches that server: after a version
+//     conflict (a description or a tag changed, say) the write is tried once
+//     more at the versions just read, which the daemon checks again; any
+//     other failure is returned.
+//
+// When the record cannot be read back, errRepointUnknown.
+func (e *Env) repointHost(ctx context.Context, h *rotHost, k *rotKeys, asJSON bool) error {
+	chain := h.chain
+	for retried := false; ; retried = true {
+		err := setHostKey(ctx, e, asJSON, daemon.SetHostKeyParams{HostID: h.host.ItemID.String(), KeyID: k.newID.String(), Chain: chain})
+		if err == nil {
+			return nil
+		}
+		l, lerr := listAll(ctx, e)
+		if lerr != nil {
+			return fmt.Errorf("%w: %v; reading it back: %v", errRepointUnknown, err, lerr)
+		}
+		i := slices.IndexFunc(l.Hosts, func(x model.Host) bool { return x.ItemID == h.host.ItemID })
+		if i < 0 {
+			return &hostMovedError{}
+		}
+		fresh := l.Hosts[i]
+		if connIdentity(fresh, l.Hosts) != h.ident {
+			return &hostMovedError{fresh: &fresh}
+		}
+		switch fresh.KeyID {
+		case k.newID:
+			return nil
+		case h.host.KeyID:
+		default:
+			return &hostMovedError{fresh: &fresh}
+		}
+		if retried || !daemon.IsCode(err, daemon.CodeChanged) {
+			return err
+		}
+		chain = hostChain(fresh, l.Hosts)
 	}
-	l, lerr := listAll(ctx, e)
-	if lerr != nil {
-		return err
-	}
-	i := slices.IndexFunc(l.Hosts, func(x model.Host) bool { return x.ItemID == h.host.ItemID })
-	if i < 0 {
-		return errHostMoved
-	}
-	fresh := l.Hosts[i]
-	if fresh.ItemVersion == h.host.ItemVersion {
-		return err // not a conflict
-	}
-	if fresh.KeyID != h.host.KeyID || connIdentity(fresh, l.Hosts) != h.ident {
-		return errHostMoved
-	}
-	fresh.KeyID = id
-	_, err = putHost(ctx, e, asJSON, fresh)
-	return err
 }
 
 // connIdentity is what decides which server a record reaches and how: its
-// addresses, port, user, route and pinned host keys, and the same for each
-// jump host on the way.
+// addresses, port, user, route, Tailscale link and pinned host keys, and
+// the same for each jump host on the way, in order.
 func connIdentity(h model.Host, hosts []model.Host) string {
 	var b strings.Builder
 	seen := map[model.ID]bool{}
 	for cur := h; ; {
-		fmt.Fprintf(&b, "%s %q %d %q %q %q;", cur.ItemID, cur.Addresses, cur.Port, cur.User, cur.Route, cur.HostKeys)
+		ts := "-"
+		if t := cur.Tailscale; t != nil {
+			ts = fmt.Sprintf("%q %q %q", t.StableNodeID, t.DNSName, t.SSH)
+		}
+		fmt.Fprintf(&b, "%s %q %d %q %q %q %s;", cur.ItemID, cur.Addresses, cur.Port, cur.User, cur.Route, cur.HostKeys, ts)
 		if cur.JumpHostID.IsZero() || seen[cur.JumpHostID] {
 			return b.String()
 		}
@@ -941,6 +1103,26 @@ func connIdentity(h model.Host, hosts []model.Host) string {
 		i := slices.IndexFunc(hosts, func(j model.Host) bool { return j.ItemID == cur.JumpHostID })
 		if i < 0 {
 			return b.String() + "missing " + cur.JumpHostID.String()
+		}
+		cur = hosts[i]
+	}
+}
+
+// hostChain is the version of h and of each jump host on its way, in
+// order, as daemon.OpSetHostKey checks them. It stops at a jump host that
+// is missing or seen before; the daemon refuses such a way.
+func hostChain(h model.Host, hosts []model.Host) []daemon.ItemVersion {
+	var out []daemon.ItemVersion
+	seen := map[model.ID]bool{}
+	for cur := h; ; {
+		out = append(out, daemon.ItemVersion{ID: cur.ItemID.String(), Version: cur.ItemVersion})
+		seen[cur.ItemID] = true
+		if cur.JumpHostID.IsZero() || seen[cur.JumpHostID] {
+			return out
+		}
+		i := slices.IndexFunc(hosts, func(j model.Host) bool { return j.ItemID == cur.JumpHostID })
+		if i < 0 {
+			return out
 		}
 		cur = hosts[i]
 	}

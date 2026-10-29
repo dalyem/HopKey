@@ -217,6 +217,12 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 			return nil, err
 		}
 		return d.opPutHost(ctx, p)
+	case OpSetHostKey:
+		var p SetHostKeyParams
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return d.opSetHostKey(ctx, p)
 	case OpPutKey:
 		var p PutKeyParams
 		if err := decode(&p); err != nil {
@@ -553,6 +559,72 @@ func (d *Daemon) opPutHost(ctx context.Context, p PutHostParams) (*model.Host, e
 		return nil, err
 	}
 	h, err := checkHostInput(p.Host, snap.Hosts)
+	if err != nil {
+		return nil, err
+	}
+	saved, err := d.store.PutHost(ctx, h)
+	if err != nil {
+		return nil, storeError(err)
+	}
+	d.localWrite()
+	return &saved, d.reloadAfter(ctx, "saved")
+}
+
+func (d *Daemon) opSetHostKey(ctx context.Context, p SetHostKeyParams) (*model.Host, error) {
+	hostID, err := model.ParseID(p.HostID)
+	if err != nil {
+		return nil, invalidf("host_id: %v", err)
+	}
+	keyID, err := model.ParseID(p.KeyID)
+	if err != nil {
+		return nil, invalidf("key_id: %v", err)
+	}
+	if len(p.Chain) == 0 || p.Chain[0].ID != hostID.String() {
+		return nil, invalidf("chain must start with the host")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	snap, err := d.store.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.ContainsFunc(snap.Keys, func(k model.Key) bool { return k.ItemID == keyID }) {
+		return nil, &Error{Code: CodeNotFound, Message: "no key " + keyID.String()}
+	}
+	byID := map[model.ID]model.Host{}
+	for _, h := range snap.Hosts {
+		byID[h.ItemID] = h
+	}
+	changed := func(what string) error {
+		return &Error{Code: CodeChanged, Message: what + " changed; nothing was written"}
+	}
+	host, ok := byID[hostID]
+	if !ok {
+		return nil, &Error{Code: CodeNotFound, Message: "no host " + hostID.String()}
+	}
+	cur := host
+	for i, want := range p.Chain {
+		if cur.ItemID.String() != want.ID || cur.ItemVersion != want.Version {
+			if i == 0 {
+				return nil, changed("the host " + host.Name)
+			}
+			return nil, changed("the way to " + host.Name + " (jump host " + cur.Name + ")")
+		}
+		if cur.JumpHostID.IsZero() {
+			if i != len(p.Chain)-1 {
+				return nil, changed("the way to " + host.Name)
+			}
+			break
+		}
+		if i == len(p.Chain)-1 {
+			return nil, changed("the way to " + host.Name)
+		}
+		if cur, ok = byID[cur.JumpHostID]; !ok {
+			return nil, changed("the way to " + host.Name + " (a jump host is missing)")
+		}
+	}
+	host.KeyID = keyID
+	h, err := checkHostInput(host, snap.Hosts)
 	if err != nil {
 		return nil, err
 	}
