@@ -27,9 +27,13 @@ type RedactParams struct {
 }
 
 // RedactResult answers OpRedact: for each text, in order, the stretches to
-// replace, by byte offset into it. Hits may overlap.
+// replace, by byte offset into it. Hits may overlap. Longest is the length
+// of the longest form of a secret it looked for (redact.Matcher.Longest):
+// a caller that changes a text it was told about checks again only the
+// bytes this close to a change. A daemon from before it leaves it out.
 type RedactResult struct {
-	Hits [][]redact.Hit `json:"hits"`
+	Hits    [][]redact.Hit `json:"hits"`
+	Longest *int           `json:"longest,omitempty"`
 }
 
 // AccountSecrets is implemented by a store that holds secrets beyond what
@@ -138,9 +142,12 @@ func (d *Daemon) opRedact(ctx context.Context, p RedactParams) (*RedactResult, e
 		return cmp.Or(strings.Compare(a.Value, b.Value), strings.Compare(a.Kind, b.Kind))
 	})
 	secrets = slices.Compact(secrets)
-	out := &RedactResult{Hits: make([][]redact.Hit, len(p.Texts))}
+	// The forms of each secret are worked out once for every text here.
+	m := redact.Prepare(secrets)
+	longest := m.Longest()
+	out := &RedactResult{Hits: make([][]redact.Hit, len(p.Texts)), Longest: &longest}
 	for i, t := range p.Texts {
-		out.Hits[i] = redact.Literals(string(t), secrets)
+		out.Hits[i] = m.Find(string(t))
 		if out.Hits[i] == nil {
 			out.Hits[i] = []redact.Hit{}
 		}

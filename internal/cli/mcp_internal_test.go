@@ -244,7 +244,7 @@ func TestRedactSpansOnePass(t *testing.T) {
 	vault := func(text, v string) []redact.Hit {
 		return redact.Literals(text, []redact.Secret{{Kind: redact.KindVaultPassword, Value: v}})
 	}
-	m := masker{names: []string{"db"}, secrets: []string{"2y z"}}
+	m := masker{names: []string{"db"}, own: hopMatcher([]string{"2y z"})}
 	for _, c := range []struct {
 		name, text, want string
 		counts           map[string]int
@@ -264,7 +264,7 @@ func TestRedactSpansOnePass(t *testing.T) {
 		ss := typedSpans(c.text)
 		joined := joinSpans(ss)
 		more := append(vault(joined, "hunter2"), redact.Patterns(joined)...)
-		out := redactSpans(ss, m.secrets, more)
+		out := redactSpans(ss, m.own, more)
 		if got := m.hideSpans(out); got != c.want {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
@@ -275,7 +275,7 @@ func TestRedactSpansOnePass(t *testing.T) {
 		}
 	}
 	// A hit past the end of the text, from a confused caller, is cut to it.
-	if got := joinSpans(redactSpans([]span{{text: "abc"}}, nil, []redact.Hit{{Lo: 1, Hi: 99, Kind: redact.KindVaultPassword}})); got != "a[redacted by hop: vault-password]" {
+	if got := joinSpans(redactSpans([]span{{text: "abc"}}, redact.Matcher{}, []redact.Hit{{Lo: 1, Hi: 99, Kind: redact.KindVaultPassword}})); got != "a[redacted by hop: vault-password]" {
 		t.Errorf("clamped hit: %q", got)
 	}
 }
@@ -291,7 +291,7 @@ func TestRedactSpansBreaksRankTiesByKind(t *testing.T) {
 		t.Fatal("the kinds do not rank the same")
 	}
 	for _, hits := range [][]redact.Hit{{a, b}, {b, a}} {
-		out := redactSpans([]span{{text: text}}, nil, hits)
+		out := redactSpans([]span{{text: text}}, redact.Matcher{}, hits)
 		if len(out) != 1 || out[0].what != redact.KindAWSAccessKeyID {
 			t.Errorf("hits %v: %+v, want one %s marker", hits, out, redact.KindAWSAccessKeyID)
 		}
@@ -327,15 +327,6 @@ func TestCapSpansCutsOnlyBetweenWholes(t *testing.T) {
 	got, _ = capSpans(ss, 5)
 	if countMarkers(counts, got); len(counts) != 0 {
 		t.Errorf("a marker cut off is counted: %v", counts)
-	}
-}
-
-// keepTail's cut, past any hit, lands on a character's start.
-func TestKeepTailKeepsWholeRunes(t *testing.T) {
-	text := strings.Repeat("é", 10) + "!" // 21 bytes: the last 6 begin inside an é
-	ss, _, cut := keepTail([]span{{text: text}}, nil, 6)
-	if got := joinSpans(ss); got != "éé!" || !cut {
-		t.Errorf("%q cut %v, want %q", got, cut, "éé!")
 	}
 }
 
@@ -411,26 +402,80 @@ func TestCapSpansKeepsWholeEscapes(t *testing.T) {
 	}
 }
 
-// scrubSpans leaves the markers and placeholders hop put in whole, though
-// its secrets stand in them, and hides a denied name that a marker it
-// puts in leaves standing on its own.
-func TestScrubSpansKeepsWholesAndMasksAgain(t *testing.T) {
+// rescan looks again only at a stretch formatting wrote in, leaves the
+// markers and placeholders hop put in whole, though its secrets stand in
+// them, and hides a denied name that a marker it puts in leaves standing
+// on its own. (A daemon with no secrets, longest 0, is not asked.)
+func TestRescanLooksOnlyAtWhatFormattingWrote(t *testing.T) {
 	l := &daemon.ListResult{Hosts: []model.Host{
 		{Header: model.Header{ItemID: model.ID{1}}, Name: "db", AgentAccess: "deny"},
 	}}
-	s := &mcpServer{secrets: []string{"h", "q"}}
+	s := &mcpServer{secrets: []string{"h", "q?x"}}
 	m := s.masker(l)
 	mk := span{text: "[redacted by hop: x]", kind: markerText, what: "x"}
-	in := m.maskSpans([]span{{text: "db:22 qdb"}, mk})
-	got, err := s.scrubSpans(context.Background(), [][]span{in}, []bool{true}, m, false, false)
+	in := m.maskSpans([]span{{text: "db:22 q"}, {text: "?", fresh: true}, {text: "xdb"}, mk, {text: "q?x"}})
+	got, err := s.rescan(context.Background(), [][]span{in}, []bool{true}, m, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := hiddenHost + ":22 [redacted by hop]" + hiddenHost + "[redacted by hop: x]"
+	// The last "q?x" stood as it is when it was first scanned, so it is
+	// not looked at again.
+	want := hiddenHost + ":22 [redacted by hop]" + hiddenHost + "[redacted by hop: x]q?x"
 	if s := joinSpans(got[0]); s != want {
 		t.Errorf("got %q, want %q", s, want)
 	}
-	if got, _ := s.scrubSpans(context.Background(), [][]span{{mk}}, []bool{false}, m, false, false); joinSpans(got[0]) != mk.text {
-		t.Errorf("a marker alone: %q", joinSpans(got[0]))
+}
+
+// What rescan does not send the daemon, the fresh text far from the last
+// limit bytes and the bytes around it, is early: capSpans keeps none of
+// it, however short what is left.
+func TestRescanMakesWhatItDidNotCheckEarly(t *testing.T) {
+	s := &mcpServer{}
+	text := "a" + strings.Repeat("b", 100)
+	in := []span{{text: "a"}, {text: "?", fresh: true}, {text: strings.Repeat("b", 100)}}
+	got, err := s.rescan(context.Background(), [][]span{in}, []bool{false}, masker{}, 5, 10, false)
+	if err != nil {
+		t.Fatal(err) // the daemon was asked: there is none here
+	}
+	// The daemon would be asked about the bytes from 87 on (102-10-5),
+	// and a secret that begins before them ends by 92: the text before 92
+	// is early. The one fresh byte is far before, so it is not asked.
+	if kept, cut := capSpans(got[0], 10); joinSpans(kept) != text[len(text)-10:] || !cut {
+		t.Errorf("limit 10: %q cut %v", joinSpans(kept), cut)
+	}
+	if kept, cut := capSpans(got[0], 50); joinSpans(kept) != text[len(text)-10:] || !cut {
+		t.Errorf("limit 50: %q cut %v, want the 10 bytes after the early text", joinSpans(kept), cut)
+	}
+}
+
+// A formatter's fresh text is a span of its own; what it leaves as it
+// was stays in spans with the kind it had, and the markers stay whole.
+func TestRewriteMarksWhatItWrites(t *testing.T) {
+	mk := span{text: "[redacted by hop]", kind: markerText, what: redact.KindHopSecret}
+	got := validSpans([]span{{text: "a\xffb"}, mk, {text: "é\xfe", kind: typedText}})
+	want := []span{{text: "a"}, {text: "\uFFFD", fresh: true}, {text: "b"}, mk, {text: "é", kind: typedText}, {text: "\uFFFD", kind: typedText, fresh: true}}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	if got := lastLinesSpans([]span{{text: " x\ny\nz \n"}}, 2); !slices.Equal(got, []span{{text: "y"}, {text: "; ", fresh: true}, {text: "z"}}) {
+		t.Errorf("lastLinesSpans: %+v", got)
+	}
+	if in := []span{{text: "ok"}}; !slices.Equal(validSpans(in), in) {
+		t.Errorf("valid text changed: %+v", validSpans(in))
+	}
+}
+
+// applyHits goes over the spans once: many hits in many spans take no
+// longer than the spans and hits do.
+func TestApplyHitsManySpans(t *testing.T) {
+	var ss []span
+	var hits []redact.Hit
+	for i := range 50000 {
+		ss = append(ss, span{text: "ab"}, span{text: "?", fresh: true})
+		hits = append(hits, redact.Hit{Lo: 3*i + 1, Hi: 3*i + 3, Kind: redact.KindHopSecret})
+	}
+	out := applyHits(ss, hits)
+	if got := joinSpans(out); got != strings.Repeat("a[redacted by hop]", 50000) {
+		t.Errorf("%.60q...", got)
 	}
 }

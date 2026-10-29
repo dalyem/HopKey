@@ -120,8 +120,18 @@ var Unmark = strings.NewReplacer(MarkOpen, "", MarkClose, "")
 // that escapes what it prints may show it in (Escaped): ssh, say, prints
 // a server's message with a backslash doubled. A hit covers the form as
 // it stands in t. Every non-empty value counts, however short.
-func Literals(t string, secrets []Secret) []Hit {
-	var out []Hit
+func Literals(t string, secrets []Secret) []Hit { return Prepare(secrets).Find(t) }
+
+// Matcher is secrets with the forms Literals looks for worked out once,
+// for looking in many texts: one request's, or every answer of a process.
+type Matcher struct {
+	forms   []Secret // each form of each secret, in order, with its kind
+	longest int
+}
+
+// Prepare works out the forms of secrets that Literals looks for.
+func Prepare(secrets []Secret) Matcher {
+	var m Matcher
 	for _, s := range secrets {
 		vs := []string{s.Value}
 		if u := Unmark.Replace(s.Value); u != s.Value {
@@ -135,17 +145,31 @@ func Literals(t string, secrets []Secret) []Hit {
 			}
 		}
 		for _, v := range vs {
-			if v == "" {
-				continue
+			if v != "" {
+				m.forms = append(m.forms, Secret{Kind: s.Kind, Value: v})
+				m.longest = max(m.longest, len(v))
 			}
-			for i := 0; ; {
-				j := strings.Index(t[i:], v)
-				if j < 0 {
-					break
-				}
-				out = append(out, Hit{Lo: i + j, Hi: i + j + len(v), Kind: s.Kind})
-				i += j + 1
+		}
+	}
+	return m
+}
+
+// Longest is the length of the longest form m looks for: a stretch of
+// text that holds none of them whole cannot gain one but within this many
+// bytes of a change.
+func (m Matcher) Longest() int { return m.longest }
+
+// Find is Literals for the secrets m was prepared from.
+func (m Matcher) Find(t string) []Hit {
+	var out []Hit
+	for _, f := range m.forms {
+		for i := 0; ; {
+			j := strings.Index(t[i:], f.Value)
+			if j < 0 {
+				break
 			}
+			out = append(out, Hit{Lo: i + j, Hi: i + j + len(f.Value), Kind: f.Kind})
+			i += j + 1
 		}
 	}
 	return out

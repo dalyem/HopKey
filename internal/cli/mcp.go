@@ -158,6 +158,24 @@ type mcpServer struct {
 	readOnly bool
 	secrets  []string
 	audit    *auditLog
+
+	ownOnce sync.Once
+	ownM    redact.Matcher
+}
+
+// own is s.secrets as Literals looks for them, worked out once (hopMatcher).
+func (s *mcpServer) own() redact.Matcher {
+	s.ownOnce.Do(func() { s.ownM = hopMatcher(s.secrets) })
+	return s.ownM
+}
+
+// hopMatcher is values, hop mcp's own secrets, ready to look for.
+func hopMatcher(values []string) redact.Matcher {
+	own := make([]redact.Secret, len(values))
+	for i, v := range values {
+		own[i] = redact.Secret{Kind: redact.KindHopSecret, Value: v}
+	}
+	return redact.Prepare(own)
 }
 
 func newMCPServer(e *Env, readOnly bool, secrets []string) (*mcp.Server, *mcpServer) {
@@ -275,7 +293,7 @@ const redacted = "[redacted by hop]"
 // remote prints in another form. The marks of text the agent typed (typed)
 // are removed with it. Command output gets more (agentView).
 func (s *mcpServer) redact(text string) string {
-	return joinSpans(redactSpans([]span{{text: unmark.Replace(text)}}, s.secrets, nil))
+	return joinSpans(redactSpans([]span{{text: unmark.Replace(text)}}, s.own(), nil))
 }
 
 // keyRedacted stands where a private key block was.
@@ -284,11 +302,21 @@ const keyRedacted = "[private key " + redacted + "]"
 // span is a piece of a message: hop's own text, text the agent typed
 // (typed), a marker redaction put in, a server's message that an error of
 // hop's ssh client quotes, as it quotes it (quotedMsgs), or the
-// placeholder a denied host's name became (maskSpans).
+// placeholder a denied host's name became (maskSpans). fresh text is what
+// formatting wrote in place of what the first scan saw (rewrite), which
+// only rescan has looked at; early text is what the cut may not keep, as
+// rescan did not look at all of it (capSpans).
 type span struct {
-	text string
-	kind spanKind
-	what string // a marker's: the kind of secret it stands for (redact.Hit)
+	text  string
+	kind  spanKind
+	what  string // a marker's: the kind of secret it stands for (redact.Hit)
+	fresh bool
+	early bool
+}
+
+// joins says that b, after a, can be one span with it.
+func (a span) joins(b span) bool {
+	return a.kind == b.kind && !a.kind.whole() && a.fresh == b.fresh && a.early == b.early
 }
 
 type spanKind int
@@ -313,13 +341,13 @@ func (k spanKind) whole() bool { return k == markerText || k == hiddenText }
 // that runs across two spans, or over a block's edge, goes whole.
 // Overlapping stretches become one marker span, named for the kind that
 // comes first (redact.Before).
-func redactSpans(ss []span, secrets []string, more []redact.Hit) []span {
-	return applyHits(ss, findHits(joinSpans(ss), secrets, more))
+func redactSpans(ss []span, own redact.Matcher, more []redact.Hit) []span {
+	return applyHits(ss, findHits(joinSpans(ss), own, more))
 }
 
 // findHits is what redactSpans replaces in t: the stretches it finds, in
-// order, overlapping ones joined.
-func findHits(t string, secrets []string, more []redact.Hit) []redact.Hit {
+// order, overlapping ones joined. own is hop's own secrets (hopMatcher).
+func findHits(t string, own redact.Matcher, more []redact.Hit) []redact.Hit {
 	var hits []redact.Hit
 	blocks := pemBlockRe.FindAllStringIndex(t, -1)
 	for _, b := range blocks {
@@ -335,11 +363,7 @@ func findHits(t string, secrets []string, more []redact.Hit) []redact.Hit {
 	}
 	// t has had the marks of typed text taken out (unmark), so a secret
 	// holding a mark rune is looked for as it stands there too (Literals).
-	own := make([]redact.Secret, len(secrets))
-	for i, v := range secrets {
-		own[i] = redact.Secret{Kind: redact.KindHopSecret, Value: v}
-	}
-	hits = append(hits, redact.Literals(t, own)...)
+	hits = append(hits, own.Find(t)...)
 	for _, h := range more {
 		if h.Lo, h.Hi = max(h.Lo, 0), min(h.Hi, len(t)); h.Lo < h.Hi {
 			hits = append(hits, h)
@@ -361,60 +385,48 @@ func findHits(t string, secrets []string, more []redact.Hit) []redact.Hit {
 }
 
 // applyHits replaces each of hits, offsets into the text of ss in order
-// and apart (findHits), with a marker span.
+// and apart (findHits), with a marker span. It goes over ss once, however
+// many hits and spans there are.
 func applyHits(ss []span, hits []redact.Hit) []span {
 	var out []span
+	i, base := 0, 0 // ss[i] begins at offset base
+	keep := func(from, to int) {
+		for i < len(ss) && base+len(ss[i].text) <= from {
+			base += len(ss[i].text)
+			i++
+		}
+		out = cutSpans(out, ss[i:], from-base, to-base)
+	}
 	last := 0
 	for _, h := range hits {
-		out = append(cutSpans(out, ss, last, h.Lo), span{text: markerFor(h.Kind), kind: markerText, what: h.Kind})
+		keep(last, h.Lo)
+		out = append(out, span{text: markerFor(h.Kind), kind: markerText, what: h.Kind})
 		last = h.Hi
 	}
-	return cutSpans(out, ss, last, len(joinSpans(ss)))
-}
-
-// keepTail cuts ss, whose hits findHits found, to its last n bytes, and
-// says whether it cut. The cut never falls inside a hit: it moves on past
-// one it would split, so what is kept holds no part of a secret, only
-// whole markers. Nor does it split a character (runeEnd). hits come back
-// as offsets into what is kept.
-func keepTail(ss []span, hits []redact.Hit, n int) ([]span, []redact.Hit, bool) {
-	t := joinSpans(ss)
-	size := len(t)
-	if size <= n {
-		return ss, hits, false
-	}
-	cut := size - n
-	for moved := true; moved; {
-		moved = false
-		for _, h := range hits {
-			if h.Lo < cut && cut < h.Hi {
-				cut, moved = h.Hi, true
-			}
-		}
-		if c := runeEnd(t, cut); c != cut {
-			cut, moved = c, true
-		}
-	}
-	var kept []redact.Hit
-	for _, h := range hits {
-		if h.Lo >= cut {
-			kept = append(kept, redact.Hit{Lo: h.Lo - cut, Hi: h.Hi - cut, Kind: h.Kind})
-		}
-	}
-	return cutSpans(nil, ss, cut, size), kept, true
+	keep(last, len(joinSpans(ss)))
+	return out
 }
 
 // capSpans keeps the last n bytes of the text of ss, which redaction and
-// masking have made, and says whether it cut. The cut moves on past what
-// it would split: a marker, a hidden host's placeholder, an escape of
-// quoted text (quotedText), a character. So what is kept is whole
-// markers, escapes and runes, and at most n bytes.
+// masking have made, and none of its early text, and says whether it
+// cut. The cut moves on past what it would split: a marker, a hidden
+// host's placeholder, an escape of quoted text (quotedText), a character.
+// So what is kept is whole markers, escapes and runes, and at most n
+// bytes. It is the last step (agentView, remoteText): what it keeps was
+// all scanned as it stands, so the cut makes no secret, and leaves no
+// piece of one.
 func capSpans(ss []span, n int) ([]span, bool) {
-	size := len(joinSpans(ss))
-	if size <= n {
+	size, floor := 0, 0
+	for _, sp := range ss {
+		size += len(sp.text)
+		if sp.early {
+			floor = size
+		}
+	}
+	cut, at := max(size-n, floor), 0
+	if cut <= 0 {
 		return ss, false
 	}
-	cut, at := size-n, 0
 	for i, sp := range ss {
 		lo := at
 		at += len(sp.text)
@@ -437,24 +449,72 @@ func capSpans(ss []span, n int) ([]span, bool) {
 			k = escapeEnd(sp.text, k)
 		}
 		k = runeEnd(sp.text, k)
-		return append([]span{{text: sp.text[k:], kind: sp.kind}}, ss[i+1:]...), true
+		sp.text = sp.text[k:]
+		return append([]span{sp}, ss[i+1:]...), true
 	}
 	return nil, true
 }
 
 // validSpans is ss with each byte that is not UTF-8 written as U+FFFD, as
-// JSON writes it, so that capSpans measures what the agent gets.
+// JSON writes it, so that what rescan and capSpans see is what the agent
+// gets.
 func validSpans(ss []span) []span {
-	out := slices.Clone(ss)
-	for i, sp := range out {
-		if utf8.ValidString(sp.text) {
+	if !slices.ContainsFunc(ss, func(sp span) bool { return !utf8.ValidString(sp.text) }) {
+		return ss
+	}
+	return rewrite(ss, func(c string) string {
+		if !utf8.ValidString(c) {
+			return "\uFFFD"
+		}
+		return c
+	})
+}
+
+// rewrite is formatting for ss, which redaction has made: f gets each
+// character of every span but the markers and placeholders
+// (spanKind.whole), a byte that is not UTF-8 alone, and says what stands
+// for it. What f writes in place of a character is fresh text, in a span
+// of its own, for rescan. f deletes nothing, so no two bytes the first
+// scan saw apart come to stand together.
+func rewrite(ss []span, f func(c string) string) []span {
+	var out []span
+	add := func(sp span) {
+		if sp.text == "" {
+			return
+		}
+		if k := len(out) - 1; k >= 0 && out[k].joins(sp) {
+			out[k].text += sp.text
+			return
+		}
+		out = append(out, sp)
+	}
+	for _, sp := range ss {
+		if sp.kind.whole() {
+			out = append(out, sp)
 			continue
 		}
-		var b strings.Builder
-		for _, c := range sp.text {
-			b.WriteRune(c) // a byte that is not UTF-8 comes as utf8.RuneError
+		t, kept := sp.text, 0 // t[kept:i] is unchanged and not yet added
+		var b strings.Builder // what f wrote since then
+		flush := func() {
+			if b.Len() > 0 {
+				add(span{text: b.String(), kind: sp.kind, fresh: true, early: sp.early})
+				b.Reset()
+			}
 		}
-		out[i].text = b.String()
+		for i := 0; i < len(t); {
+			_, n := utf8.DecodeRuneInString(t[i:])
+			c := t[i : i+n]
+			if w := f(c); w != c {
+				add(span{text: t[kept:i], kind: sp.kind, fresh: sp.fresh, early: sp.early})
+				b.WriteString(w)
+				kept = i + n
+			} else {
+				flush()
+			}
+			i += n
+		}
+		flush()
+		add(span{text: t[kept:], kind: sp.kind, fresh: sp.fresh, early: sp.early})
 	}
 	return out
 }
@@ -501,17 +561,21 @@ func countMarkers(counts map[string]int, ss []span) {
 func cutSpans(out, run []span, from, to int) []span {
 	at := 0
 	for _, sp := range run {
+		if at >= to {
+			break
+		}
 		base := at
 		at += len(sp.text)
 		lo, hi := max(from, base), min(to, at)
 		if lo >= hi {
 			continue
 		}
-		piece := sp.text[lo-base : hi-base]
-		if k := len(out) - 1; k >= 0 && out[k].kind == sp.kind && !sp.kind.whole() {
-			out[k].text += piece
+		piece := sp
+		piece.text = sp.text[lo-base : hi-base]
+		if k := len(out) - 1; k >= 0 && out[k].joins(piece) {
+			out[k].text += piece.text
 		} else {
-			out = append(out, span{text: piece, kind: sp.kind, what: sp.what})
+			out = append(out, piece)
 		}
 	}
 	return out
@@ -702,8 +766,8 @@ const hiddenHost = "<hidden host>"
 // check steps, errors and ssh's stderr. A denied host can still be another
 // host's jump host, and ssh and the daemon name it when it fails.
 type masker struct {
-	names   []string
-	secrets []string // replaced before any name is hidden
+	names []string
+	own   redact.Matcher // hop's own secrets, replaced before any name is hidden
 }
 
 // masker collects what names the denied hosts: names, aliases, addresses,
@@ -734,7 +798,7 @@ func (s *mcpServer) masker(l *daemon.ListResult) masker {
 		}
 	}
 	seen := map[string]bool{}
-	m := masker{secrets: s.secrets}
+	m := masker{own: s.own()}
 	for _, h := range l.Hosts {
 		if agentAllowed(h) {
 			continue
@@ -789,13 +853,13 @@ func (m masker) maskSpans(ss []span) []span {
 			last := 0
 			for _, w := range words {
 				if last < w[0] {
-					next = append(next, span{text: sp.text[last:w[0]], kind: sp.kind})
+					next = append(next, span{text: sp.text[last:w[0]], kind: sp.kind, fresh: sp.fresh, early: sp.early})
 				}
-				next = append(next, span{text: hiddenHost, kind: hiddenText})
+				next = append(next, span{text: hiddenHost, kind: hiddenText, early: sp.early})
 				last = w[1]
 			}
 			if last < len(sp.text) {
-				next = append(next, span{text: sp.text[last:], kind: sp.kind})
+				next = append(next, span{text: sp.text[last:], kind: sp.kind, fresh: sp.fresh, early: sp.early})
 			}
 		}
 		out = next
@@ -806,7 +870,7 @@ func (m masker) maskSpans(ss []span) []span {
 // hidden is text with hop's own secrets replaced and the denied hosts
 // hidden, as hide makes it, in its spans.
 func (m masker) hidden(text string) []span {
-	return m.maskSpans(redactSpans(typedSpans(text), m.secrets, nil))
+	return m.maskSpans(redactSpans(typedSpans(text), m.own, nil))
 }
 
 // The marks around text the agent typed. Only hop puts them in a message
@@ -1184,26 +1248,38 @@ func (s *mcpServer) checkHost(ctx context.Context, _ *mcp.CallToolRequest, in mc
 // remoteText makes a step's detail of lead, hop's own words, and text the
 // network supplied, as it came, under a host's agent_output policy: under
 // none, a note that it is withheld; otherwise the text redacted as exec's
-// output is (agentView), all of it checked before hop keeps its last
-// lines, makes it one line (lastLines, oneLine), hides the denied hosts
-// in it (maskSpans) and cuts it so that the detail is at most 64 KiB
-// (capSpans), saying so when it cut. A server's message that an error of
-// hop's own ssh client quotes is checked as it stands there and as the
-// server sent it (quotedMsgs). Text that cannot be checked is withheld.
-// Last, the whole detail, lead and notes too, is checked again as the
-// agent gets it (scrubSpans): what those steps wrote, a '?' for a tab, can
-// make a secret that was not there. What comes back is that detail.
+// output is (agentView), in the same steps, each once:
+//
+//  1. the text as runRemote kept it, twice the tail an agent gets
+//     (mcpTail), or a handshake's error;
+//  2. one scan of all of it, with the daemon (findSecrets), hop's own
+//     secrets and, under redacted, the token formats (findHits). A
+//     server's message that an error of hop's own ssh client quotes is
+//     checked as it stands there and as the server sent it (quotedMsgs);
+//  3. formatting: its last lines (lastLinesSpans) on one line (oneLine),
+//     which writes a byte that is not UTF-8 as U+FFFD too, and the denied
+//     hosts hidden (maskSpans). The markers stay whole;
+//  4. a scan of what formatting wrote, if it wrote anything (rescan): a
+//     '?' for a tab can make a secret that was not there;
+//  5. lead and the note on a cut, hop's own words, scanned on their own,
+//     in the request of step 2;
+//  6. one cut, so that the detail is at most 64 KiB, which says so when
+//     it cut (capSpans).
+//
+// Text that cannot be checked is withheld. What comes back is the detail.
 func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) func(lead, text string, lines int, fromGo bool) string {
 	return func(lead, text string, lines int, fromGo bool) string {
 		// withheld is lead and why the text is withheld, hop's words
-		// alone: its own secrets go, and the denied hosts.
+		// alone: its own secrets go.
 		withheld := func(why ...span) string {
 			ss := append(append([]span{{text: lead + "(withheld: "}}, why...), span{text: ")"})
-			out, _ := s.scrubSpans(ctx, [][]span{ss}, []bool{true}, m, false, false) // no daemon: no error
-			return joinSpans(out[0])
+			return joinSpans(redactRuns(ss, m.own))
 		}
 		if policy == model.AgentOutputNone {
 			return withheld(span{text: "the host's agent_output policy is none"})
+		}
+		unchecked := func(err error) string {
+			return withheld(append([]span{{text: "hop could not check it for the vault's secrets: "}}, m.hidden(err.Error())...)...)
 		}
 		var ss []span
 		var msgs []quotedMsg
@@ -1213,20 +1289,24 @@ func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) fun
 			ss = typedSpans(text)
 		}
 		t := joinSpans(ss)
-		texts := []string{t}
+		// hop's words, with the note on a cut and without: they never
+		// hold the network's text, but a vault value can be a word of
+		// them, and goes there as it goes from the text beside them.
+		heads := []string{lead, lead + cutNote}
+		texts := append([]string{t}, heads...)
 		for _, q := range msgs {
 			texts = append(texts, q.raw)
 		}
 		patterns := policy == model.AgentOutputRedacted
-		found, err := s.findSecrets(ctx, texts, patterns)
+		found, longest, err := s.findSecrets(ctx, texts, patterns)
 		if err != nil {
-			return withheld(append([]span{{text: "hop could not check it for the vault's secrets: "}}, m.hidden(err.Error())...)...)
+			return unchecked(err)
 		}
 		more := found[0]
 		for i, q := range msgs {
-			more = append(more, q.mapHits(findHits(q.raw, m.secrets, found[i+1]))...)
+			more = append(more, q.mapHits(findHits(q.raw, m.own, found[len(heads)+1+i]))...)
 		}
-		hits := findHits(t, m.secrets, more)
+		hits := findHits(t, m.own, more)
 		if len(msgs) > 0 {
 			// A stretch that runs into a message ends at whole escapes.
 			for i := range hits {
@@ -1234,88 +1314,211 @@ func (s *mcpServer) remoteText(ctx context.Context, policy string, m masker) fun
 					hits[i].Lo, hits[i].Hi = q.unitStart(hits[i].Lo), q.unitEnd(hits[i].Hi)
 				}
 			}
-			hits = findHits(t, nil, hits)
+			hits = findHits(t, redact.Matcher{}, hits)
 		}
 		ss = applyHits(ss, hits)
 		if lines > 0 {
 			ss = lastLinesSpans(ss, lines)
 		}
-		for i := range ss {
-			if ss[i].kind != markerText {
-				ss[i].text = oneLine(ss[i].text)
-			}
+		ss = m.maskSpans(rewrite(ss, oneLine))
+		plain := redactSpans([]span{{text: heads[0]}}, m.own, found[1])
+		noted := redactSpans([]span{{text: heads[1]}}, m.own, found[2])
+		room := tailLimit - len(joinSpans(plain))
+		body, err := s.rescan(ctx, [][]span{ss}, []bool{true}, m, longest, room, patterns)
+		if err != nil {
+			return unchecked(err)
 		}
-		body, cut := capSpans(m.maskSpans(ss), tailLimit-len(lead)-len(cutNote))
-		cut = cut || len(t) > tailLimit
-		// The markers the last check puts in can make the detail longer
-		// than the limit: then less of the text is kept, and checked again.
-		for {
-			head := lead
-			if cut {
-				head += cutNote
-			}
-			d, err := s.scrubSpans(ctx, [][]span{append([]span{{text: head}}, body...)}, []bool{true}, m, true, patterns)
-			if err != nil {
-				return withheld(append([]span{{text: "hop could not check it for the vault's secrets: "}}, m.hidden(err.Error())...)...)
-			}
-			over := len(joinSpans(d[0])) - tailLimit
-			if over <= 0 || len(body) == 0 {
-				return joinSpans(d[0])
-			}
-			body, _ = capSpans(body, len(joinSpans(body))-over)
-			cut = true
+		if b, cut := capSpans(body[0], room); !cut && len(t) <= tailLimit {
+			return joinSpans(plain) + joinSpans(b)
 		}
+		b, _ := capSpans(body[0], tailLimit-len(joinSpans(noted)))
+		return joinSpans(noted) + joinSpans(b)
 	}
 }
 
-// scrubSpans is the last check of lists, each a text as the agent gets
-// it, once every step that writes it is done. In each stretch of it
-// between the markers and the placeholders of hidden hosts, which stay as
-// they are (spanKind.whole), hop's own secrets are replaced, and with
-// check what the daemon finds (findSecrets), the token formats as well
-// with patterns; in a list masked says, the denied hosts are hidden again,
-// since a marker put in can leave a name standing alone. It checks again
-// until it finds nothing, as each marker makes new stretches: each time,
-// fewer bytes are left to check.
-func (s *mcpServer) scrubSpans(ctx context.Context, lists [][]span, masked []bool, m masker, check, patterns bool) ([][]span, error) {
-	lists = slices.Clone(lists)
-	for {
-		var texts []string
-		for _, ss := range lists {
-			for _, r := range openRuns(ss) {
-				texts = append(texts, joinSpans(ss[r[0]:r[1]]))
+// redactRuns is ss, hop's own words, with own replaced in each stretch
+// between the markers and placeholders (openRuns), which stay as they are.
+func redactRuns(ss []span, own redact.Matcher) []span {
+	var out []span
+	last := 0
+	for _, r := range openRuns(ss) {
+		out = append(append(out, ss[last:r[0]]...), redactSpans(ss[r[0]:r[1]], own, nil)...)
+		last = r[1]
+	}
+	return append(out, ss[last:]...)
+}
+
+// rescan is the scan of what formatting wrote (rewrite) in lists, each a
+// text as the agent gets it but for the cut, after the scan of the text as
+// it came. A secret can stand there now that did not, but only where
+// formatting wrote something, the fresh spans: in each stretch between
+// the markers and the placeholders (openRuns) that holds one, hop's own
+// secrets, key blocks and, with patterns, the token formats are looked
+// for over the whole stretch; the daemon looks at the bytes within
+// longest of a fresh span alone (its longest form, from the first scan;
+// all of the stretch when that is not known), all of them in one request.
+// A stretch with nothing fresh is not looked at again, so output that
+// formatting leaves as it was costs the daemon one scan.
+//
+// The daemon looks only near the last limit bytes of each text, all that
+// capSpans can keep; what it did not look at, and the bytes around it
+// that could hold a secret running into it, become early text, which
+// capSpans does not keep. In a list masked says, the denied hosts are
+// hidden again where a marker put in leaves a name standing on its own:
+// hiding one only splits a stretch up, so it makes no secret.
+func (s *mcpServer) rescan(ctx context.Context, lists [][]span, masked []bool, m masker, longest, limit int, patterns bool) ([][]span, error) {
+	type run struct {
+		list     int
+		from, to int    // where it stands in the text of lists[list]
+		text     string // that text
+		fresh    bool
+		hits     []redact.Hit
+	}
+	type region struct{ run, lo, hi int } // a run's text[lo:hi]
+	var runs []run
+	var regions []region
+	var texts []string
+	out := slices.Clone(lists)
+	for i, ss := range lists {
+		size := len(joinSpans(ss))
+		// Of a secret no longer than longest, capSpans can keep a byte only
+		// if it begins at from or later: the daemon looks from there on.
+		// One that begins before ends before from+longest, which is where
+		// the early text ends when the daemon did not look at all of it.
+		from := 0
+		if longest >= 0 && limit > 0 {
+			from = max(0, size-limit-longest)
+		}
+		early := false
+		at, k := 0, 0
+		for _, r := range openRuns(ss) {
+			for ; k < r[0]; k++ {
+				at += len(ss[k].text)
+			}
+			rn := run{list: i, from: at, text: joinSpans(ss[r[0]:r[1]])}
+			rn.to = at + len(rn.text)
+			// The stretches within longest of a fresh span, joined where
+			// they meet.
+			margin := longest
+			if margin < 0 {
+				margin = len(rn.text)
+			}
+			var near [][2]int
+			off := 0
+			for _, sp := range ss[r[0]:r[1]] {
+				if sp.fresh {
+					rn.fresh = true
+					lo, hi := max(0, off-margin), min(len(rn.text), off+len(sp.text)+margin)
+					if n := len(near) - 1; n >= 0 && lo <= near[n][1] {
+						near[n][1] = hi
+					} else {
+						near = append(near, [2]int{lo, hi})
+					}
+				}
+				off += len(sp.text)
+			}
+			for _, nr := range near {
+				if at+nr[0] < from {
+					early = true
+					nr[0] = min(nr[1], from-at)
+				}
+				if nr[0] < nr[1] && longest != 0 { // a daemon with no secrets finds none
+					regions = append(regions, region{len(runs), nr[0], nr[1]})
+					texts = append(texts, rn.text[nr[0]:nr[1]])
+				}
+			}
+			runs = append(runs, rn)
+			for ; k < r[1]; k++ {
+				at += len(ss[k].text)
 			}
 		}
-		found := make([][]redact.Hit, len(texts))
-		if check {
-			var err error
-			if found, err = s.findSecrets(ctx, texts, patterns); err != nil {
-				return nil, err
-			}
-		}
-		k, again := 0, false
-		for i, ss := range lists {
-			var out []span
-			last, hit := 0, false
-			for _, r := range openRuns(ss) {
-				hits := findHits(texts[k], s.secrets, found[k])
-				k++
-				hit = hit || len(hits) > 0
-				out = append(append(out, ss[last:r[0]]...), applyHits(ss[r[0]:r[1]], hits)...)
-				last = r[1]
-			}
-			if !hit {
-				continue
-			}
-			again, lists[i] = true, append(out, ss[last:]...)
-			if masked[i] {
-				lists[i] = m.maskSpans(lists[i])
-			}
-		}
-		if !again {
-			return lists, nil
+		if early {
+			out[i] = markEarly(ss, from+longest)
 		}
 	}
+	found := make([][]redact.Hit, len(texts))
+	if len(texts) > 0 {
+		var err error
+		if found, _, err = s.findSecrets(ctx, texts, false); err != nil {
+			return nil, err
+		}
+	}
+	more := make([][]redact.Hit, len(runs))
+	for i, rg := range regions {
+		for _, h := range found[i] {
+			more[rg.run] = append(more[rg.run], redact.Hit{Lo: rg.lo + h.Lo, Hi: rg.lo + h.Hi, Kind: h.Kind})
+		}
+	}
+	for j := range runs {
+		if !runs[j].fresh {
+			continue
+		}
+		if patterns {
+			more[j] = append(more[j], redact.Patterns(runs[j].text)...)
+		}
+		runs[j].hits = findHits(runs[j].text, m.own, more[j])
+	}
+	// out[i] has the text of lists[i], in the same spans or (markEarly)
+	// split further: each run with hits is where its offsets say.
+	for i, ss := range out {
+		starts := make([]int, len(ss))
+		for k, at := 0, 0; k < len(ss); k++ {
+			starts[k], at = at, at+len(ss[k].text)
+		}
+		index := func(at int) int { k, _ := slices.BinarySearch(starts, at); return k }
+		var next []span
+		last, hit := 0, false
+		for _, rn := range runs {
+			if rn.list != i || len(rn.hits) == 0 {
+				continue
+			}
+			lo, hi := index(rn.from), index(rn.to)
+			next = append(append(next, ss[last:lo]...), applyHits(ss[lo:hi], rn.hits)...)
+			last, hit = hi, true
+		}
+		if !hit {
+			continue
+		}
+		out[i] = append(next, ss[last:]...)
+		if masked[i] {
+			out[i] = m.maskSpans(out[i])
+		}
+	}
+	return out, nil
+}
+
+// markEarly is ss with its text before offset at early (capSpans keeps
+// none of it), and the span at moves on past split at a whole character,
+// or escape of quoted text. A marker or placeholder it falls in is early
+// whole.
+func markEarly(ss []span, at int) []span {
+	var out []span
+	pos := 0
+	for _, sp := range ss {
+		lo := pos
+		pos += len(sp.text)
+		switch {
+		case lo >= at:
+			out = append(out, sp)
+		case pos <= at || sp.kind.whole():
+			sp.early = true
+			out = append(out, sp)
+		default:
+			k := at - lo
+			if sp.kind == quotedText {
+				k = escapeEnd(sp.text, k)
+			}
+			k = runeEnd(sp.text, k)
+			head, tail := sp, sp
+			head.text, head.early, tail.text = sp.text[:k], true, sp.text[k:]
+			for _, p := range []span{head, tail} {
+				if p.text != "" {
+					out = append(out, p)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // openRuns is where ss has stretches of spans that are not whole
@@ -1338,9 +1541,10 @@ func openRuns(ss []span) [][2]int {
 }
 
 // lastLinesSpans is lastLines for ss, which redaction has made: the last
-// n lines of its text, without the space around them, joined by "; ".
-// The markers, which hold neither a line break nor space at either end,
-// go whole.
+// n lines of its text, without the space around them, joined by "; ",
+// which is fresh text (rewrite). The markers, which hold neither a line
+// break nor space at either end, go whole. What it drops is only before
+// and after what it keeps, so no two bytes come to stand together.
 func lastLinesSpans(ss []span, n int) []span {
 	t := joinSpans(ss)
 	hi := len(strings.TrimRightFunc(t, unicode.IsSpace))
@@ -1357,13 +1561,12 @@ func lastLinesSpans(ss []span, n int) []span {
 		}
 		j, from = lo+i, lo+i+1
 	}
-	out := cutSpans(nil, ss, from, hi)
-	for i := range out {
-		if out[i].kind != markerText {
-			out[i].text = strings.ReplaceAll(out[i].text, "\n", "; ")
+	return rewrite(cutSpans(nil, ss, from, hi), func(c string) string {
+		if c == "\n" {
+			return "; "
 		}
-	}
-	return out
+		return c
+	})
 }
 
 // disconnectQuote begins where x/crypto's ssh writes a server's disconnect
@@ -1893,50 +2096,41 @@ func (s *mcpServer) run(ctx context.Context, req *mcp.CallToolRequest, l *daemon
 // since, or a daemon without OpRedact) is withheld too. stderr has ssh's
 // own messages as well, which name a jump host that failed, so the denied
 // hosts are hidden in it (hide); stdout is the command's alone.
+//
+// Each stream goes through the steps remoteText's text does, each once:
+// the tail runOne kept, twice what an agent gets (mcpTail), so that a
+// secret the cut would begin inside is found whole; one scan of it;
+// formatting, which for a stream is only that JSON writes a byte that is
+// not UTF-8 as U+FFFD (validSpans), and the masking of stderr; a scan of
+// what formatting wrote, if anything (rescan); and one cut to the limit,
+// which moves past every marker (capSpans). The counts are of the markers
+// returned.
 func (s *mcpServer) agentView(ctx context.Context, h model.Host, r ExecResult, m masker) MCPExecResult {
 	out := MCPExecResult{ExecResult: r, AgentOutput: model.AgentOutputPolicy(h)}
 	out.Error = m.hide(unmark.Replace(r.Error))
 	if out.AgentOutput == model.AgentOutputNone {
 		return withhold(out, "the host's agent_output policy is none, so hop returns none of its output to agents, only its size")
 	}
-	stdout, stderr := []span{{text: unmark.Replace(r.Stdout)}}, typedSpans(r.Stderr)
-	more, err := s.findSecrets(ctx, []string{joinSpans(stdout), joinSpans(stderr)}, out.AgentOutput == model.AgentOutputRedacted)
-	if err != nil {
+	unchecked := func(err error) MCPExecResult {
 		return withhold(out, "hop could not check the output for the vault's secrets, so it is withheld: "+m.hide(err.Error()))
 	}
-	// runOne kept twice the tail an agent gets (mcpTail), all of it
-	// checked: a secret the last tailLimit bytes would begin inside is
-	// found whole, and the cut moves past it (keepTail).
-	tail := func(ss []span, secrets []string, more []redact.Hit) []span {
-		ss, hits, cut := keepTail(ss, findHits(joinSpans(ss), secrets, more), tailLimit)
-		out.Truncated = out.Truncated || cut
-		return applyHits(ss, hits)
+	streams := [][]span{{{text: unmark.Replace(r.Stdout)}}, typedSpans(r.Stderr)}
+	patterns := out.AgentOutput == model.AgentOutputRedacted
+	found, longest, err := s.findSecrets(ctx, []string{joinSpans(streams[0]), joinSpans(streams[1])}, patterns)
+	if err != nil {
+		return unchecked(err)
 	}
-	so, se := tail(stdout, s.secrets, more[0]), m.maskSpans(tail(stderr, m.secrets, more[1]))
-	// A marker can be longer than what it stands for, and so can a hidden
-	// host's placeholder, and JSON writes a byte that is not UTF-8 as
-	// U+FFFD, three bytes (validSpans): the limit holds for what is
-	// returned, and the counts are of the markers in it.
-	so, se = validSpans(so), validSpans(se)
-	so, cutOut := capSpans(so, tailLimit)
-	se, cutErr := capSpans(se, tailLimit)
+	for i := range streams {
+		streams[i] = validSpans(redactSpans(streams[i], m.own, found[i]))
+	}
+	streams[1] = m.maskSpans(streams[1])
+	streams, err = s.rescan(ctx, streams, []bool{false, true}, m, longest, tailLimit, patterns)
+	if err != nil {
+		return unchecked(err)
+	}
+	so, cutOut := capSpans(streams[0], tailLimit)
+	se, cutErr := capSpans(streams[1], tailLimit)
 	out.Truncated = out.Truncated || cutOut || cutErr
-	// What those steps wrote, a U+FFFD for a byte that is not UTF-8, and
-	// where a cut makes the text begin, can make a secret that was not
-	// there: both streams are checked again as the agent gets them
-	// (scrubSpans), and cut again while the markers put in pass the limit.
-	for {
-		ss, err := s.scrubSpans(ctx, [][]span{so, se}, []bool{false, true}, m, true, out.AgentOutput == model.AgentOutputRedacted)
-		if err != nil {
-			return withhold(out, "hop could not check the output for the vault's secrets, so it is withheld: "+m.hide(err.Error()))
-		}
-		so, cutOut = capSpans(ss[0], tailLimit)
-		se, cutErr = capSpans(ss[1], tailLimit)
-		out.Truncated = out.Truncated || cutOut || cutErr
-		if !cutOut && !cutErr {
-			break
-		}
-	}
 	out.Stdout, out.Stderr = joinSpans(so), joinSpans(se)
 	counts := map[string]int{}
 	countMarkers(counts, so)
@@ -1955,30 +2149,39 @@ func withhold(r MCPExecResult, why string) MCPExecResult {
 	return r
 }
 
+// testHookRedact, if set, sees the texts of each OpRedact call hop mcp
+// makes.
+var testHookRedact func(texts [][]byte)
+
 // findSecrets asks the daemon where the vault's secrets stand in each of
 // texts, and adds, with patterns, the well-known token formats. Every
 // offset is checked against its text: an answer that does not fit is an
-// error, so that nothing goes out half-checked.
-func (s *mcpServer) findSecrets(ctx context.Context, texts []string, patterns bool) ([][]redact.Hit, error) {
+// error, so that nothing goes out half-checked. longest is the length of
+// the longest form the daemon looked for, or -1 when it is not known: no
+// text was sent, or the daemon does not say (rescan).
+func (s *mcpServer) findSecrets(ctx context.Context, texts []string, patterns bool) (_ [][]redact.Hit, longest int, _ error) {
 	out := make([][]redact.Hit, len(texts))
 	if !slices.ContainsFunc(texts, func(t string) bool { return t != "" }) {
-		return out, nil
+		return out, -1, nil
 	}
 	p := daemon.RedactParams{Texts: make([][]byte, len(texts))}
 	for i, t := range texts {
 		p.Texts[i] = []byte(t)
 	}
+	if testHookRedact != nil {
+		testHookRedact(p.Texts)
+	}
 	var res daemon.RedactResult
 	if err := call(ctx, s.e, daemon.OpRedact, p, &res); err != nil {
-		return nil, s.daemonError(err)
+		return nil, 0, s.daemonError(err)
 	}
 	if len(res.Hits) != len(texts) {
-		return nil, failf("the daemon answered for %d texts of %d", len(res.Hits), len(texts))
+		return nil, 0, failf("the daemon answered for %d texts of %d", len(res.Hits), len(texts))
 	}
 	for i, hits := range res.Hits {
 		for _, h := range hits {
 			if h.Lo < 0 || h.Hi > len(texts[i]) || h.Lo >= h.Hi || !strings.HasPrefix(h.Kind, "vault-") {
-				return nil, failf("the daemon's answer does not fit the output")
+				return nil, 0, failf("the daemon's answer does not fit the output")
 			}
 		}
 		out[i] = hits
@@ -1986,7 +2189,11 @@ func (s *mcpServer) findSecrets(ctx context.Context, texts []string, patterns bo
 			out[i] = append(out[i], redact.Patterns(texts[i])...)
 		}
 	}
-	return out, nil
+	longest = -1
+	if res.Longest != nil {
+		longest = max(0, *res.Longest)
+	}
+	return out, longest, nil
 }
 
 // logf writes a line to hop mcp's stderr, which the MCP client keeps in its

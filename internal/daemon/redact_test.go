@@ -105,6 +105,11 @@ func TestRedactFindsVaultSecretsWithoutSendingThem(t *testing.T) {
 	if got := found(4); !slices.Equal(got, []string{redact.KindVaultPassword + "=" + password}) {
 		t.Errorf("after a byte that is not UTF-8: %q", got)
 	}
+	// The longest form is the whole key, written as JSON writes it, with
+	// each line break as \n: longer than the key.
+	if res.Longest == nil || *res.Longest <= len(k.pem) {
+		t.Errorf("longest %v, want more than the key's %d bytes", res.Longest, len(k.pem))
+	}
 
 	// Locked, it has nothing to look for, and says so.
 	if err := c.Call(ctx, OpLock, nil, nil); err != nil {
