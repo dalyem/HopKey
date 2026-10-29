@@ -62,6 +62,13 @@ const (
 	// idleRecheck is how often an idle loop looks at the store again, in
 	// case something changed that did not wake it (a publication, say).
 	idleRecheck = 30 * time.Second
+	// syncNowStepTimeout bounds each pull or push of an explicit hop sync,
+	// so one against a server that has stopped answering fails in seconds
+	// and says so, not after a request timeout or the HTTP/2 health check.
+	// It bounds a step, not the whole sync, so a long catch-up still
+	// finishes while the server keeps answering. The background loop keeps
+	// its own deadlines and backoff.
+	syncNowStepTimeout = 5 * time.Second
 	// maxSyncNowPushes bounds the records one sync.now pushes.
 	maxSyncNowPushes = 64
 	// maxReplacedNotes bounds the notes noteReplaced keeps.
@@ -989,11 +996,24 @@ func (e *syncer) serve(ctx context.Context, req *syncReq) error {
 	if st, err := e.st.Status(); err == nil {
 		before = &st
 	}
-	err = e.st.Pull(rctx, r)
+	step := func(f func(context.Context) error) error { return f(rctx) }
+	if req.kind == reqSyncNow {
+		step = func(f func(context.Context) error) error {
+			sctx, cancel := context.WithTimeout(rctx, syncNowStepTimeout)
+			defer cancel()
+			err := f(sctx)
+			if err != nil && sctx.Err() == context.DeadlineExceeded && rctx.Err() == nil {
+				err = fmt.Errorf("%w: the server did not answer within %s", syncclient.ErrUnreachable, syncNowStepTimeout)
+			}
+			return err
+		}
+	}
+	err = step(func(c context.Context) error { return e.st.Pull(c, r) })
 	if err == nil && req.kind == reqSyncNow {
 		for range maxSyncNowPushes {
 			var res store.PushResult
-			if res, err = e.pushHead(rctx, r); err != nil {
+			err = step(func(c context.Context) (err error) { res, err = e.pushHead(c, r); return })
+			if err != nil {
 				break
 			}
 			if res.Outcome != store.PushEmpty {

@@ -1584,3 +1584,29 @@ func TestMCPAuditWarningOnStderrIsRedacted(t *testing.T) {
 		t.Errorf("stderr = %q", stderr)
 	}
 }
+
+// An ssh killed by a signal has no exit status. hop exec --json and the
+// MCP exec say so in error, rather than reporting a bare exit_code 255,
+// which is also what a real ssh failure looks like.
+func TestExecSaysWhenSSHWasKilledBySignal(t *testing.T) {
+	e := newE2E(t)
+	fake := filepath.Join(e.base, "killed-ssh")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nkill -KILL $$\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := e.env(t, nil, nil, nil)
+	env.SSHBinary = fake
+	m := startMCP(t, env)
+	out := mcpCall[cli.MCPExec](m, "exec", map[string]any{"hosts": "web-1", "command": "echo ok"})
+	if r := out.Results[0]; r.ExitCode != 255 || !strings.Contains(r.Error, "ssh was stopped") || !strings.Contains(r.Error, "killed") {
+		t.Errorf("exec = %+v", r)
+	}
+
+	e.sshBin = fake
+	_, stdout, _ := e.hop(t, "exec", "web-1", "--json", "--", "echo", "ok")
+	var r cli.ExecResult
+	decodeJSON(t, stdout, &r)
+	if r.ExitCode != 255 || !strings.Contains(r.Error, "ssh was stopped") || !strings.Contains(r.Error, "killed") {
+		t.Errorf("hop exec --json = %+v", r)
+	}
+}

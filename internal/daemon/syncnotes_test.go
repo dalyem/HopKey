@@ -50,6 +50,36 @@ func TestPushToAServerThatStoppedAnsweringTimesOut(t *testing.T) {
 	})
 }
 
+// An explicit sync against a server that has stopped answering (packets
+// dropped on an established connection) fails within a few seconds and
+// says the server is unreachable, rather than waiting out the request
+// timeout or the HTTP/2 health check.
+func TestExplicitSyncToAServerThatStoppedAnsweringFailsFast(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{})
+	x.n1.must(OpSyncNow, nil, nil)
+	blackhole := interceptor(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		<-req.Context().Done()
+		return true
+	})
+	x.w.intercept.Store(&blackhole)
+	t.Cleanup(func() { x.w.intercept.Store(nil) })
+
+	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.10"))
+	start := time.Now()
+	err := x.n1.call(OpSyncNow, nil, nil)
+	took := time.Since(start)
+	if err == nil {
+		t.Fatal("sync.now succeeded against a server that does not answer")
+	}
+	if !IsCode(err, CodeUnreachable) || !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("sync.now error = %v, want an unreachable error that says so", err)
+	}
+	if took > 8*time.Second {
+		t.Errorf("sync.now took %s to fail, want about 5s", took)
+	}
+}
+
 // hop auth devices shows when each device last talked to the server, not
 // only when it last wrote: a device that only pulls is seen too.
 func TestDevicesLastSeenFollowsPulls(t *testing.T) {
