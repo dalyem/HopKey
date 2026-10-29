@@ -130,6 +130,9 @@ type rotHost struct {
 	// state is where the host's authorized_keys stands (remUnchanged and
 	// so on) once hop has started on it, and "" before.
 	state string
+	// marked says that a hop access line still authorizes the old key
+	// there. state does not count it, so the report does not use state.
+	marked bool
 }
 
 // rotPlan is the plan for one key.
@@ -791,7 +794,10 @@ var remText = map[string]string{
 // new one.
 func (h *rotHost) attention(k *rotKeys, why string) {
 	h.out.Status = rotAttention
-	h.out.Reason = why + "; " + remText[h.state] + safef("; both keys stay in the vault: %s (old) and %s (new)", k.oldName, k.newName)
+	if !h.marked {
+		why += "; " + remText[h.state]
+	}
+	h.out.Reason = why + safef("; both keys stay in the vault: %s (old) and %s (new)", k.oldName, k.newName)
 	h.out.Fix = rotateFix(k, h.host.Name)
 }
 
@@ -903,8 +909,16 @@ func (e *Env) rotateHost(ctx context.Context, h *rotHost, k *rotKeys, stamp stri
 	h.state = remOldRemoved
 
 	// 5. The old key should now be refused. Unless that is shown, the host
-	// needs attention, and the old key stays in the vault.
-	problem := w.oldRefused(ctx)
+	// needs attention, and the old key stays in the vault. A hop access
+	// line that still holds the old key is a known reason it is not: no
+	// check can show otherwise.
+	var problem string
+	if marked := markedOldLines(ed.final, k.oldPub); len(marked) > 0 {
+		h.marked = true
+		problem = markedProblem(marked)
+	} else {
+		problem = w.oldRefused(ctx)
+	}
 
 	// 6. Point the host at the new key, which logs in alone.
 	if !e.repoint(ctx, h, k, w, ed, asJSON) {
@@ -944,16 +958,23 @@ func (e *Env) finishOnNewKey(ctx context.Context, h *rotHost, k *rotKeys, w *rot
 }
 
 // removeOld removes the old key's lines from authorized_keys, over the new
-// key alone, and says why it could not, or "". It keeps h.state.
+// key alone, and says why it could not, or "". It keeps h.state. It leaves
+// hop access lines alone, and while one of them holds the old key it says
+// so: the old key is not gone.
 func (w *rotWays) removeOld(ctx context.Context, h *rotHost, k *rotKeys) string {
 	cur, why, _ := w.new.readAK(ctx)
 	if why != "" {
 		return "hop could not read " + akFile + " with the new key (" + why + ")"
 	}
 	h.state = akState(cur, k.oldPub, k.newPub)
+	problem := ""
+	if marked := markedOldLines(cur, k.oldPub); len(marked) > 0 {
+		h.marked = true
+		problem = markedProblem(marked)
+	}
 	next, removed := withoutKey(cur, k.oldPub)
 	if removed == 0 {
-		return ""
+		return problem
 	}
 	switch out, why, _ := w.new.writeAK(ctx, cur, next); out {
 	case akNotDone:
@@ -963,7 +984,7 @@ func (w *rotWays) removeOld(ctx context.Context, h *rotHost, k *rotKeys) string 
 		return "hop could not remove the old key's lines: " + why
 	}
 	h.state = akState(next, k.oldPub, k.newPub)
-	return ""
+	return problem
 }
 
 // oldRefused offers the old key alone and says, unless the server is
@@ -1471,14 +1492,20 @@ const (
 )
 
 // writeAK replaces authorized_keys content from with to. It says how that
-// ended, why when it did not end well, and the script's exit status.
+// ended, why when it did not end well, and the script's exit status. Each
+// call is a new session, with a new token. The connection carries
+// keepalives, so a server that stops answering does not hold hop for long.
 func (r rotSSH) writeAK(ctx context.Context, from, to []byte) (akOutcome, string, int) {
-	res, err := r.run(ctx, sh(akWriteScript(cksum(from), cksum(to))), to, nil)
+	res, err := r.runOpts(ctx, akKeepalive, sh(akWriteScript(cksum(from), cksum(to))), to, nil)
 	switch {
 	case sshOK(res, err):
 		return akDone, "", 0
 	case err == nil && res.exited && akRefused(res.ExitCode):
 		return akNotDone, "could not write " + akFile + " (" + sshFailure(res, err) + ")", res.ExitCode
+	case err == nil && res.exited && res.ExitCode != sshAuthFailed:
+		// 86 (mv failed, or a signal), 89 (cleanup or release not
+		// confirmed), or a status hop does not know.
+		return akUnknown, "hop could not tell whether it replaced " + akFile + " (" + sshFailure(res, err) + ")", res.ExitCode
 	}
 	return akUnknown, "lost the connection while writing " + akFile + " (" + sshFailure(res, err) + ")", res.ExitCode
 }

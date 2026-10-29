@@ -80,8 +80,20 @@ func startAKWriter(t *testing.T, home, path, script string) *akWriter {
 // for is the script's shell.
 func startAKShell(t *testing.T, home, path, script string) *akWriter {
 	t.Helper()
+	return startAKIn(t, "sh", home, path, script)
+}
+
+// startAKIn is startAKShell with the shell given.
+func startAKIn(t *testing.T, shell, home, path, script string) *akWriter {
+	t.Helper()
+	return startAKArgv(t, home, path, []string{shell, "-c", script})
+}
+
+// startAKArgv runs argv as startAKShell runs the script.
+func startAKArgv(t *testing.T, home, path string, argv []string) *akWriter {
+	t.Helper()
 	w := &akWriter{done: make(chan int, 1)}
-	w.cmd = exec.Command("sh", "-c", script)
+	w.cmd = exec.Command(argv[0], argv[1:]...)
 	w.cmd.Env = []string{"HOME=" + home, "PATH=" + path}
 	w.cmd.Stderr = &w.err
 	w.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -118,9 +130,9 @@ func waitFor(t *testing.T, what string, ok func() bool) {
 }
 
 // holdsTemp reports whether a write script is past the lock: it has made
-// its temp file in ~/.ssh.
+// its temp file in its session directory.
 func holdsTemp(home string) bool {
-	m, _ := filepath.Glob(filepath.Join(home, ".ssh", ".authorized_keys.hop-*"))
+	m, _ := filepath.Glob(filepath.Join(home, ".ssh", ".hop-s.*", "new"))
 	return len(m) > 0
 }
 
@@ -242,9 +254,9 @@ func TestAKWriteScriptLeftOverLockFailsClosed(t *testing.T) {
 		want        []string
 	}{
 		{"its process is gone", fmt.Sprintf("other-token %d %s\n", gone.Process.Pid, at),
-			[]string{fmt.Sprintf("process %d on this host took it at %s", gone.Process.Pid, at), "that process is not running"}},
+			[]string{fmt.Sprintf("process %d took it at %s, on the machine that took it", gone.Process.Pid, at)}},
 		{"its process still runs", fmt.Sprintf("other-token %d %s\n", os.Getpid(), at),
-			[]string{fmt.Sprintf("process %d on this host took it at %s", os.Getpid(), at), "that process is still running"}},
+			[]string{fmt.Sprintf("process %d took it at %s, on the machine that took it", os.Getpid(), at)}},
 		{"no owner", "", []string{"with no owner in it"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -263,7 +275,9 @@ func TestAKWriteScriptLeftOverLockFailsClosed(t *testing.T) {
 			os.Chtimes(lock, old, old)
 
 			code, stderr := runAKScriptPath(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)), next)
-			want := append(c.want, "~/.ssh/"+testLockDir+" ", "rm -r ~/.ssh/"+testLockDir+")")
+			want := append(c.want, "~/.ssh/"+testLockDir+" ", "rm -r ~/.ssh/"+testLockDir+")",
+				"hop key rotate and hop access both use this lock",
+				"on every device you use, and on every machine that shares this home directory")
 			if code != akExitLocked {
 				t.Errorf("exit %d %q, want %d", code, stderr, akExitLocked)
 			}
@@ -271,6 +285,14 @@ func TestAKWriteScriptLeftOverLockFailsClosed(t *testing.T) {
 				if !strings.Contains(stderr, w) {
 					t.Errorf("the message %q does not say %q", stderr, w)
 				}
+			}
+			// The PID is shown, never probed: it may be another machine's.
+			if strings.Contains(stderr, "running") || strings.Contains(stderr, "this host") {
+				t.Errorf("the message judges the owner's PID: %q", stderr)
+			}
+			// The waiter made nothing and removed nothing.
+			if entries, _ := os.ReadDir(filepath.Join(home, ".ssh")); len(entries) != 2 {
+				t.Errorf("~/.ssh holds %d entries, want authorized_keys and the lock", len(entries))
 			}
 			if got, _ := os.ReadFile(f); !bytes.Equal(got, orig) {
 				t.Errorf("written under another's lock: %q", got)
@@ -284,7 +306,9 @@ func TestAKWriteScriptLeftOverLockFailsClosed(t *testing.T) {
 
 // A run's traps remove its own lock and never another's: not when the lock
 // was replaced while the run held it (a user removed it, and another run
-// took it), and not when a run waiting for another's lock is stopped.
+// took it), and not when a run waiting for another's lock is stopped. A run
+// that finds its lock replaced says so and exits 89: another run may have
+// edited the file at the same time.
 func TestAKWriteScriptTrapsKeepAnotherOwnersLock(t *testing.T) {
 	const theirs = "other-token 1 2026-10-28T09:15:00Z\n"
 	orig, next := []byte("a\n"), []byte("a\nb\n")
@@ -310,11 +334,14 @@ func TestAKWriteScriptTrapsKeepAnotherOwnersLock(t *testing.T) {
 		takeOver(t, home)
 		a.stdin.Write(next)
 		a.stdin.Close()
-		if code := <-a.done; code != 0 {
-			t.Fatalf("exit %d %s", code, a.err.String())
+		if code := <-a.done; code != akExitCleanup || !strings.Contains(a.err.String(), "was removed, replaced or unreadable when this hop run went to release it") {
+			t.Fatalf("exit %d %s, want %d and the lost-lock message", code, a.err.String(), akExitCleanup)
 		}
 		if lockOwner(home) != theirs {
 			t.Errorf("the writer removed another owner's lock: owner %q", lockOwner(home))
+		}
+		if holdsTemp(home) {
+			t.Error("the session directory is still there")
 		}
 	})
 	t.Run("replaced, the run is stopped", func(t *testing.T) {
@@ -323,8 +350,8 @@ func TestAKWriteScriptTrapsKeepAnotherOwnersLock(t *testing.T) {
 		waitFor(t, "the writer to take the lock", func() bool { return held(home) })
 		takeOver(t, home)
 		syscall.Kill(-a.cmd.Process.Pid, syscall.SIGTERM)
-		if code := <-a.done; code != 86 {
-			t.Errorf("exit %d %s, want 86", code, a.err.String())
+		if code := <-a.done; code != akExitCleanup {
+			t.Errorf("exit %d %s, want %d", code, a.err.String(), akExitCleanup)
 		}
 		if lockOwner(home) != theirs {
 			t.Errorf("the stopped writer removed another owner's lock: owner %q", lockOwner(home))
