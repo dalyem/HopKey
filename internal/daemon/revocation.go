@@ -186,13 +186,15 @@ func (d *Daemon) unconfirmedLocked(err error) error {
 		err = fmt.Errorf("%w (%v)", store.ErrServerUnconfirmed, err)
 	}
 	rs.LockFor(err)
+	// Status says why before any session ends, so a hop process whose
+	// session ended and that asks status at once reads the reason.
+	why := err.Error()
+	e.set(func() { e.unconfirmed, e.checkSkipped = why, "" })
 	if refused {
 		// The server's refusal is how a revoked device learns it.
 		d.endSessions(whyRefused)
 	}
 	d.dropKeysLocked(false)
-	why := err.Error()
-	e.set(func() { e.unconfirmed, e.checkSkipped = why, "" })
 	d.logf("the vault stays locked: %v", err)
 	return err
 }
@@ -468,9 +470,9 @@ func (d *Daemon) enforceOfflineLocked(ctx context.Context) error {
 	}
 	err = fmt.Errorf("%w (%s)", store.ErrOfflineTooLong, why)
 	rs.LockFor(err)
+	e.set(func() { e.offline = why }) // before the sessions end, as in unconfirmedLocked
 	d.endSessions(whyOffline)
 	d.dropKeysLocked(false)
-	e.set(func() { e.offline = why })
 	d.sync.wake()
 	d.logf("the vault locked itself: %v", err)
 	return err
