@@ -459,12 +459,14 @@ func (s *Store) dropLostRecords() error {
 			return err
 		}
 	}
-	// The notes of replaced edits are sealed under the same local_key, and
-	// go undelivered.
-	if _, err := os.Lstat(s.l.replacedFile()); err == nil {
-		t.remove(replacedRel)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+	// The notes of replaced edits and the sync notes are sealed under the
+	// same local_key, and go undelivered.
+	for _, f := range []struct{ path, rel string }{{s.l.replacedFile(), replacedRel}, {s.l.syncNotesFile(), syncNotesRel}} {
+		if _, err := os.Lstat(f.path); err == nil {
+			t.remove(f.rel)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return s.commitTxn(t)
 }

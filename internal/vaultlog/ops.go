@@ -353,7 +353,8 @@ func (o *ItemPutOp) validate() error {
 		return err
 	}
 	if !isItemType(o.Type) {
-		return schemaFail(o.Op, "type %q", o.Type)
+		// Still a violation that stops sync, but say why (rev 17, §5.2).
+		return schemaFail(o.Op, "type %q: this vault uses an item type from a newer hop (%s); upgrade hop on this device", o.Type, o.Type)
 	}
 	return nil
 }

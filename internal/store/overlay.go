@@ -81,8 +81,9 @@ type evaluation struct {
 // evaluate rebuilds in against the verified state S with the merge rule
 // (§5.4) and, for a write, builds the candidate entry with
 // vaultlog.BuildNormal from verified state: the item_put or item_delete
-// and every companion op (§5.3, §8.6). A build that fails, or a host whose
-// jump chain would loop, holds the change. Nothing is built from the
+// and every companion op (§5.3, §8.6). A build that fails, a host whose
+// jump chain would loop, or a candidate over the server's admission limits
+// (admitWire), holds the change. Nothing is built from the
 // overlay. The caller holds s.mu.
 func (s *Store) evaluate(in merge.Intent) (evaluation, error) {
 	cur, err := s.verifiedItem(in.ItemID)
@@ -113,6 +114,11 @@ func (s *Store) evaluate(in merge.Intent) (evaluation, error) {
 		}
 		w, _, _, err := vaultlog.BuildNormal(s.state, s.sec, s.dev, ch, s.now(), objectDir(s.l.objects()))
 		if err != nil {
+			return err
+		}
+		// The admission preflight: a candidate the server would refuse as
+		// too large holds here, before it is journaled.
+		if err := admitWire(w); err != nil {
 			return err
 		}
 		ev.wire = w

@@ -88,7 +88,10 @@ const (
 type Cause string
 
 const (
-	// CauseGuardedConflict: a put where both sides changed the guarded group.
+	// CauseGuardedConflict: a put where both sides changed one unit
+	// differently, raced on a selector class, or made changes a coupling
+	// forbids combining (rev 17); or, for an item the rev 17 tables don't
+	// cover, both sides changed its guarded group (rev 16).
 	CauseGuardedConflict Cause = "guarded_conflict"
 	// CauseNotLive: a put on an item that is not live in S.
 	CauseNotLive Cause = "not_live"
@@ -117,14 +120,21 @@ type Result struct {
 	// different values: want's value replaced the one S had (§5.4), with
 	// nothing held. A put write only.
 	Replaced []string
+	// Combined, for a put write, is set when rev 16 would have held this
+	// change: rev 17 combined it with changes the user never saw (§5.4,
+	// "combined" note).
+	Combined *Combined
 
-	// Hold: the reason. For CauseGuardedConflict, Local lists the guarded
-	// members the user changed and Remote the guarded members S changed,
-	// both sorted. For CauseRuleFailure, Err is the failed rule.
-	Cause  Cause
-	Local  []string
-	Remote []string
-	Err    error
+	// Hold: the reason. For CauseGuardedConflict, Local lists the non-free
+	// members the user changed and Remote the non-free members S changed,
+	// both sorted, and Conflicts says which units, classes and couplings
+	// hold it (none when rev 16 decided the item). For CauseRuleFailure,
+	// Err is the failed rule.
+	Cause     Cause
+	Local     []string
+	Remote    []string
+	Conflicts []Conflict
+	Err       error
 }
 
 func hold(c Cause) Result { return Result{Kind: KindHold, Cause: c} }
@@ -150,7 +160,7 @@ func CheckCandidate(r Result, check func(action Action, plaintext *Item) error) 
 }
 
 // Rebuild merges the intended change against the current verified state S
-// (§5.4, "Merge rule (rev 16)").
+// (§5.4, merge rule rev 17).
 //
 // current is S's item for in.ItemID and live says it is live in S. current
 // may be nil when the item is not live (and, for a create, whenever the
@@ -185,7 +195,7 @@ func Rebuild(in Intent, current *Item, live, retired bool) Result {
 	if !live {
 		return hold(CauseNotLive)
 	}
-	return rebuildPut(in, current)
+	return rebuildPutRev17(in, current)
 }
 
 // rebuildDelete: already deleted is complete, S unchanged since seen
@@ -203,7 +213,11 @@ func rebuildDelete(in Intent, current *Item, live bool) Result {
 	return hold(CauseDeleteChanged)
 }
 
-func rebuildPut(in Intent, s *Item) Result {
+// rebuildPutRev16 is the rev 16 put rule, rev16(seen, want, S): hold if L
+// and R both contain a non-free member and want and S differ on a non-free
+// member; otherwise write want's value for every member in L and S's for
+// every other. Rev 17 uses it for an item with an unclassified member.
+func rebuildPutRev16(in Intent, s *Item) Result {
 	var local, remote []string // guarded members in L and in R
 	var replaced []string      // free members in L and R that differ
 	inL := map[string]bool{}

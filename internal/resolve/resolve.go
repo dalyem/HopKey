@@ -274,7 +274,9 @@ func onlineWord(on bool) string {
 // Names returns the host's name followed by its aliases.
 func Names(h model.Host) []string { return append([]string{h.Name}, h.Aliases...) }
 
-func normName(s string) string { return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), ".")) }
+// normName is model.NameKey, the selector key the merge uses for names and
+// aliases too (crypto spec rev 17, §5.4).
+func normName(s string) string { return model.NameKey(s) }
 
 // normAddr canonicalises an address for comparison: an IP is parsed and
 // printed in its canonical form, a name is lower-cased without a trailing dot.

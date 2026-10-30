@@ -16,6 +16,11 @@ const (
 	ChoiceEdit       Choice = "edit"
 	ChoiceTakeTheirs Choice = "take theirs"
 	ChoiceRetry      Choice = "retry"
+	// ChoiceKeepMineMerge and ChoiceTakeTheirsMerge are computed edits
+	// (rev 17): the conflict members as mine or as theirs, everything
+	// else as the automatic merge makes it.
+	ChoiceKeepMineMerge   Choice = "keep mine --merge"
+	ChoiceTakeTheirsMerge Choice = "take theirs --merge"
 )
 
 // Row names a row of the §5.4 resolution table. Its text is what a
@@ -280,4 +285,68 @@ func Retry(held Intent, cause Cause) (Intent, error) {
 		return Intent{}, err
 	}
 	return held, nil
+}
+
+const reasonNoProposal = "no merge proposal exists for this hold"
+
+// KeepMineMerge returns the replacement intent for "keep mine --merge"
+// (rev 17, §5.4): a put of P_mine with seen′ = S. P_mine takes this
+// device's values for every member of each conflict and the automatic
+// merge's everywhere else. It is a computed edit, confirmed with the Edit
+// digest (ResolveDigest). It is refused when no proposal exists (the hold is
+// not a unit, class or coupling conflict, or the item falls back to the rev
+// 16 rule) or when P_mine is what plain keep mine writes.
+func KeepMineMerge(held Intent, cause Cause, s *Item) (Intent, error) {
+	mine, _, err := mergeProposals(ChoiceKeepMineMerge, held, cause, s)
+	if err != nil {
+		return Intent{}, err
+	}
+	km, err := KeepMine(held, cause, s)
+	if err != nil {
+		return Intent{}, err
+	}
+	if mine.Equal(km.Want) {
+		return Intent{}, refuse(ChoiceKeepMineMerge, RowPutConflict, "it writes the same as keep mine: use --keep-mine")
+	}
+	return Intent{Action: ActionPut, ItemID: held.ItemID, Type: held.Type, Seen: s, Want: mine}, nil
+}
+
+// TakeTheirsMerge returns the replacement intent for "take theirs
+// --merge": a put of P_theirs, which keeps S's values for every member of
+// each conflict and takes the automatic merge's everywhere else, with
+// seen′ = S. It is refused when no proposal exists, or when P_theirs equals
+// S ("nothing to merge").
+func TakeTheirsMerge(held Intent, cause Cause, s *Item) (Intent, error) {
+	_, theirs, err := mergeProposals(ChoiceTakeTheirsMerge, held, cause, s)
+	if err != nil {
+		return Intent{}, err
+	}
+	if theirs.Equal(s) {
+		return Intent{}, refuse(ChoiceTakeTheirsMerge, RowPutConflict, "nothing to merge: use --take-theirs")
+	}
+	return Intent{Action: ActionPut, ItemID: held.ItemID, Type: held.Type, Seen: s, Want: theirs}, nil
+}
+
+func mergeProposals(c Choice, held Intent, cause Cause, s *Item) (mine, theirs *Item, err error) {
+	row, err := RowOf(held, cause)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkS(held, s); err != nil {
+		return nil, nil, err
+	}
+	if row != RowPutConflict {
+		return nil, nil, refuse(c, row, reasonNoProposal)
+	}
+	if s == nil {
+		return nil, nil, refuse(c, row, reasonNotLiveNow)
+	}
+	mine, theirs, ok, err := proposals(held, s)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
+		return nil, nil, refuse(c, row, reasonNoProposal)
+	}
+	return mine, theirs, nil
 }

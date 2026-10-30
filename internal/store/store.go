@@ -282,6 +282,12 @@ type Store struct {
 	// syncHalt is the error that stopped syncing (an equivocation or a
 	// rule violation in a server entry).
 	syncHalt error
+	// syncNotesDiscarded: an obsolete sync-notes.json (sealed under an
+	// earlier local_key) was discarded, and SyncNotes has not been
+	// acknowledged since. syncNotesDropped says why notes could not be
+	// recorded since the last acknowledgement (syncnotes.go).
+	syncNotesDiscarded bool
+	syncNotesDropped   []string
 	// pubAlarm is the equivocation the last publication resolution found
 	// (§4.3, §5.6); the publication stays pending.
 	pubAlarm error
