@@ -218,6 +218,7 @@ func printVaultStatus(e *Env, v *store.Info) {
 		return
 	}
 	e.printf("vault:        %s\n", vaultState(v))
+	printAdminLockHelp(e, v)
 	e.printf("device key:   %s\n", oneLine(v.DeviceStore))
 	if v.Head != nil {
 		e.printf("log head:     seq %s\n", v.Head.Short())

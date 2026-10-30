@@ -142,6 +142,12 @@ type LogoutOptions struct {
 	DiscardPending bool
 	// LocalOnly skips the server: RETIRED with the outcome unknown.
 	LocalOnly bool
+	// Why is AdminDeviceBlocked or AdminAccountDisabled when the
+	// server's operator had this device locked out when the user logged
+	// out, and "" otherwise. A logout with a Why leaves a Predecessor,
+	// whatever its outcome, so that the next sign-in can say what to do
+	// about the old identity. It is read only when the logout begins.
+	Why string
 }
 
 // LogoutResult says where a logout stands.
@@ -153,6 +159,9 @@ type LogoutResult struct {
 	// RevokeElsewhere means the server was not asked: if the device is
 	// still listed, revoke it from another device.
 	RevokeElsewhere bool `json:"revoke_elsewhere,omitempty"`
+	// Discarded is the number of queued changes the logout threw away,
+	// as counted when it began.
+	Discarded int `json:"discarded_changes,omitempty"`
 }
 
 type retireJournal struct {
@@ -410,8 +419,12 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 		if s.state != nil {
 			j.VaultID = s.state.VaultID
 		}
+		pc, _ := s.pendingLocked() // informational: a queue that can't be counted must not keep a logout from starting
 		t := &txn{}
 		if err := putRetirement(t, j); err != nil {
+			return nil, err
+		}
+		if err := putRetireNote(t, s.newRetireNote(opts.Why, pc)); err != nil {
 			return nil, err
 		}
 		if err := s.commitTxn(t); err != nil {
@@ -441,8 +454,12 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 	if err := addRetireCandidate(j, w); err != nil {
 		return nil, err
 	}
+	pc, _ := s.pendingLocked()
 	t := &txn{}
 	if err := putRetirement(t, j); err != nil {
+		return nil, err
+	}
+	if err := putRetireNote(t, s.newRetireNote(opts.Why, pc)); err != nil {
 		return nil, err
 	}
 	if err := s.commitTxn(t); err != nil {
@@ -505,6 +522,12 @@ func (s *Store) recordRetired(j *retireJournal, outcome string) error {
 // finishLogout runs the cleanup of a RETIRED logout. The caller holds s.mu.
 func (s *Store) finishLogout(j *retireJournal) (LogoutResult, error) {
 	res := LogoutResult{State: StateRetired, Outcome: j.Outcome, RevokeElsewhere: j.Outcome == OutcomeUnknown}
+	if unlock, err := s.lockFile(); err == nil {
+		if n := s.readRetireNote(); n != nil {
+			res.Discarded = n.Queued
+		}
+		unlock()
+	}
 	if s.state != nil {
 		s.dropLocked(ErrLoggingOut)
 	}
@@ -539,6 +562,11 @@ func (s *Store) cleanupRetired() error {
 	// remove. The mark of it goes down first and outlives the journal, so
 	// a crash anywhere from here still leaves it owed.
 	if err := markLogoutCleanup(s.l.data); err != nil {
+		return err
+	}
+	// What the next sign-in says about this identity (predecessor.go),
+	// before anything of the vault goes.
+	if err := s.recordLogoutPredecessor(j); err != nil {
 		return err
 	}
 	// The outbox, in one commit.
