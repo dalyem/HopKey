@@ -40,6 +40,11 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 		return failf("hop init needs a terminal to ask for the master password, and stdin is not one; run it in an interactive terminal")
 	}
 	cfg := e.storeConfig()
+	if pending, err := store.ForkInProgress(cfg.DataDir); err != nil {
+		return failf("%v", err)
+	} else if pending {
+		return failf("a fork of the vault in %s was interrupted; run hop vault fork --local to finish it", cfg.DataDir)
+	}
 	if ok, err := store.Exists(cfg.DataDir); err != nil {
 		return failf("%v", err)
 	} else if ok {

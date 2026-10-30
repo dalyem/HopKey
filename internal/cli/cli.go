@@ -326,6 +326,7 @@ func init() {
 		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|policy|logout|rotate|passwd|merge|resume> [--json]"},
 		"login":   {runLogin, "hop login [flags of hop auth login]"},
 		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
+		"vault":   {runVault, vaultForkUsage},
 	}
 }
 
@@ -341,6 +342,7 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop sync [resolve]
        hop auth signup|login|approve|status|devices|logout|rotate|passwd|merge|resume
        hop login | logout       aliases of hop auth login and hop auth logout
+       hop vault fork --local   keep this device's copy as a new local-only vault (account deleted, server gone)
 
 Most commands take --json (not hop <target>, daemon, mcp or passwd). Run "hop <command> -h" for its flags.
 `
