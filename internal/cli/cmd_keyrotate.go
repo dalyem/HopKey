@@ -138,6 +138,9 @@ type rotHost struct {
 	// its session directory and its lock on the host. Whatever the file
 	// holds, such a host needs attention. state does not count it.
 	cleanup []string
+	// pins, when set, are the only host keys a check's config trusts
+	// (hop access binds a target to one of the host's pins).
+	pins []ssh.PublicKey
 }
 
 // rotPlan is the plan for one key.
@@ -1445,6 +1448,16 @@ func (r rotSSH) run(ctx context.Context, command string, stdin []byte, stdout io
 
 // runOpts is run with extra ssh options.
 func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, stdin []byte, stdout io.Writer) (rotResult, error) {
+	var in io.Reader
+	if stdin != nil {
+		in = bytes.NewReader(stdin)
+	}
+	return r.runIO(ctx, rotateStepTimeout, extra, command, in, stdout)
+}
+
+// runIO is runOpts with stdin a stream (nil for none) and its own
+// deadline.
+func (r rotSSH) runIO(ctx context.Context, timeout time.Duration, extra []string, command string, stdin io.Reader, stdout io.Writer) (rotResult, error) {
 	opts := append([]string{"-T", "-o", "ConnectTimeout=10"}, extra...)
 	if stdin == nil {
 		opts = append(opts, "-n")
@@ -1456,11 +1469,11 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 	} else {
 		args = append(append([]string{"-F", r.cfg}, opts...), "--", rotCheckAlias, command)
 	}
-	runCtx, cancel := context.WithTimeout(ctx, rotateStepTimeout)
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	sc := &sshCmd{path: r.e.sshBinary(), args: append([]string{r.e.sshBinary()}, args...), env: r.e.sshEnviron(), dir: r.dir, waitDelay: time.Second}
 	if stdin != nil {
-		sc.stdin = bytes.NewReader(stdin)
+		sc.stdin = stdin
 	}
 	errTail := &tailBuffer{max: tailLimit}
 	sc.stdout, sc.stderr = stdout, errTail
@@ -1480,7 +1493,7 @@ func (r rotSSH) runOpts(ctx context.Context, extra []string, command string, std
 		res.exited = true
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		// Even if ssh exited just before the deadline, hop cannot tell.
-		res.ExitCode, res.Error = ExitFailure, fmt.Sprintf("timed out after %s", rotateStepTimeout)
+		res.ExitCode, res.Error = ExitFailure, fmt.Sprintf("timed out after %s", timeout)
 	case errors.As(runErr, &ee):
 		res.ExitCode, res.exited = ee.exited()
 		if !res.exited {
@@ -1667,6 +1680,9 @@ func (e *Env) checkConfig(h *rotHost, addr string, a *keyAgent) (string, error) 
 	base := filepath.Join(filepath.Dir(a.sock), h.host.ItemID.String())
 	var kh bytes.Buffer
 	pins, _ := parsePins(rec.HostKeys)
+	if h.pins != nil {
+		pins = h.pins // hop access: only the key a target is bound to
+	}
 	for _, p := range pins {
 		fmt.Fprintf(&kh, "%s %s", alias, ssh.MarshalAuthorizedKey(p))
 	}

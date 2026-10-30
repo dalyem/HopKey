@@ -246,6 +246,9 @@ func analyze(t model.Type, seen, want, s *Item) analysis {
 	a.cl = classifications[t]
 	all := names(seen, want, s)
 	for _, m := range all {
+		if a.cl != nil && a.cl.kind(m) == kindSystem {
+			continue // never in L or R; S's value until the writer stamps it
+		}
 		inL, inR := !memberEqual(want, seen, m), !memberEqual(s, seen, m)
 		if inL {
 			a.l = append(a.l, m)
@@ -282,6 +285,8 @@ func analyze(t model.Type, seen, want, s *Item) analysis {
 	for _, m := range all {
 		inL, inR := slices.Contains(a.l, m), slices.Contains(a.r, m)
 		switch {
+		case a.cl.kind(m) == kindSystem:
+			a.merged[m] = s.members[m]
 		case !inL:
 			a.merged[m] = s.members[m]
 		case !inR:

@@ -318,6 +318,26 @@ func (c *Candidate) checkTransitionPlain(pre, next *Secrets) error {
 			return fail(RuleKeyMaterial, "item_put of key %v changes its SSH material; a new key needs a new item ID", id)
 		}
 	}
+	// Access items: identity, targets, author, checkpoint and terminal
+	// non-regression (crypto spec rev 17, Part 2, §5.1).
+	for _, id := range sortedKeys(c.puts) {
+		if c.puts[id].Type != model.TypeAccess {
+			continue
+		}
+		a, ok := next.Items[id].Item.(*model.Access)
+		if !ok {
+			return fail(RuleItemType, "access item %v does not decode as one", id)
+		}
+		var old *model.Access
+		if o, ok := pre.Items[id]; ok {
+			if old, ok = o.Item.(*model.Access); !ok {
+				return fail(RuleItemType, "item %v changes its type to access", id)
+			}
+		}
+		if err := CheckAccessPut(old, a, c.Kind(), c.Wire.Entry.Author); err != nil {
+			return err
+		}
+	}
 	// Normal entries only: an entry that changes or deletes an item listed
 	// in the record of a grant active in the post-state, or changes the
 	// record itself, MUST contain a bundle_put for that grant (§5.3).

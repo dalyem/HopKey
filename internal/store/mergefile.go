@@ -430,6 +430,9 @@ func (s *Store) MergeStart() (MergeStatus, error) {
 	if len(s.state.DeployOps) > 0 {
 		return MergeStatus{}, fmt.Errorf("%w: it holds key deployment operations, which a merge does not move", ErrMergeRefused)
 	}
+	if liveAccess(s.state) {
+		return MergeStatus{}, fmt.Errorf("%w: it holds hop access records, which a merge does not move; remove or forget them first", ErrMergeRefused)
+	}
 	txnID, err := vaultlog.NewID()
 	if err != nil {
 		return MergeStatus{}, err

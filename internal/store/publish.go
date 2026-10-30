@@ -303,7 +303,11 @@ func (s *Store) Publish(ctx context.Context, p Publisher, opts PublishOptions) (
 		return Publication{}, err
 	}
 	defer s.syncMu.Unlock()
-	j, wires, err := s.beginPublication(opts)
+	accessOK, err := s.publishAccessCheck(ctx, p)
+	if err != nil {
+		return Publication{}, err
+	}
+	j, wires, err := s.beginPublication(opts, accessOK)
 	if err != nil {
 		return Publication{}, err
 	}
@@ -332,7 +336,9 @@ func (s *Store) ResumePublish(ctx context.Context, p Publisher) (Publication, er
 }
 
 // beginPublication runs the preflight and journals the publication.
-func (s *Store) beginPublication(opts PublishOptions) (*publicationJSON, []*vaultlog.Wire, error) {
+// accessOK says the target server lists access: without it, a log that
+// ever held an access item is refused before anything is journaled.
+func (s *Store) beginPublication(opts PublishOptions, accessOK bool) (*publicationJSON, []*vaultlog.Wire, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == nil {
@@ -389,6 +395,9 @@ func (s *Store) beginPublication(opts PublishOptions) (*publicationJSON, []*vaul
 	if err := checkUpload(j, wires); err != nil {
 		return nil, nil, err
 	}
+	if !accessOK && uploadHasAccess(wires) {
+		return nil, nil, fmt.Errorf("%w: this vault has access records; the server at %s doesn't accept them", ErrAccessUnsupported, opts.Server)
+	}
 	b, err := sealPublication(s.rec, j)
 	if err != nil {
 		return nil, nil, err
@@ -400,6 +409,63 @@ func (s *Store) beginPublication(opts PublishOptions) (*publicationJSON, []*vaul
 	}
 	s.pubAlarm, s.pubRefused = nil, false
 	return j, wires, nil
+}
+
+// ErrAccessUnsupported: the server doesn't list access among its item
+// types (crypto spec rev 17, §5.3).
+var ErrAccessUnsupported = errors.New("store: the server doesn't accept access records")
+
+// CapabilityReader is a Publisher that can read the server's item types
+// (GET /v1/capabilities). A Publisher without it can't publish a vault
+// whose log holds an access item.
+type CapabilityReader interface {
+	ItemTypes(ctx context.Context) ([]model.Type, error)
+}
+
+// publishAccessCheck is the publication preflight of §5.3: if any entry
+// from genesis to the head holds an item_put of type access (a deleted
+// record's puts are uploaded too), the server must list access. It reports
+// whether it does; beginPublication scans again under the lock, so a
+// record made after this check is still refused.
+func (s *Store) publishAccessCheck(ctx context.Context, p Publisher) (bool, error) {
+	s.mu.Lock()
+	var wires []*vaultlog.Wire
+	var err error
+	if s.state == nil {
+		err = s.lockedErr()
+	} else {
+		for seq := uint64(0); seq <= s.state.Head.Seq && err == nil; seq++ {
+			var w *vaultlog.Wire
+			if w, err = s.l.readEntry(seq); err == nil {
+				wires = append(wires, w)
+			}
+		}
+	}
+	s.mu.Unlock()
+	if err != nil || !uploadHasAccess(wires) {
+		return false, err
+	}
+	cr, ok := p.(CapabilityReader)
+	if !ok {
+		return false, fmt.Errorf("%w: hop could not check whether the server accepts access records", ErrAccessUnsupported)
+	}
+	types, err := cr.ItemTypes(ctx)
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(types, model.TypeAccess), nil
+}
+
+// uploadHasAccess reports whether any entry puts an access item.
+func uploadHasAccess(wires []*vaultlog.Wire) bool {
+	for _, w := range wires {
+		for _, op := range w.Entry.Ops {
+			if p, ok := op.(*vaultlog.ItemPutOp); ok && p.Type == model.TypeAccess {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // refuseCheckpoint refuses while a checkpoint journal or an

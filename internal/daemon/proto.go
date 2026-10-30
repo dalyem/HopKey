@@ -34,8 +34,11 @@ const (
 	// Sync ops (sync.go). They need the encrypted store; sync.now,
 	// sync.held, sync.proposal, sync.resolve and devices.list need it
 	// unlocked too.
-	OpSyncStatus   = "sync.status"
-	OpSyncNow      = "sync.now"
+	OpSyncStatus = "sync.status"
+	OpSyncNow    = "sync.now"
+	// OpSyncPull pulls and verifies, and never pushes: nothing is
+	// journaled or posted (hop access check, crypto spec rev 17 §7.8).
+	OpSyncPull     = "sync.pull"
 	OpSyncHeld     = "sync.held"
 	OpSyncProposal = "sync.proposal"
 	OpSyncResolve  = "sync.resolve"

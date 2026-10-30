@@ -42,6 +42,7 @@ type akServer struct {
 	port    int
 	home    string
 	hostKey ssh.PublicKey
+	signer  ssh.Signer // the host key's private half
 	cfg     *ssh.ServerConfig
 
 	// down makes the server unreachable: every new connection is closed
@@ -59,18 +60,28 @@ type akServer struct {
 	// onAuth, if set, sees each key a client offers before the server
 	// decides on it.
 	onAuth func(c ssh.ConnMetadata, k ssh.PublicKey)
+	// onStdin, if set, copies the client's input into the command instead
+	// of io.Copy: it returns true to have the connection dropped at once,
+	// with the command's stdin closed (a lost connection mid-session).
+	onStdin func(command string, stdin io.Writer, client io.Reader) (drop bool)
 	// path, if set, is the PATH commands run with.
 	path string
 }
 
 func startAKServer(t *testing.T, home string) *akServer {
 	t.Helper()
+	return startAKServerKey(t, home, newSigner(t))
+}
+
+// startAKServerKey is startAKServer with the host key signer: two servers
+// can present the same host key.
+func startAKServerKey(t *testing.T, home string, signer ssh.Signer) *akServer {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &akServer{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, home: home}
-	signer := newSigner(t)
+	s := &akServer{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, home: home, signer: signer}
 	s.hostKey = signer.PublicKey()
 	s.cfg = &ssh.ServerConfig{PublicKeyCallback: s.authorize}
 	s.cfg.AddHostKey(signer)
@@ -105,6 +116,12 @@ func (s *akServer) setOnAuth(f func(c ssh.ConnMetadata, k ssh.PublicKey)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onAuth = f
+}
+
+func (s *akServer) setOnStdin(f func(command string, stdin io.Writer, client io.Reader) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onStdin = f
 }
 
 func (s *akServer) setPath(path string) {
@@ -218,7 +235,7 @@ func (s *akServer) session(conn ssh.Conn, ch ssh.Channel, reqs <-chan *ssh.Reque
 		}
 		req.Reply(true, nil)
 		s.mu.Lock()
-		hook, path := s.onExec, s.path
+		hook, path, inHook := s.onExec, s.path, s.onStdin
 		s.mu.Unlock()
 		if path == "" {
 			path = os.Getenv("PATH")
@@ -227,8 +244,32 @@ func (s *akServer) session(conn ssh.Conn, ch ssh.Channel, reqs <-chan *ssh.Reque
 		cmd := exec.Command("sh", "-c", p.Command)
 		cmd.Dir = s.home
 		cmd.Env = []string{"HOME=" + s.home, "PATH=" + path}
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = ch, ch, ch.Stderr()
+		// id -un needs the nss_wrapper of scripts/with-passwd.sh, if any.
+		for _, kv := range os.Environ() {
+			if strings.HasPrefix(kv, "LD_PRELOAD=") || strings.HasPrefix(kv, "NSS_WRAPPER_") {
+				cmd.Env = append(cmd.Env, kv)
+			}
+		}
+		cmd.Stdout, cmd.Stderr = ch, ch.Stderr()
 		cmd.WaitDelay = 2 * time.Second
+		// As sshd does, the session ends when the command exits, whether
+		// or not the client has closed its stdin: the copy into the
+		// command is not waited for.
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return
+		}
+		go func() {
+			if inHook != nil && inHook(p.Command, stdin, ch) {
+				stdin.Close()
+				conn.Close()
+				return
+			}
+			if inHook == nil {
+				io.Copy(stdin, ch)
+			}
+			stdin.Close()
+		}()
 		status := uint32(0)
 		if err := cmd.Run(); err != nil {
 			status = 1
