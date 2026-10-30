@@ -415,16 +415,18 @@ func writeBackup(ctx context.Context, st Store, dir string, sync func(string) er
 // mkdirDurable creates dir and its missing parents, mode 0700, as
 // os.MkdirAll does, and after each directory it creates, syncs its
 // parent (with sync), from the top down: a backup synced in a directory
-// whose own entry a power loss can still undo is not on disk. dir's
-// parent is synced even when dir was there, in case a run that crashed
-// created it without the sync.
+// whose own entry a power loss can still undo is not on disk. The parent
+// of the deepest directory that was already there is synced first, in
+// case an earlier run created that directory and stopped before syncing
+// its entry.
 func mkdirDurable(dir string, sync func(string) error) error {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return err
 	}
 	var missing []string
-	for d := dir; ; d = filepath.Dir(d) {
+	d := dir
+	for ; ; d = filepath.Dir(d) {
 		fi, err := os.Stat(d)
 		if err == nil {
 			if !fi.IsDir() {
@@ -437,8 +439,10 @@ func mkdirDurable(dir string, sync func(string) error) error {
 		}
 		missing = append(missing, d)
 	}
-	if len(missing) == 0 {
-		return sync(filepath.Dir(dir))
+	if parent := filepath.Dir(d); parent != d {
+		if err := sync(parent); err != nil {
+			return err
+		}
 	}
 	for i := len(missing) - 1; i >= 0; i-- {
 		// One that appeared meanwhile is synced all the same.

@@ -271,11 +271,16 @@ func adminLockText(a *store.AdminRefusal, auto bool) string {
 	if !auto {
 		how = "with hop unlock"
 	}
+	// The hold outlives later answers (a 401 after the account was
+	// deleted, say), so this says what the server last reported and that
+	// the vault unlocks once the server accepts this device again, which
+	// is how the hold actually ends.
 	if a.Reason == "" {
-		return fmt.Sprintf("locked: the server's operator %s. Nothing was deleted. Ask the server's operator; "+
-			"the vault unlocks once the operator %s (%s)", what, undo, how)
+		return fmt.Sprintf("locked: the server last reported that its operator %s. Nothing was deleted. "+
+			"The vault unlocks once the server accepts this device again, usually when the operator %s (%s). Ask the server's operator",
+			what, undo, how)
 	}
-	return fmt.Sprintf("locked: the server says its operator %s. The operator's message: \"%s\". This is the server's word, not your vault's. "+
-		"Nothing was deleted. It unlocks once the operator %s (%s)",
+	return fmt.Sprintf("locked: the server last reported that its operator %s. The operator's message: \"%s\". This is the server's word, not your vault's. "+
+		"Nothing was deleted. The vault unlocks once the server accepts this device again, usually when the operator %s (%s). Ask the server's operator",
 		what, store.EscapeServerText(a.Reason), undo, how)
 }

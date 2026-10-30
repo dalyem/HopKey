@@ -641,7 +641,9 @@ func TestBackupDirIsDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	a, b := filepath.Join(root, "a"), filepath.Join(root, "a", "b")
-	if want := []string{root, a, b}; !slices.Equal(synced, want) {
+	// The parent of root (the deepest level already there) first, then
+	// the parent of each level created.
+	if want := []string{filepath.Dir(root), root, a, b}; !slices.Equal(synced, want) {
 		t.Errorf("synced %q, want %q", synced, want)
 	}
 	for _, d := range []string{a, b, dir} {
@@ -652,6 +654,33 @@ func TestBackupDirIsDurable(t *testing.T) {
 	synced = nil
 	if err := mkdirDurable(dir, record); err != nil || !slices.Equal(synced, []string{b}) {
 		t.Errorf("a directory that is there: synced %q, %v", synced, err)
+	}
+	// A run that stopped after creating a level, before syncing its
+	// parent, is made good by the next: the parent of the deepest level
+	// that is there is synced before anything below it.
+	for _, stop := range []string{"a", "b", "backups"} {
+		top := t.TempDir()
+		deep := filepath.Join(top, "a", "b", "backups")
+		failed := false
+		failAfter := func(d string) error {
+			// Fails the sync of the parent of the level named stop, once.
+			if !failed && d == filepath.Dir(filepath.Join(top, map[string]string{"a": "a", "b": "a/b", "backups": "a/b/backups"}[stop])) {
+				failed = true
+				return errors.New("injected")
+			}
+			return nil
+		}
+		if err := mkdirDurable(deep, failAfter); err == nil {
+			t.Fatalf("stop at %s: the injected sync failure was ignored", stop)
+		}
+		missed := filepath.Dir(filepath.Join(top, map[string]string{"a": "a", "b": "a/b", "backups": "a/b/backups"}[stop]))
+		synced = nil
+		if err := mkdirDurable(deep, record); err != nil {
+			t.Fatalf("stop at %s: retry: %v", stop, err)
+		}
+		if len(synced) == 0 || synced[0] != missed {
+			t.Errorf("stop at %s: retry synced %q, want %s first", stop, synced, missed)
+		}
 	}
 	notDir := filepath.Join(root, "file")
 	if err := os.WriteFile(notDir, nil, 0o600); err != nil {
