@@ -24,6 +24,8 @@ func newPlain(t model.Type) (crypto.Item, error) {
 		return new(model.Snippet), nil
 	case model.TypePolicy:
 		return new(model.Policy), nil
+	case model.TypeAccess:
+		return new(model.Access), nil
 	}
 	return nil, fmt.Errorf("store: %q items do not queue", t)
 }
@@ -98,7 +100,7 @@ func (s *Store) evaluate(in merge.Intent) (evaluation, error) {
 		return evaluation{res: merge.Result{Kind: merge.KindHold, Cause: merge.CauseIDTaken}}, nil
 	}
 	var ev evaluation
-	ev.res = merge.CheckCandidate(merge.Rebuild(in, cur, live, retired), func(action merge.Action, pt *merge.Item) error {
+	ev.res = merge.CheckCandidate(s.accessRebase(in, merge.Rebuild(in, cur, live, retired)), func(action merge.Action, pt *merge.Item) error {
 		var ch vaultlog.Changes
 		if action == merge.ActionDelete {
 			ch.Delete = []model.ID{in.ItemID}
@@ -297,6 +299,19 @@ func (s *Store) queuePut(it crypto.Item, isNew bool, cond *hostKeyWrite) error {
 	}
 	if err := crypto.ValidateItem(it); err != nil {
 		return err
+	}
+	if a, ok := it.(*model.Access); ok {
+		var cur *model.Access
+		if in.Seen != nil {
+			p, err := plainOf(in.Seen)
+			if err != nil {
+				return err
+			}
+			cur = p.(*model.Access)
+		}
+		if err := checkAccessWrite(cur, a); err != nil {
+			return err
+		}
 	}
 	if err := checkRefs(it, ov.items); err != nil {
 		return err

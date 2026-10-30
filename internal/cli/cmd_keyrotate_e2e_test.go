@@ -227,8 +227,22 @@ func (s *akServer) session(conn ssh.Conn, ch ssh.Channel, reqs <-chan *ssh.Reque
 		cmd := exec.Command("sh", "-c", p.Command)
 		cmd.Dir = s.home
 		cmd.Env = []string{"HOME=" + s.home, "PATH=" + path}
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = ch, ch, ch.Stderr()
+		// id -un needs the nss_wrapper of scripts/with-passwd.sh, if any.
+		for _, kv := range os.Environ() {
+			if strings.HasPrefix(kv, "LD_PRELOAD=") || strings.HasPrefix(kv, "NSS_WRAPPER_") {
+				cmd.Env = append(cmd.Env, kv)
+			}
+		}
+		cmd.Stdout, cmd.Stderr = ch, ch.Stderr()
 		cmd.WaitDelay = 2 * time.Second
+		// As sshd does, the session ends when the command exits, whether
+		// or not the client has closed its stdin: the copy into the
+		// command is not waited for.
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return
+		}
+		go func() { io.Copy(stdin, ch); stdin.Close() }()
 		status := uint32(0)
 		if err := cmd.Run(); err != nil {
 			status = 1

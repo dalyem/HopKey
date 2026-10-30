@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/dalyem/hopkey/internal/access"
 )
 
 // The authorized_keys edits of hop key rotate. hop reads the file over ssh,
@@ -83,14 +85,14 @@ const (
 	akHeldAdvice = `hop key rotate and hop access both use this lock, and hop never removes it on its own. ` +
 		`Remove it (rm -r LOCK) only when no hop key rotate and no hop access run can still be active for this account: ` +
 		`on every device you use, and on every machine that shares this home directory. ` +
-		`If you remove it while one is active, check ~/.ssh/authorized_keys by hand afterwards.`
+		`If you remove it while one is active, run hop access check afterwards.`
 	akHeldMsg    = `LOCK is held by another hop run: process $op took it at $ow, on the machine that took it. ` + akHeldAdvice
 	akNoOwnerMsg = `LOCK exists, with no owner in it: another hop run is taking it, or one was cut off. ` + akHeldAdvice
 	akProbeMsg   = `hop's temporary file can't be hard-linked into ~/.ssh, so hop can't be sure that replacing ~/.ssh/authorized_keys would be a rename; nothing changed`
 	akDirKeptMsg = `hop could not confirm that it removed its session directory ~/.ssh/.hop-s.TOKEN, so it left the lock LOCK in place. ` +
-		`Check ~/.ssh/authorized_keys by hand, remove ~/.ssh/.hop-s.TOKEN if it is still there, and then follow the advice for a held lock before you remove LOCK.`
+		`Check the file with hop access check, remove ~/.ssh/.hop-s.TOKEN if it is still there, and then follow the advice for a held lock before you remove LOCK.`
 	akLostLockMsg = `the lock LOCK was removed, replaced or unreadable when this hop run went to release it, ` +
-		`so another hop run may have edited ~/.ssh/authorized_keys at the same time. Check the file by hand.`
+		`so another hop run may have edited ~/.ssh/authorized_keys at the same time. Run hop access check.`
 	akUnlockMsg = `hop could not remove its lock LOCK. This hop run has finished; remove the lock (rm -r LOCK) once ` +
 		`no hop key rotate and no hop access run is active for this account, on any of your devices or machines that share this home directory.`
 )
@@ -118,49 +120,92 @@ func akWriteScript(from, to string) string {
 // login shell) are run by the tests only where the test machine has them,
 // and are not part of what hop claims to support.
 func akTokenScript(token, from, to string) string {
-	changed := `{ echo "~/.ssh/authorized_keys changed while hop was editing it" >&2; exit 83; }; `
-	return strings.NewReplacer("TOKEN", token, "LOCK", "~/.ssh/"+akLockDir, "WAIT", strconv.Itoa(akLockWait)).Replace(
-		`umask 077; f="$HOME/.ssh/authorized_keys"; d="$HOME/.ssh/` + akLockDir + `"; s="$HOME/.ssh/.hop-s.TOKEN"; p="$HOME/.ssh/.hop-p.TOKEN"; l=; o=; m=; x=; ` +
-			`if [ -L "$f" ]; then echo "~/.ssh/authorized_keys is a symbolic link; hop does not edit it" >&2; exit 81; fi; ` +
-			`if [ -f "$f" ]; then :; else echo "~/.ssh/authorized_keys does not exist" >&2; exit 82; fi; ` +
-			// same FILE "CRC SIZE": the file's cksum is that.
-			`same() { y=$(cksum < "$1") || return 1; set -- $y "$2"; [ "$1 $2" = "$3" ]; }; ` +
-			`owned() { { read -r ot op ow < "$d/owner"; } 2>/dev/null && [ "$ot" = "TOKEN" ]; }; ` +
-			// hop_end removes what this run made, and only that, trusting
-			// nothing but the exit statuses of rm and rmdir: $m the session
-			// directory, $l the lock, $o its owner line. If it cannot
-			// confirm the directory is gone, it keeps the lock.
-			`hop_end() { r=$1; trap '' HUP INT TERM PIPE; trap - EXIT; ` +
-			`if [ -n "$m" ]; then if rm -f "$s/new" "$p" && rmdir "$s"; then :; else echo "` + akDirKeptMsg + `" >&2; exit 89; fi; fi; ` +
-			`if [ -n "$l" ]; then if [ -n "$o" ] && owned; then :; elif [ -n "$o" ]; then echo "` + akLostLockMsg + `" >&2; exit 89; fi; ` +
-			`if rm -f "$d/owner" && rmdir "$d"; then :; else echo "` + akUnlockMsg + `" >&2; exit 89; fi; fi; ` +
-			`exit "$r"; }; ` +
-			// From here the exit status of a signal is not one of 81-85:
-			// the rename may have happened. While the script takes the
-			// lock and makes its session directory, a signal is only
-			// noted ($x): one that ended it between a mkdir and its flag
-			// would leave the lock, or the directory, behind. Once the
-			// flags are set the signal ends it, at once if one came.
-			`trap 'hop_end $?' EXIT; trap 'x=1' HUP INT TERM PIPE; ` +
-			`n=0; until mkdir "$d" 2>/dev/null; do [ -z "$x" ] || exit 86; n=$((n+1)); if [ $n -gt WAIT ]; then ` +
-			`if { read -r ot op ow < "$d/owner"; } 2>/dev/null; then echo "` + akHeldMsg + `" >&2; ` +
-			`else echo "` + akNoOwnerMsg + `" >&2; fi; ` +
-			`exit 85; fi; sleep 1; done; l=1; ` +
-			`if { echo "TOKEN $$ $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$d/owner"; } 2>/dev/null; then o=1; else echo "cannot write the lock LOCK" >&2; exit 84; fi; ` +
-			`if mkdir "$s" 2>/dev/null; then m=1; else echo "cannot create ~/.ssh/.hop-s.TOKEN" >&2; exit 84; fi; ` +
-			`trap 'hop_end 86' HUP INT TERM PIPE; [ -z "$x" ] || hop_end 86; ` +
-			`same "$f" "` + from + `" || ` + changed +
-			`(set -C; : > "$s/new") 2>/dev/null || { echo "cannot create a temporary file in ~/.ssh/.hop-s.TOKEN" >&2; exit 84; }; ` +
-			// The probe: if the temp file can be hard-linked into ~/.ssh,
-			// rename(2) cannot fail with EXDEV, so mv renames or fails; it
-			// never falls back to copying into authorized_keys.
-			`{ ln "$s/new" "$p" 2>/dev/null && rm -f "$p"; } || { echo "` + akProbeMsg + `" >&2; exit 84; }; ` +
-			`cp -p "$f" "$s/new" || exit 84; cat >| "$s/new" || exit 84; ` +
-			`same "$s/new" "` + to + `" || { echo "the new ~/.ssh/authorized_keys was not written completely" >&2; exit 84; }; ` +
-			`same "$f" "` + from + `" || ` + changed +
-			`mv -f "$s/new" "$f" || exit 86; ` +
-			`if command -v restorecon >/dev/null 2>&1; then restorecon "$f" >/dev/null 2>&1; fi; exit 0`)
+	return akFill(token, akScriptHead+akScriptWrite(`"`+from+`"`, `"`+to+`"`))
 }
+
+// akFill substitutes the token, the lock and the wait into a script.
+func akFill(token, script string) string {
+	return strings.NewReplacer("TOKEN", token, "LOCK", "~/.ssh/"+akLockDir, "WAIT", strconv.Itoa(akLockWait)).Replace(script)
+}
+
+// akScriptHead is what every hop edit of authorized_keys does first: the
+// symlink and missing-file checks, the lock, the owner line and the
+// session directory, with the exit trap that undoes them. hop key
+// rotate's write script and hop access's locked session both start with
+// it (spec rev 17, §7.7).
+const akScriptHead = `umask 077; f="$HOME/.ssh/authorized_keys"; d="$HOME/.ssh/` + akLockDir + `"; s="$HOME/.ssh/.hop-s.TOKEN"; p="$HOME/.ssh/.hop-p.TOKEN"; l=; o=; m=; x=; ` +
+	`if [ -L "$f" ]; then echo "~/.ssh/authorized_keys is a symbolic link; hop does not edit it" >&2; exit 81; fi; ` +
+	`if [ -f "$f" ]; then :; else echo "~/.ssh/authorized_keys does not exist" >&2; exit 82; fi; ` +
+	// same FILE "CRC SIZE": the file's cksum is that.
+	`same() { y=$(cksum < "$1") || return 1; set -- $y "$2"; [ "$1 $2" = "$3" ]; }; ` +
+	`owned() { { read -r ot op ow < "$d/owner"; } 2>/dev/null && [ "$ot" = "TOKEN" ]; }; ` +
+	// hop_end removes what this run made, and only that, trusting
+	// nothing but the exit statuses of rm and rmdir: $m the session
+	// directory, $l the lock, $o its owner line. If it cannot confirm the
+	// directory is gone, it keeps the lock.
+	`hop_end() { r=$1; trap '' HUP INT TERM PIPE; trap - EXIT; ` +
+	`if [ -n "$m" ]; then if rm -f "$s/new" "$p" && rmdir "$s"; then :; else echo "` + akDirKeptMsg + `" >&2; exit 89; fi; fi; ` +
+	`if [ -n "$l" ]; then if [ -n "$o" ] && owned; then :; elif [ -n "$o" ]; then echo "` + akLostLockMsg + `" >&2; exit 89; fi; ` +
+	`if rm -f "$d/owner" && rmdir "$d"; then :; else echo "` + akUnlockMsg + `" >&2; exit 89; fi; fi; ` +
+	`exit "$r"; }; ` +
+	// From here the exit status of a signal is not one of 81-85: the
+	// rename may have happened. While the script takes the lock and
+	// makes its session directory, a signal is only noted ($x): one that
+	// ended it between a mkdir and its flag would leave the lock, or the
+	// directory, behind. Once the flags are set the signal ends it, at
+	// once if one came.
+	`trap 'hop_end $?' EXIT; trap 'x=1' HUP INT TERM PIPE; ` +
+	`n=0; until mkdir "$d" 2>/dev/null; do [ -z "$x" ] || exit 86; n=$((n+1)); if [ $n -gt WAIT ]; then ` +
+	`if { read -r ot op ow < "$d/owner"; } 2>/dev/null; then echo "` + akHeldMsg + `" >&2; ` +
+	`else echo "` + akNoOwnerMsg + `" >&2; fi; ` +
+	`exit 85; fi; sleep 1; done; l=1; ` +
+	`if { echo "TOKEN $$ $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$d/owner"; } 2>/dev/null; then o=1; else echo "cannot write the lock LOCK" >&2; exit 84; fi; ` +
+	`if mkdir "$s" 2>/dev/null; then m=1; else echo "cannot create ~/.ssh/.hop-s.TOKEN" >&2; exit 84; fi; ` +
+	`trap 'hop_end 86' HUP INT TERM PIPE; [ -z "$x" ] || hop_end 86; `
+
+// akScriptWrite is the compare-then-rename: the file's cksum must still be
+// from, the temp file in the session directory must be hard-linkable into
+// ~/.ssh, the new content (stdin) must have cksum to, and the file is
+// compared once more before the rename. from and to are shell words.
+func akScriptWrite(from, to string) string {
+	changed := `{ echo "~/.ssh/authorized_keys changed while hop was editing it" >&2; exit 83; }; `
+	return `same "$f" ` + from + ` || ` + changed +
+		`(set -C; : > "$s/new") 2>/dev/null || { echo "cannot create a temporary file in ~/.ssh/.hop-s.TOKEN" >&2; exit 84; }; ` +
+		// The probe: if the temp file can be hard-linked into ~/.ssh,
+		// rename(2) cannot fail with EXDEV, so mv renames or fails; it
+		// never falls back to copying into authorized_keys.
+		`{ ln "$s/new" "$p" 2>/dev/null && rm -f "$p"; } || { echo "` + akProbeMsg + `" >&2; exit 84; }; ` +
+		`cp -p "$f" "$s/new" || exit 84; cat >| "$s/new" || exit 84; ` +
+		`same "$s/new" ` + to + ` || { echo "the new ~/.ssh/authorized_keys was not written completely" >&2; exit 84; }; ` +
+		`same "$f" ` + from + ` || ` + changed +
+		`mv -f "$s/new" "$f" || exit 86; ` +
+		`if command -v restorecon >/dev/null 2>&1; then restorecon "$f" >/dev/null 2>&1; fi; exit 0`
+}
+
+// The locked session of hop access (spec rev 17, §7.7): rotate's write
+// script with the read and the decision inside the lock. Once it holds the
+// lock it sends one header line, "hop-session 1 USER CRC SIZE", and then
+// the file; then it reads one decision line from stdin: "abort", or
+// "write FROM_CRC FROM_SIZE TO_CRC TO_SIZE" followed by the new content to
+// the end of input. Anything else, or the end of input before a whole
+// line, exits akExitDecision with nothing changed.
+const akExitDecision = 87
+
+const akSessionBody = `x=$(cksum < "$f") || exit 84; set -- $x; u=$(id -un) || exit 84; ` +
+	`echo "hop-session 1 $u $1 $2"; cat -- "$f" || exit 84; ` +
+	`num() { [ -n "$1" ] && [ -z "$(printf %s "$1" | tr -d 0-9)" ]; }; ` +
+	`if read -r cmd a b c e; then :; else exit 87; fi; ` +
+	`if [ "$cmd" = write ]; then :; else exit 87; fi; ` +
+	`for v in "$a" "$b" "$c" "$e"; do num "$v" || exit 87; done; `
+
+// akSessionScript is the access session with token.
+func akSessionScript(token string) string {
+	return akFill(token, akScriptHead+akSessionBody+akScriptWrite(`"$a $b"`, `"$c $e"`))
+}
+
+// akSessionRefused reports whether a session's exit status means it
+// stopped before the rename: 81 to 85, and 87.
+func akSessionRefused(code int) bool { return akRefused(code) || code == akExitDecision }
 
 // akRefused reports whether an exit status of the write script means it
 // stopped before the rename. Every other status, 86 and 89 among them,
@@ -197,7 +242,7 @@ func cksum(data []byte) string {
 	return fmt.Sprintf("%d %d", ^crc, len(data))
 }
 
-// akKey is an authorized_keys line that holds a key.
+// akKey is an authorized_keys line that holds a key (access.KeyLine).
 type akKey struct {
 	pub     ssh.PublicKey
 	options string // the options before the key type, exactly as written; "" for none
@@ -210,139 +255,19 @@ type akKey struct {
 	marked bool
 }
 
-// akMarker is the start of a hop access marker token in a comment.
-const akMarker = "hop-access:"
+// readMarker is access.ReadMarker.
+func readMarker(comment string) (id string, marked bool) { return access.ReadMarker(comment) }
 
-// readMarker says whether a comment carries a hop access marker: a token
-// (between spaces and tabs) that starts with hop-access:, in any case. id
-// is the record ID after it when that is 32 lowercase hex digits.
-func readMarker(comment string) (id string, marked bool) {
-	for _, tok := range strings.FieldsFunc(comment, func(r rune) bool { return r == ' ' || r == '\t' }) {
-		if len(tok) < len(akMarker) || !asciiEqualFold(tok[:len(akMarker)], akMarker) {
-			continue
-		}
-		if id = tok[len(akMarker):]; len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
-			id = ""
-		}
-		return id, true
-	}
-	return "", false
-}
-
-// asciiEqualFold compares a and b with ASCII letters folded, and no other.
-func asciiEqualFold(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		x, y := a[i], b[i]
-		if 'A' <= x && x <= 'Z' {
-			x += 'a' - 'A'
-		}
-		if 'A' <= y && y <= 'Z' {
-			y += 'a' - 'A'
-		}
-		if x != y {
-			return false
-		}
-	}
-	return true
-}
-
-// parseAKLine reads one authorized_keys line as sshd does: the key type
-// and its base64 at the start of the line, or else an options field first,
-// which runs to the first space or tab outside double quotes (a \" does
-// not end the quotes), and then the key. ok is false for blank lines,
-// comments (hop access tombstones among them) and anything sshd would not
-// take as a key, which hop leaves alone.
+// parseAKLine reads one authorized_keys line as sshd does
+// (access.ParseKeyLine). ok is false for blank lines, comments (hop access
+// tombstones among them) and anything sshd would not take as a key, which
+// hop leaves alone.
 func parseAKLine(line string) (k akKey, ok bool) {
-	s := strings.TrimLeft(strings.TrimSuffix(line, "\r"), " \t")
-	if s == "" || s[0] == '#' {
-		return k, false
-	}
-	if pub, comment, ok := parseAKKey(s); ok {
-		k = akKey{pub: pub, comment: comment}
-		k.marker, k.marked = readMarker(comment)
-		return k, true
-	}
-	end, ok := akOptionsEnd(s)
+	l, ok := access.ParseKeyLine(line)
 	if !ok {
 		return k, false
 	}
-	pub, comment, ok := parseAKKey(strings.TrimLeft(s[end:], " \t"))
-	if !ok {
-		return k, false
-	}
-	k = akKey{pub: pub, options: s[:end], comment: comment}
-	k.marker, k.marked = readMarker(comment)
-	for _, o := range splitAKOptions(k.options) {
-		if strings.EqualFold(o, "cert-authority") {
-			k.certCA = true
-		}
-	}
-	return k, true
-}
-
-// akOptionsEnd is sshd's sshkey_advance_past_options: the index of the
-// first space or tab outside quotes. An unterminated quote is not ok.
-func akOptionsEnd(s string) (int, bool) {
-	quoted := false
-	i := 0
-	for ; i < len(s) && (quoted || (s[i] != ' ' && s[i] != '\t')); i++ {
-		switch {
-		case s[i] == '\\' && i+1 < len(s) && s[i+1] == '"':
-			i++ // both
-		case s[i] == '"':
-			quoted = !quoted
-		}
-	}
-	return i, !(i == len(s) && quoted)
-}
-
-// splitAKOptions splits an options field at the commas outside quotes.
-func splitAKOptions(opts string) []string {
-	var out []string
-	quoted, start := false, 0
-	for i := 0; i < len(opts); i++ {
-		switch {
-		case opts[i] == '\\' && i+1 < len(opts) && opts[i+1] == '"':
-			i++
-		case opts[i] == '"':
-			quoted = !quoted
-		case opts[i] == ',' && !quoted:
-			out = append(out, opts[start:i])
-			start = i + 1
-		}
-	}
-	return append(out, opts[start:])
-}
-
-// parseAKKey reads "<type> <base64>[ <comment>]": the key, if the type
-// names a key and the base64 holds a key of that type, and the comment,
-// without the spaces and tabs around it.
-func parseAKKey(s string) (ssh.PublicKey, string, bool) {
-	typ, rest, ok := cutSpace(s)
-	if !ok {
-		return nil, "", false
-	}
-	b64, comment, _ := cutSpace(strings.TrimLeft(rest, " \t"))
-	blob, err := base64.StdEncoding.DecodeString(b64)
-	if err != nil {
-		return nil, "", false
-	}
-	pub, err := ssh.ParsePublicKey(blob)
-	if err != nil || pub.Type() != typ {
-		return nil, "", false
-	}
-	return pub, strings.Trim(comment, " \t"), true
-}
-
-// cutSpace cuts s at its first space or tab.
-func cutSpace(s string) (before, after string, found bool) {
-	if i := strings.IndexAny(s, " \t"); i >= 0 {
-		return s[:i], s[i+1:], true
-	}
-	return s, "", s != ""
+	return akKey{pub: l.Pub, options: l.Options, certCA: l.CertCA, comment: l.Comment, marker: l.Marker, marked: l.Marked}, true
 }
 
 // akEdit is the plan for one host's authorized_keys.

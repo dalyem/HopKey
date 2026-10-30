@@ -302,6 +302,7 @@ func TestClassificationIsComplete(t *testing.T) {
 	for typ, v := range map[model.Type]any{
 		model.TypeHost: model.Host{}, model.TypeSnippet: model.Snippet{}, model.TypeKey: model.Key{},
 		model.TypeCredential: model.Credential{}, model.TypePolicy: model.Policy{},
+		model.TypeAccess: model.Access{},
 	} {
 		cl := classifications[typ]
 		if cl == nil {
@@ -322,6 +323,12 @@ func TestClassificationIsComplete(t *testing.T) {
 			if cl.sets[m] != nil {
 				kinds++
 			}
+			if slices.Contains(cl.system, m) {
+				kinds++
+				if IsGuarded(typ, m) {
+					t.Errorf("%s.%s is a system member but guarded", typ, m)
+				}
+			}
 			units := 0
 			for _, u := range cl.units {
 				if slices.Contains(u.members, m) {
@@ -339,7 +346,7 @@ func TestClassificationIsComplete(t *testing.T) {
 			}
 		}
 		// Nothing the tables list is missing from the type.
-		listed := slices.Clone(cl.free)
+		listed := slices.Concat(cl.free, cl.system)
 		for m := range cl.sets {
 			listed = append(listed, m)
 		}
@@ -357,6 +364,18 @@ func TestClassificationIsComplete(t *testing.T) {
 	}
 	if _, ok := classifications[model.TypeGrant]; ok {
 		t.Error("grants are never merged")
+	}
+	// by is access's one system member; no other type has one (§5.0).
+	if got := jsonMembers(reflect.TypeOf(model.Access{})); len(got) != 7 {
+		t.Errorf("access has members %v, want 7", got)
+	}
+	for typ, cl := range classifications {
+		if want := typ == model.TypeAccess; want != (len(cl.system) > 0) {
+			t.Errorf("%s has system members %v", typ, cl.system)
+		}
+	}
+	if !IsSystem(model.TypeAccess, "by") || IsSystem(model.TypeHost, "by") {
+		t.Error("IsSystem")
 	}
 }
 

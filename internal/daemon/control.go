@@ -268,6 +268,9 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 	if result, ok, err := d.dispatchSync(ctx, req); ok {
 		return result, err
 	}
+	if result, ok, err := d.dispatchAccess(ctx, req, decode); ok {
+		return result, err
+	}
 	return nil, invalidf("unknown op %q", req.Op)
 }
 
@@ -763,6 +766,24 @@ func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	snap, err := d.store.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	// Access records are deleted only through hop access (rm, forget),
+	// and a host can't go while one still has it in a state that isn't
+	// removed or abandoned (crypto spec rev 17, §7.5).
+	for _, a := range snap.Access {
+		if a.ItemID == id {
+			return invalidf("%s is a hop access record; use hop access rm or hop access forget", a.Label)
+		}
+		for _, t := range a.Targets {
+			if t.HostItemID == id && !model.AccessTerminal(t.State) {
+				return invalidf("hop access record %s still has this host %s; run hop access rm %s first, or hop access rm %s --abandon HOST",
+					a.Label, t.State, a.Label, a.Label)
+			}
+		}
+	}
 	if err := d.store.Delete(ctx, id); err != nil {
 		return storeError(err)
 	}

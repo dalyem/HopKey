@@ -12,6 +12,8 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/dalyem/hopkey/internal/access"
+	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/model"
 )
 
@@ -22,10 +24,17 @@ type Store struct {
 	// the error is returned to the caller.
 	Persist func(model.Snapshot) error
 
+	// DeviceID is the device the store stamps on access records (by).
+	// Zero means DefaultDeviceID.
+	DeviceID model.ID
+
 	mu     sync.Mutex
 	snap   model.Snapshot
 	writes int
 }
+
+// DefaultDeviceID is the device a Store stamps by default.
+var DefaultDeviceID = model.ID{0xde, 0x71, 0xce}
 
 var _ model.Store = (*Store)(nil)
 
@@ -89,6 +98,7 @@ func (s *Store) Delete(_ context.Context, id model.ID) error {
 	next.Keys = without(next.Keys, id, &found, func(k *model.Key) *model.Header { return &k.Header })
 	next.Credentials = without(next.Credentials, id, &found, func(c *model.Credential) *model.Header { return &c.Header })
 	next.Snippets = without(next.Snippets, id, &found, func(sn *model.Snippet) *model.Header { return &sn.Header })
+	next.Access = without(next.Access, id, &found, func(a *model.Access) *model.Header { return &a.Header })
 	if !found {
 		return model.ErrNotFound
 	}
@@ -177,7 +187,8 @@ func holdsID(snap model.Snapshot, id model.ID) bool {
 	return slices.ContainsFunc(snap.Hosts, func(x model.Host) bool { return x.ItemID == id }) ||
 		slices.ContainsFunc(snap.Keys, func(x model.Key) bool { return x.ItemID == id }) ||
 		slices.ContainsFunc(snap.Credentials, func(x model.Credential) bool { return x.ItemID == id }) ||
-		slices.ContainsFunc(snap.Snippets, func(x model.Snippet) bool { return x.ItemID == id })
+		slices.ContainsFunc(snap.Snippets, func(x model.Snippet) bool { return x.ItemID == id }) ||
+		slices.ContainsFunc(snap.Access, func(x model.Access) bool { return x.ItemID == id })
 }
 
 func normalizeHost(h model.Host) model.Host {
@@ -258,7 +269,62 @@ func cloneSnapshot(s model.Snapshot) model.Snapshot {
 		sn.Params = slices.Clone(sn.Params)
 		out.Snippets = append(out.Snippets, sn)
 	}
+	for _, a := range s.Access {
+		out.Access = append(out.Access, *access.Clone(&a))
+	}
 	return out
+}
+
+// PutAccess creates or replaces an access record, stamped with DeviceID,
+// after the schema and V_access (crypto spec rev 17, §5.1).
+func (s *Store) PutAccess(_ context.Context, a model.Access) (model.Access, error) {
+	a = *access.Clone(&a)
+	a.By = s.DeviceID
+	if a.By.IsZero() {
+		a.By = DefaultDeviceID
+	}
+	check := a
+	if check.ItemID.IsZero() {
+		check.ItemID = model.ID{1}
+	}
+	check.V, check.Type = 1, model.TypeAccess
+	if err := crypto.ValidateAccess(&check); err != nil {
+		return model.Access{}, err
+	}
+	var cur *model.Access
+	if !a.ItemID.IsZero() {
+		s.mu.Lock()
+		for i := range s.snap.Access {
+			if s.snap.Access[i].ItemID == a.ItemID {
+				cur = access.Clone(&s.snap.Access[i])
+			}
+		}
+		s.mu.Unlock()
+	}
+	if err := access.Check(cur, &a, access.PathWrite); err != nil {
+		return model.Access{}, err
+	}
+	return put(s, a, model.TypeAccess, func(sn *model.Snapshot) *[]model.Access { return &sn.Access }, func(a *model.Access) *model.Header { return &a.Header })
+}
+
+// DeleteAccess deletes an access record whose targets are all terminal,
+// and removed unless forget.
+func (s *Store) DeleteAccess(ctx context.Context, id model.ID, forget bool) error {
+	s.mu.Lock()
+	var cur *model.Access
+	for i := range s.snap.Access {
+		if s.snap.Access[i].ItemID == id {
+			cur = access.Clone(&s.snap.Access[i])
+		}
+	}
+	s.mu.Unlock()
+	if cur == nil {
+		return model.ErrNotFound
+	}
+	if err := access.CheckDelete(cur, forget); err != nil {
+		return err
+	}
+	return s.Delete(ctx, id)
 }
 
 func cloneHost(h model.Host) model.Host {

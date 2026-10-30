@@ -319,6 +319,7 @@ func (s *Server) routes() {
 	lim := s.lim
 	for _, rt := range []*route{
 		{pattern: "GET /v1/healthz", ipRate: s.rates.IP, h: s.healthz},
+		{pattern: "GET /v1/capabilities", ipRate: s.rates.IP, h: s.capabilities},
 		{pattern: "POST /v1/prelogin", ipRate: s.rates.PreloginIP, body: lim.MaxBody, h: s.prelogin},
 		{pattern: "POST /v1/login", ipRate: s.rates.LoginIP, body: lim.MaxBody, h: s.login},
 		{pattern: "POST /v1/recover", ipRate: s.rates.LoginIP, body: lim.MaxBody, h: s.recover},
@@ -769,6 +770,17 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request, c *call) error 
 		OK      bool   `json:"ok"`
 		Version string `json:"version"`
 	}{true, version.Version})
+	return nil
+}
+
+// capabilities: GET /v1/capabilities → JCS({"v":1, "item_types":[...]}),
+// the item types this build accepts, sorted (crypto spec rev 17, §5.3). It
+// describes the build, not an account, so it needs no authentication.
+func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, c *call) error {
+	writeJSON(w, http.StatusOK, struct {
+		V         int          `json:"v"`
+		ItemTypes []model.Type `json:"item_types"`
+	}{1, vaultlog.ItemTypes()})
 	return nil
 }
 
