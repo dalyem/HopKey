@@ -343,9 +343,13 @@ func printForkPlan(out io.Writer, p store.ForkPlan, discardOld bool) {
 func printForkDone(out io.Writer, r *store.ForkResult) {
 	fmt.Fprintf(out, "\nForked: %s now holds a new local-only vault (account %s, vault %s, device %s).\n",
 		oneLine(r.DataDir), r.New.AccountID, r.New.VaultID, r.New.DeviceID)
-	if r.Discarded {
+	switch {
+	case r.Discarded:
 		fmt.Fprintln(out, "The old vault was deleted from this device.")
-	} else {
+	case r.BackupMissing:
+		fmt.Fprintf(out, "The old vault is missing from %s, and the fork could not verify that it deleted it (was it moved away?). "+
+			"If a copy of it is elsewhere, delete that when you no longer need it.\n", oneLine(r.Backup))
+	default:
 		fmt.Fprintf(out, "The old vault is kept in %s; nothing opens or syncs it there. Delete it when you no longer need it.\n", oneLine(r.Backup))
 	}
 	if len(r.OtherDevices) > 0 || len(r.Departed) > 0 {

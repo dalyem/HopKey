@@ -400,6 +400,7 @@ func TestForkCrashAtEachStep(t *testing.T) {
 		{"fork:imported", false, false},
 		{"fork:verified", true, false},
 		{"fork:moved-old", true, false},
+		{"fork:moved-old", true, true},
 		{"fork:moved-new", true, false},
 		{"fork:moved-new", true, true},
 		{"fork:discarding", true, true},
