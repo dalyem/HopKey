@@ -466,7 +466,9 @@ func TestPredecessorWritesAreSerialized(t *testing.T) {
 	}
 	for name, op := range map[string]func(dir string, old Predecessor) error{
 		"forget": func(dir string, old Predecessor) error { return ForgetPredecessor(dir, old.DeviceID) },
-		"mark":   func(dir string, old Predecessor) error { return MarkPredecessorReported(dir, old.DeviceID) },
+		"mark": func(dir string, old Predecessor) error {
+			return MarkPredecessorReported(dir, old.DeviceID, AdviceRevoke)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -507,9 +509,10 @@ func TestPredecessorWritesAreSerialized(t *testing.T) {
 	}
 }
 
-// An entry is unreported until a command has shown it; marking is
-// idempotent, an entry that is not there is no error, and a record
-// written before the mark existed still parses.
+// An entry is unreported until a command has shown it; marking records
+// which advice was shown, replaces an earlier kind, is idempotent, no
+// advice or an entry that is not there is no error and no change, and a
+// record written before the mark existed still parses.
 func TestPredecessorReportedMark(t *testing.T) {
 	dir := t.TempDir()
 	p := Predecessor{AccountID: model.ID{1}, DeviceID: model.ID{2, 1}, Server: "https://hop.example", Email: "a@example.com",
@@ -517,18 +520,30 @@ func TestPredecessorReportedMark(t *testing.T) {
 	if err := recordPredecessor(dir, p); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := ReadPredecessors(dir); len(got) != 1 || got[0].IsReported() {
+	if got, _ := ReadPredecessors(dir); len(got) != 1 || got[0].Reported != "" {
 		t.Fatalf("a new entry: %+v", got)
 	}
 	for i := 0; i < 2; i++ {
-		if err := MarkPredecessorReported(dir, p.DeviceID); err != nil {
+		if err := MarkPredecessorReported(dir, p.DeviceID, AdviceRevoke); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := MarkPredecessorReported(dir, model.ID{9}); err != nil {
+	if err := MarkPredecessorReported(dir, model.ID{9}, AdviceRevoke); err != nil {
 		t.Errorf("marking an unknown device: %v", err)
 	}
-	if got, _ := ReadPredecessors(dir); len(got) != 1 || !got[0].IsReported() || got[0].Why != AdminDeviceBlocked {
+	if got, _ := ReadPredecessors(dir); len(got) != 1 || got[0].Reported != AdviceRevoke || got[0].Why != AdminDeviceBlocked {
 		t.Errorf("after marking: %+v", got)
+	}
+	if err := MarkPredecessorReported(dir, p.DeviceID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ReadPredecessors(dir); got[0].Reported != AdviceRevoke {
+		t.Errorf("marking no advice changed the entry: %+v", got)
+	}
+	if err := MarkPredecessorReported(dir, p.DeviceID, AdviceRotate); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ReadPredecessors(dir); got[0].Reported != AdviceRotate {
+		t.Errorf("a different advice did not replace the earlier one: %+v", got)
 	}
 }

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"slices"
 
 	"github.com/dalyem/hopkey/internal/daemon"
@@ -144,10 +145,41 @@ func oldDevices(entries []store.Predecessor, accountID string, active []store.De
 	return out
 }
 
+// advice is the kind of advice the report carries: store.AdviceRevoke
+// while the identity is still in the account, store.AdviceRotate when it
+// is out but the lock it was under warrants new keys, and "" when there
+// is nothing more to say. A predecessor entry records the kind a command
+// has shown, so that advice that changes (the device list was unknown,
+// then known) is shown again before the entry is consumed.
+func (r oldDeviceReport) advice() string {
+	switch {
+	case r.StillInAccount:
+		return store.AdviceRevoke
+	case r.Command != "":
+		return store.AdviceRotate
+	}
+	return ""
+}
+
+// checkedPrinter writes to w and keeps the first error: the report of
+// the old identities is consumed only if it was written.
+type checkedPrinter struct {
+	w   io.Writer
+	err error
+}
+
+func (p *checkedPrinter) printf(format string, args ...any) {
+	if p.err == nil {
+		_, p.err = fmt.Fprintf(p.w, format, args...)
+	}
+}
+
 // printOldDevices tells the user, after a sign-in, what became of the
 // identity this machine had before (Q15): it prints the exact command and
-// runs nothing.
-func printOldDevices(e *Env, rs []oldDeviceReport) {
+// runs nothing. It fails with the first write error: output that did not
+// get out has not told the user anything.
+func printOldDevices(w io.Writer, rs []oldDeviceReport) error {
+	p := &checkedPrinter{w: w}
 	for _, r := range rs {
 		id := oneLine(r.DeviceID)
 		locked := "was logged out of"
@@ -157,47 +189,61 @@ func printOldDevices(e *Env, rs []oldDeviceReport) {
 		case store.AdminAccountDisabled:
 			locked = "the operator's disabling of the account had locked when you logged it out of"
 		}
-		e.printf("\nBefore this sign-in, this machine was device %s, which %s the account.\n", id, locked)
+		p.printf("\nBefore this sign-in, this machine was device %s, which %s the account.\n", id, locked)
 		if r.DiscardedChanges > 0 {
 			held := ""
 			if r.HeldChanges > 0 {
 				held = fmt.Sprintf(", %d of them held for your decision,", r.HeldChanges)
 			}
-			e.printf("The %d change(s) it had queued%s were discarded by that logout; make them again here if you still need them.\n", r.DiscardedChanges, held)
+			p.printf("The %d change(s) it had queued%s were discarded by that logout; make them again here if you still need them.\n", r.DiscardedChanges, held)
 		}
 		switch {
 		case r.StillInAccount:
-			e.printf("That logout did not tell the server (--local-only), so %s is still in the account. Nothing was changed for you.\n", id)
-			e.printf("If its files could have been copied while it was locked, cut it off from this device:\n")
-			e.printf("    %s\n", r.Command)
-			e.printf("That replaces every key in the account and shows a new Emergency Kit. If you are sure nobody copied the files, you can leave it: a block can be lifted by the operator, a revocation can't.\n")
+			p.printf("That logout did not tell the server (--local-only), so %s is still in the account. Nothing was changed for you.\n", id)
+			p.printf("If its files could have been copied while it was locked, cut it off from this device:\n")
+			p.printf("    %s\n", r.Command)
+			p.printf("That replaces every key in the account and shows a new Emergency Kit. If you are sure nobody copied the files, you can leave it: a block can be lifted by the operator, a revocation can't.\n")
 		default:
 			if r.Outcome == store.OutcomeUnknown {
-				e.printf("That logout did not tell the server, but %s is not in the account now", id)
+				p.printf("That logout did not tell the server, but %s is not in the account now", id)
 				if r.Command == "" {
-					e.printf(": nothing is left to cut off.\n")
+					p.printf(": nothing is left to cut off.\n")
 				} else {
-					e.printf(".\n")
+					p.printf(".\n")
 				}
 			} else {
-				e.printf("That logout removed it from the account.\n")
+				p.printf("That logout removed it from the account.\n")
 			}
 			if r.Command != "" {
-				e.printf("If its files could have been copied while it was locked, replace every key in the account with:\n    %s\n", r.Command)
-				e.printf("and keep only the devices you trust.\n")
+				p.printf("If its files could have been copied while it was locked, replace every key in the account with:\n    %s\n", r.Command)
+				p.printf("and keep only the devices you trust.\n")
 			}
 		}
 		if r.Why != "" || r.StillInAccount {
-			e.printf("The SSH keys and passwords stored in the vault are not changed by any of this. If the files may have been copied, rotate the SSH keys (hop key rotate) and change the passwords where they are used.\n")
+			p.printf("The SSH keys and passwords stored in the vault are not changed by any of this. If the files may have been copied, rotate the SSH keys (hop key rotate) and change the passwords where they are used.\n")
 		}
 	}
+	return p.err
+}
+
+// reportLoginOldDevices prints the old-device advice at the end of a
+// sign-in and, only once it was written, settles the entries. A write
+// that failed (a full disk) leaves them for hop auth status to show.
+func reportLoginOldDevices(w io.Writer, rs []oldDeviceReport, settle func()) error {
+	if err := printOldDevices(w, rs); err != nil {
+		return fmt.Errorf("writing what became of this machine's earlier identity: %w", err)
+	}
+	settle()
+	return nil
 }
 
 // settleOldDevices is what a command does with the identities it has
 // just reported: it forgets the ones that are not still in the account,
-// and marks the others reported. active is the devices the verified log
-// lists now, and ok whether it could be read; without it nothing is
-// forgotten, only marked.
+// and marks the others with the advice that was shown (oldDevice's, with
+// the same active and ok the report was made from). active is the devices
+// the verified log lists now, and ok whether it could be read; without it
+// nothing is forgotten, only marked, and the mark is the advice a command
+// that did not know the device list gave.
 func settleOldDevices(dataDir string, entries []store.Predecessor, accountID string, active []store.DeviceListing, ok bool) error {
 	for _, p := range entries {
 		if p.AccountID.String() != accountID {
@@ -207,7 +253,7 @@ func settleOldDevices(dataDir string, entries []store.Predecessor, accountID str
 		if ok && !slices.ContainsFunc(active, func(d store.DeviceListing) bool { return d.ID == p.DeviceID }) {
 			err = store.ForgetPredecessor(dataDir, p.DeviceID)
 		} else {
-			err = store.MarkPredecessorReported(dataDir, p.DeviceID)
+			err = store.MarkPredecessorReported(dataDir, p.DeviceID, oldDevice(p, active, ok).advice())
 		}
 		if err != nil {
 			return err
@@ -222,9 +268,12 @@ func settleOldDevices(dataDir string, entries []store.Predecessor, accountID str
 // yet: a sign-in that was cut short between installing the new identity
 // and printing leaves them unreported. An identity with nothing more to
 // say, or whose advice was shown before, is forgotten when the device
-// list could be read. Nothing it returns is consumed here: the returned
-// function marks the shown entries reported, and the caller runs it once
-// they are printed.
+// list could be read. Advice that differs from what was shown before (a
+// status with no device list assumed the identity was still in the
+// account and said revoke; the list now says it is gone, and rotate is
+// new) is shown again. Nothing it returns is consumed here: the returned
+// function marks the shown entries with the advice shown, and the caller
+// runs it once the lines are written.
 func statusOldDevices(ctx context.Context, e *Env, c *daemon.Client, accountID string, unlocked bool) ([]oldDeviceReport, func()) {
 	dataDir := e.storeConfig().DataDir
 	entries, err := store.ReadPredecessors(dataDir)
@@ -247,7 +296,7 @@ func reportOldDevices(dataDir string, entries []store.Predecessor, accountID str
 		}
 		r := oldDevice(p, active, known)
 		switch {
-		case r.StillInAccount, r.Command != "" && !p.IsReported():
+		case r.StillInAccount, r.Command != "" && p.Reported != r.advice():
 			out = append(out, r)
 			shown = append(shown, p)
 		case known:
@@ -255,8 +304,8 @@ func reportOldDevices(dataDir string, entries []store.Predecessor, accountID str
 		}
 	}
 	return out, func() {
-		for _, p := range shown {
-			_ = store.MarkPredecessorReported(dataDir, p.DeviceID)
+		for i, p := range shown {
+			_ = store.MarkPredecessorReported(dataDir, p.DeviceID, out[i].advice())
 		}
 	}
 }
@@ -274,6 +323,20 @@ func oldDeviceLines(rs []oldDeviceReport) []string {
 		out = append(out, fmt.Sprintf("old device:   %s, this machine's earlier identity, is out of the account, but it was locked out by the operator; if its files could have been copied, replace every key in the account: %s (shown once)", id, r.Command))
 	}
 	return out
+}
+
+// printOldDeviceLines writes oldDeviceLines to w, and fails with the
+// first write error: hop auth status consumes the advice only once it
+// was written.
+func printOldDeviceLines(w io.Writer, rs []oldDeviceReport) error {
+	p := &checkedPrinter{w: w}
+	for _, l := range oldDeviceLines(rs) {
+		p.printf("%s\n", l)
+	}
+	if p.err != nil {
+		return fmt.Errorf("writing what became of this machine's earlier identity: %w", p.err)
+	}
+	return nil
 }
 
 // loginAdminHint is what hop auth login says when the machine is

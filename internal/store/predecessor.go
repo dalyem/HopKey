@@ -22,7 +22,7 @@ import (
 //
 //	vault/retire-note.json = JCS({"v":1, "server":s, "email":s, "queued":n, "held":n, "why":""|"device_blocked"|"account_disabled"})
 //	predecessor.json       = JCS({"v":1, "entries":[{"account_id":id, "device_id":id, "server":s, "email":s,
-//	                              "outcome":"committed"|"departed"|"unknown", "queued":n, "held":n, "why":..., "reported":""|"yes", "at":ts}]})
+//	                              "outcome":"committed"|"departed"|"unknown", "queued":n, "held":n, "why":..., "reported":""|"revoke"|"rotate", "at":ts}]})
 //
 // The note is written in the same commit as the retirement journal, so
 // the journal never exists without it. The cleanup of a RETIRED logout
@@ -40,9 +40,10 @@ import (
 // before the logout can finish. Every read-modify-write of
 // predecessor.json runs under predecessor.lock in the data directory, so
 // that a sign-in, a status and a logout in different processes never lose
-// each other's entries. An entry carries "reported" once a command has
-// told the user about it; the commands that consume an entry
-// (hop auth status) show it first when it was never reported.
+// each other's entries. An entry carries "reported", the advice
+// (revoke or rotate) a command has told the user about it; the commands
+// that consume an entry (hop auth status) show the advice first when the
+// one that applies now was never shown.
 
 const (
 	retireNoteRel      = "retire-note.json"
@@ -70,8 +71,9 @@ type retireNote struct {
 // told: the device may still be in the account). Queued and Held are the
 // changes the logout discarded, the held ones among them. Why is
 // AdminDeviceBlocked or AdminAccountDisabled when the operator's refusal
-// had locked the device, and "" otherwise. Reported is "yes" once a
-// command has shown the user what became of the identity, and "" before.
+// had locked the device, and "" otherwise. Reported is the advice
+// a command has shown the user about the identity (AdviceRevoke or
+// AdviceRotate), and "" before any.
 type Predecessor struct {
 	AccountID model.ID        `json:"account_id"`
 	DeviceID  model.ID        `json:"device_id"`
@@ -85,11 +87,16 @@ type Predecessor struct {
 	At        model.Timestamp `json:"at"`
 }
 
-// predecessorReported is the value of Predecessor.Reported.
-const predecessorReported = "yes"
-
-// IsReported says whether the user has been told about this identity.
-func (p Predecessor) IsReported() bool { return p.Reported == predecessorReported }
+// The advice a command can have shown for a predecessor, the values of
+// Predecessor.Reported: AdviceRevoke while the identity is still in the
+// account (revoke it from a trusted device), AdviceRotate when it is out
+// of the account but the lock it was under warrants new keys. An entry
+// written by a build that recorded "yes" matches neither, so the advice
+// is shown once more.
+const (
+	AdviceRevoke = "revoke"
+	AdviceRotate = "rotate"
+)
 
 // predecessorRMWHook is a test seam: it runs between the read and the
 // write of a read-modify-write of predecessor.json, with the lock held.
@@ -191,9 +198,14 @@ func ForgetPredecessor(dataDir string, id model.ID) error {
 	return writePredecessors(dataDir, kept)
 }
 
-// MarkPredecessorReported records that the user has been told about the
-// entry for device id. An entry that is not there is no error.
-func MarkPredecessorReported(dataDir string, id model.ID) error {
+// MarkPredecessorReported records that the user has been shown advice
+// (AdviceRevoke or AdviceRotate) about the entry for device id, in place
+// of whatever was shown before. No advice, or an entry that is not
+// there, is no error and no change.
+func MarkPredecessorReported(dataDir string, id model.ID, advice string) error {
+	if advice == "" {
+		return nil
+	}
 	unlock, err := lockPredecessors(dataDir)
 	if err != nil {
 		return err
@@ -211,8 +223,8 @@ func MarkPredecessorReported(dataDir string, id model.ID) error {
 	}
 	changed := false
 	for i := range entries {
-		if entries[i].DeviceID == id && !entries[i].IsReported() {
-			entries[i].Reported = predecessorReported
+		if entries[i].DeviceID == id && entries[i].Reported != advice {
+			entries[i].Reported = advice
 			changed = true
 		}
 	}

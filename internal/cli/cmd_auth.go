@@ -594,9 +594,7 @@ func printLogin(e *Env, asJSON bool, method string, res *authflow.LoginResult) e
 		printSurvivors(e, res.Recovery.Devices)
 	}
 	e.printf("The hop daemon keeps this device in sync from now on.\n")
-	printOldDevices(e, r.OldDevices)
-	settle()
-	return nil
+	return reportLoginOldDevices(e.Stdout, r.OldDevices, settle)
 }
 
 // ---- approve ----
@@ -859,11 +857,17 @@ func authStatus(ctx context.Context, e *Env, args []string, settle *func()) erro
 			}
 		}
 	}
+	// settleOld is handed to the caller only where the advice was written.
+	settleOld := func() {}
 	if a.AccountID != "" {
-		a.OldDevices, *settle = statusOldDevices(ctx, e, c, a.AccountID, !a.Locked)
+		a.OldDevices, settleOld = statusOldDevices(ctx, e, c, a.AccountID, !a.Locked)
 	}
 	if o.asJSON {
-		return printJSON(e, a)
+		if err := printJSON(e, a); err != nil {
+			return err
+		}
+		*settle = settleOld
+		return nil
 	}
 	ended := func() {
 		if l := e.endedLine(a.EndedSessions); l != "" {
@@ -943,9 +947,10 @@ func authStatus(ctx context.Context, e *Env, args []string, settle *func()) erro
 			e.printf("warning:      %s\n", oneLine(w))
 		}
 	}
-	for _, l := range oldDeviceLines(a.OldDevices) {
-		e.printf("%s\n", l)
+	if err := printOldDeviceLines(e.Stdout, a.OldDevices); err != nil {
+		return err
 	}
+	*settle = settleOld
 	return nil
 }
 
