@@ -36,8 +36,10 @@ race)
 	# in its work directory, in /tmp, until it exits, and by the store
 	# package they fill most of the 512 MiB tmpfs.
 	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" sh -c '
+		packages=$(go list ./internal/...) || exit $?
+		[ -n "$packages" ] || { echo "go list found no packages" >&2; exit 1; }
 		status=0
-		for p in $(go list ./internal/...); do
+		for p in $packages; do
 			go test -race -p 1 "$p" || status=1
 		done
 		exit $status'

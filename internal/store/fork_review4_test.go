@@ -217,15 +217,22 @@ func TestForkResumedDeletionWithoutAManifest(t *testing.T) {
 		}
 		rewrite(t, p, b)
 	}
+	// Without a manifest nothing shows the backup unchanged (the source
+	// digest leaves out entry contents and objects), so even a whole one
+	// is kept, and moving it away is the way to finish.
 	t.Run("whole", func(t *testing.T) {
 		cfg, backup, _ := discardingFork(t)
 		legacy(t, cfg)
-		res, _, err := ResumeFork(context.Background(), cfg, ForkOptions{})
-		if err != nil || res == nil || !res.Discarded {
-			t.Fatalf("resume: %+v %v", res, err)
+		resumeRefused(t, cfg, backup, layout{data: backup}.deviceConfig(), ErrForkStale)
+		if err := os.Rename(backup, backup+".kept"); err != nil {
+			t.Fatal(err)
 		}
-		if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("the backup: %v", err)
+		res, _, err := ResumeFork(context.Background(), cfg, ForkOptions{})
+		if err != nil || res == nil || res.Discarded || !res.BackupMissing {
+			t.Fatalf("resume with the backup moved away: %+v %v", res, err)
+		}
+		if _, err := os.Stat(backup + ".kept"); err != nil {
+			t.Errorf("the moved backup: %v", err)
 		}
 	})
 	t.Run("part", func(t *testing.T) {

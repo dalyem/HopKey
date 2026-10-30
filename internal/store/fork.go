@@ -1974,20 +1974,18 @@ func holdBackup(cfg Config, j *forkJournal, owner *backupOwner) (map[string]stri
 // (j.DiscardManifest) lists, each as it was, a directory still a directory
 // and a file with the same content. A path changed or added means the
 // backup was opened and changed since: ErrForkStale, and nothing more is
-// deleted. A journal with no manifest (an earlier build) goes on only with
-// the whole backup as the fork read it (j.Source).
+// deleted. A journal with no manifest (an earlier build) never deletes a
+// backup that is still there: the source digest leaves out entry contents
+// and objects, so it can't show the backup is unchanged.
 func leftOfBackup(j *forkJournal) error {
-	d, files, err := forkSourceScan(j.Backup, true)
-	if err != nil {
-		return err
-	}
 	if j.DiscardManifest == nil {
-		if d == j.Source {
-			return nil
-		}
-		return fmt.Errorf("%w: the old vault in %s is not as the fork read it, and this fork, begun by an earlier hop, did not record what its deletion may leave; "+
+		return fmt.Errorf("%w: this fork, begun by an earlier hop, did not record what the old vault in %s held when it began to delete it, so hop can't tell whether it changed since; "+
 			"nothing more of it was deleted, and its device key may be gone already. To keep what is left of it, move %s elsewhere; "+
 			"hop vault fork --local then finishes the fork without it", ErrForkStale, j.Backup, j.Backup)
+	}
+	_, files, err := forkSourceScan(j.Backup, true)
+	if err != nil {
+		return err
 	}
 	rels := make([]string, 0, len(files))
 	for rel := range files {
