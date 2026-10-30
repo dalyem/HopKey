@@ -402,6 +402,7 @@ func TestForkCrashAtEachStep(t *testing.T) {
 		{"fork:moved-old", true, false},
 		{"fork:moved-new", true, false},
 		{"fork:moved-new", true, true},
+		{"fork:discarding", true, true},
 		{"fork:discarded", true, true},
 	} {
 		t.Run(c.stage, func(t *testing.T) {

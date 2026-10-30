@@ -43,7 +43,7 @@ import (
 //	D.forked-<date>-<vault8>/      the old data directory, kept as it was (unless --discard-old)
 //
 //	fork.json = {"v":1, "state":"staging"|"verified"|"swapped"|"done", "txn_id":id, "data_dir":str,
-//	             "backup":str, "discard_old":bool, "discarded":bool, "old":{ids}, "new":{ids},
+//	             "backup":str, "discard_old":bool, "discarding":bool, "discarded":bool, "old":{ids}, "new":{ids},
 //	             "new_store":str, "source":digest, "new_head":head, "new_items":n, ...counts}
 //
 // The gate: everything that opens or makes a vault in D (Open, hop init,
@@ -52,7 +52,10 @@ import (
 // (or ResumeFork, AbandonFork) to its end. The owner lock can't do this
 // alone: it moves with the old vault when the swap renames D. The fence
 // (forkFence) refuses with ErrForkPending once a fork's new vault has
-// verified and until the fork is done.
+// verified and until the fork is done. The backup is fenced as well while
+// the fork is unfinished (backupFence): opening a directory named as a
+// fork's backup takes D.lock shared too, and is refused while a journal
+// that is not done names it.
 //
 // Steps, each durable before the next:
 //
@@ -71,9 +74,12 @@ import (
 //     owner, and still matching source) is renamed to the backup, then
 //     D.fork-new to D.
 //   - swapped is recorded once the new vault in D checks out. With
-//     --discard-old, the backup's device records and then its directory
-//     are deleted, only after that check. done is recorded, and the
-//     journal stays as the record of the fork.
+//     --discard-old, the backup is checked (the old vault, unowned, still
+//     matching source; otherwise ErrForkStale, and it is kept), discarding
+//     is recorded, and then the backup's device records and its directory
+//     are deleted. done is recorded, and the journal stays as the record
+//     of the fork. A crash after the old vault moved checks the backup the
+//     same way before the new vault goes into D.
 //
 // A crash before verified leaves the old vault as it was: the next run
 // deletes the staging directory (and its keychain entry), and the fork
@@ -191,12 +197,16 @@ type ForkResult struct {
 }
 
 type forkJournal struct {
-	V          int             `json:"v"`
-	State      string          `json:"state"`
-	TxnID      model.ID        `json:"txn_id"`
-	DataDir    string          `json:"data_dir"`
-	Backup     string          `json:"backup"`
-	DiscardOld bool            `json:"discard_old"`
+	V          int      `json:"v"`
+	State      string   `json:"state"`
+	TxnID      model.ID `json:"txn_id"`
+	DataDir    string   `json:"data_dir"`
+	Backup     string   `json:"backup"`
+	DiscardOld bool     `json:"discard_old"`
+	// Discarding is recorded, after the backup was checked to be the old
+	// vault as the fork read it, before anything of it is deleted: only
+	// then may a resumed deletion find its identity files gone.
+	Discarding bool            `json:"discarding,omitempty"`
 	Discarded  bool            `json:"discarded"`
 	At         model.Timestamp `json:"at"`
 	Plan       forkPlanRecord  `json:"plan"`
@@ -302,6 +312,9 @@ func (j *forkJournal) check(data string) error {
 	if j.State != forkStaging && (j.Source == "" || j.NewHead.Seq == 0 || j.NewItems < 0) {
 		return bad("has no record of the vaults it verified")
 	}
+	if j.Discarding && (!j.DiscardOld || (j.State != forkSwapped && j.State != forkDone)) {
+		return bad("says it was deleting the backup before the new vault was in place")
+	}
 	return nil
 }
 
@@ -317,6 +330,49 @@ func isForkBackup(data string, vault model.ID, backup string) bool {
 	}
 	_, err := time.Parse("20060102", rest[:8])
 	return err == nil
+}
+
+// backupSource returns D when dir is named as a fork of D names its
+// backup (D.forked-<yyyymmdd>-<8 hex digits>), and "" otherwise.
+func backupSource(dir string) string {
+	base := filepath.Base(dir)
+	i := strings.LastIndex(base, forkBackupStem)
+	if i <= 0 {
+		return ""
+	}
+	rest := base[i+len(forkBackupStem):]
+	if len(rest) != 8+1+8 || rest[8] != '-' || strings.Trim(rest[9:], "0123456789abcdef") != "" {
+		return ""
+	}
+	if _, err := time.Parse("20060102", rest[:8]); err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(dir), base[:i])
+}
+
+// backupFence refuses with ErrForkPending while dir is the backup of a
+// fork that has not finished: the fork moved the old vault there, and
+// checks it against what it copied before it deletes it (--discard-old)
+// or puts it back (--abandon). A journal that can't be read fences it too.
+// The journal is in D's staging directory until the swap, then in D.
+func backupFence(dir string) error {
+	src := backupSource(dir)
+	if src == "" {
+		return nil
+	}
+	for _, jd := range []string{src + forkNewSuffix, src} {
+		j, err := readForkJournal(jd)
+		if err != nil {
+			return fmt.Errorf("%w (%v)", ErrForkPending, err)
+		}
+		if j != nil {
+			if j.Backup == dir && j.State != forkDone {
+				return ErrForkPending
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 // resolveLoose resolves p through symlinks as far as it exists: every
@@ -400,22 +456,37 @@ func gateOptional(err error) bool {
 
 // enterGate takes the gate of dataDir (see the file comment) shared and
 // checks the fence. The caller calls the returned func once it owns the
-// vault or has given up. A fork running there makes it ErrVaultBusy.
+// vault or has given up. A fork running there makes it ErrVaultBusy. A
+// directory named as a fork's backup is behind the gate of the data
+// directory it would be the backup of as well (taken first): a fork there
+// holds that gate, not the backup's, while it moves the old vault in.
 func enterGate(dataDir string) (func(), error) {
 	data, staging, err := forkPaths(dataDir)
 	if err != nil {
 		return nil, err
 	}
-	f, err := filelock.TryLockShared(data + forkGateSuffix)
-	if errors.Is(err, filelock.ErrLocked) {
-		return nil, ErrVaultBusy
-	}
-	if err != nil && !gateOptional(err) {
-		return nil, err
-	}
+	var gates []*os.File
 	leave := func() {
-		if f != nil {
+		for _, f := range gates {
 			f.Close()
+		}
+	}
+	paths := []string{data + forkGateSuffix}
+	if src := backupSource(data); src != "" {
+		paths = []string{src + forkGateSuffix, data + forkGateSuffix}
+	}
+	for _, p := range paths {
+		f, err := filelock.TryLockShared(p)
+		if errors.Is(err, filelock.ErrLocked) {
+			leave()
+			return nil, ErrVaultBusy
+		}
+		if err != nil && !gateOptional(err) {
+			leave()
+			return nil, err
+		}
+		if f != nil {
+			gates = append(gates, f)
 		}
 	}
 	if err := forkFence(data, staging); err != nil {
@@ -446,8 +517,12 @@ func takeForkGate(data string) (*os.File, error) {
 // with --discard-old), nor the new one before the fork checks it. So it is
 // for any state recovery would not act on by itself. A fork that never
 // verified fences nothing while the old vault is in data: it is still the
-// vault, and the fork's next run deletes the staging directory.
+// vault, and the fork's next run deletes the staging directory. data is
+// fenced too while it is an unfinished fork's backup (backupFence).
 func forkFence(data, staging string) error {
+	if err := backupFence(data); err != nil {
+		return err
+	}
 	hasStaging, err := pathExists(staging)
 	if err != nil {
 		return err
@@ -612,6 +687,9 @@ func ResumeFork(ctx context.Context, cfg Config, opts ForkOptions) (res *ForkRes
 			return nil, false, fmt.Errorf("%w: the fork journal in %s is %q, with no staging directory", ErrForkDamaged, data, j.State)
 		}
 	}
+	if opts.KeepOld && !j.Discarding {
+		j.DiscardOld = false
+	}
 	if err := finishFork(ctx, cfg, data, j); err != nil {
 		return nil, false, err
 	}
@@ -674,7 +752,13 @@ func AbandonFork(ctx context.Context, cfg Config) (bool, error) {
 		if err := isOldVault(cfg, j.Backup, j); err != nil {
 			return false, err
 		}
-		if err := os.Rename(j.Backup, data); err != nil {
+		owner, err := lockBackup(j.Backup)
+		if err != nil {
+			return false, err
+		}
+		err = os.Rename(j.Backup, data)
+		owner.Close()
+		if err != nil {
 			return false, err
 		}
 		if err := syncDir(filepath.Dir(data)); err != nil {
@@ -746,6 +830,10 @@ type ForkOptions struct {
 	// Passphrase opens a sealed device key file in place of
 	// HOP_DEVICE_PASSPHRASE. The new vault's sealed file gets it too.
 	Passphrase []byte
+	// KeepOld, for ResumeFork, keeps the backup of a fork that was to
+	// delete it (--discard-old), unless its deletion had begun: the way
+	// to finish a fork whose backup changed after the swap.
+	KeepOld bool
 }
 
 // PendingFork is a fork prepared and not committed: it owns the old
@@ -772,6 +860,8 @@ type PendingFork struct {
 	init *PendingInit
 	ncfg Config
 	done bool
+	// abandoned is set when Commit failed and left no new vault.
+	abandoned bool
 }
 
 // PrepareFork opens the vault in cfg.DataDir, checks that it may be
@@ -803,6 +893,10 @@ func PrepareFork(ctx context.Context, cfg Config, opts ForkOptions) (*PendingFor
 		if err == nil {
 			err = ErrForkPending
 		}
+		return nil, err
+	}
+	if err := backupFence(data); err != nil {
+		gate.Close()
 		return nil, err
 	}
 	ocfg := cfg
@@ -957,7 +1051,7 @@ func forkCarries(t model.Type) bool {
 // account.json and sync-notes.json.
 func forkSourceDigest(data string) (string, error) {
 	skip := map[string]bool{
-		"vault/owner.lock": true, "vault/lock": true, "vault/objects": true,
+		"vault/owner.lock": true, "vault/lock": true, "vault/objects": true, predecessorLock: true,
 		"vault/" + contactRel: true, "vault/account.json": true, "vault/" + syncNotesRel: true,
 	}
 	h := sha256.New()
@@ -1248,14 +1342,18 @@ func (p *PendingFork) Commit(ctx context.Context, discardOld bool) (*ForkResult,
 	}
 	var err error
 	if j.TxnID, err = vaultlog.NewID(); err != nil {
+		p.abandoned = true
 		return nil, err
 	}
 	if err := j.check(p.data); err != nil {
+		p.abandoned = true
 		return nil, err
 	}
 	if err := p.stage(ctx, j); err != nil {
 		if aerr := abandonStaging(p.ncfg, p.staging, j); aerr != nil {
 			err = fmt.Errorf("%w (and its staging directory %s could not be deleted: %v)", err, p.staging, aerr)
+		} else {
+			p.abandoned = true
 		}
 		return nil, err
 	}
@@ -1273,6 +1371,13 @@ func (p *PendingFork) Commit(ctx context.Context, discardOld bool) (*ForkResult,
 	r.Warnings = p.plan.Warnings
 	return r, nil
 }
+
+// Abandoned reports whether a Commit that failed is known to have left no
+// new vault: it failed before it began, or its staging directory was
+// deleted. Only then does the Emergency Kit Generate returned belong to
+// no vault. Any other failure may have left the new vault in place (or a
+// fork that ResumeFork finishes), so its kit must be kept.
+func (p *PendingFork) Abandoned() bool { return p.abandoned }
 
 func (p *PendingFork) planRecord() forkPlanRecord {
 	pl := p.plan
@@ -1646,9 +1751,9 @@ func finishFork(ctx context.Context, cfg Config, data string, j *forkJournal) er
 			if err := forkStage("fork:moved-old"); err != nil {
 				return err
 			}
-		} else if err := isOldVault(cfg, j.Backup, j); err != nil {
-			// Not in data, not in the backup: where the old vault went is
-			// not known, so nothing takes its place.
+		} else if err := checkBackup(cfg, j); err != nil {
+			// Not in data, and not in the backup as the fork read it: the
+			// old vault is missing or changed, so nothing takes its place.
 			return err
 		}
 		if err := os.Rename(staging, data); err != nil {
@@ -1673,7 +1778,7 @@ func finishFork(ctx context.Context, cfg Config, data string, j *forkJournal) er
 		}
 	}
 	if j.DiscardOld && !j.Discarded {
-		if err := discardBackup(cfg, j); err != nil {
+		if err := discardBackup(cfg, data, j); err != nil {
 			return fmt.Errorf("the new vault is in place, but the old one in %s could not be deleted: %w", j.Backup, err)
 		}
 		if err := forkStage("fork:discarded"); err != nil {
@@ -1719,18 +1824,84 @@ func moveOld(cfg Config, data string, j *forkJournal) error {
 	return syncDir(filepath.Dir(data))
 }
 
-// discardBackup deletes the old data directory: the device records its
-// device.json names (keychain entries; device key files go with the
-// directory), then the directory. A backup that holds another vault is
-// not touched.
-func discardBackup(cfg Config, j *forkJournal) error {
+// lockBackup takes the owner lock of the vault in the backup dir, without
+// waiting: a process that has it open (one that does not know the fence)
+// makes it ErrVaultBusy. A backup whose vault directory is gone (a
+// deletion that was cut short) has no owner to exclude, and gives a nil
+// file, which closes harmlessly.
+func lockBackup(dir string) (*os.File, error) {
+	f, err := filelock.TryLock(layout{data: dir}.ownerLock())
+	switch {
+	case errors.Is(err, filelock.ErrLocked):
+		return nil, fmt.Errorf("%w: a process has the old vault in %s open", ErrVaultBusy, dir)
+	case errors.Is(err, os.ErrNotExist):
+		return nil, nil
+	}
+	return f, err
+}
+
+// checkBackup requires the backup to hold the old vault, unowned, and as
+// the fork read it (j.Source): a change made there since (by a hop that
+// does not know the fence) is not put out of use by the swap, nor deleted.
+func checkBackup(cfg Config, j *forkJournal) error {
+	_, err := holdBackup(cfg, j)
+	return err
+}
+
+// holdBackup is checkBackup, and keeps the backup's owner lock: the caller
+// closes the file.
+func holdBackup(cfg Config, j *forkJournal) (*os.File, error) {
+	if err := isOldVault(cfg, j.Backup, j); err != nil {
+		return nil, err
+	}
+	f, err := lockBackup(j.Backup)
+	if err != nil {
+		return nil, err
+	}
+	if d, err := forkSourceDigest(j.Backup); err != nil || d != j.Source {
+		f.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: the old vault in %s is not as the fork read it (it was opened and changed since?); it was kept as it is. "+
+			"While the new vault is not in place, hop vault fork --local --abandon puts the old one back; once it is, "+
+			"hop vault fork --local --keep-old finishes the fork and keeps the old vault", ErrForkStale, j.Backup)
+	}
+	return f, nil
+}
+
+// discardBackup deletes the backup of the fork j of data: the device
+// records its device.json names (keychain entries; device key files go
+// with the directory), then the directory. First the backup must be the
+// old vault, unowned and as the fork read it (holdBackup), and that is
+// recorded (j.Discarding) before anything is deleted. A deletion resumed
+// after that may find its files partly gone; one that was not recorded
+// deletes nothing it can't identify. A backup that is gone is deleted
+// already (or was moved away by hand).
+func discardBackup(cfg Config, data string, j *forkJournal) error {
 	backup := j.Backup
 	if ok, err := pathExists(backup); err != nil || !ok {
 		return err
 	}
+	var owner *os.File
+	var err error
+	if !j.Discarding {
+		if owner, err = holdBackup(cfg, j); err != nil {
+			return err
+		}
+		defer owner.Close()
+		j.Discarding = true
+		if err := writeForkJournal(data, j); err != nil {
+			return err
+		}
+	} else {
+		if owner, err = lockBackup(backup); err != nil {
+			return err
+		}
+		defer owner.Close()
+	}
 	s := &Store{cfg: cfg, l: layout{data: backup}}
-	dc, err := s.readDeviceConfig()
-	if err == nil {
+	if dc, err := s.readDeviceConfig(); err == nil {
 		if err := isOldVault(cfg, backup, j); err != nil {
 			return err
 		}
@@ -1741,6 +1912,9 @@ func discardBackup(cfg Config, j *forkJournal) error {
 			}
 		}
 	} else if ok, _ := pathExists(s.l.deviceConfig()); ok {
+		return err
+	}
+	if err := forkStage("fork:discarding"); err != nil {
 		return err
 	}
 	if err := os.RemoveAll(backup); err != nil {
