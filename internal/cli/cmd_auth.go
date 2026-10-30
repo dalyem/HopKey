@@ -342,6 +342,10 @@ type loginReport struct {
 	Method     string             `json:"method"`
 	Merge      *store.MergeStatus `json:"merge,omitempty"`
 	Recovery   *checkpointReport  `json:"recovery,omitempty"`
+	// OldDevices are the identities this machine had before a logout that
+	// left something to do about them (hop auth logout on a device the
+	// operator locked out, or --local-only). Nothing has been run for them.
+	OldDevices []oldDeviceReport `json:"old_devices,omitempty"`
 }
 
 // discardReport is the --json shape of hop auth login --discard.
@@ -417,6 +421,9 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	defer c.CloseIdleConnections()
+	// Asked before the daemon stops: the operator's refusal lives in its
+	// memory only.
+	lock := daemonAdminLock(ctx, e)
 	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
@@ -450,6 +457,9 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	if err != nil {
 		if errors.Is(context.Cause(ctx), errStdinClosed) {
 			return failf("stdin closed, so the login was cancelled")
+		}
+		if lock != nil && errors.Is(err, authflow.ErrSignedIn) {
+			return failf("%s", loginAdminHint(lock))
 		}
 		return authFailure(err)
 	}
@@ -552,8 +562,22 @@ func printLogin(e *Env, asJSON bool, method string, res *authflow.LoginResult) e
 	if res.Recovery != nil {
 		r.Recovery = newCheckpointReport(res.Recovery)
 	}
+	// What became of this machine's earlier identity (Q15): the commands
+	// are printed, never run, and an entry that needs nothing more is
+	// forgotten once it has been reported.
+	dataDir := e.storeConfig().DataDir
+	entries, _ := store.ReadPredecessors(dataDir)
+	devs, devErr := s.Devices()
+	r.OldDevices = oldDevices(entries, r.AccountID, devs, devErr == nil)
+	// Settled once the report is out: a sign-in cut short before that
+	// leaves the entries unreported for hop auth status to show.
+	settle := func() { _ = settleOldDevices(dataDir, entries, r.AccountID, devs, devErr == nil) }
 	if asJSON {
-		return printJSON(e, r)
+		if err := printJSON(e, r); err != nil {
+			return err
+		}
+		settle()
+		return nil
 	}
 	e.printf("Signed in to %s as %s.\n", oneLine(r.Server), fmtDevice(name, id))
 	if m := res.Merge; m != nil {
@@ -570,7 +594,7 @@ func printLogin(e *Env, asJSON bool, method string, res *authflow.LoginResult) e
 		printSurvivors(e, res.Recovery.Devices)
 	}
 	e.printf("The hop daemon keeps this device in sync from now on.\n")
-	return nil
+	return reportLoginOldDevices(e.Stdout, r.OldDevices, settle)
 }
 
 // ---- approve ----
@@ -731,6 +755,10 @@ type AuthStatus struct {
 	SecretKeyStale bool                     `json:"secret_key_stale,omitempty"`
 	KitPending     bool                     `json:"kit_pending,omitempty"`
 	Sync           *daemon.SyncStatusResult `json:"sync,omitempty"`
+	// OldDevices are identities this machine left in the account when it
+	// logged out without telling the server (hop auth logout --local-only):
+	// still active, until a device in the account revokes them.
+	OldDevices []oldDeviceReport `json:"old_devices,omitempty"`
 	// EndedSessions is the ssh sessions the daemon told to end, on a
 	// revocation say: termination requests sent, not ends confirmed.
 	EndedSessions *daemon.EndedSessions `json:"ended_sessions,omitempty"`
@@ -738,6 +766,17 @@ type AuthStatus struct {
 }
 
 func runAuthStatus(ctx context.Context, e *Env, args []string) error {
+	var settle func()
+	err := authStatus(ctx, e, args, &settle)
+	if err == nil && settle != nil {
+		settle() // the advice about earlier identities is consumed once it is out
+	}
+	return err
+}
+
+// authStatus is runAuthStatus; it sets *settle to what to run once the
+// report is printed.
+func authStatus(ctx context.Context, e *Env, args []string, settle *func()) error {
 	fs := newFlags(e, "auth status", authCommands["status"].usage)
 	var o authOpts
 	o.jsonFlag(fs)
@@ -818,8 +857,17 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 			}
 		}
 	}
+	// settleOld is handed to the caller only where the advice was written.
+	settleOld := func() {}
+	if a.AccountID != "" {
+		a.OldDevices, settleOld = statusOldDevices(ctx, e, c, a.AccountID, !a.Locked)
+	}
 	if o.asJSON {
-		return printJSON(e, a)
+		if err := printJSON(e, a); err != nil {
+			return err
+		}
+		*settle = settleOld
+		return nil
 	}
 	ended := func() {
 		if l := e.endedLine(a.EndedSessions); l != "" {
@@ -871,6 +919,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		e.printf("vault:        locked: hop unlock refuses on a revoked device\n")
 	case st.Vault != nil:
 		e.printf("vault:        %s\n", vaultState(st.Vault))
+		printAdminLockHelp(e, st.Vault)
 	default:
 		e.printf("vault:        locked; run hop unlock\n")
 	}
@@ -898,6 +947,10 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 			e.printf("warning:      %s\n", oneLine(w))
 		}
 	}
+	if err := printOldDeviceLines(e.Stdout, a.OldDevices); err != nil {
+		return err
+	}
+	*settle = settleOld
 	return nil
 }
 
@@ -1136,27 +1189,35 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	u := o.ui(e)
-	q := "Log out? This device leaves the account, and its keys and its copy of the vault are deleted."
-	if *localOnly {
-		q = "Wipe this device without telling the server? Its keys and its copy of the vault are deleted; revoke it from another device afterwards."
+	if !o.yes && !u.interactive {
+		return failf("hop auth logout deletes this device's keys and its copy of the vault, and there is no terminal to confirm on: pass --yes")
 	}
-	if !o.yes {
-		if !u.interactive {
-			return failf("hop auth logout deletes this device's keys and its copy of the vault, and there is no terminal to confirm on: pass --yes")
+	// Asked before the daemon stops: the operator's refusal lives in its
+	// memory only.
+	lock := daemonAdminLock(ctx, e)
+	// A sealed device key opens with its passphrase, which a logout that
+	// tells the server needs to sign the retirement.
+	var pass []byte
+	if !*localOnly && e.Getenv(store.PassphraseEnv) == "" && canAskPassphrase(e) {
+		if pass, err = e.ReadPassword("Device passphrase: "); err != nil {
+			return failf("reading the device passphrase: %v", err)
 		}
-		ok, err := confirm(e, false, q)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return failf("not logged out")
-		}
+		defer clear(pass)
 	}
 	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
 	defer h.release(ctx)
+	if len(pass) > 0 {
+		getenv := h.cfg.Getenv
+		h.cfg.Getenv = func(k string) string {
+			if k == store.PassphraseEnv {
+				return string(pass)
+			}
+			return getenv(k)
+		}
+	}
 	s, err := h.open(ctx)
 	if err != nil {
 		return err
@@ -1190,7 +1251,41 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return failf("%v", err)
 	}
 	id := s.Info().DeviceID
-	res, err := authflow.Logout(ctx, env, s, store.LogoutOptions{DiscardPending: *discard, LocalOnly: *localOnly})
+	// What the logout throws away, said before anything is asked or
+	// deleted. A logout already under way (RETIRING) counted it when it
+	// began.
+	var pc store.PendingChanges
+	if state, err := s.Retirement(); err != nil {
+		return failf("%v", err)
+	} else if state == "" {
+		if pc, err = s.PendingChanges(); err != nil {
+			return failf("%v", err)
+		}
+		if pc.Queued > 0 && !*discard {
+			return failf("this device has %s that the server has not received, and a logout throws them away: wait for the daemon to send them (hop sync shows them), "+
+				"or log out with --discard-pending to drop them%s", pendingChangesText(pc), lockedLogoutHint(lock))
+		}
+	}
+	if !o.yes {
+		q := "Log out? This device leaves the account, and its keys and its copy of the vault are deleted."
+		if *localOnly {
+			q = "Wipe this device without telling the server? Its keys and its copy of the vault are deleted; the old device ID is still in the account until you revoke it from the new device."
+		}
+		if pc.Queued > 0 {
+			fmt.Fprintf(e.Stderr, "This device has %s that the server has not received. They are lost: they are not kept for the next sign-in.\n", pendingChangesText(pc))
+		}
+		if lock != nil {
+			fmt.Fprintf(e.Stderr, "The server's operator has locked this device out. After the logout, hop auth login signs this machine in again as a new device (master password and current Secret Key).\n")
+		}
+		ok, err := confirm(e, false, q)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return failf("not logged out")
+		}
+	}
+	res, err := authflow.Logout(ctx, env, s, store.LogoutOptions{DiscardPending: *discard, LocalOnly: *localOnly, Why: adminLockWhy(lock)})
 	if errors.Is(err, store.ErrLogoutPending) && errors.Is(err, syncclient.ErrUnauthorized) {
 		// The server doesn't know this device (401): a deleted account's
 		// included, but the server doesn't say so, and neither does this.
@@ -1199,7 +1294,12 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 			"hop auth logout --local-only finishes the logout by deleting that copy, which may be the last one")
 	}
 	if errors.Is(err, store.ErrLogoutPending) {
-		return failf("the server could not tell yet whether the logout went through, so it is not finished: the daemon finishes it once the server answers, or run hop logout again")
+		return failf("the server could not tell yet whether the logout went through, so it is not finished: the daemon finishes it once the server answers, or run hop logout again (%v)%s",
+			err, localOnlyHint(lock))
+	}
+	if errors.Is(err, store.ErrDeviceKey) {
+		return failf("%v. A logout that tells the server signs with the device key: if it is sealed, set %s to its passphrase (or run on a terminal to type it); "+
+			"hop auth logout --local-only needs no key", err, store.PassphraseEnv)
 	}
 	if err != nil {
 		return authFailure(err)
@@ -1216,12 +1316,49 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return nil
 	}
 	if res.RevokeElsewhere {
-		e.printf("This device was wiped: its keys and vault are deleted. The server was not told:\n")
-		e.printf("if another device still lists it, revoke it there with hop auth devices revoke %s\n", oneLine(id))
-		return nil
+		e.printf("This device was wiped: its keys and vault are deleted. The server was not told, so device %s is still in the account.\n", oneLine(id))
+	} else {
+		e.printf("Logged out: this device left the account, and its keys and vault are deleted.\n")
 	}
-	e.printf("Logged out: this device left the account, and its keys and vault are deleted.\n")
+	if res.Discarded > 0 {
+		e.printf("%d queued change(s) were discarded.\n", res.Discarded)
+	}
+	printLogoutNext(e, res, id, lock != nil || res.Why != "")
 	return nil
+}
+
+// lockedLogoutHint is the end of a refusal to log out with queued
+// changes on a device the operator locked out.
+func lockedLogoutHint(lock *store.AdminRefusal) string {
+	if lock == nil {
+		return ""
+	}
+	return ". The server's operator has locked this device out, so they will not be sent until it lets the device in again"
+}
+
+// localOnlyHint says what to do when the server won't take the logout of
+// a device the operator locked out.
+func localOnlyHint(lock *store.AdminRefusal) string {
+	if lock == nil {
+		return ""
+	}
+	return "; if the server keeps refusing, hop auth logout --local-only --discard-pending wipes this device without it"
+}
+
+// printLogoutNext says what follows a logout: how this machine signs in
+// again, and what to do about the old identity. It runs nothing.
+func printLogoutNext(e *Env, res store.LogoutResult, id string, locked bool) {
+	if res.RevokeElsewhere {
+		e.printf("To sign in again as a new device: hop auth login (master password and current Secret Key). "+
+			"Then, from that device, take the old one out of the account: hop auth devices revoke %s\n", oneLine(id))
+		e.printf("hop auth login reminds you of that command. If another device is signed in, it can run it now.\n")
+		return
+	}
+	if locked {
+		e.printf("To sign in again as a new device: hop auth login (master password and current Secret Key).\n")
+		e.printf("If this device's files could have been copied while it was locked, then run hop auth rotate from the new device, " +
+			"and rotate the SSH keys and passwords stored in the vault.\n")
+	}
 }
 
 // wipeSSHConfig removes what the vault decrypted into the ssh config

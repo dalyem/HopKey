@@ -1274,6 +1274,12 @@ func (s *Store) Info() Info {
 	if cfg, err := s.readDeviceConfig(); err == nil {
 		info.DeviceStore = s.deviceStore(cfg).Describe()
 		info.AccountID = cfg.AccountID.String()
+		// device.json names this device whether or not the vault is
+		// unlocked: a locked device's ID is what a logout, or the steps
+		// for getting back in, must name. The unlocked ID, below, wins.
+		if !cfg.DeviceID.IsZero() {
+			info.DeviceID = cfg.DeviceID.String()
+		}
 		info.StaleDevices = len(cfg.StaleDevices)
 		if s.state != nil {
 			info.StaleDevices = len(s.staleActive(cfg))

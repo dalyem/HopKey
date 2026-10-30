@@ -142,6 +142,12 @@ type LogoutOptions struct {
 	DiscardPending bool
 	// LocalOnly skips the server: RETIRED with the outcome unknown.
 	LocalOnly bool
+	// Why is AdminDeviceBlocked or AdminAccountDisabled when the
+	// server's operator had this device locked out when the user logged
+	// out, and "" otherwise. A logout with a Why leaves a Predecessor,
+	// whatever its outcome, so that the next sign-in can say what to do
+	// about the old identity. It is read only when the logout begins.
+	Why string
 }
 
 // LogoutResult says where a logout stands.
@@ -153,6 +159,13 @@ type LogoutResult struct {
 	// RevokeElsewhere means the server was not asked: if the device is
 	// still listed, revoke it from another device.
 	RevokeElsewhere bool `json:"revoke_elsewhere,omitempty"`
+	// Discarded is the number of queued changes the logout threw away,
+	// as counted when it began.
+	Discarded int `json:"discarded_changes,omitempty"`
+	// Why is AdminDeviceBlocked or AdminAccountDisabled when the
+	// operator's refusal had locked this device, whether the caller knew
+	// it when the logout began or the retirement found it out.
+	Why string `json:"why,omitempty"`
 }
 
 type retireJournal struct {
@@ -410,8 +423,12 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 		if s.state != nil {
 			j.VaultID = s.state.VaultID
 		}
+		pc, _ := s.pendingLocked() // informational: a queue that can't be counted must not keep a logout from starting
 		t := &txn{}
 		if err := putRetirement(t, j); err != nil {
+			return nil, err
+		}
+		if err := putRetireNote(t, s.newRetireNote(opts.Why, pc)); err != nil {
 			return nil, err
 		}
 		if err := s.commitTxn(t); err != nil {
@@ -441,8 +458,12 @@ func (s *Store) beginLogout(opts LogoutOptions) (*retireJournal, error) {
 	if err := addRetireCandidate(j, w); err != nil {
 		return nil, err
 	}
+	pc, _ := s.pendingLocked()
 	t := &txn{}
 	if err := putRetirement(t, j); err != nil {
+		return nil, err
+	}
+	if err := putRetireNote(t, s.newRetireNote(opts.Why, pc)); err != nil {
 		return nil, err
 	}
 	if err := s.commitTxn(t); err != nil {
@@ -505,6 +526,12 @@ func (s *Store) recordRetired(j *retireJournal, outcome string) error {
 // finishLogout runs the cleanup of a RETIRED logout. The caller holds s.mu.
 func (s *Store) finishLogout(j *retireJournal) (LogoutResult, error) {
 	res := LogoutResult{State: StateRetired, Outcome: j.Outcome, RevokeElsewhere: j.Outcome == OutcomeUnknown}
+	if unlock, err := s.lockFile(); err == nil {
+		if n := s.readRetireNote(); n != nil {
+			res.Discarded, res.Why = n.Queued, n.Why
+		}
+		unlock()
+	}
 	if s.state != nil {
 		s.dropLocked(ErrLoggingOut)
 	}
@@ -539,6 +566,11 @@ func (s *Store) cleanupRetired() error {
 	// remove. The mark of it goes down first and outlives the journal, so
 	// a crash anywhere from here still leaves it owed.
 	if err := markLogoutCleanup(s.l.data); err != nil {
+		return err
+	}
+	// What the next sign-in says about this identity (predecessor.go),
+	// before anything of the vault goes.
+	if err := s.recordLogoutPredecessor(j); err != nil {
 		return err
 	}
 	// The outbox, in one commit.
@@ -783,6 +815,9 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 		case errors.Is(err, ErrSessionEnded), errors.Is(err, ErrAdminRefused):
 			// No session (the operator's refusal included): retire-status
 			// and retire-post stay open to a device that signs.
+			if nerr := s.noteAdminRefusal(err); nerr != nil {
+				return pending, fmt.Errorf("%w: %w", ErrLogoutPending, nerr)
+			}
 			outcome, err := s.retireStatus(ctx, r, auth, j, outside, v, errors.Is(err, ErrAdminRefused))
 			if err != nil {
 				return pending, err
@@ -815,11 +850,17 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 				return err
 			}
 			_, err := r.Post(ctx, auth, w)
-			if errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrAdminRefused) {
-				_, err = r.RetirePost(ctx, auth, w)
-			}
 			return err
 		})
+		if errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrAdminRefused) {
+			if nerr := s.noteAdminRefusal(err); nerr != nil {
+				return pending, fmt.Errorf("%w: %w", ErrLogoutPending, nerr)
+			}
+			err = outside(func() error {
+				_, err := r.RetirePost(ctx, auth, w)
+				return err
+			})
+		}
 		if err != nil && !errors.Is(err, ErrHeadConflict) && !errors.Is(err, ErrSessionEnded) && !errors.Is(err, ErrAdminRefused) {
 			return pending, fmt.Errorf("%w: %w", ErrLogoutPending, err)
 		}
@@ -979,6 +1020,9 @@ func (s *Store) retireStatus(ctx context.Context, r Retirer, auth DeviceAuth, j 
 		return "", nil
 	}
 	if err := outside(func() error { return r.Reauthenticate(ctx, auth) }); err != nil {
+		if nerr := s.noteAdminRefusal(err); nerr != nil {
+			err = errors.Join(err, nerr)
+		}
 		return "", fmt.Errorf("%w: %w", ErrLogoutPending, err)
 	}
 	return "", nil
