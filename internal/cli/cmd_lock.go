@@ -248,7 +248,8 @@ func vaultState(v *store.Info) string {
 	case v.AdminLock != nil:
 		return adminLockText(v.AdminLock, v.ServerUnconfirmed)
 	case v.ServerUnconfirmed:
-		return "locked: the server did not confirm this device is still in the account; hop unlock asks it again"
+		return "locked: the server no longer confirms this device is in the account. Nothing on this device was deleted. " +
+			"hop unlock asks the server again; if it keeps refusing, check with the server's operator"
 	case v.OfflineTooLong:
 		return "locked: offline too long; connect to the server, then run hop unlock"
 	}
@@ -256,15 +257,12 @@ func vaultState(v *store.Info) string {
 }
 
 // adminLockText says why the server's operator keeps the vault locked:
-// the account disabled or deleted, or this device blocked, and the
-// operator's message, the server's word, escaped again here, since the
-// server may not have stripped its control characters. auto is whether
-// the daemon unlocks it by itself once the operator lets the device in;
-// after hop lock, or an unlock that failed, only hop unlock does.
+// the account disabled or this device blocked, and the operator's
+// message, the server's word, escaped again here, since the server may
+// not have stripped its control characters. auto is whether the daemon
+// unlocks it by itself once the operator lets the device in; after hop
+// lock, or an unlock that failed, only hop unlock does.
 func adminLockText(a *store.AdminRefusal, auto bool) string {
-	if a.Code == store.AdminAccountDeleted {
-		return deletedLockText
-	}
 	what, undo := "disabled this account", "enables the account"
 	if a.Code == store.AdminDeviceBlocked {
 		what, undo = "blocked this device", "unblocks this device"
@@ -281,10 +279,3 @@ func adminLockText(a *store.AdminRefusal, auto bool) string {
 		"Nothing was deleted. It unlocks once the operator %s (%s)",
 		what, store.EscapeServerText(a.Reason), undo, how)
 }
-
-// deletedLockText is the lock of a device whose account the server's
-// operator deleted. Nothing brings the account back on that server, but
-// nothing on this device was deleted either.
-const deletedLockText = "locked: the server says its operator deleted this account. This is the server's word, not your vault's. " +
-	"Nothing on this device was deleted: its copy of the vault stays here, locked, but the account can't sign in or sync on that server again. " +
-	"hop auth logout --local-only deletes this device's copy, which may be the last one"

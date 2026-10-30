@@ -2,10 +2,11 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/http"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,34 +24,38 @@ import (
 // it runs in three steps, each with its audit row:
 //
 //  1. Fence. One transaction checks that the account is as the operator
-//     confirmed it, records its vault head in delete_fences, and deletes
-//     its sessions and login tokens again. From then on the server
-//     refuses the account every write (retire-post included), session,
-//     login, recovery, enrollment claim and retire-status, so its head
-//     stays at the fenced one. CancelDelete lifts the fence.
-//  2. Backup. VACUUM INTO a new file of mode 0600, verified: opened
-//     read-only, PRAGMA integrity_check, the account and its fence there,
-//     its vault head the fenced head. A failure stops here: the fence
-//     stays and nothing is deleted.
+//     confirmed it, records its vault head in delete_fences under a new
+//     random fence ID, and deletes its sessions and login tokens again.
+//     From then on the server refuses the account every write
+//     (retire-post included), session, login, recovery, enrollment claim
+//     and retire-status, so its head stays at the fenced one.
+//     CancelDelete lifts the fence.
+//  2. Backup. VACUUM INTO a new file of mode 0600, in a directory created
+//     durably if need be (mkdirDurable), verified: opened read-only,
+//     PRAGMA integrity_check, the account and its fence there, its vault
+//     head the fenced head. A failure stops here: the fence stays and
+//     nothing is deleted.
 //  3. Delete. One transaction checks that the fence still stands and the
 //     head is still the fenced one, deletes every row of the account
-//     (accountRows), tombstones its account, vault and device IDs
-//     (deleted_ids) and writes the audit row, with the account ID and
-//     never the email.
+//     (accountRows), tombstones its account and vault IDs (deleted_ids)
+//     and writes the audit row, with the account ID and never the email.
+//
+// A fence is known by its ID alone: a cancel and a new fence in the same
+// second, at the same head, is another fence, and a delete, resume or
+// cancel shown the old one refuses with "changed".
 //
 // The email is not tombstoned: it can be invited again, and signs up as
-// a new account with new IDs. A device of the deleted account is told
-// account_deleted when it asks for a challenge (authChallenge): it locks
-// in memory, as for any refusal by the operator, and nothing on it is
-// deleted; its local copy stays, for the owner to salvage.
+// a new account with new IDs. A device of the deleted account gets the
+// 401 any unknown device gets: the server tells a caller nothing before
+// it proves something, and the device's key went with the account. Its
+// client locks as for any answer that does not confirm the device, and
+// nothing on it is deleted; its local copy stays, for the owner to
+// salvage.
 //
 // The pre-delete backup holds the deleted account, and every other one:
 // deleting it is the operator's job. A database restored from a file
 // older than the delete brings the account back, without its tombstones;
 // nothing here can prevent that.
-
-// CodeAccountDeleted is the refusal a device of a deleted account gets.
-const CodeAccountDeleted = "account_deleted"
 
 // Audit actions of account delete.
 const (
@@ -58,14 +63,6 @@ const (
 	ActionDelete       = "accounts.delete"
 	ActionDeleteCancel = "accounts.delete.cancel"
 )
-
-// errAccountDeleted answers a challenge for a device of a deleted
-// account. It is the one operator refusal given before the caller proved
-// anything: the device's key went with the account, so nothing can be
-// proved. It is given only to a caller that names the account and a
-// device it had, and tells it no more than prelogin already does to
-// whoever knew the account: the email no longer answers with that ID.
-var errAccountDeleted = &adminRefusalError{&apiError{http.StatusForbidden, CodeAccountDeleted, "the server's operator deleted this account", nil}, ""}
 
 // fenceRefusal refuses the account a request while a delete fences it, as
 // a disabled account, which it is: a delete needs a prior disable, and
@@ -99,8 +96,8 @@ type DeletePlan struct {
 	Fence     *DeleteFence
 	Head      vaultlog.Head
 	UsedBytes int64
-	// Devices are every device the account has had; their IDs are
-	// tombstoned with it.
+	// Devices are every device the account has had, which the delete
+	// removes.
 	Devices []model.ID
 	// Rows are the account's rows per table, every one of which the
 	// delete removes.
@@ -175,12 +172,11 @@ func PlanDelete(ctx context.Context, st Store, who string, op Operator, minDisab
 
 // sameDeletePlan reports whether got is still the account the operator
 // confirmed in want: the same account and vault, at the same head, with
-// the same devices, disabled since the same time, and the same fence or
-// none. Row counts move on their own (challenges, last seen) and are not
-// compared, nor is the disable's reason.
+// the same devices, disabled since the same time, and the same fence (by
+// its ID) or none. Row counts move on their own (challenges, last seen)
+// and are not compared, nor is the disable's reason.
 func sameDeletePlan(got, want *DeletePlan) bool {
-	sameFence := (got.Fence == nil) == (want.Fence == nil) &&
-		(got.Fence == nil || got.Fence.At.Equal(want.Fence.At) && got.Fence.Head == want.Fence.Head)
+	sameFence := (got.Fence == nil) == (want.Fence == nil) && (got.Fence == nil || got.Fence.ID == want.Fence.ID)
 	return got.AccountID == want.AccountID && got.VaultID == want.VaultID && got.Head == want.Head &&
 		slices.Equal(got.Devices, want.Devices) && sameFence &&
 		got.Disabled != nil && want.Disabled != nil && got.Disabled.At.Equal(want.Disabled.At)
@@ -212,6 +208,9 @@ type DeleteOptions struct {
 	BackupDir string
 	// NoBackup skips the backup. It is for tests.
 	NoBackup bool
+	// syncDir makes a new directory entry durable; nil is syncDir. Tests
+	// set it.
+	syncDir func(dir string) error
 }
 
 // DeleteResult is what a delete did.
@@ -219,17 +218,19 @@ type DeleteResult struct {
 	AccountID model.ID
 	VaultID   model.ID
 	Head      vaultlog.Head // the vault's head when it was deleted: the fenced one
+	FenceID   model.ID
 	FencedAt  time.Time
 	// Backup is the verified pre-delete backup; "" with NoBackup. It holds
 	// the deleted account and every other one.
 	Backup string
 	// Rows are the rows deleted per table.
 	Rows map[string]int
-	// Devices are the device IDs tombstoned with the account.
+	// Devices are the IDs of the devices deleted with the account.
 	Devices []model.ID
 }
 
 type fenceParams struct {
+	FenceID    model.ID    `json:"fence_id"`
 	VaultID    model.ID    `json:"vault_id"`
 	HeadSeq    uint64      `json:"head_seq,string"`
 	HeadH      crypto.Hash `json:"head_h"`
@@ -238,6 +239,7 @@ type fenceParams struct {
 
 // deleteParams are the delete's audit params: never the email.
 type deleteParams struct {
+	FenceID  model.ID       `json:"fence_id"`
 	VaultID  model.ID       `json:"vault_id"`
 	HeadSeq  uint64         `json:"head_seq,string"`
 	HeadH    crypto.Hash    `json:"head_h"`
@@ -263,7 +265,11 @@ func DeleteAccount(ctx context.Context, st Store, op Operator, want *DeletePlan,
 	}
 	fence := want.Fence
 	if fence == nil {
-		params := &fenceParams{VaultID: want.VaultID, HeadSeq: want.Head.Seq, HeadH: want.Head.H}
+		var id model.ID
+		if _, err := rand.Read(id[:]); err != nil {
+			return nil, nil, err
+		}
+		params := &fenceParams{FenceID: id, VaultID: want.VaultID, HeadSeq: want.Head.Seq, HeadH: want.Head.H}
 		if want.Disabled != nil {
 			params.DisabledAt = want.Disabled.At.Unix()
 		}
@@ -272,7 +278,7 @@ func DeleteAccount(ctx context.Context, st Store, op Operator, want *DeletePlan,
 			if err != nil {
 				return nil, err
 			}
-			f := &DeleteFence{AccountID: got.AccountID, VaultID: got.VaultID, At: op.Now.Truncate(time.Second), Head: got.Head}
+			f := &DeleteFence{ID: id, AccountID: got.AccountID, VaultID: got.VaultID, At: op.Now.Truncate(time.Second), Head: got.Head}
 			if err := tx.SetDeleteFence(got.AccountID, f); err != nil {
 				return nil, err
 			}
@@ -298,11 +304,15 @@ func DeleteAccount(ctx context.Context, st Store, op Operator, want *DeletePlan,
 		return nil, entries, err
 	}
 
-	res := &DeleteResult{AccountID: want.AccountID, VaultID: want.VaultID, Head: fence.Head, FencedAt: fence.At}
-	params := &deleteParams{VaultID: fence.VaultID, HeadSeq: fence.Head.Seq, HeadH: fence.Head.H, FencedAt: fence.At.Unix(),
+	res := &DeleteResult{AccountID: want.AccountID, VaultID: want.VaultID, Head: fence.Head, FenceID: fence.ID, FencedAt: fence.At}
+	params := &deleteParams{FenceID: fence.ID, VaultID: fence.VaultID, HeadSeq: fence.Head.Seq, HeadH: fence.Head.H, FencedAt: fence.At.Unix(),
 		Rows: map[string]int{}, Devices: []model.ID{}}
 	if !opts.NoBackup {
-		path, berr := writeBackup(ctx, st, opts.BackupDir, fence, op.Now)
+		sync := opts.syncDir
+		if sync == nil {
+			sync = syncDir
+		}
+		path, berr := writeBackup(ctx, st, opts.BackupDir, sync, fence, op.Now)
 		if path != "" {
 			params.Backup = &path
 		}
@@ -329,7 +339,7 @@ func DeleteAccount(ctx context.Context, st Store, op Operator, want *DeletePlan,
 		if err != nil {
 			return nil, err
 		}
-		if f == nil || !f.At.Equal(fence.At) || f.Head != fence.Head || f.VaultID != a.VaultID {
+		if f == nil || f.ID != fence.ID || f.VaultID != a.VaultID {
 			return nil, adminErr("changed", "the delete's fence was lifted or set again since the backup; nothing was deleted")
 		}
 		v, err := tx.Vault(a.VaultID)
@@ -348,6 +358,9 @@ func DeleteAccount(ctx context.Context, st Store, op Operator, want *DeletePlan,
 		if err != nil {
 			return nil, err
 		}
+		for _, d := range devs {
+			params.Devices = append(params.Devices, d.DeviceID)
+		}
 		rows, err := tx.DeleteAccountRows(a.ID, a.VaultID)
 		if err != nil {
 			return nil, err
@@ -357,12 +370,6 @@ func DeleteAccount(ctx context.Context, st Store, op Operator, want *DeletePlan,
 		}
 		if err := tx.InsertDeleted(DeletedVault, a.VaultID, a.ID, op.Now); err != nil {
 			return nil, err
-		}
-		for _, d := range devs {
-			if err := tx.InsertDeleted(DeletedDevice, d.DeviceID, a.ID, op.Now); err != nil {
-				return nil, err
-			}
-			params.Devices = append(params.Devices, d.DeviceID)
 		}
 		params.Rows, res.Rows, res.Devices = rows, rows, params.Devices
 		return &a.ID, nil
@@ -380,16 +387,16 @@ func BackupName(accountID model.ID, now time.Time) string {
 	return fmt.Sprintf("pre-delete-%s-%s.db", accountID, now.UTC().Format("20060102T150405Z"))
 }
 
-// writeBackup writes the pre-delete backup into dir and verifies it
-// against the fence. A backup that does not verify is removed: it is no
-// backup, and it holds every account. The path is returned once one was
-// chosen.
-func writeBackup(ctx context.Context, st Store, dir string, f *DeleteFence, now time.Time) (string, error) {
+// writeBackup writes the pre-delete backup into dir, created durably
+// with sync if need be (mkdirDurable), and verifies it against the fence.
+// A backup that does not verify is removed: it is no backup, and it holds
+// every account. The path is returned once one was chosen.
+func writeBackup(ctx context.Context, st Store, dir string, sync func(string) error, f *DeleteFence, now time.Time) (string, error) {
 	if dir == "" {
 		return "", errors.New("no backup directory")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+	if err := mkdirDurable(dir, sync); err != nil {
+		return "", fmt.Errorf("the backup directory %s: %w", dir, err)
 	}
 	path, err := filepath.Abs(filepath.Join(dir, BackupName(f.AccountID, now)))
 	if err != nil {
@@ -405,10 +412,51 @@ func writeBackup(ctx context.Context, st Store, dir string, f *DeleteFence, now 
 	return path, nil
 }
 
+// mkdirDurable creates dir and its missing parents, mode 0700, as
+// os.MkdirAll does, and after each directory it creates, syncs its
+// parent (with sync), from the top down: a backup synced in a directory
+// whose own entry a power loss can still undo is not on disk. dir's
+// parent is synced even when dir was there, in case a run that crashed
+// created it without the sync.
+func mkdirDurable(dir string, sync func(string) error) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for d := dir; ; d = filepath.Dir(d) {
+		fi, err := os.Stat(d)
+		if err == nil {
+			if !fi.IsDir() {
+				return fmt.Errorf("%s is not a directory", d)
+			}
+			break
+		}
+		if !errors.Is(err, fs.ErrNotExist) || filepath.Dir(d) == d {
+			return err
+		}
+		missing = append(missing, d)
+	}
+	if len(missing) == 0 {
+		return sync(filepath.Dir(dir))
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		// One that appeared meanwhile is synced all the same.
+		if err := os.Mkdir(missing[i], 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		if err := sync(filepath.Dir(missing[i])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // VerifyBackup checks that the database file at path is a sound copy
 // taken under the fence f: it opens read-only, passes PRAGMA
 // integrity_check, is of this schema version, and holds the account,
-// disabled, with f as its fence and f's head as its vault's head.
+// disabled, with f as its fence (by its ID, time and head) and f's head
+// as its vault's head.
 func VerifyBackup(ctx context.Context, path string, f *DeleteFence) error {
 	if _, err := os.Stat(path); err != nil {
 		return err
@@ -442,17 +490,17 @@ func VerifyBackup(ctx context.Context, path string, f *DeleteFence) error {
 		return errors.New("it does not hold the account, disabled")
 	}
 	var at, seq, fseq int64
-	var h, fh []byte
-	err = db.QueryRowContext(ctx, `SELECT f.fenced_at, f.head_seq, f.head_h, v.head_seq, v.head_h
+	var id, h, fh []byte
+	err = db.QueryRowContext(ctx, `SELECT f.fence_id, f.fenced_at, f.head_seq, f.head_h, v.head_seq, v.head_h
 		FROM delete_fences f JOIN vaults v ON v.vault_id = f.vault_id AND v.account_id = f.account_id
-		WHERE f.account_id = ?`, f.AccountID[:]).Scan(&at, &fseq, &fh, &seq, &h)
+		WHERE f.account_id = ?`, f.AccountID[:]).Scan(&id, &at, &fseq, &fh, &seq, &h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return errors.New("it does not hold the account's fence, or its vault")
 	}
 	if err != nil {
 		return err
 	}
-	if at != f.At.Unix() || fseq < 0 || uint64(fseq) != f.Head.Seq || !slices.Equal(fh, f.Head.H[:]) {
+	if !slices.Equal(id, f.ID[:]) || at != f.At.Unix() || fseq < 0 || uint64(fseq) != f.Head.Seq || !slices.Equal(fh, f.Head.H[:]) {
 		return errors.New("its fence is not this delete's")
 	}
 	if seq < 0 || uint64(seq) != f.Head.Seq || !slices.Equal(h, f.Head.H[:]) {
@@ -481,18 +529,20 @@ func planCancel(tx Tx, who string, op Operator) (*DeletePlan, error) {
 }
 
 type cancelParams struct {
-	FencedAt int64  `json:"fenced_at"`
-	HeadSeq  uint64 `json:"head_seq,string"`
+	FenceID  model.ID `json:"fence_id"`
+	FencedAt int64    `json:"fenced_at"`
+	HeadSeq  uint64   `json:"head_seq,string"`
 }
 
 // CancelDelete lifts the fence of the delete PlanCancelDelete showed as
 // want. The account stays disabled; hop-server accounts enable undoes
-// that. It refuses with "changed" when the fence is not the one shown.
+// that. It refuses with "changed" when the fence is not the one shown (by
+// its ID).
 func CancelDelete(ctx context.Context, st Store, op Operator, want *DeletePlan) (*DeletePlan, *AuditEntry, error) {
 	if want.Fence == nil {
 		return nil, nil, adminErr("not_deleting", "no delete of the account is in progress")
 	}
-	params := &cancelParams{FencedAt: want.Fence.At.Unix(), HeadSeq: want.Fence.Head.Seq}
+	params := &cancelParams{FenceID: want.Fence.ID, FencedAt: want.Fence.At.Unix(), HeadSeq: want.Fence.Head.Seq}
 	var out *DeletePlan
 	entry, err := op.change(ctx, st, ActionDeleteCancel, &want.AccountID, params, func(tx Tx) (*model.ID, error) {
 		got, err := planCancel(tx, want.AccountID.String(), op)
@@ -503,7 +553,7 @@ func CancelDelete(ctx context.Context, st Store, op Operator, want *DeletePlan) 
 		if err != nil {
 			return nil, err
 		}
-		if !got.Fence.At.Equal(want.Fence.At) || got.Fence.Head != want.Fence.Head {
+		if got.Fence.ID != want.Fence.ID {
 			return nil, adminErr("changed", "the delete's fence changed since it was shown; run the command again")
 		}
 		if err := tx.SetDeleteFence(got.AccountID, nil); err != nil {

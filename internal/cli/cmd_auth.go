@@ -1191,9 +1191,12 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	}
 	id := s.Info().DeviceID
 	res, err := authflow.Logout(ctx, env, s, store.LogoutOptions{DiscardPending: *discard, LocalOnly: *localOnly})
-	if ar := (*store.AdminRefusal)(nil); errors.Is(err, store.ErrLogoutPending) && errors.As(err, &ar) && ar.Code == store.AdminAccountDeleted {
-		return failf("the server's operator deleted this account, so the server can't record this logout, and it stays pending: " +
-			"this device's copy of the vault stays here, locked. hop auth logout --local-only finishes it by deleting that copy, which may be the last one")
+	if errors.Is(err, store.ErrLogoutPending) && errors.Is(err, syncclient.ErrUnauthorized) {
+		// The server doesn't know this device (401): a deleted account's
+		// included, but the server doesn't say so, and neither does this.
+		return failf("the server no longer knows this device, so it can't record this logout, and it stays pending: " +
+			"this device's copy of the vault stays here, locked. Check with the server's operator; " +
+			"hop auth logout --local-only finishes the logout by deleting that copy, which may be the last one")
 	}
 	if errors.Is(err, store.ErrLogoutPending) {
 		return failf("the server could not tell yet whether the logout went through, so it is not finished: the daemon finishes it once the server answers, or run hop logout again")

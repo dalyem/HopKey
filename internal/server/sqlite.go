@@ -213,14 +213,14 @@ CREATE TABLE IF NOT EXISTS device_blocks (
 // schemaV5 is what version 5 added: account delete. A delete_fences row
 // is a delete in progress (hop-server accounts delete): from the fence to
 // the delete, the account's head stays where the fence recorded it. Once
-// an account is deleted, its account and vault IDs, and its device IDs
-// with its account ID, stay in deleted_ids for good: the triggers refuse
-// an account or vault row with a deleted account or vault ID on every
-// insertion path, so an ID is never reused, and a device of the deleted
-// account is told so (account_deleted). Neither table is a foreign key.
+// an account is deleted, its account and vault IDs stay in deleted_ids
+// for good: the triggers refuse an account or vault row with a deleted
+// account or vault ID on every insertion path, so an ID is never reused.
+// Neither table is a foreign key.
 const schemaV5 = `
 CREATE TABLE IF NOT EXISTS delete_fences (
 	account_id BLOB PRIMARY KEY,
+	fence_id   BLOB NOT NULL,
 	vault_id   BLOB NOT NULL,
 	fenced_at  INTEGER NOT NULL,
 	head_seq   INTEGER NOT NULL,
@@ -1198,10 +1198,10 @@ func (t *sqliteTx) DeleteLoginTokens(accountID model.ID) error {
 
 func (t *sqliteTx) DeleteFence(accountID model.ID) (*DeleteFence, error) {
 	f := DeleteFence{AccountID: accountID}
-	var vid, h []byte
+	var id, vid, h []byte
 	var at int64
-	err := t.row(`SELECT vault_id, fenced_at, head_seq, head_h FROM delete_fences WHERE account_id = ?`,
-		accountID[:]).Scan(&vid, &at, &f.Head.Seq, &h)
+	err := t.row(`SELECT fence_id, vault_id, fenced_at, head_seq, head_h FROM delete_fences WHERE account_id = ?`,
+		accountID[:]).Scan(&id, &vid, &at, &f.Head.Seq, &h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1209,15 +1209,15 @@ func (t *sqliteTx) DeleteFence(accountID model.ID) (*DeleteFence, error) {
 		return nil, mapErr(err)
 	}
 	f.At = fromUnix(at)
-	return &f, errors.Join(scanID(vid, &f.VaultID), scanHash(h, &f.Head.H))
+	return &f, errors.Join(scanID(id, &f.ID), scanID(vid, &f.VaultID), scanHash(h, &f.Head.H))
 }
 
 func (t *sqliteTx) SetDeleteFence(accountID model.ID, f *DeleteFence) error {
 	if f == nil {
 		return t.exec(`DELETE FROM delete_fences WHERE account_id = ?`, accountID[:])
 	}
-	return t.exec(`INSERT INTO delete_fences (account_id, vault_id, fenced_at, head_seq, head_h) VALUES (?, ?, ?, ?, ?)`,
-		f.AccountID[:], f.VaultID[:], unix(f.At), f.Head.Seq, f.Head.H[:])
+	return t.exec(`INSERT INTO delete_fences (account_id, fence_id, vault_id, fenced_at, head_seq, head_h) VALUES (?, ?, ?, ?, ?, ?)`,
+		f.AccountID[:], f.ID[:], f.VaultID[:], unix(f.At), f.Head.Seq, f.Head.H[:])
 }
 
 // accountRows are an account's rows, table by table, in an order its
@@ -1287,11 +1287,4 @@ func (t *sqliteTx) DeleteAccountRows(accountID, vaultID model.ID) (map[string]in
 func (t *sqliteTx) InsertDeleted(kind DeletedKind, id, accountID model.ID, at time.Time) error {
 	return t.exec(`INSERT INTO deleted_ids (kind, id, account_id, deleted_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT (kind, id, account_id) DO NOTHING`, string(kind), id[:], accountID[:], unix(at))
-}
-
-func (t *sqliteTx) DeviceDeleted(accountID, deviceID model.ID) (bool, error) {
-	var n int
-	err := t.row(`SELECT COUNT(*) FROM deleted_ids WHERE kind = ? AND id = ? AND account_id = ?`,
-		string(DeletedDevice), deviceID[:], accountID[:]).Scan(&n)
-	return n > 0, mapErr(err)
 }

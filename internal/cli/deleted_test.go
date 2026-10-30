@@ -33,15 +33,19 @@ func deleteAccount(t *testing.T, m *machine) {
 }
 
 // hop logout on a device whose account the operator deleted can't be
-// recorded by the server: it says so and how to give up on it, and
-// deletes nothing; hop logout --local-only then wipes the device.
+// recorded by the server, which answers it as any device it doesn't
+// know: hop says the server no longer knows the device, whom to ask and
+// how to give up on it, claims no delete, and deletes nothing; hop logout
+// --local-only then wipes the device.
 func TestLogoutOfADeletedAccount(t *testing.T) {
 	m := signedUp(t)
 	deleteAccount(t, m)
 	s := &session{}
-	if code := m.hop(t, s, "logout", "--yes"); code == 0 || !strings.Contains(s.stderr.String(), "operator deleted this account") ||
-		!strings.Contains(s.stderr.String(), "hop auth logout --local-only") {
-		t.Fatalf("logout of a deleted account: exit %d: %s", code, s.stderr.String())
+	code := m.hop(t, s, "logout", "--yes")
+	msg := s.stderr.String()
+	if code == 0 || !strings.Contains(msg, "the server no longer knows this device") || !strings.Contains(msg, "server's operator") ||
+		!strings.Contains(msg, "hop auth logout --local-only") || strings.Contains(msg, "deleted this account") {
+		t.Fatalf("logout of a deleted account: exit %d: %s", code, msg)
 	}
 	if ok, err := store.Exists(m.data); err != nil || !ok {
 		t.Fatalf("the pending logout deleted the vault: %v, %v", ok, err)

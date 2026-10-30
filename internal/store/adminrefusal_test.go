@@ -59,9 +59,6 @@ func TestAdminRefusal(t *testing.T) {
 	if s := (&AdminRefusal{Code: AdminAccountDisabled}).Error(); s != "the server's operator disabled this account" {
 		t.Errorf("without a reason: %q", s)
 	}
-	if s := (&AdminRefusal{Code: AdminAccountDeleted}).Error(); s != "the server's operator deleted this account" {
-		t.Errorf("a deleted account: %q", s)
-	}
 	if errors.Is(ErrSessionEnded, ErrAdminRefused) {
 		t.Error("ErrSessionEnded matches ErrAdminRefused")
 	}

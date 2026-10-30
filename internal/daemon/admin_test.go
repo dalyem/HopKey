@@ -13,6 +13,7 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/server"
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/syncclient"
 )
 
 // Tests for the server's operator refusing this device (hop-server
@@ -633,8 +634,14 @@ func TestStaleActiveAnswerKeepsANewerAdminLock(t *testing.T) {
 // after the disable it needs, without a backup.
 func deleteAccount(t *testing.T, w *syncWorld) {
 	t.Helper()
-	ctx := context.Background()
 	disableAccount(t, w, "")
+	deleteDisabled(t, w)
+}
+
+// deleteDisabled deletes the disabled account, without a backup.
+func deleteDisabled(t *testing.T, w *syncWorld) {
+	t.Helper()
+	ctx := context.Background()
 	p, err := server.PlanDelete(ctx, w.st, syncEmail, adminOp(), 0)
 	if err != nil {
 		t.Fatal(err)
@@ -644,11 +651,43 @@ func deleteAccount(t *testing.T, w *syncWorld) {
 	}
 }
 
-// hop sync on a device whose account was deleted is told account_deleted
-// at its challenge, and the device locks as for a disable: the agent
-// empties, the ssh sessions hop started end with the reason, and nothing
-// is recorded or deleted, the vault's files included. The retry and hop
-// unlock ask again and stay locked.
+// refusedLocked checks that n is locked by a server that no longer knows
+// the device (a 401, as for a deleted account's device): the agent
+// empty, the vault locked in memory as unconfirmed, a session refused,
+// with no operator's refusal in the store or in status (the server
+// claims none), no revocation and no report, and nothing deleted.
+func refusedLocked(t *testing.T, n *node) {
+	t.Helper()
+	if k := n.agentKeys(); k != 0 {
+		t.Errorf("%s: the agent serves %d key(s)", n.name, k)
+	}
+	info := n.st.Info()
+	if !info.Locked || !info.ServerUnconfirmed || info.AdminLock != nil || !strings.Contains(info.LockReason, store.ErrSessionRefused.Error()) {
+		t.Errorf("%s: the vault is not locked by a refused session alone: %+v, %+v", n.name, info, info.AdminLock)
+	}
+	var st StatusResult
+	n.must(OpStatus, nil, &st)
+	if st.Vault == nil || !st.Vault.Locked || st.Vault.AdminLock != nil {
+		t.Errorf("%s: status: %+v", n.name, st.Vault)
+	}
+	if st.Sync == nil || st.Sync.State == SyncRevoked || st.Sync.ServerRetirement != nil {
+		t.Errorf("%s: a refusal counted as a revocation: %+v", n.name, st.Sync)
+	}
+	data := n.cfg.DataDir
+	if exists(t, filepath.Join(data, "vault", "server-revoked.json")) {
+		t.Errorf("%s: a report was recorded", n.name)
+	}
+	if !exists(t, filepath.Join(data, "device.json")) || !exists(t, filepath.Join(data, "vault", "state.json")) {
+		t.Fatalf("%s: the vault was deleted", n.name)
+	}
+}
+
+// hop sync on a device whose account was deleted gets the 401 of a
+// device the server doesn't know, and the device locks as a client from
+// before account delete does: the agent empties, the ssh sessions hop
+// started end, and nothing is recorded or deleted, the vault's files
+// included. Nothing claims a delete. The retry and hop unlock ask again
+// and stay locked.
 func TestDeleteLocksHopSync(t *testing.T) {
 	x := newSyncSetup(t)
 	ctx := context.Background()
@@ -662,29 +701,30 @@ func TestDeleteLocksHopSync(t *testing.T) {
 
 	deleteAccount(t, x.w)
 	err := x.n2.call(OpSyncNow, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "operator deleted this account") {
+	if err == nil || strings.Contains(err.Error(), "deleted") {
 		t.Errorf("hop sync of a deleted account: %v", err)
 	}
-	session.ended(t, 5*time.Second, whyDeleted)
-	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
-	if e := endedStatus(t, x.n2); e == nil || e.Why != whyDeleted {
+	session.ended(t, 5*time.Second, whyRefused)
+	refusedLocked(t, x.n2)
+	if e := endedStatus(t, x.n2); e == nil || e.Why != whyRefused {
 		t.Errorf("ended sessions in status: %+v", e)
 	}
 
 	if x.n2.d.retryUnconfirmed(ctx) {
 		t.Fatal("the retry unlocked a deleted account's vault")
 	}
-	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
-	err = x.n2.call(OpUnlock, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "operator deleted this account") {
-		t.Errorf("hop unlock of a deleted account: %v", err)
+	refusedLocked(t, x.n2)
+	if err := x.n2.call(OpUnlock, nil, nil); err == nil {
+		t.Error("hop unlock of a deleted account succeeded")
 	}
-	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+	refusedLocked(t, x.n2)
 }
 
-// A delete reaches running daemons through their long-polls: both
-// devices lock, whatever they saw first (the disable a delete needs, or
-// the delete), and their next retry says the account was deleted.
+// Running daemons lock on the disable a delete needs, with the
+// operator's refusal in status; the delete that follows reaches them
+// through their long-polls as a 401, which replaces the lock's reason
+// but not that refusal's hold (TestAdminLockSurvivesAGenericRefusal):
+// they stay locked, nothing claims a delete, and nothing is deleted.
 func TestDeleteLocksTheBackgroundPull(t *testing.T) {
 	x := newSyncSetup(t)
 	x.w.start(x.n1, x.n1.st, SyncOptions{Wait: time.Second})
@@ -694,13 +734,24 @@ func TestDeleteLocksTheBackgroundPull(t *testing.T) {
 			t.Fatalf("setup: %s's agent serves %d key(s)", n.name, k)
 		}
 	}
-	deleteAccount(t, x.w)
+	disableAccount(t, x.w, "")
 	for _, n := range []*node{x.n1, x.n2} {
 		eventually(t, 15*time.Second, n.name+" locks", func() bool { return n.agentKeys() == 0 })
+		adminHeld(t, n, store.AdminAccountDisabled)
+	}
+	deleteDisabled(t, x.w)
+	for _, n := range []*node{x.n1, x.n2} {
 		if n.d.retryUnconfirmed(context.Background()) {
 			t.Fatalf("%s: the retry unlocked a deleted account's vault", n.name)
 		}
-		adminLocked(t, n, store.AdminAccountDeleted, "")
+		if info := n.st.Info(); !info.Locked || !info.ServerUnconfirmed || info.AdminLock != nil ||
+			!strings.Contains(info.LockReason, store.ErrSessionRefused.Error()) || strings.Contains(info.LockReason, "deleted") {
+			t.Errorf("%s: the 401 is not the lock's reason: %+v", n.name, info)
+		}
+		adminHeld(t, n, store.AdminAccountDisabled)
+		if !exists(t, filepath.Join(n.cfg.DataDir, "device.json")) || !exists(t, filepath.Join(n.cfg.DataDir, "vault", "state.json")) {
+			t.Fatalf("%s: the vault was deleted", n.name)
+		}
 	}
 }
 
@@ -721,7 +772,7 @@ func TestDeleteLocksAPush(t *testing.T) {
 	}
 	x.n2.pause(false)
 	eventually(t, 15*time.Second, "the push is refused and the laptop locks", func() bool { return x.n2.agentKeys() == 0 })
-	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+	refusedLocked(t, x.n2)
 	// Status can't count a locked vault's outbox; its files are there.
 	if empty, err := x.n2.st.OutboxEmpty(); err != nil || empty {
 		t.Errorf("the queued change is gone after the refused push: empty %v, %v", empty, err)
@@ -733,11 +784,12 @@ func TestDeleteLocksAtStart(t *testing.T) {
 	x := newSyncSetup(t)
 	deleteAccount(t, x.w)
 	x.w.startWatched(x.n2, x.n2.st) // fails if the agent ever served a key
-	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+	refusedLocked(t, x.n2)
 }
 
-// A logout of a device whose account was deleted can't be recorded: it
-// stays pending with the operator's refusal, posts nothing, and deletes
+// A logout of a device whose account was deleted can't be recorded: the
+// server answers it as a device it doesn't know (401), so it stays
+// pending, with no operator's refusal claimed, posts nothing, and deletes
 // nothing on the device; --local-only is the way out, and it wipes.
 func TestLogoutOfADeletedAccount(t *testing.T) {
 	x := newSyncSetup(t)
@@ -753,8 +805,7 @@ func TestLogoutOfADeletedAccount(t *testing.T) {
 	retirer := x.w.client(t).Retirer(x.pub.VaultID)
 	for range 2 {
 		res, err := x.n2.st.Logout(ctx, retirer, store.LogoutOptions{})
-		var ar *store.AdminRefusal
-		if !errors.Is(err, store.ErrLogoutPending) || !errors.As(err, &ar) || ar.Code != store.AdminAccountDeleted ||
+		if !errors.Is(err, store.ErrLogoutPending) || errors.Is(err, store.ErrAdminRefused) || !errors.Is(err, syncclient.ErrUnauthorized) ||
 			res.Done || res.State != store.StateRetiring {
 			t.Fatalf("logout of a deleted account: %+v, %v", res, err)
 		}

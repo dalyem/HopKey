@@ -82,7 +82,6 @@ const (
 	// The server's operator refused this device (unconfirmedLocked).
 	whyDisabled = "the server's operator disabled this account"
 	whyBlocked  = "the server's operator blocked this device"
-	whyDeleted  = "the server's operator deleted this account"
 	whyLock     = "hop lock --end-sessions ran"
 )
 

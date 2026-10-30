@@ -258,7 +258,6 @@ type fakeAuth struct {
 	logs       int
 	tokens     map[string]bool
 	inactive   bool   // session challenges get 401
-	deleted    bool   // challenges get 403 account_deleted
 	refuse     int    // this many session requests get 401
 	refuse403  int    // this many session requests get 403 without an admin code
 	admin      string // session requests get 403 with this admin code
@@ -285,10 +284,6 @@ func (f *fakeAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.challenges++
 		if f.inactive {
 			f.unauthorized(w)
-			return
-		}
-		if f.deleted {
-			writeCanon(w, http.StatusForbidden, errorResponse{errorBody{Code: store.AdminAccountDeleted, Message: "deleted"}})
 			return
 		}
 		ch := make([]byte, crypto.ChallengeSize)
@@ -503,27 +498,6 @@ func TestSessionAdminRefused(t *testing.T) {
 	}
 }
 
-// A challenge refused with account_deleted (the operator deleted the
-// account) is the operator's refusal at once, like a session refused with
-// an admin code: no session is asked for, it is not a session ending, and
-// it is not retryable.
-func TestChallengeAccountDeleted(t *testing.T) {
-	f, r, _, _, _ := sessionFixture(t)
-	f.set(func(f *fakeAuth) { f.deleted = true })
-	_, _, err := r.Since(bg, 0)
-	var ar *store.AdminRefusal
-	if !errors.Is(err, ErrAdminRefused) || !errors.As(err, &ar) || ar.Code != store.AdminAccountDeleted || ar.Reason != "" {
-		t.Fatalf("a deleted account's challenge: %v (%+v)", err, ar)
-	}
-	if errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrUnauthorized) || Retryable(err) {
-		t.Errorf("account_deleted matches more: %v", err)
-	}
-	if !strings.Contains(err.Error(), "operator deleted this account") {
-		t.Errorf("text %q", err.Error())
-	}
-	wantCounts(t, f, 1, 0, 0)
-}
-
 // A session response without a vault_id (an older server), or with a zero
 // one, is malformed, and nothing is cached from it.
 func TestSessionWithoutVaultIDRefused(t *testing.T) {
@@ -702,11 +676,6 @@ func TestErrorMapping(t *testing.T) {
 			var ar *store.AdminRefusal
 			return errors.As(err, &ar) && ar.Code == store.AdminDeviceBlocked && ar.Reason == ""
 		}}},
-		{403, env("account_deleted"), []check{is(ErrAdminRefused), retry(false), code("account_deleted"), func(err error) bool {
-			var ar *store.AdminRefusal
-			return errors.As(err, &ar) && ar.Code == store.AdminAccountDeleted && ar.Reason == ""
-		}}},
-		{401, env("account_deleted"), []check{not(ErrAdminRefused), is(ErrUnauthorized)}},
 		{403, env("forbidden"), []check{not(ErrAdminRefused), retry(false), code("forbidden")}},
 		{401, env("account_disabled"), []check{not(ErrAdminRefused), is(ErrUnauthorized)}},
 		{403, `{"error":{"code":"account_disabled","message":"m","reason":""}}`, []check{not(ErrAdminRefused), code("")}},

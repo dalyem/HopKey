@@ -151,7 +151,8 @@ func TestAccountsDeleteFenceCancelAndJSON(t *testing.T) {
 	}
 
 	out, _ = mustRun(t, "accounts", "delete", "--cancel", acct.String(), "--dry-run", "--data", dir)
-	if !strings.Contains(out, "would lift the delete's fence") || !strings.Contains(out, "dry run: nothing changed") {
+	if !strings.Contains(out, "would lift the delete's fence") || !strings.Contains(out, "dry run: nothing changed") ||
+		!strings.Contains(out, "(fence ") {
 		t.Errorf("cancel --dry-run:\n%s", out)
 	}
 	out, errOut := mustRun(t, "accounts", "delete", "--cancel", "bob@example.com", "--yes", "--json", "--data", dir)
@@ -175,6 +176,7 @@ func TestAccountsDeleteFenceCancelAndJSON(t *testing.T) {
 	var res struct {
 		Deleted struct {
 			AccountID model.ID       `json:"account_id"`
+			FenceID   model.ID       `json:"fence_id"`
 			Devices   []model.ID     `json:"devices"`
 			Rows      map[string]int `json:"rows"`
 		} `json:"deleted"`
@@ -182,7 +184,7 @@ func TestAccountsDeleteFenceCancelAndJSON(t *testing.T) {
 		Backup *string `json:"backup"`
 		Audit  []int64 `json:"audit_ids"`
 	}
-	if err := json.Unmarshal([]byte(out), &res); err != nil || res.Deleted.AccountID != acct || len(res.Deleted.Devices) != 1 ||
+	if err := json.Unmarshal([]byte(out), &res); err != nil || res.Deleted.AccountID != acct || res.Deleted.FenceID.IsZero() || len(res.Deleted.Devices) != 1 ||
 		res.Deleted.Rows["accounts"] != 1 || res.Exists == nil || *res.Exists || res.Backup != nil || len(res.Audit) != 2 {
 		t.Errorf("delete --json: %s, %v", out, err)
 	}

@@ -831,7 +831,7 @@ func TestMigrateV4ToV5(t *testing.T) {
 	}
 	st.Close()
 	e2 := newEnvAt(t, path)
-	wantCode(t, e2.challenge(v, A, "session"), 403, CodeAccountDeleted, "a challenge after the migration and a delete")
+	wantCode(t, e2.challenge(v, A, "session"), 401, "unauthorized", "a challenge after the migration and a delete")
 }
 
 // A version 2 database from before device_seen existed gains it too.

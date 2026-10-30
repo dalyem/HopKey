@@ -19,6 +19,8 @@ import (
 // Tests for account delete (delete.go): the fence, the verified backup,
 // the delete of every row of the account and nothing else, the
 // tombstones that keep its IDs from coming back, and what its devices see.
+// A fence is known by its ID (TestDeleteFenceIdentity), and the backup's
+// directory is created durably (TestBackupDirIsDurable).
 
 // disable disables v's account at the env's clock.
 func (e *env) disable(v *tvault, reason string) {
@@ -237,7 +239,12 @@ func TestDeleteAccount(t *testing.T) {
 	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
 		t.Errorf("backup dir: %v, %v", fi.Mode(), err)
 	}
-	fence := &DeleteFence{AccountID: acct, VaultID: vid, At: res.FencedAt, Head: res.Head}
+	fence := &DeleteFence{ID: res.FenceID, AccountID: acct, VaultID: vid, At: res.FencedAt, Head: res.Head}
+	for _, en := range entries {
+		if res.FenceID.IsZero() || !strings.Contains(string(en.Params), `"fence_id":"`+res.FenceID.String()+`"`) {
+			t.Errorf("audit row %s without the fence ID %s", en.Params, res.FenceID)
+		}
+	}
 	if err := VerifyBackup(ctx, res.Backup, fence); err != nil {
 		t.Errorf("the backup does not verify: %v", err)
 	}
@@ -266,8 +273,8 @@ func TestDeleteAccount(t *testing.T) {
 	r, _ := e.readLog(other, e.session(other, other.dev(0)), "")
 	wantStatus(t, r, 200, "the other account reads its log")
 	var tomb int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM deleted_ids WHERE account_id = ?`, acct[:]).Scan(&tomb); err != nil || tomb != 6 {
-		t.Errorf("%d tombstones (%v), want the account, the vault and 4 devices", tomb, err)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM deleted_ids WHERE account_id = ?`, acct[:]).Scan(&tomb); err != nil || tomb != 2 {
+		t.Errorf("%d tombstones (%v), want the account and the vault", tomb, err)
 	}
 	if _, err := ShowAccount(ctx, e.st, v.email, e.clock.now()); err == nil {
 		t.Error("the deleted account is still shown")
@@ -283,11 +290,12 @@ func TestDeleteAccount(t *testing.T) {
 	}
 }
 
-// After a delete, a device of the account is told account_deleted when
-// it asks for a challenge, for a session or for retire-status, with no
-// reason; an unknown device of the account, or the device under another
-// account, still gets the uniform 401, as do its login, its recovery and
-// its old sessions. Prelogin answers for the email as for any unknown one.
+// After a delete, a device of the account gets the uniform 401 an
+// unknown device gets, for a session or a retire-status challenge: the
+// server tells it nothing before it proves anything, and it no longer can.
+// So do an unknown device of the account and the device under another
+// account, its login, its recovery and its old sessions. Prelogin answers
+// for the email as for any unknown one.
 func TestDeletedAccountRefusals(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -308,17 +316,16 @@ func TestDeletedAccountRefusals(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	unknown := e.challenge(v, randID(t), crypto.OperationSession)
+	wantCode(t, unknown, 401, "unauthorized", "an unknown device of a deleted account")
 	for _, dev := range []model.ID{A, B} {
 		for _, op := range []string{crypto.OperationSession, crypto.OperationRetireStatus} {
 			r := e.challenge(v, dev, op)
-			wantCode(t, r, 403, CodeAccountDeleted, "a challenge for a device of a deleted account")
-			if reason, ok := errorReason(t, r); ok {
-				t.Errorf("a reason %q with account_deleted", reason)
+			if r.status != unknown.status || string(r.body) != string(unknown.body) {
+				t.Errorf("a %s challenge for a device of a deleted account: %v, want an unknown device's %v", op, r, unknown)
 			}
 		}
 	}
-	wantCode(t, e.do("POST", "/v1/auth/challenge", "", challengeRequest{v.accountID(), randID(t), "session"}), 401, "unauthorized",
-		"an unknown device of a deleted account")
 	wantCode(t, e.do("POST", "/v1/auth/challenge", "", challengeRequest{randID(t), A, "session"}), 401, "unauthorized",
 		"a device of a deleted account under another account")
 	r, _ := e.readLog(v, old, "")
@@ -612,9 +619,191 @@ func TestDeleteResumesFromItsFence(t *testing.T) {
 	if len(entries) != 1 || entries[0].Action != ActionDelete || entries[0].Result != "ok" || !res.FencedAt.Equal(f.At) {
 		t.Errorf("resumed delete: %+v, %+v", res, entries)
 	}
-	if err := VerifyBackup(ctx, res.Backup, f); err != nil {
-		t.Errorf("the backup does not verify: %v", err)
+	if err := VerifyBackup(ctx, res.Backup, f); err != nil || res.FenceID != f.ID {
+		t.Errorf("the backup does not verify: %v (fence %v, want %v)", err, res.FenceID, f.ID)
 	}
+}
+
+// The backup's directory and its missing parents are made 0700, and
+// after each is made its parent is synced, from the top down, so a power
+// loss can't keep the delete and lose the directory the backup is in. A
+// directory that is there has its parent synced all the same. A sync
+// that fails is a failed backup: nothing is deleted and the fence stays.
+func TestBackupDirIsDurable(t *testing.T) {
+	root := t.TempDir()
+	var synced []string
+	record := func(d string) error {
+		synced = append(synced, d)
+		return nil
+	}
+	dir := filepath.Join(root, "a", "b", "backups")
+	if err := mkdirDurable(dir, record); err != nil {
+		t.Fatal(err)
+	}
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "a", "b")
+	if want := []string{root, a, b}; !slices.Equal(synced, want) {
+		t.Errorf("synced %q, want %q", synced, want)
+	}
+	for _, d := range []string{a, b, dir} {
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+			t.Errorf("%s: %v, %v", d, fi, err)
+		}
+	}
+	synced = nil
+	if err := mkdirDurable(dir, record); err != nil || !slices.Equal(synced, []string{b}) {
+		t.Errorf("a directory that is there: synced %q, %v", synced, err)
+	}
+	notDir := filepath.Join(root, "file")
+	if err := os.WriteFile(notDir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mkdirDurable(filepath.Join(notDir, "backups"), record); err == nil {
+		t.Error("a directory under a file was made")
+	}
+
+	e := newEnv(t)
+	ctx := context.Background()
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	e.disable(v, "")
+	plan, err := PlanDelete(ctx, e.st, v.email, e.op(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(t.TempDir(), "data")
+	backups := filepath.Join(data, "backups")
+	failing := func(d string) error {
+		if d == data {
+			return errors.New("injected sync failure")
+		}
+		return nil
+	}
+	_, entries, err := DeleteAccount(ctx, e.st, e.op(), plan, DeleteOptions{BackupDir: backups, syncDir: failing})
+	wantAdminCode(t, err, "backup_failed", "a delete whose backup directory could not be synced")
+	if len(entries) != 2 || entries[1].Result != "backup_failed" {
+		t.Errorf("audit rows %+v", entries)
+	}
+	if names, _ := os.ReadDir(backups); len(names) != 0 {
+		t.Errorf("a backup was written after the failed sync: %v", names)
+	}
+	var f *DeleteFence
+	e.view(func(tx Tx) (err error) {
+		f, err = tx.DeleteFence(v.accountID())
+		return err
+	})
+	if f == nil {
+		t.Fatal("the failed sync lifted the fence")
+	}
+	wantFence(t, e, v, f, "after a failed sync")
+
+	// Run again, it syncs what the failed run made, and deletes.
+	plan, err = PlanDelete(ctx, e.st, v.email, e.op(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	synced = nil
+	res, _, err := DeleteAccount(ctx, e.st, e.op(), plan, DeleteOptions{BackupDir: backups, syncDir: record})
+	if err != nil || filepath.Dir(res.Backup) != backups || !slices.Equal(synced, []string{data}) {
+		t.Errorf("the delete run again: %+v, %v; synced %q", res, err, synced)
+	}
+}
+
+// backupHook is a Store whose Backup runs after once the copy is
+// written: what happens there happens to a delete in flight, between its
+// backup and its delete transaction.
+type backupHook struct {
+	Store
+	after func()
+}
+
+func (s backupHook) Backup(ctx context.Context, path string) error {
+	err := s.Store.Backup(ctx, path)
+	if err == nil {
+		s.after()
+	}
+	return err
+}
+
+// cancelFence lifts v's delete fence as hop-server accounts delete
+// --cancel does.
+func cancelFence(t *testing.T, e *env, v *tvault) {
+	t.Helper()
+	ctx := context.Background()
+	p, err := PlanCancelDelete(ctx, e.st, v.email, e.op())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := CancelDelete(ctx, e.st, e.op(), p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wantFence fails unless v's account is there, fenced by want.
+func wantFence(t *testing.T, e *env, v *tvault, want *DeleteFence, what string) {
+	t.Helper()
+	e.view(func(tx Tx) error {
+		if _, err := tx.Account(v.accountID()); err != nil {
+			t.Errorf("%s: the account: %v", what, err)
+		}
+		f, err := tx.DeleteFence(v.accountID())
+		if err != nil || f == nil || *f != *want {
+			t.Errorf("%s: the fence is %+v (%v), want %+v", what, f, err, want)
+		}
+		return nil
+	})
+}
+
+// A fence is not known by when it was set and the head it holds: a
+// cancel and a new fence in the same second, at the same head, make
+// another fence. A delete in flight across them refuses its delete, and
+// a resume or a cancel shown the old fence refuses; the new fence stands.
+func TestDeleteFenceIdentity(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	v := newVault(t, "a@example.com")
+	e.publish(v)
+	e.disable(v, "")
+
+	// In flight: the backup is taken under the first fence, then the
+	// fence is lifted and set again, at the same time and head.
+	plan, err := PlanDelete(ctx, e.st, v.email, e.op(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second *DeleteFence
+	hooked := backupHook{e.st, func() {
+		cancelFence(t, e, v)
+		second = failBackup(t, e, v)
+	}}
+	_, entries, err := DeleteAccount(ctx, hooked, e.op(), plan, DeleteOptions{BackupDir: t.TempDir()})
+	wantAdminCode(t, err, "changed", "a delete whose fence was set again in flight")
+	if second == nil {
+		t.Fatal("the backup hook did not run")
+	}
+	if n := len(entries); n != 2 || entries[n-1].Action != ActionDelete || entries[n-1].Result != "changed" {
+		t.Errorf("audit rows %+v", entries)
+	}
+	wantFence(t, e, v, second, "after a delete in flight across a new fence")
+
+	// Stale: a resume and a cancel shown the fence before.
+	resume, err := PlanDelete(ctx, e.st, v.email, e.op(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, err := PlanCancelDelete(ctx, e.st, v.email, e.op())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelFence(t, e, v)
+	third := failBackup(t, e, v)
+	if !third.At.Equal(second.At) || third.Head != second.Head {
+		t.Fatalf("setup: the fences differ by time or head: %+v, %+v", second, third)
+	}
+	_, _, err = DeleteAccount(ctx, e.st, e.op(), resume, DeleteOptions{BackupDir: t.TempDir()})
+	wantAdminCode(t, err, "changed", "a resume shown the fence before")
+	_, _, err = CancelDelete(ctx, e.st, e.op(), cancel)
+	wantAdminCode(t, err, "changed", "a cancel shown the fence before")
+	wantFence(t, e, v, third, "after a stale resume and cancel")
 }
 
 // VerifyBackup refuses a copy taken before the fence, one whose fence or
@@ -641,6 +830,8 @@ func TestVerifyBackupRefuses(t *testing.T) {
 	moved.Head.Seq++
 	otherFence := *f
 	otherFence.At = f.At.Add(time.Second)
+	otherID := *f
+	otherID.ID = randID(t)
 	garbage := filepath.Join(t.TempDir(), "garbage.db")
 	b, err := os.ReadFile(good)
 	if err != nil {
@@ -659,6 +850,7 @@ func TestVerifyBackupRefuses(t *testing.T) {
 		{"a backup from before the fence", early, f},
 		{"another head", good, &moved},
 		{"another fence", good, &otherFence},
+		{"another fence at the same time and head", good, &otherID},
 		{"a damaged file", garbage, f},
 		{"no file", filepath.Join(t.TempDir(), "none.db"), f},
 	} {

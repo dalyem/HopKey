@@ -41,9 +41,10 @@ type deletePlanJSON struct {
 	PendingInvites []inviteJSON   `json:"pending_invites"`
 }
 
-// deletingJSON is a delete in progress: when its fence was set, and the
-// head it holds the vault at.
+// deletingJSON is a delete in progress: its fence's ID, when it was set,
+// and the head it holds the vault at.
 type deletingJSON struct {
+	FenceID  model.ID  `json:"fence_id"`
 	FencedAt time.Time `json:"fenced_at"`
 	HeadSeq  uint64    `json:"head_seq"`
 }
@@ -55,7 +56,7 @@ func deletePlanOf(p *server.DeletePlan, now time.Time) deletePlanJSON {
 		PendingInvites: invitesJSON(p.Invites, now),
 	}
 	if p.Fence != nil {
-		out.Deleting = &deletingJSON{FencedAt: p.Fence.At.UTC(), HeadSeq: p.Fence.Head.Seq}
+		out.Deleting = &deletingJSON{FenceID: p.Fence.ID, FencedAt: p.Fence.At.UTC(), HeadSeq: p.Fence.Head.Seq}
 	}
 	out.Devices = append(out.Devices, p.Devices...)
 	return out
@@ -89,11 +90,11 @@ func printDeletePlan(w io.Writer, p *server.DeletePlan) {
 		fmt.Fprintf(w, "  %s for the email stay\n", plural(len(p.Invites), "pending invite", "pending invites"))
 	}
 	if p.Fence != nil {
-		fmt.Fprintf(w, "  a delete started %s is in progress: the account is fenced at head seq %d\n", when(p.Fence.At), p.Fence.Head.Seq)
+		fmt.Fprintf(w, "  a delete started %s is in progress: the account is fenced at head seq %d (fence %s)\n", when(p.Fence.At), p.Fence.Head.Seq, p.Fence.ID)
 	}
 }
 
-const deleteHelp = "This cannot be undone. Every row above is deleted from this server; the account, vault and device IDs " +
+const deleteHelp = "This cannot be undone. Every row above is deleted from this server; the account and vault IDs " +
 	"are never used again, and the audit trail keeps the account ID. The email can be invited again, as a new account. " +
 	"First the account is fenced (the server refuses it every write, session and logout), then a backup is written and verified, " +
 	"and only then is it deleted; if the backup fails, nothing is deleted and the account stays fenced " +
@@ -205,7 +206,7 @@ func accountsDelete(args []string, stdout, stderr io.Writer) error {
 			Exists  bool        `json:"exists"`
 			Backup  *string     `json:"backup"`
 			Audit   []int64     `json:"audit_ids"`
-		}{deletedJSON{res.AccountID, res.VaultID, res.Head.Seq, res.FencedAt.UTC(), append([]model.ID{}, res.Devices...), res.Rows},
+		}{deletedJSON{res.AccountID, res.VaultID, res.Head.Seq, res.FenceID, res.FencedAt.UTC(), append([]model.ID{}, res.Devices...), res.Rows},
 			false, strOrNil(res.Backup), ids})
 	}
 	fmt.Fprintf(stdout, "deleted account %s at head seq %d: %s\n", res.AccountID, res.Head.Seq, rowsText(res.Rows))
@@ -220,6 +221,7 @@ type deletedJSON struct {
 	AccountID model.ID       `json:"account_id"`
 	VaultID   model.ID       `json:"vault_id"`
 	HeadSeq   uint64         `json:"head_seq"`
+	FenceID   model.ID       `json:"fence_id"`
 	FencedAt  time.Time      `json:"fenced_at"`
 	Devices   []model.ID     `json:"devices"`
 	Rows      map[string]int `json:"rows"`

@@ -186,19 +186,19 @@ type Tx interface {
 	// DeleteAccountRows deletes the rows AccountRows counts and returns
 	// how many it deleted per table. It writes no tombstone.
 	DeleteAccountRows(accountID, vaultID model.ID) (map[string]int, error)
-	// InsertDeleted tombstones an ID of a deleted account: its own, its
-	// vault's, or one of its devices'. An account or vault row with a
-	// tombstoned account or vault ID can never be written again.
+	// InsertDeleted tombstones an ID of a deleted account: its own, or
+	// its vault's. An account or vault row with a tombstoned account or
+	// vault ID can never be written again.
 	InsertDeleted(kind DeletedKind, id, accountID model.ID, at time.Time) error
-	// DeviceDeleted reports whether deviceID was a device of the deleted
-	// account accountID.
-	DeviceDeleted(accountID, deviceID model.ID) (bool, error)
 }
 
 // DeleteFence is an account delete in progress: from when the fence was
 // set (At) until the delete or its cancel, the server refuses the
 // account every write, session and login, so its vault stays at Head.
+// ID, random, tells it from any other fence of the account, one set in
+// the same second at the same head included.
 type DeleteFence struct {
+	ID        model.ID
 	AccountID model.ID
 	VaultID   model.ID
 	At        time.Time
@@ -211,7 +211,6 @@ type DeletedKind string
 const (
 	DeletedAccount DeletedKind = "account"
 	DeletedVault   DeletedKind = "vault"
-	DeletedDevice  DeletedKind = "device"
 )
 
 // AdminBlock is an operator's disable of an account or block of a device:

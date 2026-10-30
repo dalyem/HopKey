@@ -58,8 +58,8 @@ var (
 var ErrSessionEnded = store.ErrSessionEnded
 
 // ErrAdminRefused is store.ErrAdminRefused: a 403 with the code
-// account_disabled, device_blocked or account_deleted, the server's
-// operator refusing the account or this device. The error is also a *store.AdminRefusal, which
+// account_disabled or device_blocked, the server's operator refusing the
+// account or this device. The error is also a *store.AdminRefusal, which
 // carries the code and the operator's reason.
 var ErrAdminRefused = store.ErrAdminRefused
 
@@ -71,9 +71,8 @@ type APIError struct {
 	Status  int
 	Code    string // the R11 code; empty when the body was not an R11 error
 	Message string
-	// Admin is set for a 403 account_disabled, device_blocked or
-	// account_deleted, with the operator's reason: the error then matches
-	// ErrAdminRefused.
+	// Admin is set for a 403 account_disabled or device_blocked, with the
+	// operator's reason: the error then matches ErrAdminRefused.
 	Admin *store.AdminRefusal
 }
 
@@ -171,8 +170,7 @@ func responseError(status int, body []byte) error {
 		return fmt.Errorf("%w: a head_conflict error without a head", ErrMalformedResponse)
 	}
 	e := &APIError{Status: status, Code: er.Error.Code, Message: er.Error.Message}
-	if status == http.StatusForbidden && (e.Code == store.AdminAccountDisabled || e.Code == store.AdminDeviceBlocked ||
-		e.Code == store.AdminAccountDeleted) {
+	if status == http.StatusForbidden && (e.Code == store.AdminAccountDisabled || e.Code == store.AdminDeviceBlocked) {
 		e.Admin = &store.AdminRefusal{Code: e.Code, Reason: er.Error.Reason}
 	}
 	return e
