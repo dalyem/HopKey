@@ -213,6 +213,14 @@ func (s *Store) Resolve(r Resolution) error {
 		if ev.res.Kind == merge.KindHold {
 			return fmt.Errorf("%w: %s", ErrStillHeld, ev.res.Cause)
 		}
+		if rec.Intent.Type == model.TypeAccess {
+			if ev.res.Kind == merge.KindDrop && rec.Intent.Action != merge.ActionDelete {
+				return ErrNothingToRecord
+			}
+			if err := s.checkAccessResolution(rec.Intent.ItemID, ev.res.Plaintext); err != nil {
+				return err
+			}
+		}
 	case merge.ChoiceKeepMine, merge.ChoiceEdit, merge.ChoiceKeepMineMerge, merge.ChoiceTakeTheirsMerge:
 		repl, _, err := s.replacement(rec, ev, &r)
 		if err != nil {
@@ -310,6 +318,17 @@ func (s *Store) replacement(rec *record, ev evaluation, r *Resolution) (merge.In
 	}
 	if err != nil {
 		return merge.Intent{}, model.ID{}, err
+	}
+	// An access item's replacement is stamped before it is shown, digested
+	// or checked (§5.0), and refused if V_access refuses it, if it changes
+	// nothing but by, or if it touches an attestation.
+	if repl.Want, err = s.stampItem(repl.Want); err != nil {
+		return merge.Intent{}, model.ID{}, err
+	}
+	if repl.Type == model.TypeAccess {
+		if err := s.checkAccessResolution(repl.ItemID, repl.Want); err != nil {
+			return merge.Intent{}, model.ID{}, err
+		}
 	}
 	if repl.Action == merge.ActionCreate && repl.ItemID != held.ItemID {
 		if err := s.checkFreshID(repl.ItemID); err != nil {

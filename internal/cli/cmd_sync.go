@@ -1341,10 +1341,20 @@ func (r *resolver) report(h *daemon.HeldChange, choice string, res *daemon.SyncR
 	if err != nil {
 		return r.resolveError(h.N, err)
 	}
+	// Resolving a hop access record never touches a host, so the hosts may
+	// now disagree with it (spec rev 17, §2.11 as amended by Part 2).
+	accessNote := "the hosts may now disagree with the hop access record; run hop access check"
 	if r.asJSON {
-		return printJSON(r.e, map[string]any{"resolved": h.N, "choice": choice, "status": res.Status})
+		out := map[string]any{"resolved": h.N, "choice": choice, "status": res.Status}
+		if h.Type == model.TypeAccess {
+			out["note"] = accessNote
+		}
+		return printJSON(r.e, out)
 	}
 	r.e.printf("change %d resolved: %s\n", h.N, choice)
+	if h.Type == model.TypeAccess {
+		r.e.printf("%s\n", accessNote)
+	}
 	if res.Status != nil {
 		printSyncBlock(r.e, r.e.Stdout, res.Status, syncBlockOpts{})
 	}

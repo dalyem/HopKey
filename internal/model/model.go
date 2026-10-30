@@ -74,6 +74,7 @@ const (
 	TypeSnippet    Type = "snippet"
 	TypeGrant      Type = "grant"
 	TypePolicy     Type = "policy"
+	TypeAccess     Type = "access"
 )
 
 // Header is the part every item plaintext shares. ItemVersion is a u64
@@ -250,6 +251,7 @@ type Snapshot struct {
 	Credentials []Credential
 	Snippets    []Snippet
 	Policies    []Policy
+	Access      []Access
 	Marks       map[ID]Mark
 }
 

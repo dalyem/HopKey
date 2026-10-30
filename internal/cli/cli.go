@@ -326,7 +326,11 @@ func init() {
 		"auth":    {runAuth, "hop auth <signup|login|approve|status|devices|policy|logout|rotate|passwd|merge|resume> [--json]"},
 		"login":   {runLogin, "hop login [flags of hop auth login]"},
 		"logout":  {runLogout, "hop logout [flags of hop auth logout]"},
-		"vault":   {runVault, vaultForkUsage},
+		"access": {runAccess, "hop access add LABEL HOST... --pubkey KEY --fingerprint SHA256:... [--from CIDR,...] [--restrict|--no-forwarding] [--alongside] [--yes] [--json]" +
+			" | hop access add LABEL [HOST...] [--alongside] | hop access rm LABEL [HOST...] [--same-machine] [--yes] [--json] | hop access rm LABEL --abandon HOST [--yes]" +
+			" | hop access migrate LABEL HOST [--yes] | hop access forget LABEL [--yes] | hop access ls [LABEL] [--json]" +
+			" | hop access check [LABEL] [--host HOST]... [--all-hosts] [--json]"},
+		"vault": {runVault, vaultForkUsage},
 	}
 }
 
@@ -336,6 +340,7 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop ls [tag] | info <target> | add | edit | rm
        hop key add|ls|rm|rotate | import ssh-config | ts import|link
        hop snippet add|ls|rm
+       hop access add|rm|ls|check|migrate|forget   a colleague's key on your hosts
        hop mcp [--read-only] | mcp install   tools for local AI agents (MCP)
        hop setup [--service] | status | daemon
        hop init | lock | unlock [--password] | passwd

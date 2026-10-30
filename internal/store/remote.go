@@ -323,7 +323,7 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 		if err != nil {
 			return st, sec, err
 		}
-		if err := s.commitVerified(c.Wire, h, next, rec); err != nil {
+		if err := s.commitVerified(c.Wire, h, st, next, nsec, rec); err != nil {
 			// nsec was never installed: drop what it does not share.
 			supersede(nsec, sec)
 			return st, sec, err
@@ -339,9 +339,12 @@ func (s *Store) applyEntries(st *vaultlog.State, sec *vaultlog.Secrets, dev vaul
 // the entry, state.json and every outbox record it settles (§11.1). A
 // record whose candidate is this entry is deleted; a record whose live
 // candidate was at this seq with another H has it marked dead, and a login
-// merge's receipt for an import it settles is written with it (§4.4). rec
+// merge's receipt for an import it settles is written with it (§4.4). A
+// checkpoint that revokes devices which last changed live access records
+// adds its access-review note in the same commit (rev 17 §7.5). pre is the
+// state the entry was verified on, and sec the post-state's secrets. rec
 // opens the outbox. The caller holds s.mu and the file lock.
-func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.State, rec *deviceRecord) error {
+func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, pre, st *vaultlog.State, sec *vaultlog.Secrets, rec *deviceRecord) error {
 	if err := s.l.writeObjects(w); err != nil {
 		return err
 	}
@@ -368,7 +371,13 @@ func (s *Store) commitVerified(w *vaultlog.Wire, h crypto.Hash, st *vaultlog.Sta
 		return err
 	}
 	// So are the sync notes, whether or not the outbox has records.
-	if err := s.settleSyncNotes(t, w.Entry.Seq, hashAt, rec, st.VaultID); err != nil {
+	var ready []syncNoteJSON
+	if note, err := accessReviewNote(w, pre, st, sec); err != nil {
+		return err
+	} else if note != nil {
+		ready = append(ready, *note)
+	}
+	if err := s.settleSyncNotes(t, w.Entry.Seq, hashAt, rec, st.VaultID, ready...); err != nil {
 		return err
 	}
 	// A journaled checkpoint's candidate at this seq is settled in the same

@@ -104,8 +104,14 @@ func startAKArgv(t *testing.T, home, path string, argv []string) *akWriter {
 	if err := w.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	// A script that never ends would hang the package until go test's
+	// own timeout, with nothing said about which run it was. After
+	// akRunLimit its process group is killed, so done reports -1 (killed)
+	// and the test fails on that code with the script's stderr.
+	watchdog := time.AfterFunc(akRunLimit, func() { syscall.Kill(-w.cmd.Process.Pid, syscall.SIGKILL) })
 	go func() {
 		err := w.cmd.Wait()
+		watchdog.Stop()
 		code := 0
 		if ee, ok := err.(*exec.ExitError); ok {
 			code = ee.ExitCode()
@@ -113,10 +119,14 @@ func startAKArgv(t *testing.T, home, path string, argv []string) *akWriter {
 		w.done <- code
 	}()
 	t.Cleanup(func() {
+		watchdog.Stop()
 		syscall.Kill(-w.cmd.Process.Pid, syscall.SIGKILL)
 	})
 	return w
 }
+
+// akRunLimit bounds one run of a remote script in these tests.
+const akRunLimit = 60 * time.Second
 
 // waitFor polls until ok, or fails the test after a few seconds.
 func waitFor(t *testing.T, what string, ok func() bool) {

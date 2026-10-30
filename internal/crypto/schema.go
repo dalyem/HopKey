@@ -269,7 +269,8 @@ func ValidateGrant(g *model.Grant) error {
 }
 
 // Item is one decoded §6.5 plaintext: *model.Host, *model.Key,
-// *model.Credential, *model.Snippet, *model.Grant or *model.Policy.
+// *model.Credential, *model.Snippet, *model.Grant, *model.Policy or
+// *model.Access.
 type Item any
 
 // ItemHeader returns the shared header of an Item.
@@ -286,6 +287,8 @@ func ItemHeader(it Item) (model.Header, error) {
 	case *model.Grant:
 		return v.Header, nil
 	case *model.Policy:
+		return v.Header, nil
+	case *model.Access:
 		return v.Header, nil
 	default:
 		return model.Header{}, fmt.Errorf("crypto: %T is not an item plaintext", it)
@@ -307,6 +310,8 @@ func ValidateItem(it Item) error {
 		return ValidateGrant(v)
 	case *model.Policy:
 		return ValidatePolicy(v)
+	case *model.Access:
+		return ValidateAccess(v)
 	default:
 		return fmt.Errorf("crypto: %T is not an item plaintext", it)
 	}
@@ -329,6 +334,8 @@ func ParseItem(t model.Type, b []byte) (Item, error) {
 		it = new(model.Grant)
 	case model.TypePolicy:
 		it = new(model.Policy)
+	case model.TypeAccess:
+		it = new(model.Access)
 	default:
 		return nil, schemaErr("type", "unknown item type %q", t)
 	}

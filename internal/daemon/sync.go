@@ -5,8 +5,10 @@ import (
 	crand "crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,6 +205,20 @@ type syncer struct {
 	// noteMu makes each noteReplaced's read, record and acknowledgement
 	// one step, so no note is recorded twice.
 	noteMu sync.Mutex
+	// reviews are the access-review notes the store holds, as status
+	// shows them, by note ID, and reviewsEvicted is the store's count of
+	// those dropped undelivered. They are kept apart from the bounded
+	// replaced, so newer notes never push one out, and are read again from
+	// the store whenever its notes are (showReviews): an acknowledgement
+	// by hop access ls (OpAccessReviewAck) takes a note out, and a restart
+	// brings back every note not yet acknowledged.
+	reviews        map[uint64]string
+	reviewsEvicted uint64
+	// reviewsLogged are the access-review notes this daemon has logged,
+	// and evictedLogged says it logged that some were dropped; noteMu
+	// guards both.
+	reviewsLogged map[uint64]bool
+	evictedLogged bool
 	// retired is the server's word that this device left the account
 	// (reportedLocked), and whether its proof wiped the device.
 	retired *ServerRetirement
@@ -682,12 +698,7 @@ func (e *syncer) noteReplaced() {
 			msg := fmt.Sprintf("%s: this device's edit of its %s replaced a different value another device had saved first "+
 				"(for this field the last change to reach the server wins)", what, strings.Join(r.Fields, ", "))
 			e.d.logf("sync: %s", msg)
-			e.set(func() {
-				e.replaced = append(e.replaced, msg)
-				if len(e.replaced) > maxReplacedNotes {
-					e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
-				}
-			})
+			e.addNote(msg)
 		}
 		err = e.st.AckReplacements(rs)
 	}
@@ -708,6 +719,17 @@ func (e *syncer) noteReplaced() {
 	}
 }
 
+// addNote adds msg to the notes of replaced and combined edits status
+// shows, keeping the newest maxReplacedNotes.
+func (e *syncer) addNote(msg string) {
+	e.set(func() {
+		e.replaced = append(e.replaced, msg)
+		if len(e.replaced) > maxReplacedNotes {
+			e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
+		}
+	})
+}
+
 // noteSyncNotes does for the store's sync notes what noteReplaced does
 // for the notes of replaced edits: a combined note says that a push wrote
 // this device's change together with another device's change to the same
@@ -715,8 +737,24 @@ func (e *syncer) noteReplaced() {
 // caller holds noteMu.
 func (e *syncer) noteSyncNotes() error {
 	ns, err := e.st.SyncNotes()
-	if err != nil || ns.Empty() {
+	if err != nil {
 		return err
+	}
+	// Access-review notes stay until hop access ls shows them (and
+	// acknowledges them), across restarts: status shows the store's
+	// current set, and nothing here acknowledges them.
+	e.showReviews(ns)
+	ns.AccessReviews = nil
+	if _, ok := ns.Evicted[store.NoteAccessReview]; ok {
+		ev := maps.Clone(ns.Evicted)
+		delete(ev, store.NoteAccessReview)
+		ns.Evicted = ev
+		if len(ev) == 0 {
+			ns.Evicted = nil
+		}
+	}
+	if ns.Empty() {
+		return nil
 	}
 	var msgs []string
 	if ns.Discarded {
@@ -738,14 +776,79 @@ func (e *syncer) noteSyncNotes() error {
 	}
 	for _, msg := range msgs {
 		e.d.logf("sync: %s", msg)
-		e.set(func() {
-			e.replaced = append(e.replaced, msg)
-			if len(e.replaced) > maxReplacedNotes {
-				e.replaced = e.replaced[len(e.replaced)-maxReplacedNotes:]
-			}
-		})
+		e.addNote(msg)
 	}
 	return e.st.AckSyncNotes(ns)
+}
+
+// showReviews makes the access-review warnings of status the notes ns
+// holds, and logs each note, and the first count of dropped ones, once
+// per daemon. The caller holds noteMu.
+func (e *syncer) showReviews(ns store.SyncNotes) {
+	cur := make(map[uint64]string, len(ns.AccessReviews))
+	for _, r := range ns.AccessReviews {
+		cur[r.ID] = AccessReviewText(r)
+		if !e.reviewsLogged[r.ID] {
+			if e.reviewsLogged == nil {
+				e.reviewsLogged = map[uint64]bool{}
+			}
+			e.reviewsLogged[r.ID] = true
+			e.d.logf("sync: %s", cur[r.ID])
+		}
+	}
+	evicted := ns.Evicted[store.NoteAccessReview]
+	if evicted > 0 && !e.evictedLogged {
+		e.evictedLogged = true
+		e.d.logf("sync: %s", accessReviewsEvictedText(evicted))
+	}
+	e.set(func() { e.reviews, e.reviewsEvicted = cur, evicted })
+}
+
+// refreshReviews reads the store's access-review notes again, after an
+// acknowledgement.
+func (e *syncer) refreshReviews() {
+	e.noteMu.Lock()
+	defer e.noteMu.Unlock()
+	if ns, err := e.st.SyncNotes(); err == nil {
+		e.showReviews(ns)
+	}
+}
+
+// reviewWarnings are the access-review warnings of status, in note
+// order. The caller holds mu.
+func (e *syncer) reviewWarnings() []string {
+	ids := slices.Sorted(maps.Keys(e.reviews))
+	out := make([]string, 0, len(ids)+1)
+	for _, id := range ids {
+		out = append(out, e.reviews[id])
+	}
+	if e.reviewsEvicted > 0 {
+		out = append(out, accessReviewsEvictedText(e.reviewsEvicted))
+	}
+	return out
+}
+
+func accessReviewsEvictedText(n uint64) string {
+	return fmt.Sprintf("%d older notes of hop access records to review were dropped before they were shown; review every record with hop access ls and hop access check", n)
+}
+
+// AccessReviewText is how an access-review note is shown: a checkpoint
+// revoked the devices that last changed these hop access records (crypto
+// spec rev 17, §7.5). The note is a snapshot of that checkpoint: a later
+// change by an active device doesn't withdraw it, and hop access ls's
+// by_retired_device mark is what follows the record's current state.
+func AccessReviewText(r store.AccessReviewNote) string {
+	devs := make([]string, len(r.Devices))
+	for i, d := range r.Devices {
+		devs[i] = d.String()
+	}
+	labels := make([]string, len(r.Items))
+	for i, it := range r.Items {
+		labels[i] = fmt.Sprintf("%q", it.Label)
+	}
+	return fmt.Sprintf("the checkpoint at seq %d revoked device(s) %s, which last changed the hop access record(s) %s at that checkpoint. "+
+		"Revoking a device revokes no colleague: review them with hop access ls and hop access check",
+		r.CheckpointSeq, strings.Join(devs, ", "), strings.Join(labels, ", "))
 }
 
 func (e *syncer) noteHalt(why string, equivocation bool) {
@@ -1223,6 +1326,7 @@ func (e *syncer) status() SyncStatusResult {
 		out.Backoff = &SyncBackoff{Attempt: e.attempt, RetryAt: e.retryAt}
 	}
 	out.Warnings = append(out.Warnings, e.notes...)
+	out.Warnings = append(out.Warnings, e.reviewWarnings()...)
 	out.Warnings = append(out.Warnings, e.replaced...)
 	return out
 }

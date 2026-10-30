@@ -224,6 +224,10 @@ func withHeader(it crypto.Item, version uint64) (crypto.Item, model.Header, erro
 		c := *v
 		c.Header = h
 		return &c, h, nil
+	case *model.Access:
+		c := *v
+		c.Header = h
+		return &c, h, nil
 	}
 	return nil, model.Header{}, fmt.Errorf("vaultlog: %T is not an item plaintext", it)
 }

@@ -70,6 +70,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dalyem/hopkey/internal/access"
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/filelock"
@@ -1497,6 +1498,8 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 			snap.Snippets = append(snap.Snippets, c)
 		case *model.Policy:
 			snap.Policies = append(snap.Policies, *v)
+		case *model.Access:
+			snap.Access = append(snap.Access, *access.Clone(v))
 		}
 	}
 	byName := func(a, b model.Header, an, bn string) int {
@@ -1510,6 +1513,7 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 	slices.SortFunc(snap.Credentials, func(a, b model.Credential) int { return byName(a.Header, b.Header, a.Name, b.Name) })
 	slices.SortFunc(snap.Snippets, func(a, b model.Snippet) int { return byName(a.Header, b.Header, a.Name, b.Name) })
 	slices.SortFunc(snap.Policies, func(a, b model.Policy) int { return byName(a.Header, b.Header, "", "") })
+	slices.SortFunc(snap.Access, func(a, b model.Access) int { return byName(a.Header, b.Header, a.Label, b.Label) })
 	return snap
 }
 
@@ -1693,6 +1697,8 @@ func header(it crypto.Item) *model.Header {
 		return &v.Header
 	case *model.Policy:
 		return &v.Header
+	case *model.Access:
+		return &v.Header
 	}
 	return nil
 }
@@ -1718,6 +1724,9 @@ func put[T any](s *Store, it *T, typ model.Type, cond *hostKeyWrite) (*T, error)
 		h.ItemID, h.ItemVersion = id, 0
 	}
 	h.V, h.Type = crypto.Version, typ
+	if a, ok := any(it).(*model.Access); ok {
+		s.stampAccess(a)
+	}
 	if s.server {
 		if err := s.queuePut(it, isNew, cond); err != nil {
 			return nil, err
@@ -1760,6 +1769,18 @@ func (s *Store) checkPut(it crypto.Item, isNew bool) error {
 			return fmt.Errorf("store: item %s is a %s, not a %s", h.ItemID, cur.Type, h.Type)
 		case h.ItemVersion != cur.ItemVersion:
 			return fmt.Errorf("store: item %s is at version %d, not %d", h.ItemID, cur.ItemVersion, h.ItemVersion)
+		}
+	}
+	if a, ok := it.(*model.Access); ok {
+		var cur *model.Access
+		if !isNew {
+			cur = s.verifiedAccess(h.ItemID)
+		}
+		if err := checkAccessWrite(cur, a); err != nil {
+			return err
+		}
+		if taken := s.verifiedLabelTaken(h.ItemID, a.Label); taken != "" {
+			return labelErr(taken)
 		}
 	}
 	if host, ok := it.(*model.Host); ok {

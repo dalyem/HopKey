@@ -12,7 +12,10 @@ import (
 //
 //   - atomic: compared whole, and in exactly one unit;
 //   - set: a list of strings, merged three-way by selector class;
-//   - free: merges on its own, and the rebasing side's value wins.
+//   - free: merges on its own, and the rebasing side's value wins;
+//   - system: set by the writer from explicit inputs, never merged, and
+//     left out of L, R and every unit (rev 17 Part 2, §5.0). The caller
+//     stamps it on every write (StampSystem).
 //
 // A member the type's classification doesn't list is unclassified, and a
 // change to one makes the whole item fall back to the rev 16 rule.
@@ -24,6 +27,7 @@ const (
 	kindAtomic
 	kindSet
 	kindFree
+	kindSystem
 )
 
 // Unit names, as a conflict reports them.
@@ -35,6 +39,7 @@ const (
 	UnitKey        = "key"
 	UnitCredential = "credential"
 	UnitPolicy     = "policy"
+	UnitAccess     = "access"
 )
 
 // Coupling names, as a conflict reports them.
@@ -64,6 +69,7 @@ type classification struct {
 	units     []unit
 	sets      map[string]func(string) string // set member -> class key
 	free      []string
+	system    []string
 	couplings []coupling
 }
 
@@ -94,12 +100,28 @@ var classifications = map[model.Type]*classification{
 	model.TypePolicy: {
 		units: []unit{{UnitPolicy, []string{"max_offline"}}},
 	},
+	// One unit: an access record's target states come from planners that
+	// act on real hosts, and a combination of two devices' lists could
+	// record a state no host is in (§5.0).
+	model.TypeAccess: {
+		units:  []unit{{UnitAccess, []string{"label", "record_id", "public_key", "fingerprint", "options", "targets"}}},
+		system: []string{"by"},
+	},
+}
+
+// IsSystem reports whether member of an item of type t is a system member
+// (§5.0): access's by, and nothing in any other type.
+func IsSystem(t model.Type, member string) bool {
+	c := classifications[t]
+	return c != nil && slices.Contains(c.system, member)
 }
 
 func (c *classification) kind(member string) memberKind {
 	switch {
 	case slices.Contains(c.free, member):
 		return kindFree
+	case slices.Contains(c.system, member):
+		return kindSystem
 	case c.sets[member] != nil:
 		return kindSet
 	}

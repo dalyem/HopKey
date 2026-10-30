@@ -183,7 +183,7 @@ func TestAKScriptMessages(t *testing.T) {
 			"hop key rotate and hop access both use this lock",
 			"Remove it (rm -r LOCK) only when no hop key rotate and no hop access run can still be active for this account",
 			"on every device you use, and on every machine that shares this home directory",
-			"check ~/.ssh/authorized_keys by hand afterwards",
+			"run hop access check afterwards",
 		} {
 			if !strings.Contains(m, want) {
 				t.Errorf("%q does not say %q", m, want)
@@ -193,9 +193,11 @@ func TestAKScriptMessages(t *testing.T) {
 			t.Errorf("%q judges whether a process runs", m)
 		}
 	}
-	for name, m := range msgs {
-		if strings.Contains(m, "hop access check") {
-			t.Errorf("%s message names hop access check, which does not exist yet: %s", name, m)
+	// hop access check finds what a lost lock or a kept session
+	// directory may have left (spec rev 17, §7.7).
+	for name, m := range map[string]string{"session directory": akDirKeptMsg, "lost lock": akLostLockMsg} {
+		if !strings.Contains(m, "hop access check") {
+			t.Errorf("%s message doesn't suggest hop access check: %s", name, m)
 		}
 	}
 	s := akWriteScript("1 2", "3 4")
