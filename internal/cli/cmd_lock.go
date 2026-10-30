@@ -218,6 +218,7 @@ func printVaultStatus(e *Env, v *store.Info) {
 		return
 	}
 	e.printf("vault:        %s\n", vaultState(v))
+	printAdminLockHelp(e, v)
 	e.printf("device key:   %s\n", oneLine(v.DeviceStore))
 	if v.Head != nil {
 		e.printf("log head:     seq %s\n", v.Head.Short())
@@ -248,7 +249,8 @@ func vaultState(v *store.Info) string {
 	case v.AdminLock != nil:
 		return adminLockText(v.AdminLock, v.ServerUnconfirmed)
 	case v.ServerUnconfirmed:
-		return "locked: the server did not confirm this device is still in the account; hop unlock asks it again"
+		return "locked: the server no longer confirms this device is in the account. Nothing on this device was deleted. " +
+			"hop unlock asks the server again; if it keeps refusing, check with the server's operator"
 	case v.OfflineTooLong:
 		return "locked: offline too long; connect to the server, then run hop unlock"
 	}
@@ -270,11 +272,16 @@ func adminLockText(a *store.AdminRefusal, auto bool) string {
 	if !auto {
 		how = "with hop unlock"
 	}
+	// The hold outlives later answers (a 401 after the account was
+	// deleted, say), so this says what the server last reported and that
+	// the vault unlocks once the server accepts this device again, which
+	// is how the hold actually ends.
 	if a.Reason == "" {
-		return fmt.Sprintf("locked: the server's operator %s. Nothing was deleted. Ask the server's operator; "+
-			"the vault unlocks once the operator %s (%s)", what, undo, how)
+		return fmt.Sprintf("locked: the server last reported that its operator %s. Nothing was deleted. "+
+			"The vault unlocks once the server accepts this device again, usually when the operator %s (%s). Ask the server's operator",
+			what, undo, how)
 	}
-	return fmt.Sprintf("locked: the server says its operator %s. The operator's message: \"%s\". This is the server's word, not your vault's. "+
-		"Nothing was deleted. It unlocks once the operator %s (%s)",
+	return fmt.Sprintf("locked: the server last reported that its operator %s. The operator's message: \"%s\". This is the server's word, not your vault's. "+
+		"Nothing was deleted. The vault unlocks once the server accepts this device again, usually when the operator %s (%s). Ask the server's operator",
 		what, store.EscapeServerText(a.Reason), undo, how)
 }
