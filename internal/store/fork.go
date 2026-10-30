@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -216,13 +217,15 @@ type forkJournal struct {
 	// vault as the fork read it, before anything of it is deleted: only
 	// then may a resumed deletion find its identity files gone.
 	Discarding bool `json:"discarding,omitempty"`
-	// DiscardFiles is the backup as its deletion began, recorded with
-	// Discarding: every path forkSourceDigest commits to, with its kind
-	// and, for a file, a SHA-256 of its content. A resumed deletion goes on
-	// only with a backup whose files are all listed, unchanged: what a
-	// deletion cut short leaves.
-	DiscardFiles map[string]string `json:"discard_files,omitempty"`
-	Discarded    bool              `json:"discarded"`
+	// DiscardManifest is the backup as its deletion began, recorded with
+	// Discarding: every path in it, with its kind and, for a file, a
+	// SHA-256 of its content (forkSourceScan). A resumed deletion goes on
+	// only with a backup whose paths are all listed, unchanged: what a
+	// deletion cut short leaves. A journal of an earlier build, with
+	// Discarding and no manifest (its discard_files left out the entries'
+	// contents and the objects), resumes only on the whole backup.
+	DiscardManifest map[string]string `json:"discard_manifest,omitempty"`
+	Discarded       bool              `json:"discarded"`
 	// BackupMissing is ForkResult's.
 	BackupMissing bool            `json:"backup_missing,omitempty"`
 	At            model.Timestamp `json:"at"`
@@ -1073,20 +1076,35 @@ func forkCarries(t model.Type) bool {
 // merge and publication files, and the rest), and every directory. Left
 // out are the locks, the objects (the head names them), and the files an
 // open or close rewrites with no change to the vault: contact.json,
-// account.json and sync-notes.json.
+// account.json and sync-notes.json. A data directory with anything but
+// directories and regular files in it, anywhere (a symbolic link), is
+// refused: hop makes none there, and the fork neither follows nor deletes
+// one.
 func forkSourceDigest(data string) (string, error) {
-	d, _, err := forkSourceScan(data)
+	d, _, err := forkSourceScan(data, false)
 	return d, err
 }
 
-// forkSourceScan is forkSourceDigest, and lists what it commits to: each
-// path with its kind ("d", "e", "o <mode>" or "f <SHA-256 of the
-// content>").
-func forkSourceScan(data string) (string, map[string]string, error) {
-	files := map[string]string{}
+// forkSourceScan is forkSourceDigest and, with manifest, the manifest of
+// data that its deletion checks: every path under it, the ones the digest
+// leaves out too, as "d" for a directory or "f <SHA-256 of the content>"
+// for a file.
+func forkSourceScan(data string, manifest bool) (string, map[string]string, error) {
+	var files map[string]string
+	if manifest {
+		files = map[string]string{}
+	}
 	skip := map[string]bool{
 		"vault/owner.lock": true, "vault/lock": true, "vault/objects": true, predecessorLock: true,
 		"vault/" + contactRel: true, "vault/account.json": true, "vault/" + syncNotesRel: true,
+	}
+	skipped := func(rel string) bool {
+		for r := rel; r != "."; r = path.Dir(r) {
+			if skip[r] {
+				return true
+			}
+		}
+		return false
 	}
 	h := sha256.New()
 	err := filepath.WalkDir(data, func(p string, d fs.DirEntry, err error) error {
@@ -1098,32 +1116,39 @@ func forkSourceScan(data string) (string, map[string]string, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		digested := !skipped(rel)
 		switch {
-		case skip[rel] && d.IsDir():
-			return filepath.SkipDir
-		case skip[rel]:
-			return nil
 		case d.IsDir():
-			fmt.Fprintf(h, "d %q\n", rel)
-			files[rel] = "d"
+			if digested {
+				fmt.Fprintf(h, "d %q\n", rel)
+			}
+			if manifest {
+				files[rel] = "d"
+			}
 			return nil
 		case !d.Type().IsRegular():
-			fmt.Fprintf(h, "o %q %v\n", rel, d.Type())
-			files[rel] = fmt.Sprintf("o %v", d.Type())
-			return nil
-		case strings.HasPrefix(rel, "vault/entries/"):
+			return fmt.Errorf("%w: %s in %s is not a regular file or a directory (%v); a vault's data directory holds none",
+				ErrForkRefused, rel, data, d.Type())
+		}
+		entry := strings.HasPrefix(rel, "vault/entries/")
+		if digested && entry {
 			fmt.Fprintf(h, "e %q\n", rel)
-			files[rel] = "e"
+		}
+		if !manifest && (!digested || entry) {
 			return nil
 		}
 		b, err := os.ReadFile(p)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(h, "f %q %d\n", rel, len(b))
-		h.Write(b)
-		sum := sha256.Sum256(b)
-		files[rel] = "f " + hex.EncodeToString(sum[:])
+		if manifest {
+			sum := sha256.Sum256(b)
+			files[rel] = "f " + hex.EncodeToString(sum[:])
+		}
+		if digested && !entry {
+			fmt.Fprintf(h, "f %q %d\n", rel, len(b))
+			h.Write(b)
+		}
 		return nil
 	})
 	if err != nil {
@@ -1924,7 +1949,7 @@ func lockBackup(dir string) (*os.File, error) {
 // the fork read it (j.Source): a change made there since (by a hop that
 // does not know the fence) is not put out of use by the swap, nor
 // deleted. owner takes the backup's owner lock unless it holds it already,
-// and keeps it. It returns the backup's files (forkSourceScan).
+// and keeps it. It returns the backup's manifest (forkSourceScan).
 func holdBackup(cfg Config, j *forkJournal, owner *backupOwner) (map[string]string, error) {
 	if err := isOldVault(cfg, j.Backup, j); err != nil {
 		return nil, err
@@ -1932,7 +1957,7 @@ func holdBackup(cfg Config, j *forkJournal, owner *backupOwner) (map[string]stri
 	if err := owner.take(j.Backup); err != nil {
 		return nil, err
 	}
-	d, files, err := forkSourceScan(j.Backup)
+	d, files, err := forkSourceScan(j.Backup, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1945,17 +1970,24 @@ func holdBackup(cfg Config, j *forkJournal, owner *backupOwner) (map[string]stri
 }
 
 // leftOfBackup requires the backup, whose deletion j records as begun, to
-// be what that deletion leaves of the old vault: all of it as the fork read
-// it (j.Source), or a part whose every file the deletion recorded
-// (j.DiscardFiles), unchanged. A file changed or added means the backup was
-// opened and changed since: ErrForkStale, and nothing more is deleted.
+// be what that deletion leaves of the old vault: paths that its manifest
+// (j.DiscardManifest) lists, each as it was, a directory still a directory
+// and a file with the same content. A path changed or added means the
+// backup was opened and changed since: ErrForkStale, and nothing more is
+// deleted. A journal with no manifest (an earlier build) goes on only with
+// the whole backup as the fork read it (j.Source).
 func leftOfBackup(j *forkJournal) error {
-	d, files, err := forkSourceScan(j.Backup)
+	d, files, err := forkSourceScan(j.Backup, true)
 	if err != nil {
 		return err
 	}
-	if d == j.Source {
-		return nil
+	if j.DiscardManifest == nil {
+		if d == j.Source {
+			return nil
+		}
+		return fmt.Errorf("%w: the old vault in %s is not as the fork read it, and this fork, begun by an earlier hop, did not record what its deletion may leave; "+
+			"nothing more of it was deleted, and its device key may be gone already. To keep what is left of it, move %s elsewhere; "+
+			"hop vault fork --local then finishes the fork without it", ErrForkStale, j.Backup, j.Backup)
 	}
 	rels := make([]string, 0, len(files))
 	for rel := range files {
@@ -1963,7 +1995,7 @@ func leftOfBackup(j *forkJournal) error {
 	}
 	slices.Sort(rels)
 	for _, rel := range rels {
-		if want, ok := j.DiscardFiles[rel]; !ok || want != files[rel] {
+		if want, ok := j.DiscardManifest[rel]; !ok || want != files[rel] {
 			return fmt.Errorf("%w: the old vault in %s changed after the fork began to delete it (%s is not as the fork recorded it; was it opened and changed since?); "+
 				"nothing more of it was deleted, and its device key may be gone already. To keep what is left of it, move %s elsewhere; "+
 				"hop vault fork --local then finishes the fork without it", ErrForkStale, j.Backup, rel, j.Backup)
@@ -1978,7 +2010,7 @@ func leftOfBackup(j *forkJournal) error {
 // It reports whether it deleted it.
 //
 // First the backup must be the old vault, unowned and as the fork read it
-// (holdBackup), and that is recorded (j.Discarding, with j.DiscardFiles)
+// (holdBackup), and that is recorded (j.Discarding, with j.DiscardManifest)
 // before anything is deleted. A deletion resumed after that goes on only
 // with what it may have left (leftOfBackup).
 //
@@ -2004,7 +2036,7 @@ func discardBackup(cfg Config, data string, j *forkJournal, owner *backupOwner) 
 		if err != nil {
 			return false, err
 		}
-		j.Discarding, j.DiscardFiles = true, files
+		j.Discarding, j.DiscardManifest = true, files
 		if err := writeForkJournal(data, j); err != nil {
 			return false, err
 		}
