@@ -223,6 +223,7 @@ type device struct {
 	home  string
 	paths daemon.Paths
 	c     *daemon.Client
+	d     *daemon.Daemon
 }
 
 func (w *resolveWorld) startDaemon(t *testing.T, name string, st *store.Store) *device {
@@ -248,7 +249,7 @@ func (w *resolveWorld) startDaemon(t *testing.T, name string, st *store.Store) *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	dv.c = c
+	dv.c, dv.d = c, d
 	return dv
 }
 

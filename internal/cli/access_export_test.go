@@ -23,3 +23,12 @@ func SetAccessSessionTimeout(t testing.TB, d time.Duration) {
 	accessSessionTimeout = d
 	t.Cleanup(func() { accessSessionTimeout = old })
 }
+
+// SetAccessDeadlines sets the client's deadline from a session's header
+// to the end of its payload, and how long a session the client gave up on
+// may take to end, until the test ends.
+func SetAccessDeadlines(t testing.TB, decision, grace time.Duration) {
+	oldD, oldG := accessDecisionDeadline, accessAbortGrace
+	accessDecisionDeadline, accessAbortGrace = decision, grace
+	t.Cleanup(func() { accessDecisionDeadline, accessAbortGrace = oldD, oldG })
+}

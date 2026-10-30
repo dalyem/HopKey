@@ -313,6 +313,7 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 	if err != nil {
 		return err
 	}
+	v.local = al.Local
 	if !al.Local {
 		// Read-only: the pull journals and posts nothing (§7.8).
 		if err := v.pullOnly(ctx); err != nil {

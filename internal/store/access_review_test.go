@@ -162,6 +162,68 @@ func TestAccessReviewNoteAfterRevocation(t *testing.T) {
 	}
 }
 
+// A record made before a device was enrolled, then changed by that
+// device, is attributed to it (by), and when the device is revoked the
+// note names the record, the device is in the retired list hop access ls
+// marks records with, and verified state keeps by through the checkpoint.
+// A device enrolled after the checkpoint opens the vault with the record
+// still attributed to the revoked device (§7.5).
+func TestAccessReviewNamesARecordOfALaterDevice(t *testing.T) {
+	ctx := context.Background()
+	a, b, r := newCkptPair(t)
+	alice, err := createAccess(t, b.s, "alice", randomID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushAll(t, b.s, r)
+	// The laptop is enrolled after alice exists, and changes her.
+	c := secondDeviceNamed(t, a, r, "laptop")
+	pull(t, c.s, r)
+	cur := overlayAccess(t, c.s, alice.ItemID)
+	cur.Targets[0].State = model.AccessInstalled
+	if _, err := c.s.PutAccess(ctx, cur); err != nil {
+		t.Fatal(err)
+	}
+	pushAll(t, c.s, r)
+	pull(t, a.s, r)
+	pull(t, b.s, r)
+	cID := deviceID(t, c.s)
+	if got := verifiedAccessOf(t, b.s, alice.ItemID); got == nil || got.By != cID {
+		t.Fatalf("before the revocation: %+v", got)
+	}
+	kit, err := a.s.RevokeDevices(ctx, r, []byte(testPassword), []string{"laptop"}, CheckpointOptions{Keep: []string{deviceID(t, b.s).String()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pull(t, a.s, r)
+	pull(t, b.s, r)
+	for _, s := range []*Store{a.s, b.s} {
+		ns, err := s.SyncNotes()
+		if err != nil || len(ns.AccessReviews) != 1 {
+			t.Fatalf("notes %+v %v", ns, err)
+		}
+		n := ns.AccessReviews[0]
+		if !slices.Equal(n.Devices, []model.ID{cID}) || len(n.Items) != 1 || n.Items[0].ItemID != alice.ItemID || n.Items[0].Label != "alice" {
+			t.Fatalf("note %+v", n)
+		}
+		if !slices.Contains(s.RetiredDevices(), cID) {
+			t.Fatalf("retired %v", s.RetiredDevices())
+		}
+		if got := verifiedAccessOf(t, s, alice.ItemID); got == nil || got.By != cID {
+			t.Fatalf("after the checkpoint: %+v", got)
+		}
+	}
+	// The checkpoint made a new Secret Key.
+	d := secondDeviceNamed(t, &fixture{cfg: a.cfg, kit: kit, s: a.s}, r, "tablet")
+	pull(t, d.s, r)
+	if got := verifiedAccessOf(t, d.s, alice.ItemID); got == nil || got.By != cID {
+		t.Fatalf("the new device: %+v", got)
+	}
+	if !slices.Contains(d.s.RetiredDevices(), cID) {
+		t.Fatalf("the new device's retired list %v", d.s.RetiredDevices())
+	}
+}
+
 // A checkpoint that revokes a device that last changed no live record
 // adds no note.
 func TestAccessReviewNoteOnlyWhenRecordsAreAttributed(t *testing.T) {

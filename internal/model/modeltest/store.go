@@ -321,6 +321,21 @@ func (s *Store) PutAccess(_ context.Context, a model.Access) (model.Access, erro
 	return put(s, a, model.TypeAccess, func(sn *model.Snapshot) *[]model.Access { return &sn.Access }, func(a *model.Access) *model.Header { return &a.Header })
 }
 
+// InjectAccess stores a as it is, with a new item ID and none of
+// PutAccess's checks: a record an older or foreign writer put, which the
+// log took, since only writers keep labels unique (§5.1). It returns the
+// record as stored.
+func (s *Store) InjectAccess(a model.Access) model.Access {
+	a = *access.Clone(&a)
+	rand.Read(a.ItemID[:])
+	a.V, a.Type, a.ItemVersion = 1, model.TypeAccess, 1
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.Access = append(s.snap.Access, a)
+	s.writes++
+	return a
+}
+
 // DeleteAccess deletes an access record whose targets are all terminal,
 // and removed unless forget.
 func (s *Store) DeleteAccess(ctx context.Context, id model.ID, forget bool) error {

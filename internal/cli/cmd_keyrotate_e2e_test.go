@@ -42,6 +42,7 @@ type akServer struct {
 	port    int
 	home    string
 	hostKey ssh.PublicKey
+	signer  ssh.Signer // the host key's private half
 	cfg     *ssh.ServerConfig
 
 	// down makes the server unreachable: every new connection is closed
@@ -69,12 +70,18 @@ type akServer struct {
 
 func startAKServer(t *testing.T, home string) *akServer {
 	t.Helper()
+	return startAKServerKey(t, home, newSigner(t))
+}
+
+// startAKServerKey is startAKServer with the host key signer: two servers
+// can present the same host key.
+func startAKServerKey(t *testing.T, home string, signer ssh.Signer) *akServer {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &akServer{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, home: home}
-	signer := newSigner(t)
+	s := &akServer{ln: ln, port: ln.Addr().(*net.TCPAddr).Port, home: home, signer: signer}
 	s.hostKey = signer.PublicKey()
 	s.cfg = &ssh.ServerConfig{PublicKeyCallback: s.authorize}
 	s.cfg.AddHostKey(signer)

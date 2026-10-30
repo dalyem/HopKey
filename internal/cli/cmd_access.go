@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -92,12 +93,14 @@ func (v *accessVault) caps(ctx context.Context) error {
 	return nil
 }
 
+// list returns the vault's access records. It changes nothing in v: a
+// fence that runs past its session's deadline still calls it (byID), so
+// local is set only by caps and lookup, when a command starts.
 func (v *accessVault) list(ctx context.Context) (*daemon.AccessListResult, error) {
 	var r daemon.AccessListResult
 	if err := call(ctx, v.e, daemon.OpAccessList, nil, &r); err != nil {
 		return nil, err
 	}
-	v.local = r.Local
 	return &r, nil
 }
 
@@ -131,6 +134,7 @@ func (v *accessVault) lookup(ctx context.Context, label string) (*model.Access, 
 	if err != nil {
 		return nil, err
 	}
+	v.local = l.Local
 	var found *model.Access
 	for i := range l.Access {
 		if model.NameKey(l.Access[i].Label) != model.NameKey(label) {
@@ -432,12 +436,11 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 			return err
 		}
 		next = committed
-		// The commit pulled: the host records may have changed since the
-		// list above, and the binding check reads the current pins.
-		if l, err = listAll(ctx, e); err != nil {
-			return err
-		}
+		// The commit pulled, so the host records may have changed since
+		// the list above: addOne checks each binding against them again,
+		// right before it connects.
 	} else if len(act) > 0 {
+		accessTestHook("before-resume", next)
 		if next, err = v.committed(ctx, next); err != nil {
 			return failf("%v", err)
 		}
@@ -450,7 +453,7 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 			continue
 		}
 		accessTestHook("before-session", next)
-		tr, r := e.addOne(ctx, v, l, next, *t)
+		tr, r := e.addOne(ctx, v, next, *t)
 		tr.Warnings = append(warnings[hid], tr.Warnings...)
 		res.Targets = append(res.Targets, tr)
 		if r != nil {
@@ -461,8 +464,8 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 	return e.finishAccessRun(res, o.asJSON)
 }
 
-// accessTestHook is called at points of a planner run (before-session,
-// before-record) with the record the run acts for. Tests replace it to
+// accessTestHook is called at points of a planner run (before-resume,
+// before-session, before-record) with the record the run acts for. Tests replace it to
 // interleave runs.
 var accessTestHook = func(point string, a *model.Access) {}
 
@@ -598,41 +601,38 @@ func unbound(t model.AccessTarget, label, host string) string {
 
 // addOne acts on one pending target (§7.2). It returns the target's
 // report and the result to record, nil when nothing is stored.
-func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, a *model.Access, t model.AccessTarget) (AccessTargetResult, *access.Result) {
-	ix := hostIndex{l.Hosts}
-	name := ix.name(t.HostItemID)
-	tr := AccessTargetResult{Host: name, HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP, State: t.State, Gen: t.Gen}
-	h, ok := ix.byID(t.HostItemID)
-	pin := boundPin(h, t.ServerKeyFP)
-	if !ok || pin == nil {
-		tr.Message = unbound(t, a.Label, name)
+func (e *Env) addOne(ctx context.Context, v *accessVault, a *model.Access, t model.AccessTarget) (AccessTargetResult, *access.Result) {
+	tr := AccessTargetResult{HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP, State: t.State, Gen: t.Gen}
+	b := e.bindingNow(ctx, t)
+	tr.Host = b.name
+	switch {
+	case b.err != nil:
+		tr.Message = safef("not applied: %v", b.err)
+		return tr, nil
+	case b.pin == nil:
+		tr.Message = unbound(t, a.Label, b.name)
 		return tr, nil
 	}
-	c, why := e.accessConnect(ctx, h, l, []ssh.PublicKey{pin})
+	c, why := e.accessConnect(ctx, b.host, b.l, []ssh.PublicKey{b.pin})
 	if why != "" {
 		tr.Message = "not applied: " + why
 		return tr, nil
 	}
 	defer c.close()
-	var d access.Decision
-	var fenced, userChanged bool
-	var gotUser string
-	end := c.session(ctx, func(user string, content []byte) sessionDecision {
-		gotUser = user
+	end := c.session(ctx, func(ctx context.Context, user string, content []byte) sessionDecision {
 		if user != t.User {
-			userChanged = true
-			return sessionDecision{}
+			return sessionDecision{userChanged: true}
 		}
-		if !e.accessFence(ctx, v, a, t, model.AccessPending) {
-			fenced = true
-			return sessionDecision{}
+		if why := e.accessFence(ctx, v, a, t, model.AccessPending); why != "" {
+			return sessionDecision{fenced: why}
 		}
-		d = access.DecideAdd(content, a, t.Alongside)
+		d := access.DecideAdd(content, a, t.Alongside)
 		if d.Outcome == access.OutWrite {
-			return sessionDecision{to: d.New}
+			return sessionDecision{to: d.New, d: d}
 		}
-		return sessionDecision{}
+		return sessionDecision{d: d}
 	})
+	d, gotUser := end.decision.d, end.user
 	// The host's outcome; recordResults marks it recorded once the put
 	// that stores it is journaled.
 	res := func(state, errText string) *access.Result {
@@ -655,12 +655,12 @@ func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, 
 		return notApplied(strings.TrimSuffix(end.why, ".") + "; run hop access add " + a.Label + " again")
 	case end.exited && end.code == akExitDecision && end.sent == sentAbort:
 		switch {
-		case userChanged:
+		case !end.gotHeader || end.abortWhy != "" || !end.decided:
+			return notApplied(strings.TrimPrefix(end.abortWhy+"; ", "; ") + "run hop access add " + a.Label + " again")
+		case end.decision.userChanged:
 			return tr, res(model.AccessFailed, "the host now logs in as "+gotUser)
-		case fenced:
-			return notApplied("another hop run owns this target now")
-		case !end.gotHeader || end.abortWhy != "":
-			return notApplied(end.abortWhy + "; run hop access add " + a.Label + " again")
+		case end.decision.fenced != "":
+			return notApplied(end.decision.fenced)
 		case d.Outcome == access.OutInstalled:
 			return tr, res(model.AccessInstalled, "")
 		case d.Outcome == access.OutRefused:
@@ -669,7 +669,9 @@ func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, 
 		}
 		return notApplied("the session ended without a decision")
 	case end.exited && end.code == akExitDecision, end.sent != sentWrite:
-		return notApplied("the session ended before hop sent its change (" + end.why + "); run hop access add " + a.Label + " again")
+		// The client's own reason, when it gave up, says more than how
+		// ssh ended after that.
+		return notApplied("the session ended before hop sent its change (" + cmp.Or(end.abortWhy, end.why) + "); run hop access add " + a.Label + " again")
 	case end.exited && end.code == 0:
 		return tr, res(model.AccessInstalled, "")
 	}
@@ -678,7 +680,7 @@ func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, 
 	if end.exited && end.code == akExitCleanup {
 		tr.Warnings = append(tr.Warnings, end.why+"; run hop access check")
 	}
-	got, why := c.read(ctx)
+	got, why := e.reread(ctx, c, a, t)
 	if why != "" {
 		return tr, res(model.AccessFailed, "hop could not tell whether it changed "+akFile+": "+why)
 	}
@@ -694,22 +696,76 @@ func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, 
 // accessFence is the pull under the lock (§7.2 step 3, §7.3 step 3): the
 // newest verified state must still hold the record a (the same item ID and
 // record ID) with t in state at t's gen, with the same binding, user and
-// alongside. A pull that fails, or a record with a queued change, fails
-// the fence. The pull pushes nothing.
-func (e *Env) accessFence(ctx context.Context, v *accessVault, a *model.Access, t model.AccessTarget, state string) bool {
+// alongside, and the host's pins must still include the binding (§7.6):
+// the pull may bring in another device's change to them. A pull that
+// fails, or a record with a queued change, fails the fence. The pull
+// pushes nothing. It returns why it failed, or "".
+func (e *Env) accessFence(ctx context.Context, v *accessVault, a *model.Access, t model.AccessTarget, state string) string {
+	const owned = "another hop run owns this target now"
 	if err := v.pullOnly(ctx); err != nil {
-		return false
+		return safef("hop could not sync under the lock (%v); run it again", err)
 	}
 	cur, marked, err := v.byID(ctx, a.ItemID, a.RecordID)
 	if err != nil || cur == nil || marked {
-		return false
+		return owned
 	}
-	for _, x := range cur.Targets {
-		if x.HostItemID == t.HostItemID && x.ServerKeyFP == t.ServerKeyFP {
-			return x.State == state && x.Gen == t.Gen && x.User == t.User && x.Alongside == t.Alongside
-		}
+	i := slices.IndexFunc(cur.Targets, func(x model.AccessTarget) bool {
+		return x.HostItemID == t.HostItemID && x.ServerKeyFP == t.ServerKeyFP
+	})
+	if i < 0 {
+		return owned
 	}
-	return false
+	if x := cur.Targets[i]; x.State != state || x.Gen != t.Gen || x.User != t.User || x.Alongside != t.Alongside {
+		return owned
+	}
+	if b := e.bindingNow(ctx, t); b.err != nil || b.pin == nil {
+		return unbound(t, a.Label, b.name)
+	}
+	return ""
+}
+
+// binding is a target's host as the vault holds it now.
+type binding struct {
+	l    *daemon.ListResult
+	host model.Host
+	name string
+	// pin is the host's pin with the target's binding; nil when the host
+	// is gone or its pins no longer include it.
+	pin ssh.PublicKey
+	err error
+}
+
+// bindingNow reads the host records again and finds t's host and bound
+// pin in them (§7.6). Every connection after a target's preflight comes
+// after this check, and trusts only the pin it returns: a commit, a
+// resume's sync or an earlier session's fence may have brought in
+// another device's change to the pins since the run listed the hosts, and
+// that list would still trust a key the change removed.
+func (e *Env) bindingNow(ctx context.Context, t model.AccessTarget) binding {
+	l, err := listAll(ctx, e)
+	if err != nil {
+		return binding{name: "host " + t.HostItemID.String(), err: err}
+	}
+	ix := hostIndex{l.Hosts}
+	b := binding{l: l, name: ix.name(t.HostItemID)}
+	if h, ok := ix.byID(t.HostItemID); ok {
+		b.host, b.pin = h, boundPin(h, t.ServerKeyFP)
+	}
+	return b
+}
+
+// reread reads the file again after a session whose end leaves the
+// rename uncertain (§7.7), on the session's restricted connection, once
+// the binding check passes again: the session's pull may have brought in
+// a change to the pins.
+func (e *Env) reread(ctx context.Context, c *accessConn, a *model.Access, t model.AccessTarget) ([]byte, string) {
+	switch b := e.bindingNow(ctx, t); {
+	case b.err != nil:
+		return nil, safef("%v", b.err)
+	case b.pin == nil:
+		return nil, unbound(t, a.Label, b.name)
+	}
+	return c.read(ctx)
 }
 
 // recordResults writes the run's results in one put, built against the
@@ -913,10 +969,8 @@ func runAccessRm(ctx context.Context, e *Env, args []string) error {
 			return err
 		}
 		next = committed
-		if l, err = listAll(ctx, e); err != nil {
-			return err
-		}
 	} else if len(act) > 0 {
+		accessTestHook("before-resume", next)
 		if next, err = v.committed(ctx, next); err != nil {
 			return failf("%v", err)
 		}
@@ -928,7 +982,7 @@ func runAccessRm(ctx context.Context, e *Env, args []string) error {
 			continue
 		}
 		accessTestHook("before-session", next)
-		tr, r := e.rmOne(ctx, v, l, next, *t)
+		tr, r := e.rmOne(ctx, v, next, *t)
 		res.Targets = append(res.Targets, tr)
 		if r != nil {
 			results = append(results, *r)
@@ -1067,41 +1121,40 @@ func (e *Env) accessAbandon(ctx context.Context, v *accessVault, ix hostIndex, a
 }
 
 // rmOne acts on one removing target (§7.3).
-func (e *Env) rmOne(ctx context.Context, v *accessVault, l *daemon.ListResult, a *model.Access, t model.AccessTarget) (AccessTargetResult, *access.Result) {
-	ix := hostIndex{l.Hosts}
-	name := ix.name(t.HostItemID)
-	tr := AccessTargetResult{Host: name, HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP, State: t.State, Gen: t.Gen}
-	h, ok := ix.byID(t.HostItemID)
-	pin := boundPin(h, t.ServerKeyFP)
-	if !ok || pin == nil {
+func (e *Env) rmOne(ctx context.Context, v *accessVault, a *model.Access, t model.AccessTarget) (AccessTargetResult, *access.Result) {
+	tr := AccessTargetResult{HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP, State: t.State, Gen: t.Gen}
+	b := e.bindingNow(ctx, t)
+	name := b.name
+	tr.Host = name
+	switch {
+	case b.err != nil:
+		tr.Message = safef("not applied: %v", b.err)
+		return tr, nil
+	case b.pin == nil:
 		tr.Message = unbound(t, a.Label, name)
 		return tr, nil
 	}
-	c, why := e.accessConnect(ctx, h, l, []ssh.PublicKey{pin})
+	ix := hostIndex{b.l.Hosts}
+	c, why := e.accessConnect(ctx, b.host, b.l, []ssh.PublicKey{b.pin})
 	if why != "" {
 		tr.Message = "not applied: " + why
 		return tr, nil
 	}
 	defer c.close()
-	var d access.Decision
-	var fenced, userChanged bool
-	var gotUser string
-	end := c.session(ctx, func(user string, content []byte) sessionDecision {
-		gotUser = user
+	end := c.session(ctx, func(ctx context.Context, user string, content []byte) sessionDecision {
 		if user != t.User {
-			userChanged = true
-			return sessionDecision{}
+			return sessionDecision{userChanged: true}
 		}
-		if !e.accessFence(ctx, v, a, t, model.AccessRemoving) {
-			fenced = true
-			return sessionDecision{}
+		if why := e.accessFence(ctx, v, a, t, model.AccessRemoving); why != "" {
+			return sessionDecision{fenced: why}
 		}
-		d = access.DecideRemove(content, a, t.Gen, name)
+		d := access.DecideRemove(content, a, t.Gen, name)
 		if d.Outcome == access.OutWrite {
-			return sessionDecision{to: d.New}
+			return sessionDecision{to: d.New, d: d}
 		}
-		return sessionDecision{}
+		return sessionDecision{d: d}
 	})
+	d, gotUser := end.decision.d, end.user
 	if d.Warn != "" {
 		tr.Warnings = append(tr.Warnings, d.Warn)
 	}
@@ -1151,12 +1204,12 @@ func (e *Env) rmOne(ctx context.Context, v *accessVault, l *daemon.ListResult, a
 		return notApplied(strings.TrimSuffix(end.why, ".") + "; run hop access rm " + a.Label + " again")
 	case end.exited && end.code == akExitDecision && end.sent == sentAbort:
 		switch {
-		case userChanged:
+		case !end.gotHeader || end.abortWhy != "" || !end.decided:
+			return notApplied(strings.TrimPrefix(end.abortWhy+"; ", "; ") + "run hop access rm " + a.Label + " again")
+		case end.decision.userChanged:
 			return tr, stay("the host now logs in as " + gotUser)
-		case fenced:
-			return notApplied("another hop run owns this target now")
-		case !end.gotHeader || end.abortWhy != "":
-			return notApplied(end.abortWhy + "; run hop access rm " + a.Label + " again")
+		case end.decision.fenced != "":
+			return notApplied(end.decision.fenced)
 		case d.Outcome == access.OutRemoved:
 			return tr, removed()
 		case d.Outcome == access.OutRefused:
@@ -1165,14 +1218,16 @@ func (e *Env) rmOne(ctx context.Context, v *accessVault, l *daemon.ListResult, a
 		}
 		return notApplied("the session ended without a decision")
 	case end.exited && end.code == akExitDecision, end.sent != sentWrite:
-		return notApplied("the session ended before hop sent its change (" + end.why + "); run hop access rm " + a.Label + " again")
+		// The client's own reason, when it gave up, says more than how
+		// ssh ended after that.
+		return notApplied("the session ended before hop sent its change (" + cmp.Or(end.abortWhy, end.why) + "); run hop access rm " + a.Label + " again")
 	case end.exited && end.code == 0:
 		return tr, removed()
 	}
 	if end.exited && end.code == akExitCleanup {
 		tr.Warnings = append(tr.Warnings, end.why+"; run hop access check")
 	}
-	got, why := c.read(ctx)
+	got, why := e.reread(ctx, c, a, t)
 	if why != "" {
 		return tr, stay("hop could not tell whether it changed " + akFile + ": " + why)
 	}
@@ -1261,16 +1316,13 @@ func runAccessMigrate(ctx context.Context, e *Env, args []string) error {
 		}
 		return silent(1)
 	}
-	if l, err = listAll(ctx, e); err != nil {
-		return err
-	}
 	var tr AccessTargetResult
 	var r *access.Result
 	accessTestHook("before-session", committed)
 	if t.State == model.AccessRemoving {
-		tr, r = e.rmOne(ctx, v, l, committed, *t)
+		tr, r = e.rmOne(ctx, v, committed, *t)
 	} else {
-		tr, r = e.addOne(ctx, v, l, committed, *t)
+		tr, r = e.addOne(ctx, v, committed, *t)
 	}
 	res.Targets = append(res.Targets, tr)
 	var results []access.Result

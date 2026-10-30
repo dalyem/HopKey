@@ -31,6 +31,7 @@ import (
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/server"
 	"github.com/dalyem/hopkey/internal/store"
+	"github.com/dalyem/hopkey/internal/syncclient"
 )
 
 // hop access in a published vault: two devices (desk and laptop), each
@@ -47,7 +48,11 @@ type pubAccess struct {
 	laptop    *device
 	colleague ssh.Signer
 	pub, fp   string
-	intercept atomic.Pointer[func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool]
+	// deskCfg and publication are the desk's store and the vault it
+	// published, for a test that stops the desk's daemon.
+	deskCfg     store.Config
+	publication store.Publication
+	intercept   atomic.Pointer[func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool]
 }
 
 func newPubAccess(t *testing.T, hosts int) *pubAccess {
@@ -130,6 +135,7 @@ func newPubAccess(t *testing.T, hosts int) *pubAccess {
 		t.Fatalf("publish: %v", err)
 	}
 	s2 := signInDevice(t, c, resolveStoreConfig(t, "laptop"), p.Kit(), pub)
+	x.deskCfg, x.publication = cfg1, pub
 	x.desk = x.w.startDaemon(t, "desk", s1)
 	x.laptop = x.w.startDaemon(t, "laptop", s2)
 	return x
@@ -501,4 +507,181 @@ func TestAccessPublishedStalePrefixTombstoneBlocksTheAdd(t *testing.T) {
 			t.Errorf("check offers add over a tombstone: %+v", f)
 		}
 	}
+}
+
+// Review r2 #1: a resume's sync brings in another device's removal of the
+// bound pin, and the run must not trust the list it read before that
+// sync. web-1 pins F1 (the key it presents) and F2. The laptop commits
+// alice pending on web-1, bound to F1, and can't post it. While the
+// laptop is served an old prefix, the desk removes F1 from web-1's pins.
+// The laptop resumes: its list still shows F1, and the sync that commits
+// the queued record pulls the desk's change. The run refuses with the
+// binding diagnostic, connects nowhere and stores nothing.
+func TestAccessPublishedResumeRechecksThePin(t *testing.T) {
+	x := newPubAccess(t, 1)
+	h := installHooks(t)
+	wh := &withholder{st: x.w.st, device: x.deviceID(x.laptop)}
+	var refuse atomic.Bool
+	x.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		if refuse.Load() && isLogPost(req) && wh.deviceOf(req) == wh.device {
+			http.Error(rw, "down for maintenance", http.StatusServiceUnavailable)
+			return true
+		}
+		return wh.serve(rw, req, next)
+	})
+	f1 := authorizedKeysLine(x.srv[0].hostKey)
+	f2 := authorizedKeysLine(newSigner(t).PublicKey())
+	setPins := func(pins ...string) {
+		t.Helper()
+		hst := x.desk.host(t, "web-1")
+		hst.HostKeys = pins
+		x.desk.must(t, daemon.OpPutHost, daemon.PutHostParams{Host: *hst}, nil)
+		waitFor(t, 15*time.Second, "the desk pushes web-1", func() bool { return x.desk.syncStatus(t).Pending == 0 })
+	}
+	setPins(f1, f2)
+	waitFor(t, 15*time.Second, "the laptop has both pins", func() bool {
+		hst := x.laptop.host(t, "web-1")
+		return hst != nil && len(hst.HostKeys) == 2
+	})
+
+	refuse.Store(true)
+	code, out := x.hop(x.laptop, "access", "add", "alice", "web-1", "--pubkey", x.pub, "--fingerprint", x.fp, "--yes", "--json")
+	if code == 0 || !strings.Contains(out, "recorded, not applied") || x.ak(0) != x.orig[0] {
+		t.Fatalf("the laptop's add: %d %s", code, out)
+	}
+	a := x.record(x.laptop, "alice")
+	if a == nil || len(a.Targets) != 1 || a.Targets[0].ServerKeyFP != ssh.FingerprintSHA256(x.srv[0].hostKey) {
+		t.Fatalf("the queued record %+v", a)
+	}
+	wh.freeze(t)
+	setPins(f2)
+	if hst := x.laptop.host(t, "web-1"); hst == nil || len(hst.HostKeys) != 2 {
+		t.Fatalf("the laptop already has the desk's change: %+v", hst)
+	}
+
+	// The resume reads the stale list; the sync that commits the queued
+	// record then brings in the desk's change.
+	h.on("before-resume", a.RecordID, func() {
+		wh.unfreeze()
+		refuse.Store(false)
+	})
+	var logins atomic.Int32
+	x.srv[0].setOnAuth(func(ssh.ConnMetadata, ssh.PublicKey) { logins.Add(1) })
+	code, out = x.hop(x.laptop, "access", "add", "alice", "--json")
+	res := decodeRun(out)
+	if code == 0 || len(res.Targets) != 1 || res.Targets[0].Recorded || !strings.Contains(res.Targets[0].Message, "no longer include") {
+		t.Fatalf("the resume: %d %s", code, out)
+	}
+	if hst := x.laptop.host(t, "web-1"); hst == nil || len(hst.HostKeys) != 1 {
+		t.Fatalf("the resume's sync did not bring in the desk's change: %+v", hst)
+	}
+	if n := logins.Load(); n != 0 || x.ak(0) != x.orig[0] {
+		t.Fatalf("the host was reached (%d logins) or changed: %q", n, x.ak(0))
+	}
+	l := x.list(x.laptop)
+	if len(l.Access) != 1 || len(l.Marks) != 0 || l.Access[0].Targets[0].State != model.AccessPending || l.Access[0].Targets[0].Gen != 1 {
+		t.Fatalf("the record after the refused resume: %+v", l)
+	}
+}
+
+// restartDesk stops the desk's daemon, runs f (if any) on its store with
+// no daemon over it, and starts a new daemon over the store.
+func (x *pubAccess) restartDesk(f func(s *store.Store)) {
+	t := x.t
+	t.Helper()
+	x.desk.c.Close()
+	if err := x.desk.d.Close(); err != nil {
+		t.Logf("closing the desk: %v", err)
+	}
+	s, err := store.Open(context.Background(), x.deskCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f != nil {
+		f(s)
+	}
+	x.desk = x.w.startDaemon(t, "desk", s)
+}
+
+// The access-review note end to end, through the CLI (§7.5; review r2
+// #3): the laptop adds alice; the desk revokes the laptop. hop status on
+// the desk shows the note, after a restart too; hop access ls shows it on
+// stderr, marks alice as last changed by a revoked device, and
+// acknowledges the note; from then on neither hop status nor hop access
+// ls shows it, also after a restart.
+func TestAccessReviewNoteThroughTheCLI(t *testing.T) {
+	x := newPubAccess(t, 1)
+	if code, _ := x.add(x.laptop, "alice", "web-1"); code != 0 {
+		t.Fatal("the laptop's add")
+	}
+	waitFor(t, 15*time.Second, "the desk has alice", func() bool { return x.record(x.desk, "alice") != nil })
+	laptop := x.deviceID(x.laptop).String()
+	x.restartDesk(func(s *store.Store) {
+		dev, err := syncclient.StoreDevice(s.DeviceAuth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := x.w.client(t).Remote(x.publication.VaultID, dev)
+		if _, err := s.RevokeDevices(context.Background(), r, []byte(resolvePassword), []string{laptop}, store.CheckpointOptions{}); err != nil {
+			t.Fatalf("revoke: %v", err)
+		}
+	})
+	const note = "which last changed the hop access record(s)"
+	status := func() string {
+		t.Helper()
+		_, out := x.hop(x.desk, "status")
+		return out
+	}
+	x.hop(x.desk, "sync")
+	waitFor(t, 15*time.Second, "hop status shows the note", func() bool { return strings.Contains(status(), note) })
+	// Not acknowledged by a restart.
+	x.restartDesk(nil)
+	x.hop(x.desk, "sync")
+	waitFor(t, 15*time.Second, "hop status shows the note after a restart", func() bool { return strings.Contains(status(), note) })
+
+	var so, se bytes.Buffer
+	code := x.hopSplit(x.desk, &so, &se, "access", "ls", "--json")
+	var views []cli.AccessView
+	if code != 0 || json.Unmarshal(so.Bytes(), &views) != nil || len(views) != 1 || !views[0].ByRetired || views[0].By != laptop {
+		t.Fatalf("hop access ls: %d %s %s", code, so.String(), se.String())
+	}
+	if !strings.Contains(se.String(), "note: ") || !strings.Contains(se.String(), note) {
+		t.Fatalf("hop access ls didn't show the note: %s", se.String())
+	}
+	if out := status(); strings.Contains(out, note) {
+		t.Fatalf("hop status after hop access ls: %s", out)
+	}
+	if code, out := x.hop(x.desk, "access", "ls"); code != 0 || strings.Contains(out, note) {
+		t.Fatalf("hop access ls again: %d %s", code, out)
+	}
+	x.restartDesk(nil)
+	x.hop(x.desk, "sync")
+	if out := status(); strings.Contains(out, note) {
+		t.Fatalf("hop status after a restart: %s", out)
+	}
+	if code, out := x.hop(x.desk, "access", "ls"); code != 0 || strings.Contains(out, note) || !strings.Contains(out, "revoked or retired") {
+		t.Fatalf("hop access ls after a restart: %d %s", code, out)
+	}
+}
+
+// hopSplit is hop with stdout and stderr apart.
+func (x *pubAccess) hopSplit(dv *device, so, se *bytes.Buffer, args ...string) int {
+	t := x.t
+	t.Helper()
+	env := &cli.Env{
+		Stdin: strings.NewReader(""), Stdout: so, Stderr: se,
+		Getenv: func(string) string { return "" },
+		Home:   dv.home, Paths: dv.paths, SSHProbeEnv: passwdShimEnv(),
+		PasswdHome: func() (string, error) { return dv.home, nil },
+		StartDaemon: func() error {
+			t.Error("the CLI tried to start a daemon, but one is running")
+			return errors.New("unexpected daemon start")
+		},
+		DialTimeout: 5 * time.Second,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	code := cli.Run(ctx, args, env)
+	t.Logf("%s: hop %s: exit %d\n%s%s", dv.name, strings.Join(args, " "), code, so.String(), se.String())
+	return code
 }

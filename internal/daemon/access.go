@@ -195,6 +195,9 @@ func (d *Daemon) opAccessReviewAck(p AccessReviewAckParams) error {
 	if err := d.sync.st.AckSyncNotes(n); err != nil {
 		return storeError(err)
 	}
+	// Status stops showing what was acknowledged, now rather than after
+	// the next sync.
+	d.sync.refreshReviews()
 	return nil
 }
 
