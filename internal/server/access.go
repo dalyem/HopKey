@@ -21,9 +21,10 @@ import (
 // device's key sees, since the signature is checked first. A disabled
 // account is also refused login and recovery tokens, after the secret
 // matched. Retire-status and retire-post stay open, so a device can finish
-// its own logout. Nothing here changes vault data or devices.active, which
-// mirrors the signed log: these are reversible access controls, not
-// revocations, and the server can make no device wipe itself.
+// its own logout, until a delete fences the account (delete.go). Nothing
+// here changes vault data or devices.active, which mirrors the signed
+// log: these are reversible access controls, not revocations, and the
+// server can make no device wipe itself.
 
 // Refusal codes (R11). The status is 403: never 429 or a 5xx, which a
 // client takes for an unreachable server.
@@ -102,10 +103,10 @@ func errDeviceBlocked(b *AdminBlock) error {
 	return &adminRefusalError{&apiError{http.StatusForbidden, CodeDeviceBlocked, "the server's operator blocked this device", nil}, b.Reason}
 }
 
-// adminRefusal returns the refusal for an account the operator disabled,
-// or, when device is not nil, a device the operator blocked; nil when
-// neither. Call it only once the caller proved it holds the device's key
-// or the account's secret.
+// adminRefusal returns the refusal for an account the operator disabled
+// or is deleting (fenceRefusal), or, when device is not nil, a device the
+// operator blocked; nil when none. Call it only once the caller proved it
+// holds the device's key or the account's secret.
 func adminRefusal(tx Tx, accountID model.ID, device *model.ID) error {
 	b, err := tx.AccountDisabled(accountID)
 	if err != nil {
@@ -113,6 +114,9 @@ func adminRefusal(tx Tx, accountID model.ID, device *model.ID) error {
 	}
 	if b != nil {
 		return errAccountDisabled(b)
+	}
+	if err := fenceRefusal(tx, accountID); err != nil {
+		return err
 	}
 	if device == nil {
 		return nil
@@ -316,12 +320,18 @@ func planEnable(who string, op Operator) func(Tx) (*AccessPlan, error) {
 		if err == nil && p.Disabled == nil {
 			err = adminErr("not_disabled", "the account is not disabled")
 		}
+		if err == nil {
+			var f *DeleteFence
+			if f, err = tx.DeleteFence(p.AccountID); err == nil && f != nil {
+				err = adminErr("deleting", "a delete of the account is in progress; hop-server accounts delete --cancel lifts it first")
+			}
+		}
 		return p, err
 	}
 }
 
 // PlanEnable returns what EnableAccount would do. It refuses an account
-// that is not disabled.
+// that is not disabled, or that a delete is fencing.
 func PlanEnable(ctx context.Context, st Store, who string, op Operator) (*AccessPlan, error) {
 	return view(ctx, st, planEnable(who, op))
 }

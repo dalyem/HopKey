@@ -98,7 +98,7 @@ var (
 	// server refusing this device a session, as it refuses a revoked one.
 	ErrSessionRefused = errors.New("the server refused this device a session")
 	// ErrAdminRefused matches an *AdminRefusal: the server's operator
-	// disabled the account or blocked this device.
+	// disabled or deleted the account, or blocked this device.
 	ErrAdminRefused = errors.New("the server's operator refused this device")
 	// ErrWipeIncomplete means a revocation was proven (ErrDeviceRevoked
 	// matches too) but wiping this device's copy of the vault did not
@@ -115,20 +115,25 @@ var (
 )
 
 // Admin refusal codes (R11): the server's operator disabled the account,
-// or blocked this device. The server sends them with 403, only to a
-// caller that proved the device's key or the account's secret.
+// blocked this device, or deleted the account. The server sends them with
+// 403. The first two go only to a caller that proved the device's key or
+// the account's secret; account_deleted goes to whoever asks for a
+// challenge for a device the deleted account had, since the server no
+// longer holds the device's key to check.
 const (
 	AdminAccountDisabled = "account_disabled"
 	AdminDeviceBlocked   = "device_blocked"
+	AdminAccountDeleted  = "account_deleted"
 )
 
 // AdminRefusal is the server refusing this device because its operator
-// disabled the account or blocked the device (Code), with the operator's
-// Reason ("" when none was given). It is the server's word, not the
-// account's: the vault locks in memory, as for any answer that does not
-// confirm the device (ErrServerUnconfirmed), and nothing is recorded or
-// deleted. It matches ErrAdminRefused. Reason comes from the server
-// unchecked; Error escapes it, and so must anything else that shows it.
+// disabled the account, blocked the device or deleted the account (Code),
+// with the operator's Reason ("" when none was given). It is the server's
+// word, not the account's: the vault locks in memory, as for any answer
+// that does not confirm the device (ErrServerUnconfirmed), and nothing is
+// recorded or deleted, a delete included: this device's copy stays. It
+// matches ErrAdminRefused. Reason comes from the server unchecked; Error
+// escapes it, and so must anything else that shows it.
 type AdminRefusal struct {
 	Code   string `json:"code"`
 	Reason string `json:"reason,omitempty"`
@@ -136,8 +141,11 @@ type AdminRefusal struct {
 
 func (e *AdminRefusal) Error() string {
 	what := "the server's operator disabled this account"
-	if e.Code == AdminDeviceBlocked {
+	switch e.Code {
+	case AdminDeviceBlocked:
 		what = "the server's operator blocked this device"
+	case AdminAccountDeleted:
+		what = "the server's operator deleted this account"
 	}
 	if e.Reason != "" {
 		what += fmt.Sprintf("; the operator's message: \"%s\" (the server's word, not your vault's)", EscapeServerText(e.Reason))

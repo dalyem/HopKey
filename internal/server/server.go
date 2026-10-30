@@ -253,7 +253,8 @@ type errorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	// Reason is the operator's reason for an admin refusal
-	// (account_disabled, device_blocked), absent when none was given.
+	// (account_disabled, device_blocked), absent when none was given, and
+	// always for account_deleted.
 	Reason string `json:"reason,optional"`
 }
 

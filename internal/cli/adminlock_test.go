@@ -22,6 +22,11 @@ func TestVaultStateOfAnAdminLock(t *testing.T) {
 			[]string{"locked: the server's operator disabled this account. Nothing was deleted. Ask the server's operator"}},
 		{&store.AdminRefusal{Code: store.AdminDeviceBlocked},
 			[]string{"locked: the server's operator blocked this device", "unblocks this device"}},
+		// A delete: nothing to wait for, but nothing on the device went.
+		{&store.AdminRefusal{Code: store.AdminAccountDeleted},
+			[]string{"locked: the server says its operator deleted this account", "the server's word, not your vault's",
+				"Nothing on this device was deleted", "copy of the vault stays here", "can't sign in or sync on that server again",
+				"hop auth logout --local-only deletes this device's copy"}},
 	} {
 		got := vaultState(&store.Info{Locked: true, ServerUnconfirmed: true, AdminLock: c.lock})
 		for _, w := range c.want {

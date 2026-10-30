@@ -604,19 +604,32 @@ func schemaVersionOf(t *testing.T, db *sql.DB) string {
 	return string(v)
 }
 
+// dropV5 undoes what version 5 added.
+var dropV5 = []string{
+	`DROP TRIGGER accounts_insert_deleted`, `DROP TRIGGER accounts_update_deleted`,
+	`DROP TRIGGER vaults_insert_deleted`, `DROP TRIGGER vaults_update_deleted`,
+	`DROP TABLE deleted_ids`, `DROP TABLE delete_fences`,
+}
+
 // v2DB copies e's database and turns the copy into exactly what a version 2
 // server would have written: the same rows, and a schema identical to the
 // frozen version 2 schema.
 func v2DB(t *testing.T, e *env) string {
 	t.Helper()
-	return oldDB(t, e, "2", `DROP TABLE account_admin`, `DROP TABLE device_blocks`,
-		`DROP INDEX admin_audit_account`, `DROP TABLE admin_audit`)
+	return oldDB(t, e, "2", append(slices.Clone(dropV5), `DROP TABLE account_admin`, `DROP TABLE device_blocks`,
+		`DROP INDEX admin_audit_account`, `DROP TABLE admin_audit`)...)
 }
 
 // v3DB is v2DB for version 3.
 func v3DB(t *testing.T, e *env) string {
 	t.Helper()
-	return oldDB(t, e, "3", `DROP TABLE account_admin`, `DROP TABLE device_blocks`)
+	return oldDB(t, e, "3", append(slices.Clone(dropV5), `DROP TABLE account_admin`, `DROP TABLE device_blocks`)...)
+}
+
+// v4DB is v2DB for version 4.
+func v4DB(t *testing.T, e *env) string {
+	t.Helper()
+	return oldDB(t, e, "4", dropV5...)
 }
 
 // oldDB copies e's database, runs drop on the copy and records version,
@@ -648,10 +661,10 @@ func oldDB(t *testing.T, e *env, version string, drop ...string) string {
 	return path
 }
 
-// A populated version 2 database moves to version 4 on open: admin_audit
-// and the access tables appear, every existing row is kept, and the server
-// and the admin commands work on it.
-func TestMigrateV2ToV4(t *testing.T) {
+// A populated version 2 database moves to version 5 on open: admin_audit,
+// the access tables and the delete tables appear, every existing row is
+// kept, and the server and the admin commands work on it.
+func TestMigrateV2ToV5(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	v, A, _, _, _ := adminVault(e)
@@ -667,11 +680,11 @@ func TestMigrateV2ToV4(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := openRaw(t, path)
-	if v := schemaVersionOf(t, raw); v != "4" {
+	if v := schemaVersionOf(t, raw); v != "5" {
 		t.Errorf("schema version %q after the migration", v)
 	}
 	after := tableCounts(t, raw)
-	for _, tbl := range []string{"admin_audit", "account_admin", "device_blocks"} {
+	for _, tbl := range []string{"admin_audit", "account_admin", "device_blocks", "delete_fences", "deleted_ids"} {
 		if n, ok := after[tbl]; !ok || n != 0 {
 			t.Errorf("%s: %d rows (there: %v)", tbl, n, ok)
 		}
@@ -696,27 +709,28 @@ func TestMigrateV2ToV4(t *testing.T) {
 
 	// Opening again changes nothing; a database from a newer server is
 	// refused, and the refusal creates nothing.
-	if v := schemaVersionOf(t, raw); v != "4" {
+	if v := schemaVersionOf(t, raw); v != "5" {
 		t.Errorf("schema version %q after reopening", v)
 	}
-	for _, q := range []string{`UPDATE meta SET v = CAST('5' AS BLOB) WHERE k = 'schema_version'`, `DROP TABLE device_seen`} {
+	for _, q := range []string{`UPDATE meta SET v = CAST('6' AS BLOB) WHERE k = 'schema_version'`, `DROP TABLE device_seen`} {
 		if _, err := raw.Exec(q); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if st3, err := OpenSQLite(path); err == nil {
 		st3.Close()
-		t.Error("opened a version 5 database")
+		t.Error("opened a version 6 database")
 	}
 	if slices.ContainsFunc(schemaOf(t, raw), func(o sqlObject) bool { return o.Name == "device_seen" }) {
 		t.Error("refusing a newer database created a table")
 	}
 }
 
-// A populated version 3 database, with audit rows, moves to version 4 on
-// open: account_admin and device_blocks appear empty, every existing row
-// is kept, and an access change and the server's refusal work on it.
-func TestMigrateV3ToV4(t *testing.T) {
+// A populated version 3 database, with audit rows, moves to version 5 on
+// open: account_admin, device_blocks and the delete tables appear empty,
+// every existing row is kept, and an access change and the server's
+// refusal work on it.
+func TestMigrateV3ToV5(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	v, A, _, _, _ := adminVault(e)
@@ -733,11 +747,11 @@ func TestMigrateV3ToV4(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := openRaw(t, path)
-	if v := schemaVersionOf(t, raw); v != "4" {
+	if v := schemaVersionOf(t, raw); v != "5" {
 		t.Errorf("schema version %q after the migration", v)
 	}
 	after := tableCounts(t, raw)
-	for _, tbl := range []string{"account_admin", "device_blocks"} {
+	for _, tbl := range []string{"account_admin", "device_blocks", "delete_fences", "deleted_ids"} {
 		if n, ok := after[tbl]; !ok || n != 0 {
 			t.Errorf("%s: %d rows (there: %v)", tbl, n, ok)
 		}
@@ -758,6 +772,68 @@ func TestMigrateV3ToV4(t *testing.T) {
 	wantCode(t, e2.sessionAttempt(v, A), 403, CodeAccountDisabled, "a session after the migration and a disable")
 }
 
+// A populated version 4 database, disabled account and blocked device and
+// all, moves to version 5 on open: delete_fences and deleted_ids appear
+// empty with their triggers, every existing row is kept, and a delete
+// runs on it, its IDs then refused as on a new database.
+func TestMigrateV4ToV5(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	v, A, B, _, _ := adminVault(e)
+	sel := DeviceSelection{IDs: []string{B.String()}}
+	bp, err := PlanBlockDevices(ctx, e.st, v.email, sel, e.op())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := BlockDevices(ctx, e.st, e.op(), v.email, sel, "lost", bp); err != nil {
+		t.Fatal(err)
+	}
+	e.disable(v, "closing")
+	path := v4DB(t, e)
+	before := tableCounts(t, openRaw(t, path))
+	if before["accounts"] != 1 || before["account_admin"] != 1 || before["device_blocks"] != 1 || before["admin_audit"] != 2 {
+		t.Fatalf("the version 4 database is not populated: %v", before)
+	}
+	st, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := openRaw(t, path)
+	if v := schemaVersionOf(t, raw); v != "5" {
+		t.Errorf("schema version %q after the migration", v)
+	}
+	after := tableCounts(t, raw)
+	for _, tbl := range []string{"delete_fences", "deleted_ids"} {
+		if n, ok := after[tbl]; !ok || n != 0 {
+			t.Errorf("%s: %d rows (there: %v)", tbl, n, ok)
+		}
+		delete(after, tbl)
+	}
+	if !mapsEqual(before, after) {
+		t.Errorf("rows changed: %v, then %v", before, after)
+	}
+	fresh := openRaw(t, e.path)
+	if got, want := schemaOf(t, raw), schemaOf(t, fresh); !slices.Equal(got, want) {
+		t.Errorf("the migrated schema is not a new database's:\n%v\nwant\n%v", got, want)
+	}
+	plan, err := PlanDelete(ctx, st, v.email, e.op(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DeleteAccount(ctx, st, e.op(), plan, DeleteOptions{BackupDir: t.TempDir()}); err != nil {
+		t.Fatalf("a delete after the migration: %v", err)
+	}
+	err = st.Update(ctx, func(tx Tx) error {
+		return tx.InsertAccount(&Account{ID: v.accountID(), Email: "n@example.com", VaultID: randID(t), Salt: []byte{}, CreatedAt: e.clock.now()})
+	})
+	if !errors.Is(err, ErrDuplicate) {
+		t.Errorf("the deleted ID inserted again after the migration: %v", err)
+	}
+	st.Close()
+	e2 := newEnvAt(t, path)
+	wantCode(t, e2.challenge(v, A, "session"), 403, CodeAccountDeleted, "a challenge after the migration and a delete")
+}
+
 // A version 2 database from before device_seen existed gains it too.
 func TestMigrateV2WithoutDeviceSeen(t *testing.T) {
 	e := newEnv(t)
@@ -773,7 +849,7 @@ func TestMigrateV2WithoutDeviceSeen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if v := schemaVersionOf(t, raw); v != "4" {
+	if v := schemaVersionOf(t, raw); v != "5" {
 		t.Errorf("schema version %q", v)
 	}
 	if _, err := ShowAccount(context.Background(), st, v.email, e.clock.now()); err != nil {
@@ -840,7 +916,7 @@ func TestOpenWhileAnotherWriterHoldsTheLock(t *testing.T) {
 				t.Fatalf("opening once the writer is done: %v", err)
 			}
 			st.Close()
-			if v := schemaVersionOf(t, raw); v != "4" {
+			if v := schemaVersionOf(t, raw); v != "5" {
 				t.Errorf("schema version %q after the writer finished", v)
 			}
 		})

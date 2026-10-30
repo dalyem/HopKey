@@ -260,8 +260,11 @@ func (d *Daemon) adminLock() *store.AdminRefusal {
 // it is shown on the session's terminal and kept in status.
 func whyAdmin(a *store.AdminRefusal) string {
 	why := whyDisabled
-	if a.Code == store.AdminDeviceBlocked {
+	switch a.Code {
+	case store.AdminDeviceBlocked:
 		why = whyBlocked
+	case store.AdminAccountDeleted:
+		why = whyDeleted
 	}
 	if a.Reason != "" {
 		why += fmt.Sprintf(": \"%s\" (the server's word)", store.EscapeServerText(a.Reason))

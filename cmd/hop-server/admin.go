@@ -238,7 +238,7 @@ func table(w io.Writer) *tabwriter.Writer { return tabwriter.NewWriter(w, 0, 0, 
 
 func accounts(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: hop-server accounts ls|show|disable|enable")
+		return errors.New("usage: hop-server accounts ls|show|disable|enable|delete")
 	}
 	switch args[0] {
 	case "ls":
@@ -249,6 +249,8 @@ func accounts(args []string, stdout, stderr io.Writer) error {
 		return accountsDisable(args[1:], stdout, stderr)
 	case "enable":
 		return accountsEnable(args[1:], stdout, stderr)
+	case "delete":
+		return accountsDelete(args[1:], stdout, stderr)
 	}
 	return fmt.Errorf("unknown accounts command %q", args[0])
 }
@@ -268,6 +270,7 @@ type accountJSON struct {
 	LastBootstrapSeq  *int64     `json:"last_bootstrap_seq"`
 	LastCheckpointSeq *int64     `json:"last_checkpoint_seq"`
 	Disabled          *blockJSON `json:"disabled"`
+	Deleting          *time.Time `json:"deleting"` // when a delete in progress fenced it
 }
 
 func accountOf(a *server.AccountSummary) accountJSON {
@@ -276,7 +279,7 @@ func accountOf(a *server.AccountSummary) accountJSON {
 		QuotaBytes: a.QuotaBytes, Reserve: a.Reserve.String(), ActiveDevices: a.ActiveDevices, Devices: a.AllDevices,
 		LastSeen: timeOrNil(a.LastSeen), HeadSeq: a.HeadSeq,
 		LastBootstrapSeq: seqOrNil(a.LastBootstrap), LastCheckpointSeq: seqOrNil(a.LastCheckpoint),
-		Disabled: blockOf(a.Disabled),
+		Disabled: blockOf(a.Disabled), Deleting: timeOrNil(a.Deleting),
 	}
 }
 
@@ -325,7 +328,10 @@ func accountsLs(args []string, stdout io.Writer) error {
 	fmt.Fprintln(tw, "ACCOUNT\tEMAIL\tSTATE\tCREATED\tUSED\tQUOTA\tRESERVE\tDEVICES\tLAST SEEN\tHEAD\tCHECKPOINT")
 	for _, a := range list {
 		state := "enabled"
-		if a.Disabled != nil {
+		switch {
+		case !a.Deleting.IsZero():
+			state = "deleting"
+		case a.Disabled != nil:
 			state = "disabled"
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d/%d\t%s\t%d\t%s\n", a.ID, esc(a.Email), state, when(a.CreatedAt),
@@ -425,6 +431,9 @@ func accountsShow(args []string, stdout io.Writer) error {
 	fmt.Fprintf(tw, "vault\t%s\n", d.VaultID)
 	fmt.Fprintf(tw, "created\t%s\n", when(d.CreatedAt))
 	fmt.Fprintf(tw, "access\t%s\n", disabledText(d.Disabled))
+	if !d.Deleting.IsZero() {
+		fmt.Fprintf(tw, "delete\tin progress since %s: the account is fenced (hop-server accounts delete finishes it, --cancel lifts it)\n", when(d.Deleting))
+	}
 	quota := quotaText(d.QuotaBytes)
 	if d.QuotaBytes == 0 {
 		quota = "the server default (--quota-mib)"

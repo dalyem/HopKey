@@ -171,7 +171,48 @@ type Tx interface {
 	SetDeviceBlock(accountID, deviceID model.ID, b *AdminBlock) error
 	// DeleteLoginTokens deletes the account's login and recovery tokens.
 	DeleteLoginTokens(accountID model.ID) error
+
+	// Account delete (hop-server accounts delete).
+
+	// DeleteFence returns the account's delete in progress, or nil.
+	DeleteFence(accountID model.ID) (*DeleteFence, error)
+	// SetDeleteFence starts a delete of the account, or ends it when f is
+	// nil.
+	SetDeleteFence(accountID model.ID, f *DeleteFence) error
+	// AccountRows counts the account's rows per table: every row a delete
+	// removes, the registration it used and the enrollment mailboxes it
+	// claimed included.
+	AccountRows(accountID, vaultID model.ID) (map[string]int, error)
+	// DeleteAccountRows deletes the rows AccountRows counts and returns
+	// how many it deleted per table. It writes no tombstone.
+	DeleteAccountRows(accountID, vaultID model.ID) (map[string]int, error)
+	// InsertDeleted tombstones an ID of a deleted account: its own, its
+	// vault's, or one of its devices'. An account or vault row with a
+	// tombstoned account or vault ID can never be written again.
+	InsertDeleted(kind DeletedKind, id, accountID model.ID, at time.Time) error
+	// DeviceDeleted reports whether deviceID was a device of the deleted
+	// account accountID.
+	DeviceDeleted(accountID, deviceID model.ID) (bool, error)
 }
+
+// DeleteFence is an account delete in progress: from when the fence was
+// set (At) until the delete or its cancel, the server refuses the
+// account every write, session and login, so its vault stays at Head.
+type DeleteFence struct {
+	AccountID model.ID
+	VaultID   model.ID
+	At        time.Time
+	Head      vaultlog.Head
+}
+
+// DeletedKind is what a tombstoned ID was.
+type DeletedKind string
+
+const (
+	DeletedAccount DeletedKind = "account"
+	DeletedVault   DeletedKind = "vault"
+	DeletedDevice  DeletedKind = "device"
+)
 
 // AdminBlock is an operator's disable of an account or block of a device:
 // when, and the reason given ("" for none), already sanitized

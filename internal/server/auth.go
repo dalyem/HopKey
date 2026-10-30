@@ -187,7 +187,9 @@ func newChallenge() ([]byte, crypto.Hash, error) {
 // → {challenge}. Session challenges need an active device; retire-status
 // challenges are issued for any device the account has ever had (R5). The
 // challenge is bound to the configured origin, the account, the device,
-// the operation and a 60-second expiry.
+// the operation and a 60-second expiry. A device of an account the
+// operator deleted gets 403 account_deleted instead of the 401 for an
+// unknown device (errAccountDeleted).
 func (s *Server) authChallenge(w http.ResponseWriter, r *http.Request, c *call) error {
 	var req challengeRequest
 	if err := s.decode(c.body, &req); err != nil {
@@ -206,6 +208,11 @@ func (s *Server) authChallenge(w http.ResponseWriter, r *http.Request, c *call) 
 	err = s.store.Update(r.Context(), func(tx Tx) error {
 		d, err := tx.Device(req.AccountID, req.DeviceID)
 		if errors.Is(err, ErrNotFound) {
+			if gone, err := tx.DeviceDeleted(req.AccountID, req.DeviceID); err != nil {
+				return err
+			} else if gone {
+				return errAccountDeleted
+			}
 			return errUnauthorized
 		}
 		if err != nil {

@@ -191,7 +191,8 @@ type claimResponse struct {
 }
 
 // sessionPrincipal authenticates a device session inside tx. Login and
-// recovery tokens never authorize enrollment (R6).
+// recovery tokens never authorize enrollment (R6), and an account a
+// delete fences is refused it (fenceRefusal).
 func (s *Server) sessionPrincipal(tx Tx, tok crypto.Hash) (*principal, error) {
 	p, err := s.authenticate(tx, tok)
 	if err != nil {
@@ -199,6 +200,9 @@ func (s *Server) sessionPrincipal(tx Tx, tok crypto.Hash) (*principal, error) {
 	}
 	if p.kind != credSession {
 		return nil, errUnauthorized
+	}
+	if err := fenceRefusal(tx, p.accountID); err != nil {
+		return nil, err
 	}
 	return p, nil
 }
@@ -289,6 +293,16 @@ func (s *Server) mailboxAuth(tx Tx, tok crypto.Hash, id model.ID, okID bool) (m 
 			return nil, 0, nil, err
 		case !s.now().Before(m.ExpiresAt):
 			m = nil
+		case m.AccountID != nil:
+			// A mailbox claimed by an account a delete fences is gone
+			// for both parties, as the delete will make it.
+			f, err := tx.DeleteFence(*m.AccountID)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if f != nil {
+				m = nil
+			}
 		}
 	}
 	if m != nil && subtle.ConstantTimeCompare(tok[:], m.TokenHash[:]) == 1 {

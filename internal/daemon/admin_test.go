@@ -628,3 +628,151 @@ func TestStaleActiveAnswerKeepsANewerAdminLock(t *testing.T) {
 		t.Error("hop unlock with the server unreachable loaded keys after the stale answer")
 	}
 }
+
+// deleteAccount deletes the account as hop-server accounts delete does,
+// after the disable it needs, without a backup.
+func deleteAccount(t *testing.T, w *syncWorld) {
+	t.Helper()
+	ctx := context.Background()
+	disableAccount(t, w, "")
+	p, err := server.PlanDelete(ctx, w.st, syncEmail, adminOp(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := server.DeleteAccount(ctx, w.st, adminOp(), p, server.DeleteOptions{NoBackup: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// hop sync on a device whose account was deleted is told account_deleted
+// at its challenge, and the device locks as for a disable: the agent
+// empties, the ssh sessions hop started end with the reason, and nothing
+// is recorded or deleted, the vault's files included. The retry and hop
+// unlock ask again and stay locked.
+func TestDeleteLocksHopSync(t *testing.T) {
+	x := newSyncSetup(t)
+	ctx := context.Background()
+	x.w.start(x.n1, x.n1.st, SyncOptions{noPoll: true})
+	x.w.start(x.n2, x.n2.st, SyncOptions{noPoll: true})
+	x.n1.putHost(webHost("web1", x.keyID, "203.0.113.16"))
+	x.n1.must(OpSyncNow, nil, nil)
+	x.n2.must(OpSyncNow, nil, nil)
+	eventually(t, 10*time.Second, "web1 reaches the laptop", func() bool { return strings.Contains(x.n2.config(), "Host web1\n") })
+	session := watchAt(t, x.n2.d.ControlSocket(), "web1", "")
+
+	deleteAccount(t, x.w)
+	err := x.n2.call(OpSyncNow, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "operator deleted this account") {
+		t.Errorf("hop sync of a deleted account: %v", err)
+	}
+	session.ended(t, 5*time.Second, whyDeleted)
+	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+	if e := endedStatus(t, x.n2); e == nil || e.Why != whyDeleted {
+		t.Errorf("ended sessions in status: %+v", e)
+	}
+
+	if x.n2.d.retryUnconfirmed(ctx) {
+		t.Fatal("the retry unlocked a deleted account's vault")
+	}
+	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+	err = x.n2.call(OpUnlock, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "operator deleted this account") {
+		t.Errorf("hop unlock of a deleted account: %v", err)
+	}
+	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+}
+
+// A delete reaches running daemons through their long-polls: both
+// devices lock, whatever they saw first (the disable a delete needs, or
+// the delete), and their next retry says the account was deleted.
+func TestDeleteLocksTheBackgroundPull(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n1, x.n1.st, SyncOptions{Wait: time.Second})
+	x.w.start(x.n2, x.n2.st, SyncOptions{Wait: time.Second})
+	for _, n := range []*node{x.n1, x.n2} {
+		if k := n.agentKeys(); k != 1 {
+			t.Fatalf("setup: %s's agent serves %d key(s)", n.name, k)
+		}
+	}
+	deleteAccount(t, x.w)
+	for _, n := range []*node{x.n1, x.n2} {
+		eventually(t, 15*time.Second, n.name+" locks", func() bool { return n.agentKeys() == 0 })
+		if n.d.retryUnconfirmed(context.Background()) {
+			t.Fatalf("%s: the retry unlocked a deleted account's vault", n.name)
+		}
+		adminLocked(t, n, store.AdminAccountDeleted, "")
+	}
+}
+
+// A change queued on a device whose account was deleted is pushed by the
+// loop, refused, and the device locks; the change stays queued.
+func TestDeleteLocksAPush(t *testing.T) {
+	x := newSyncSetup(t)
+	x.w.start(x.n2, x.n2.st, SyncOptions{noPoll: true})
+	// The loop is idle once hop sync is answered, so the pause holds from
+	// its next step on: nothing reaches the server before the delete, and
+	// the change is queued after it.
+	x.n2.must(OpSyncNow, nil, nil)
+	x.n2.pause(true)
+	deleteAccount(t, x.w)
+	x.n2.putHost(webHost("web2", x.keyID, "203.0.113.17"))
+	if k := x.n2.agentKeys(); k != 1 {
+		t.Fatalf("setup: the paused laptop serves %d key(s) before its push", k)
+	}
+	x.n2.pause(false)
+	eventually(t, 15*time.Second, "the push is refused and the laptop locks", func() bool { return x.n2.agentKeys() == 0 })
+	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+	// Status can't count a locked vault's outbox; its files are there.
+	if empty, err := x.n2.st.OutboxEmpty(); err != nil || empty {
+		t.Errorf("the queued change is gone after the refused push: empty %v, %v", empty, err)
+	}
+}
+
+// A daemon that starts for a deleted account locks before any key loads.
+func TestDeleteLocksAtStart(t *testing.T) {
+	x := newSyncSetup(t)
+	deleteAccount(t, x.w)
+	x.w.startWatched(x.n2, x.n2.st) // fails if the agent ever served a key
+	adminLocked(t, x.n2, store.AdminAccountDeleted, "")
+}
+
+// A logout of a device whose account was deleted can't be recorded: it
+// stays pending with the operator's refusal, posts nothing, and deletes
+// nothing on the device; --local-only is the way out, and it wipes.
+func TestLogoutOfADeletedAccount(t *testing.T) {
+	x := newSyncSetup(t)
+	ctx := context.Background()
+	deleteAccount(t, x.w)
+	var posts atomic.Int32
+	x.w.setIntercept(func(rw http.ResponseWriter, req *http.Request, next http.Handler) bool {
+		if req.Method == http.MethodPost && (req.URL.Path == "/v1/retire-status/post" || strings.HasSuffix(req.URL.Path, "/log")) {
+			posts.Add(1)
+		}
+		return false
+	})
+	retirer := x.w.client(t).Retirer(x.pub.VaultID)
+	for range 2 {
+		res, err := x.n2.st.Logout(ctx, retirer, store.LogoutOptions{})
+		var ar *store.AdminRefusal
+		if !errors.Is(err, store.ErrLogoutPending) || !errors.As(err, &ar) || ar.Code != store.AdminAccountDeleted ||
+			res.Done || res.State != store.StateRetiring {
+			t.Fatalf("logout of a deleted account: %+v, %v", res, err)
+		}
+	}
+	if n := posts.Load(); n != 0 {
+		t.Errorf("the pending logout posted %d time(s)", n)
+	}
+	data := x.n2.cfg.DataDir
+	for _, f := range []string{filepath.Join(data, "device.json"), filepath.Join(data, "vault", "state.json")} {
+		if !exists(t, f) {
+			t.Errorf("the pending logout removed %s", f)
+		}
+	}
+	res, err := x.n2.st.Logout(ctx, nil, store.LogoutOptions{LocalOnly: true})
+	if err != nil || !res.Done {
+		t.Fatalf("logout --local-only: %+v, %v", res, err)
+	}
+	if exists(t, filepath.Join(data, "device.json")) {
+		t.Error("logout --local-only left device.json")
+	}
+}
