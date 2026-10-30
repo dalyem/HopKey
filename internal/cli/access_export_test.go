@@ -8,8 +8,8 @@ import (
 )
 
 // SetAccessTestHook has f called at the points of a hop access run
-// (before-session, before-record) until the test ends. f must be safe
-// for concurrent runs.
+// (before-session, before-record, before-check-read) until the test
+// ends. f must be safe for concurrent runs.
 func SetAccessTestHook(t testing.TB, f func(point string, a *model.Access)) {
 	old := accessTestHook
 	accessTestHook = f

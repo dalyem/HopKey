@@ -219,13 +219,12 @@ func (c *accessConn) session(ctx context.Context, decide func(ctx context.Contex
 	defer cancel()
 	var end sessionEnd
 	protoDone := make(chan struct{})
-	gaveUp := make(chan struct{}, 1)
+	gaveUp := make(chan struct{})
+	giveUp := sync.OnceFunc(func() { close(gaveUp) })
 	go func() {
 		defer close(protoDone)
 		defer inW.Close()
-		if c.protocol(ctx, outR, inW, decide, &end) {
-			gaveUp <- struct{}{}
-		}
+		c.protocol(ctx, outR, inW, decide, &end, giveUp)
 	}()
 	go func() {
 		select {
@@ -254,13 +253,15 @@ func (c *accessConn) session(ctx context.Context, decide func(ctx context.Contex
 }
 
 // protocol reads the header and the file, gets the decision, and sends
-// it. It records what it sent in end, and reports whether it gave up at
-// its deadline. The deadline starts at the end of the header: a host that
-// sends the file slowly, a slow decision and a slow payload all count
-// against it. Whatever it stops on, the rest of the host's output is read
-// and discarded until it ends: the copy from ssh's stdout into out must
-// never block, or ssh's end (and a timeout's kill) would wait for it.
-func (c *accessConn) protocol(ctx context.Context, out io.Reader, in *io.PipeWriter, decide func(context.Context, string, []byte) sessionDecision, end *sessionEnd) (gaveUp bool) {
+// it. It records what it sent in end, and calls giveUp the moment its
+// deadline passes, before anything it then writes and whether or not the
+// write it was in ever completes: the session's grace starts then. The
+// deadline starts at the end of the header: a host that sends the file
+// slowly, a slow decision and a slow payload all count against it.
+// Whatever it stops on, the rest of the host's output is read and
+// discarded until it ends: the copy from ssh's stdout into out must never
+// block, or ssh's end (and a timeout's kill) would wait for it.
+func (c *accessConn) protocol(ctx context.Context, out io.Reader, in *io.PipeWriter, decide func(context.Context, string, []byte) sessionDecision, end *sessionEnd, giveUp func()) {
 	br := bufio.NewReaderSize(out, 256)
 	// reading is open while a goroutine still reads the file from br; the
 	// drain waits for it, so only one reader at a time uses br.
@@ -286,29 +287,29 @@ func (c *accessConn) protocol(ctx context.Context, out io.Reader, in *io.PipeWri
 	case errors.Is(err, bufio.ErrBufferFull):
 		// More than 256 bytes without a newline: not a header.
 		abort("the host's answer is not a hop session header")
-		return false
+		return
 	case err != nil:
-		return false // no header: the script stopped before it (81-85), or the connection did
+		return // no header: the script stopped before it (81-85), or the connection did
 	}
 	f := strings.Fields(string(line))
 	if len(f) != 5 || f[0] != "hop-session" || f[1] != "1" {
 		abort("the host's answer is not a hop session header")
-		return false
+		return
 	}
 	size, serr := strconv.ParseInt(f[4], 10, 64)
 	if serr != nil || size < 0 || size > akMaxSize {
 		abort(akFile + " is larger than 1 MiB")
-		return false
+		return
 	}
 	dctx, stop := context.WithDeadline(ctx, time.Now().Add(accessDecisionDeadline))
 	defer stop()
-	late := func() bool {
+	late := func() {
+		giveUp()
 		why := errSessionDeadline.Error()
 		if ctx.Err() != nil {
 			why = "the run was interrupted"
 		}
 		abort(why)
-		return true
 	}
 	content := make([]byte, size)
 	var rerr error
@@ -321,16 +322,17 @@ func (c *accessConn) protocol(ctx context.Context, out io.Reader, in *io.PipeWri
 	case <-reading:
 		reading = nil
 	case <-dctx.Done():
-		return late()
+		late()
+		return
 	}
 	if rerr != nil {
-		return false
+		return
 	}
 	if cksum(content) != f[3]+" "+f[4] {
 		// Only a writer that ignores the lock changes the file between
 		// the two commands.
 		abort(akFile + " changed while hop was reading it")
-		return false
+		return
 	}
 	drain()
 	user := f[2]
@@ -344,25 +346,32 @@ func (c *accessConn) protocol(ctx context.Context, out io.Reader, in *io.PipeWri
 	select {
 	case d = <-ch:
 	case <-dctx.Done():
-		return late()
+		late()
+		return
 	}
 	if dctx.Err() != nil {
-		return late()
+		late()
+		return
 	}
 	end.decided, end.decision = true, d
 	if d.to == nil {
 		fmt.Fprint(in, "abort\n")
 		end.sent = sentAbort
-		return false
+		return
 	}
-	cut := context.AfterFunc(dctx, func() { in.CloseWithError(errSessionDeadline) })
+	// A deadline that passes while the payload is still going out ends
+	// the client's input and starts the grace; the session's end is
+	// then unconfirmed, and the caller reads the file again.
+	cut := context.AfterFunc(dctx, func() {
+		giveUp()
+		in.CloseWithError(errSessionDeadline)
+	})
 	defer cut()
 	end.sent = sentWrite
 	if _, err := fmt.Fprintf(in, "write %s %s\n", cksum(content), cksum(d.to)); err != nil {
-		return false
+		return
 	}
 	in.Write(d.to)
-	return false
 }
 
 // read reads authorized_keys on a restricted connection, without the

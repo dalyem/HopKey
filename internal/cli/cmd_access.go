@@ -465,8 +465,9 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 }
 
 // accessTestHook is called at points of a planner run (before-resume,
-// before-session, before-record) with the record the run acts for. Tests replace it to
-// interleave runs.
+// before-session, before-record) with the record the run acts for, and
+// by check before each file it reads for a target (before-check-read).
+// Tests replace it to interleave runs.
 var accessTestHook = func(point string, a *model.Access) {}
 
 // newAccessRecord builds a new record from the input policy of §6.2.
@@ -726,9 +727,10 @@ func (e *Env) accessFence(ctx context.Context, v *accessVault, a *model.Access, 
 
 // binding is a target's host as the vault holds it now.
 type binding struct {
-	l    *daemon.ListResult
-	host model.Host
-	name string
+	l     *daemon.ListResult
+	found bool // the host record exists
+	host  model.Host
+	name  string
 	// pin is the host's pin with the target's binding; nil when the host
 	// is gone or its pins no longer include it.
 	pin ssh.PublicKey
@@ -742,14 +744,20 @@ type binding struct {
 // another device's change to the pins since the run listed the hosts, and
 // that list would still trust a key the change removed.
 func (e *Env) bindingNow(ctx context.Context, t model.AccessTarget) binding {
+	return e.pinNow(ctx, t.HostItemID, t.ServerKeyFP)
+}
+
+// pinNow reads the host records again and finds host id and its pin with
+// fingerprint fp in them, as bindingNow does for a target.
+func (e *Env) pinNow(ctx context.Context, id model.ID, fp string) binding {
 	l, err := listAll(ctx, e)
 	if err != nil {
-		return binding{name: "host " + t.HostItemID.String(), err: err}
+		return binding{name: "host " + id.String(), err: err}
 	}
 	ix := hostIndex{l.Hosts}
-	b := binding{l: l, name: ix.name(t.HostItemID)}
-	if h, ok := ix.byID(t.HostItemID); ok {
-		b.host, b.pin = h, boundPin(h, t.ServerKeyFP)
+	b := binding{l: l, name: ix.name(id)}
+	if h, ok := ix.byID(id); ok {
+		b.found, b.host, b.pin = true, h, boundPin(h, fp)
 	}
 	return b
 }

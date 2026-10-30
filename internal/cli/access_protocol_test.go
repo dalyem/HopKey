@@ -3,11 +3,17 @@ package cli
 import (
 	"context"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/access"
+	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/resolve"
 )
 
 // The client's side of a locked session (§7.7) over pipes: the host is
@@ -40,8 +46,14 @@ func startProtocol(t *testing.T, decide func(context.Context, string, []byte) se
 	c := &accessConn{}
 	go func() {
 		var r protoRun
-		r.gaveUp = c.protocol(context.Background(), outR, inW, decide, &r.end)
+		gaveUp := make(chan struct{})
+		c.protocol(context.Background(), outR, inW, decide, &r.end, sync.OnceFunc(func() { close(gaveUp) }))
 		inW.Close()
+		select {
+		case <-gaveUp:
+			r.gaveUp = true
+		default:
+		}
 		done <- r
 	}()
 	return outW, sent, done
@@ -193,5 +205,90 @@ func TestProtocolDecisionInTime(t *testing.T) {
 	}
 	if r.gaveUp || r.end.sent != sentWrite || !r.end.decided || string(r.end.decision.to) != string(next) {
 		t.Fatalf("end %+v", r.end)
+	}
+}
+
+// Review r3 #3: a deadline that passes while the payload is still going
+// out gives up at once, while the write is still blocked: the grace
+// starts at the deadline, not when (or whether) the write ends. The host
+// here reads none of the client's input.
+func TestProtocolPayloadPastTheDeadlineGivesUp(t *testing.T) {
+	setDeadline(t, 300*time.Millisecond)
+	outR, outW := io.Pipe()
+	inR, inW := io.Pipe()
+	t.Cleanup(func() {
+		outW.Close()
+		inR.Close()
+	})
+	go func() {
+		io.WriteString(outW, protoHeader(protoFile))
+		outW.Write(protoFile)
+	}()
+	gaveUp := make(chan time.Time, 1)
+	returned := make(chan sessionEnd, 1)
+	c := &accessConn{}
+	start := time.Now()
+	go func() {
+		var end sessionEnd
+		decide := func(context.Context, string, []byte) sessionDecision {
+			return sessionDecision{to: []byte(strings.Repeat("x", 64<<10))}
+		}
+		c.protocol(context.Background(), outR, inW, decide, &end, sync.OnceFunc(func() { gaveUp <- time.Now() }))
+		returned <- end
+	}()
+	select {
+	case at := <-gaveUp:
+		if el := at.Sub(start); el > 2*time.Second {
+			t.Fatalf("gave up %v after the start", el)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("protocol never gave up on a payload past its deadline")
+	}
+	select {
+	case end := <-returned:
+		// Sent, but unconfirmed: the caller reads the file again.
+		if end.sent != sentWrite || !end.decided || end.abortWhy != "" {
+			t.Fatalf("end %+v", end)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("protocol did not return")
+	}
+}
+
+// Review r3 #3, through session and a child process: the stand-in ssh
+// sends a valid header and the file, then never reads its input, so a
+// payload larger than a pipe's buffer stalls. The session ends within the
+// deadline and the grace (and the kill's wait), not at its timeout.
+func TestSessionPayloadStallEndsAtDeadlinePlusGrace(t *testing.T) {
+	shPath, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	dir := t.TempDir()
+	hdr := filepath.Join(dir, "hdr")
+	if err := os.WriteFile(hdr, []byte(protoHeader(protoFile)+string(protoFile)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(fake, []byte("#!"+shPath+"\ncat '"+hdr+"'\nexec sleep 60\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldT, oldD, oldG := accessSessionTimeout, accessDecisionDeadline, accessAbortGrace
+	accessSessionTimeout, accessDecisionDeadline, accessAbortGrace = 40*time.Second, 500*time.Millisecond, 500*time.Millisecond
+	t.Cleanup(func() { accessSessionTimeout, accessDecisionDeadline, accessAbortGrace = oldT, oldD, oldG })
+	e := &Env{SSHBinary: fake, Environ: os.Environ(), Stderr: io.Discard,
+		Paths: daemon.Paths{RunDir: filepath.Join(dir, "run"), ConfigDir: filepath.Join(dir, "cfg"), StateDir: filepath.Join(dir, "state")}}
+	c := &accessConn{e: e, ssh: rotSSH{e: e, t: &target{rr: &daemon.ResolveResult{Result: &resolve.Result{}}, alias: "hop-test"}, cfg: filepath.Join(dir, "config"), dir: dir}}
+	payload := []byte(strings.Repeat("x", 1<<20))
+	start := time.Now()
+	end := c.session(context.Background(), func(context.Context, string, []byte) sessionDecision {
+		return sessionDecision{to: payload}
+	})
+	took := time.Since(start)
+	if limit := accessDecisionDeadline + accessAbortGrace + 5*time.Second; took > limit {
+		t.Fatalf("the session took %v (limit %v): it waited for the stalled host", took, limit)
+	}
+	if !end.gotHeader || !end.decided || end.sent != sentWrite || end.exited {
+		t.Fatalf("end %+v", end)
 	}
 }

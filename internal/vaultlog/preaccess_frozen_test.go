@@ -13,10 +13,9 @@ import (
 // check, copied from bc30d59 (internal/vaultlog/ops.go:339-358). Between
 // that build and this one, the public stage changed only in the
 // allowlist, so today's decoder with these copies is that build's public
-// stage. Unlock replays cached entries through the same verifier
-// (internal/store/store.go, the replay from the newest anchor), so this is
-// also what that build does to an access entry already in its cache. Do
-// not change them to follow the current code: they stand for a build that
+// stage. This is the narrower schema regression; the unlock of a cache
+// with an access entry in it, through that build's readEntry, is
+// internal/store/preaccess_frozen_test.go. Do not change them to follow the current code: they stand for a build that
 // is already out there (crypto spec rev 17, §5.3, §8.4 Compatibility).
 
 func frozenPreAccessIsItemType(t model.Type) bool {

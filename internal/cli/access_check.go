@@ -328,15 +328,13 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 	}
 	k := &accessCheck{e: e, ix: hostIndex{l.Hosts}, records: al.Access, read: map[string]bool{}}
 	unread := false
+	// Every connection check makes trusts only a pin it found in the host
+	// records read again right before it (pinNow, §7.6), not in the list
+	// above: an earlier read can take long, and the daemon may pull
+	// another device's removal of a pin meanwhile. A file already read is
+	// not read again, nor checked again.
 	cache := map[string]checkRead{}
-	readAs := func(h model.Host, pins []ssh.PublicKey, key string) checkRead {
-		if r, ok := cache[key]; ok {
-			return r
-		}
-		r := e.checkFile(ctx, h, l, pins)
-		cache[key] = r
-		return r
-	}
+	cur := l // the host records as last read
 	targeted := map[model.ID]bool{}
 	for i := range al.Access {
 		a := &al.Access[i]
@@ -354,26 +352,35 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 				k.add(AccessFinding{Kind: findCantRead, Host: name, HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP,
 					Label: a.Label, RecordID: a.RecordID.String(), TargetState: t.State, Message: why, Fix: fix, Unread: true})
 			}
-			h, ok := k.ix.byID(t.HostItemID)
-			pin := boundPin(h, t.ServerKeyFP)
-			if !ok || pin == nil {
-				// Terminal targets too: a removed target's line can come
-				// back, and check couldn't look (exit status 2).
-				why, fix := unbound(t, a.Label, name), ""
-				switch {
-				case !ok && model.AccessTerminal(t.State):
-					why = "the host was deleted, so hop can't read the file of this " + t.State + " target"
-				case !ok:
-					why = "the host was deleted; hop access rm " + a.Label + " --abandon " + t.HostItemID.String()
-				case model.AccessTerminal(t.State):
-					why = safef("the host's pinned keys no longer include %s, the key this %s target is bound to, so hop can't read its file", t.ServerKeyFP, t.State)
-					fix = "hop trust " + name + " if the machine still presents " + t.ServerKeyFP
-				}
-				cantRead(why, fix)
-				continue
-			}
 			key := t.HostItemID.String() + " " + t.ServerKeyFP
-			r := readAs(h, []ssh.PublicKey{pin}, key)
+			r, cached := cache[key]
+			if !cached {
+				b := e.bindingNow(ctx, t)
+				if b.err != nil {
+					cantRead(safef("could not read the host records again: %v", b.err), "")
+					continue
+				}
+				cur = b.l
+				if !b.found || b.pin == nil {
+					// Terminal targets too: a removed target's line can come
+					// back, and check couldn't look (exit status 2).
+					why, fix := unbound(t, a.Label, name), ""
+					switch {
+					case !b.found && model.AccessTerminal(t.State):
+						why = "the host was deleted, so hop can't read the file of this " + t.State + " target"
+					case !b.found:
+						why = "the host was deleted; hop access rm " + a.Label + " --abandon " + t.HostItemID.String()
+					case model.AccessTerminal(t.State):
+						why = safef("the host's pinned keys no longer include %s, the key this %s target is bound to, so hop can't read its file", t.ServerKeyFP, t.State)
+						fix = "hop trust " + name + " if the machine still presents " + t.ServerKeyFP
+					}
+					cantRead(why, fix)
+					continue
+				}
+				accessTestHook("before-check-read", a)
+				r = e.checkFile(ctx, b.host, b.l, []ssh.PublicKey{b.pin})
+				cache[key] = r
+			}
 			if r.why == "" && r.user != t.User {
 				r.why = "the host now logs in as " + r.user + ", not " + t.User
 			}
@@ -385,9 +392,24 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 			k.targetFindings(a, t, name, r)
 			// A known shared pin: the same file through every other host
 			// record that pins the key (§7.4). A read that fails there is
-			// a file check couldn't read.
-			for _, o := range k.ix.sharedPins(t.ServerKeyFP, t.HostItemID) {
-				or := readAs(o, []ssh.PublicKey{pin}, o.ItemID.String()+" "+t.ServerKeyFP)
+			// a file check couldn't read. A host record that no longer
+			// pins the key when its turn comes is no longer a shared pin.
+			for _, o := range (hostIndex{cur.Hosts}).sharedPins(t.ServerKeyFP, t.HostItemID) {
+				okey := o.ItemID.String() + " " + t.ServerKeyFP
+				or, cached := cache[okey]
+				if !cached {
+					ob := e.pinNow(ctx, o.ItemID, t.ServerKeyFP)
+					if ob.err == nil && ob.pin == nil {
+						continue
+					}
+					if ob.err != nil {
+						or.why = safef("could not read the host records again: %v", ob.err)
+					} else {
+						cur = ob.l
+						or = e.checkFile(ctx, ob.host, ob.l, []ssh.PublicKey{ob.pin})
+						cache[okey] = or
+					}
+				}
 				if or.why == "" && or.user != t.User {
 					or.why = "it logs in as " + or.user + ", not " + t.User
 				}
@@ -412,17 +434,28 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 			if targeted[h.ItemID] || (len(hostsFlag.vals) > 0 && !slices.Contains(hostsFlag.vals, h.Name)) {
 				continue
 			}
-			pins, _ := parsePins(h.HostKeys)
+			key := h.ItemID.String() + " all"
+			fl, err := listAll(ctx, e)
+			if err != nil {
+				unread = true
+				k.add(AccessFinding{Kind: findCantRead, Host: h.Name, HostID: h.ItemID.String(), Message: safef("could not read the host records again: %v", err), Unread: true})
+				continue
+			}
+			now, ok := (hostIndex{fl.Hosts}).byID(h.ItemID)
+			if !ok {
+				continue
+			}
+			pins, _ := parsePins(now.HostKeys)
 			if len(pins) == 0 {
 				continue
 			}
-			r := readAs(h, pins, h.ItemID.String()+" all")
+			r := e.checkFile(ctx, now, fl, pins)
 			if r.why != "" {
 				unread = true
 				k.add(AccessFinding{Kind: findCantRead, Host: h.Name, HostID: h.ItemID.String(), Message: r.why, Unread: true})
 				continue
 			}
-			k.fileFindings(h.Name, r, h.ItemID.String()+" all")
+			k.fileFindings(h.Name, r, key)
 		}
 	}
 	return k.report(e, *asJSON, unread)
