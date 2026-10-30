@@ -1,0 +1,13 @@
+{
+  "account_id": "101112131415161718191a1b1c1d1e1f",
+  "auth_key": "5536dd7836ad0f9369e49bf4238d970c61258f54323a88db1cc0bf119bbd1fe5",
+  "auth_sha256": "8f61285aa945453d2890e0b21492bbfd245571d07a73f388545c38a7dadbd990",
+  "enc_key": "4cedcdeb3fc217975e985eac8594448e852e1ea9c4d9203d417632d5d51c1fbf",
+  "nfkc_auth_key": "96ec394c4a0687307860ff0ed45dc8517bef4d05d5dfff55b4f13ae1168116d1",
+  "nfkc_password": "correct horse battery staﬀ",
+  "password": "correct horse battery staple",
+  "pw_key": "69179d01c6bb55ad92b2a02b8173c63bc5fa97afa62afae27205c8bab763fc85",
+  "salt": "c30e6e82c3ae04bf9ebe2bfb6cb16392",
+  "secret_key": "H1-HQPK01-4KKCNA-RPNW6-K7N78-DEV8S-0NDWV~",
+  "sk_key": "f8f0985ae7d7b0174632a169a661116a8aae9d961a5b222b7d2725cdce4736e7"
+}

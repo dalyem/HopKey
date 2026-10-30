@@ -1,0 +1,11 @@
+{
+  "acct_priv": "{\"account_id\":\"101112131415161718191a1b1c1d1e1f\",\"akv\":1,\"kem_sk\":\"8OML2Fsxrztv1pc1xS_pEkdyQGTh1ZjbkElOXbXDmOc\",\"sig_seed\":\"mQhCWGz93bh_vUz479KMXFT366YcjKdJhn6hNSeZ7Tc\",\"v\":1}",
+  "enc_key": "ae861bb058c7bf1753743cc8260b0c3343c4a251fa21add49b0b050dbe2087c9",
+  "pw_blob": "{\"ct\":\"_AATsOAKym9cXqg3RAEdDZHxLpP9cVVFevLTEyeSZHo2ozCUrE98NrvV4Gn0PtYpWsktPdLW0MzIyX-i5K82jwYLvhmphxqoEL9MKUKlqTDtYO_JAwKHDGEnWsVexuwBYZFDhDl5lW7rKRdOjrAck33552aov9eF5pKjlDTqiV6wdYYE8DJGDt0KQQ_po0Z5xyBMK0vcb5i5baL1yS1Vhp9dD5Ur4N8J9sBwcCnBlNkwMn51Bmn1T7ZfI-AKKoQ\",\"nonce\":\"FJAGa3eJNbC7SSXj2xUcW0JK18Y73DB6\",\"suite\":1,\"v\":1}",
+  "r_auth": "a72061d8a1efa195375a4318fbb035c6dd613995292f881a69af9831e42e4a68",
+  "r_auth_sha256": "1804f29c4f412c0c8e3673c720af07d8f9564dab8d766676626299735dbed784",
+  "rk": "897fa3054ca1815114c8c18d5e7b4d9d9fedbd047944c28f33123b0cd10920e2",
+  "rk_blob": "{\"ct\":\"IGaeHwX9mw0X6K9XXoxRrZwqkq1iRI7M0L5dBEWrj2_qfx3yv92NB98AGzltcSw8AQzhH_4MWRlbZa4RZpOGhuvd-r5Vo7DN06iL6C6UbqxC3mXPQLaWvxZvK3tq_SgzFAV330dbzKsLA6xGpCdxVK9RddD5tTm22y9yOq_YczzRtbTs4-vAvCLAadngxAU9PIWUPhZvvYamisdgPiAR98Pm8rT1o4k9xt5T-tWe0smaEr09coTSJ8NF2J6d3kE\",\"nonce\":\"xsFQqRJSCxx8acINSMRk45qtA4vh_ykF\",\"suite\":1,\"v\":1}",
+  "rk_blob_sha256": "2f13057849140fdb79573a374a79d53c1b81a20ad05b4afc733b8c62a93b4723",
+  "rk_key": "f09dbb136e42d6de18a9cd19e9ccb0f67a818ed9db9bb9827b29631ee15c3788"
+}

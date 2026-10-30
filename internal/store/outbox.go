@@ -1,0 +1,816 @@
+package store
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/dalyem/hopkey/internal/canonjson"
+	"github.com/dalyem/hopkey/internal/crypto"
+	"github.com/dalyem/hopkey/internal/merge"
+	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/vaultlog"
+)
+
+// The outbox of a server-backed vault (§11.1). Every host, key, credential
+// and snippet write is stored first as a record, one file per record:
+//
+//	vault/outbox/<n>.json   record = JCS({"v":2, "vault_id":id, "n":u64s, "sealed":AEAD(local_key, state, aad), "wires":[wire, ...]})
+//	vault/outbox.json       the next n, and the count of records lost with an unreadable device record
+//
+// with
+//
+//	intent = JCS({"v":1, "action":"create"|"put"|"delete", "item_id":id, "type":type, "seen":item|null, "want":item|null, "import":id|""})
+//	state  = JCS({"v":2, "intent":intent, "held":bool, "candidates":[{"seq":u64s, "prev":h, "h":h, "status":"live"|"committed"|"dead"}],
+//	              "replaced":[{"h":h, "name":string, "fields":[member, ...]}]})
+//	aad    = lp("hopkey/v1/outbox") || lp(vault_id) || u64(n)
+//
+// replaced says, for a candidate by its h, which free members it replaces
+// of another device's values (Replacement), journaled with the candidate.
+// A version 1 record, which has no replaced member, is still read.
+//
+// Records are pushed in strict n order. Only the head is ever pushed, and a
+// held head blocks every record behind it. A record never changes except
+// for its held flag, its candidates and, while held, an in-place
+// resolution. The AEAD covers the intent, the hold flag and the candidate
+// list: a local attacker who can write the files but can't read local_key
+// can delete or roll back records, but can't change them or mark them
+// committed.
+
+var (
+	// ErrLocalKey means the device record has no usable local_key, so the
+	// outbox can't be read or written.
+	ErrLocalKey = errors.New("store: the device-local key is unavailable")
+	// ErrServerBacked means the operation is not available in a
+	// server-backed vault (or needs the server).
+	ErrServerBacked = errors.New("store: this vault is server-backed; the operation needs the server")
+	// ErrNotServerBacked means the operation needs a server-backed vault.
+	ErrNotServerBacked = errors.New("store: this vault is local-only")
+)
+
+const (
+	labelOutbox = "hopkey/v1/outbox"
+
+	outboxVersion = 1
+	// recordVersion is the version of outbox/<n>.json and of its sealed
+	// state. Version 2 added the sealed state's replaced member; a version
+	// 1 record is still read (with none).
+	recordVersion = 2
+
+	statusLive      = "live"
+	statusCommitted = "committed"
+	statusDead      = "dead"
+)
+
+func (l layout) outbox() string     { return filepath.Join(l.vault(), "outbox") }
+func (l layout) outboxMeta() string { return filepath.Join(l.vault(), "outbox.json") }
+func (l layout) serverFile() string { return filepath.Join(l.vault(), "server.json") }
+
+// Paths of the outbox files in a transaction, relative to vault/.
+func outboxRel(n uint64) string { return "outbox/" + strconv.FormatUint(n, 10) + ".json" }
+
+const (
+	outboxMetaRel = "outbox.json"
+	serverRel     = "server.json"
+	stateRel      = "state.json"
+)
+
+func entryRel(seq uint64) string { return "entries/" + strconv.FormatUint(seq, 10) + ".json" }
+
+// outboxAAD is lp("hopkey/v1/outbox") || lp(vault_id_bytes) || u64(n).
+func outboxAAD(vaultID model.ID, n uint64) []byte {
+	aad := crypto.LP([]byte(labelOutbox))
+	aad = append(aad, crypto.LP(vaultID[:])...)
+	return append(aad, crypto.U64(n)...)
+}
+
+// intentJSON is the sealed intent.
+type intentJSON struct {
+	V      int            `json:"v"`
+	Action merge.Action   `json:"action"`
+	ItemID model.ID       `json:"item_id"`
+	Type   model.Type     `json:"type"`
+	Seen   *canonjson.Raw `json:"seen"`
+	Want   *canonjson.Raw `json:"want"`
+	Import model.ID       `json:"import"`
+}
+
+// candidate is one posted candidate of a record: its entry's seq, prev and
+// H, and what verified history says about it.
+type candidate struct {
+	Seq    uint64      `json:"seq,string"`
+	Prev   crypto.Hash `json:"prev"`
+	H      crypto.Hash `json:"h"`
+	Status string      `json:"status"`
+}
+
+// sealedState is the plaintext of a record's sealed member.
+type sealedState struct {
+	V          int            `json:"v"`
+	Intent     intentJSON     `json:"intent"`
+	Held       bool           `json:"held"`
+	Candidates []candidate    `json:"candidates"`
+	Replaced   []replacedJSON `json:"replaced"`
+}
+
+// sealedStateV1 is sealedState as version 1 wrote it.
+type sealedStateV1 struct {
+	V          int         `json:"v"`
+	Intent     intentJSON  `json:"intent"`
+	Held       bool        `json:"held"`
+	Candidates []candidate `json:"candidates"`
+}
+
+// replacedJSON says, for the candidate with H, what it replaces of another
+// device's (Replacement; the item is the record's intent's). It is kept
+// with the journaled candidate so that whichever pull settles the
+// candidate, in this process or after a restart, can report it.
+type replacedJSON struct {
+	H      crypto.Hash `json:"h"`
+	Name   string      `json:"name"`
+	Fields []string    `json:"fields"`
+}
+
+// recordFile is outbox/<n>.json.
+type recordFile struct {
+	V       int                 `json:"v"`
+	VaultID model.ID            `json:"vault_id"`
+	N       uint64              `json:"n,string"`
+	Sealed  crypto.AEADEnvelope `json:"sealed"`
+	Wires   []canonjson.Raw     `json:"wires"`
+}
+
+// outboxMeta is outbox.json: the next record number, so a number is never
+// reused, and how many records an unreadable device record lost (§11).
+type outboxMeta struct {
+	V    int    `json:"v"`
+	Next uint64 `json:"next,string"`
+	Lost uint64 `json:"lost,string"`
+}
+
+// record is an opened outbox record.
+type record struct {
+	N      uint64
+	Held   bool
+	Intent merge.Intent
+	Import model.ID
+	Cands  []candidate
+	// Wires holds the candidate wires by H. A wire in the file whose H is
+	// not listed in the sealed candidates is ignored.
+	Wires map[crypto.Hash]*vaultlog.Wire
+	// Replaced holds, by H, what a candidate replaces of another device's
+	// values, for the candidates that replace any.
+	Replaced map[crypto.Hash]*Replacement
+}
+
+// replacement is what candidate h replaces, or nil.
+func (r *record) replacement(h crypto.Hash) *Replacement {
+	rp := r.Replaced[h]
+	if rp == nil {
+		return nil
+	}
+	out := *rp
+	out.ItemID, out.Type = r.Intent.ItemID, r.Intent.Type
+	out.Fields = slices.Clone(rp.Fields)
+	return &out
+}
+
+// live returns the record's live candidate, if it has one.
+func (r *record) live() *candidate {
+	for i := range r.Cands {
+		if r.Cands[i].Status == statusLive {
+			return &r.Cands[i]
+		}
+	}
+	return nil
+}
+
+func intentToJSON(in merge.Intent, imp model.ID) intentJSON {
+	j := intentJSON{V: outboxVersion, Action: in.Action, ItemID: in.ItemID, Type: in.Type, Import: imp}
+	if in.Seen != nil {
+		raw := canonjson.Raw(in.Seen.Plaintext())
+		j.Seen = &raw
+	}
+	if in.Want != nil {
+		raw := canonjson.Raw(in.Want.Plaintext())
+		j.Want = &raw
+	}
+	return j
+}
+
+func (j *intentJSON) intent() (merge.Intent, error) {
+	if j.V != outboxVersion {
+		return merge.Intent{}, fmt.Errorf("intent v %d", j.V)
+	}
+	in := merge.Intent{Action: j.Action, ItemID: j.ItemID, Type: j.Type}
+	for _, p := range []struct {
+		raw *canonjson.Raw
+		out **merge.Item
+	}{{j.Seen, &in.Seen}, {j.Want, &in.Want}} {
+		if p.raw == nil {
+			continue
+		}
+		it, err := merge.ParseItem(*p.raw)
+		if err != nil {
+			return merge.Intent{}, err
+		}
+		*p.out = it
+	}
+	return in, in.Validate()
+}
+
+// sealRecord encodes r under key for the vault.
+func sealRecord(key *crypto.SymKey, vaultID model.ID, r *record) ([]byte, error) {
+	st := sealedState{
+		V: recordVersion, Intent: intentToJSON(r.Intent, r.Import), Held: r.Held,
+		Candidates: slices.Clone(r.Cands), Replaced: []replacedJSON{},
+	}
+	if st.Candidates == nil {
+		st.Candidates = []candidate{}
+	}
+	for _, c := range r.Cands {
+		if rp := r.Replaced[c.H]; rp != nil {
+			st.Replaced = append(st.Replaced, replacedJSON{H: c.H, Name: rp.Name, Fields: slices.Clone(rp.Fields)})
+		}
+	}
+	pt, err := canonjson.Marshal(st)
+	if err != nil {
+		return nil, err
+	}
+	env, err := crypto.SealAEAD(key, pt, outboxAAD(vaultID, r.N))
+	if err != nil {
+		return nil, err
+	}
+	f := recordFile{V: recordVersion, VaultID: vaultID, N: r.N, Sealed: env, Wires: []canonjson.Raw{}}
+	for _, c := range r.Cands {
+		w, ok := r.Wires[c.H]
+		if !ok {
+			continue
+		}
+		b, err := w.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		f.Wires = append(f.Wires, b)
+	}
+	return canonjson.Marshal(f)
+}
+
+// openRecord decodes outbox/<n>.json. Anything that fails, including the
+// AEAD, is ErrCorrupt: only hop writes these files.
+func openRecord(key *crypto.SymKey, vaultID model.ID, n uint64, b []byte) (*record, error) {
+	bad := func(format string, args ...any) error {
+		return fmt.Errorf("%w: outbox record %d: %s", ErrCorrupt, n, fmt.Sprintf(format, args...))
+	}
+	var f recordFile
+	if err := canonjson.Unmarshal(b, &f); err != nil {
+		return nil, bad("%v", err)
+	}
+	if (f.V != recordVersion && f.V != 1) || f.N != n || f.VaultID != vaultID {
+		return nil, bad("wrong version, number or vault")
+	}
+	pt, err := crypto.OpenAEAD(key, f.Sealed, outboxAAD(vaultID, n))
+	if err != nil {
+		return nil, bad("the sealed state does not open")
+	}
+	var st sealedState
+	if f.V == 1 {
+		var v1 sealedStateV1
+		err = canonjson.Unmarshal(pt, &v1)
+		st = sealedState{V: v1.V, Intent: v1.Intent, Held: v1.Held, Candidates: v1.Candidates}
+	} else {
+		err = canonjson.Unmarshal(pt, &st)
+	}
+	clear(pt)
+	if err != nil || st.V != f.V {
+		return nil, bad("the sealed state does not parse")
+	}
+	in, err := st.Intent.intent()
+	if err != nil {
+		return nil, bad("intent: %v", err)
+	}
+	r := &record{N: n, Held: st.Held, Intent: in, Import: st.Intent.Import, Cands: st.Candidates, Wires: map[crypto.Hash]*vaultlog.Wire{}}
+	listed := map[crypto.Hash]bool{}
+	live := 0
+	for _, c := range r.Cands {
+		switch c.Status {
+		case statusLive:
+			live++
+		case statusDead, statusCommitted:
+		default:
+			return nil, bad("candidate status %q", c.Status)
+		}
+		if listed[c.H] {
+			return nil, bad("a candidate is listed twice")
+		}
+		listed[c.H] = true
+	}
+	if live > 1 {
+		return nil, bad("more than one live candidate")
+	}
+	for _, rj := range st.Replaced {
+		if !listed[rj.H] || r.Replaced[rj.H] != nil || len(rj.Fields) == 0 {
+			return nil, bad("a replacement names no candidate, one twice, or no field")
+		}
+		if r.Replaced == nil {
+			r.Replaced = map[crypto.Hash]*Replacement{}
+		}
+		r.Replaced[rj.H] = &Replacement{Name: rj.Name, Fields: rj.Fields}
+	}
+	for _, raw := range f.Wires {
+		w, err := vaultlog.ParseWire(raw)
+		if err != nil {
+			continue
+		}
+		h, err := w.Entry.Hash()
+		if err != nil || !listed[h] {
+			continue // §11.1: a wire whose H isn't in sealed is ignored
+		}
+		r.Wires[h] = w
+	}
+	return r, nil
+}
+
+// outboxNumbers lists the record numbers on disk, ascending. A missing
+// outbox directory is an empty outbox.
+func (l layout) outboxNumbers() ([]uint64, error) {
+	ents, err := os.ReadDir(l.outbox())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []uint64
+	for _, e := range ents {
+		name := e.Name()
+		if strings.HasPrefix(name, ".tmp") {
+			continue
+		}
+		num, ok := strings.CutSuffix(name, ".json")
+		n, err := strconv.ParseUint(num, 10, 64)
+		if !ok || err != nil || strconv.FormatUint(n, 10) != num || n == 0 {
+			return nil, fmt.Errorf("%w: unexpected file %s in %s", ErrCorrupt, name, l.outbox())
+		}
+		out = append(out, n)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// readOutbox opens every record, in n order. The caller holds the file
+// lock.
+func (s *Store) readOutbox() ([]*record, error) {
+	if s.state == nil || s.rec == nil {
+		return nil, s.lockedErr()
+	}
+	return s.readOutboxAs(s.rec, s.state.VaultID)
+}
+
+// readOutboxAs is readOutbox with rec's local_key, for vault vaultID. The
+// caller holds the file lock.
+func (s *Store) readOutboxAs(rec *deviceRecord, vaultID model.ID) ([]*record, error) {
+	ns, err := s.l.outboxNumbers()
+	if err != nil || len(ns) == 0 {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, s.lockedErr()
+	}
+	key, err := rec.localKey()
+	if err != nil {
+		return nil, err
+	}
+	defer key.Zero()
+	out := make([]*record, 0, len(ns))
+	for _, n := range ns {
+		b, err := os.ReadFile(filepath.Join(s.l.outbox(), strconv.FormatUint(n, 10)+".json"))
+		if err != nil {
+			return nil, err
+		}
+		r, err := openRecord(key, vaultID, n, b)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// outboxKey returns local_key. The record in memory was made durable at
+// unlock (upgradeRecord), so it may be used.
+func (s *Store) outboxKey() (*crypto.SymKey, error) {
+	if s.rec == nil {
+		return nil, s.lockedErr()
+	}
+	return s.rec.localKey()
+}
+
+// putRecord adds r's file to t.
+func (s *Store) putRecord(t *txn, r *record) error {
+	if s.state == nil || s.rec == nil {
+		return s.lockedErr()
+	}
+	return s.putRecordAs(t, r, s.rec, s.state.VaultID)
+}
+
+// putRecordAs is putRecord with rec's local_key, for vault vaultID.
+func (s *Store) putRecordAs(t *txn, r *record, rec *deviceRecord, vaultID model.ID) error {
+	key, err := rec.localKey()
+	if err != nil {
+		return err
+	}
+	defer key.Zero()
+	b, err := sealRecord(key, vaultID, r)
+	if err != nil {
+		return err
+	}
+	t.put(outboxRel(r.N), b)
+	return nil
+}
+
+func (s *Store) readOutboxMeta() (outboxMeta, error) {
+	m := outboxMeta{V: outboxVersion, Next: 1}
+	b, err := os.ReadFile(s.l.outboxMeta())
+	if errors.Is(err, os.ErrNotExist) {
+		return m, nil
+	}
+	if err != nil {
+		return m, err
+	}
+	if err := canonjson.Unmarshal(b, &m); err != nil || m.V != outboxVersion || m.Next == 0 {
+		return m, fmt.Errorf("%w: %s does not parse", ErrCorrupt, s.l.outboxMeta())
+	}
+	return m, nil
+}
+
+func putOutboxMeta(t *txn, m outboxMeta) error {
+	b, err := canonjson.Marshal(m)
+	if err != nil {
+		return err
+	}
+	t.put(outboxMetaRel, b)
+	return nil
+}
+
+// appendRecord queues a new record after every existing one, together
+// with the counter, in one transaction. The caller holds the file lock.
+func (s *Store) appendRecord(in merge.Intent) (uint64, error) {
+	m, err := s.readOutboxMeta()
+	if err != nil {
+		return 0, err
+	}
+	ns, err := s.l.outboxNumbers()
+	if err != nil {
+		return 0, err
+	}
+	n := m.Next
+	if len(ns) > 0 && ns[len(ns)-1] >= n {
+		n = ns[len(ns)-1] + 1
+	}
+	t := &txn{}
+	if err := s.putRecord(t, &record{N: n, Intent: in, Cands: []candidate{}, Wires: map[crypto.Hash]*vaultlog.Wire{}}); err != nil {
+		return 0, err
+	}
+	m.Next = n + 1
+	if err := putOutboxMeta(t, m); err != nil {
+		return 0, err
+	}
+	return n, s.commitTxn(t)
+}
+
+// serverFile is vault/server.json, present in a server-backed vault. It
+// says which server the vault syncs with and how this device signed in,
+// so that the sync engine can reconnect, and sign in again, without asking:
+//
+//	JCS({"v":2, "server":str, "email":str, "recovery_gen":u32})
+//
+// server is the server's origin and email the normalized sign-in email,
+// both "" for a vault that EnableServerMode switched without either.
+// recovery_gen is the creds gen a recovery sign-in (§4.5) found, and 0
+// otherwise: while it is set, the recovery's checkpoint with new
+// credentials (§10.1) is due. Only this device's own checkpoint ends it
+// (recoveryCheckpointDone), in the commit that installs it. Phase 2's
+// first format, {"v":1}, reads as v2 with nothing in it. Nothing in it is
+// secret.
+type serverFile struct {
+	V           int    `json:"v"`
+	Server      string `json:"server"`
+	Email       string `json:"email"`
+	RecoveryGen uint32 `json:"recovery_gen"`
+}
+
+const serverFileVersion = 2
+
+// readServerFile reads vault/server.json, or returns nil when the vault is
+// local-only.
+func (l layout) readServerFile() (*serverFile, error) {
+	b, err := os.ReadFile(l.serverFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var f serverFile
+	if err := canonjson.Unmarshal(b, &f); err == nil && f.V == serverFileVersion {
+		return &f, nil
+	}
+	var v1 struct {
+		V int `json:"v"`
+	}
+	if err := canonjson.Unmarshal(b, &v1); err != nil || v1.V != 1 {
+		return nil, fmt.Errorf("%w: %s does not parse", ErrCorrupt, l.serverFile())
+	}
+	return &serverFile{V: serverFileVersion}, nil
+}
+
+// serverBacked reports whether vault/server.json marks the vault as
+// server-backed.
+func (l layout) serverBacked() (bool, error) {
+	f, err := l.readServerFile()
+	return f != nil, err
+}
+
+// serverModeOps adds the switch to server-backed mode, with f's server and
+// sign-in, to t. The publication and the sign-ins commit it together with
+// their own files.
+func serverModeOps(t *txn, f serverFile) error {
+	f.V = serverFileVersion
+	b, err := canonjson.Marshal(f)
+	if err != nil {
+		return err
+	}
+	t.put(serverRel, b)
+	return nil
+}
+
+// ServerInfo is what a server-backed vault keeps about its server
+// (vault/server.json). It holds no secrets.
+type ServerInfo struct {
+	// Server is the server's origin, and Email the normalized sign-in
+	// email: "" when the vault was switched without them
+	// (EnableServerMode).
+	Server string `json:"server,omitempty"`
+	Email  string `json:"email,omitempty"`
+	// CheckpointDue means a recovery sign-in (§4.5) is not finished: a
+	// checkpoint with new credentials (§10.1), authored by this device,
+	// must commit first. It stays set, across restarts, until the commit
+	// that installs such a checkpoint clears it (recoveryCheckpointDone).
+	// A checkpoint another device commits, a password change elsewhere
+	// included, does not: the credentials it sets are not the ones this
+	// recovery chose.
+	CheckpointDue bool `json:"checkpoint_due,omitempty"`
+	// VaultID and AccountID name the vault on the server and its account.
+	// While the vault is locked they come from the stored state
+	// (state.json), which is public and not verified until the next
+	// unlock: enough to address the server, never to trust what it says.
+	VaultID   model.ID `json:"vault_id,omitzero"`
+	AccountID model.ID `json:"account_id,omitzero"`
+}
+
+// ServerInfo returns the server a server-backed vault syncs with, the
+// vault and account it holds there, and whether a recovery's checkpoint is
+// due. It fails with ErrNotServerBacked for a local-only vault. It works
+// while the vault is locked.
+func (s *Store) ServerInfo() (ServerInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := s.l.readServerFile()
+	if err != nil {
+		return ServerInfo{}, err
+	}
+	if f == nil {
+		return ServerInfo{}, ErrNotServerBacked
+	}
+	info := s.serverInfoOf(f)
+	if s.state != nil {
+		info.VaultID, info.AccountID = s.state.VaultID, s.state.Account.AccountID
+		return info, nil
+	}
+	stored, _, err := s.readStoredState()
+	if err != nil {
+		return ServerInfo{}, err
+	}
+	if stored != nil {
+		info.VaultID, info.AccountID = stored.VaultID, stored.Account.AccountID
+	}
+	return info, nil
+}
+
+// serverInfoOf is f as ServerInfo.
+func (s *Store) serverInfoOf(f *serverFile) ServerInfo {
+	return ServerInfo{Server: f.Server, Email: f.Email, CheckpointDue: f.RecoveryGen != 0}
+}
+
+// recoveryCheckpointDone reports whether w, a checkpoint verified as post
+// (the state it leads to) and committed through the server, ends the
+// obligation of a recovery sign-in that f records (§4.5, §10.1): self, this
+// device, authored it, and it moves the credentials past the generation
+// the recovery found. A checkpoint by any other device does not, nor does
+// any other entry.
+func recoveryCheckpointDone(f *serverFile, w *vaultlog.Wire, post *vaultlog.State, self model.ID) bool {
+	return f != nil && f.RecoveryGen != 0 && w != nil && post != nil &&
+		w.Entry.Kind == vaultlog.KindCheckpoint && w.Entry.Author == self && !self.IsZero() &&
+		post.Head.Seq == w.Entry.Seq && post.Creds.Gen > f.RecoveryGen
+}
+
+// clearRecoveryDue adds to t the vault/server.json that ends a recovery's
+// obligation, when w, verified as post, ends it (recoveryCheckpointDone,
+// with this device as self), and reports whether it did. Slice E's
+// journaled checkpoint calls it with its committed candidate, in the same
+// commit that installs it, so CheckpointDue clears exactly when that
+// checkpoint is durable. The caller holds s.mu and the file lock, and the
+// store is unlocked.
+func (s *Store) clearRecoveryDue(t *txn, w *vaultlog.Wire, post *vaultlog.State) (bool, error) {
+	f, err := s.l.readServerFile()
+	if err != nil {
+		return false, err
+	}
+	if s.dev == nil || !recoveryCheckpointDone(f, w, post, s.dev.ID) {
+		return false, nil
+	}
+	f.RecoveryGen = 0
+	return true, serverModeOps(t, *f)
+}
+
+// EnableServerMode makes the vault server-backed (§11.1) in one durable
+// commit: from then on every host, key, credential and snippet write goes
+// through the outbox, and only verified entries pulled from the server are
+// written to the local log. D2's publication and slice E's login call it
+// once the vault's log is on the server.
+func (s *Store) EnableServerMode() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state == nil {
+		return s.lockedErr()
+	}
+	if s.server {
+		return nil
+	}
+	if _, err := s.outboxKey(); err != nil {
+		return err
+	}
+	unlock, err := s.lockFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// A publication switches the mode itself, once it is verified; a frozen
+	// merge source never becomes server-backed.
+	if err := s.refuseLocalAppend(); err != nil {
+		return err
+	}
+	t := &txn{}
+	if err := serverModeOps(t, serverFile{}); err != nil {
+		return err
+	}
+	if err := s.commitTxn(t); err != nil {
+		return err
+	}
+	s.server = true
+	return nil
+}
+
+// ServerBacked reports whether the vault is server-backed.
+func (s *Store) ServerBacked() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.server
+}
+
+// OutboxEmpty reports whether the outbox holds no record, pending or held.
+// It reads only file names, so it works while the vault is locked. Logout
+// refuses unless it is empty or --discard-pending is given (§11.1).
+func (s *Store) OutboxEmpty() (bool, error) {
+	ns, err := s.l.outboxNumbers()
+	return len(ns) == 0, err
+}
+
+// HasCheckpointJournal reports whether a checkpoint journal exists (§10.1),
+// including one whose kit can no longer be read. Logout always refuses
+// while one does (§11.1).
+func (s *Store) HasCheckpointJournal() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ok, err := s.l.checkpointExists(); err != nil || ok {
+		return ok, err
+	}
+	seqs, err := s.journalSeqs()
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return len(seqs) > 0, err
+}
+
+// LostIntents returns how many queued changes were lost because a password
+// unlock replaced an unreadable device record (§11). It stays non-zero
+// until AckLostIntents.
+func (s *Store) LostIntents() (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.readOutboxMeta()
+	return m.Lost, err
+}
+
+// LostJournals are the journals a password unlock dropped because no
+// readable device record could open them (§11): what was in progress is
+// unknown, so each may still need the user.
+type LostJournals struct {
+	// Checkpoint means a server-backed checkpoint's journal was dropped.
+	// Its candidate may have committed: then the account has credentials
+	// whose Emergency Kit no one can read, and only a new checkpoint (hop
+	// auth rotate) makes a kit again. If it did not, nothing changed.
+	Checkpoint bool `json:"checkpoint"`
+	// Approval means an approval's journal was dropped. Its device_add may
+	// have committed: then the new device is active but never received its
+	// delivery, and only a checkpoint that revokes it removes it.
+	Approval bool `json:"approval"`
+}
+
+type lostJournalsFile struct {
+	V          int  `json:"v"`
+	Checkpoint bool `json:"checkpoint"`
+	Approval   bool `json:"approval"`
+}
+
+const lostJournalsRel = "lost-journals.json"
+
+func (l layout) lostJournalsFile() string { return filepath.Join(l.vault(), lostJournalsRel) }
+
+func (s *Store) readLostJournals() (LostJournals, error) {
+	b, err := os.ReadFile(s.l.lostJournalsFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return LostJournals{}, nil
+	}
+	if err != nil {
+		return LostJournals{}, err
+	}
+	var f lostJournalsFile
+	if canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
+		return LostJournals{}, fmt.Errorf("%w: %s does not parse", ErrCorrupt, s.l.lostJournalsFile())
+	}
+	return LostJournals{Checkpoint: f.Checkpoint, Approval: f.Approval}, nil
+}
+
+func putLostJournals(t *txn, lost LostJournals) error {
+	b, err := canonjson.Marshal(lostJournalsFile{V: 1, Checkpoint: lost.Checkpoint, Approval: lost.Approval})
+	if err != nil {
+		return err
+	}
+	t.put(lostJournalsRel, b)
+	return nil
+}
+
+// LostJournals reports the journals a password unlock dropped (see
+// LostJournals), until AckLostJournals. It works while the vault is
+// locked.
+func (s *Store) LostJournals() (LostJournals, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readLostJournals()
+}
+
+// AckLostJournals records that the user has seen the loss LostJournals
+// reports.
+func (s *Store) AckLostJournals() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, err := s.lockFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if lost, err := s.readLostJournals(); err != nil || lost == (LostJournals{}) {
+		return err
+	}
+	t := &txn{}
+	t.remove(lostJournalsRel)
+	return s.commitTxn(t)
+}
+
+// AckLostIntents records that the user has seen the loss LostIntents
+// reports.
+func (s *Store) AckLostIntents() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlock, err := s.lockFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	m, err := s.readOutboxMeta()
+	if err != nil || m.Lost == 0 {
+		return err
+	}
+	m.Lost = 0
+	t := &txn{}
+	if err := putOutboxMeta(t, m); err != nil {
+		return err
+	}
+	return s.commitTxn(t)
+}
