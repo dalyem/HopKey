@@ -161,6 +161,7 @@ type AccountSummary struct {
 	AllDevices     int       // every device the account has had
 	LastSeen       time.Time // the latest of its devices; zero when none was seen
 	Disabled       *AdminBlock
+	Deleting       time.Time // when a delete in progress was started; zero when none is
 }
 
 // ListAccounts returns every account, oldest first.

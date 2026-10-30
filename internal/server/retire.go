@@ -142,6 +142,11 @@ func (s *Server) retireStatus(w http.ResponseWriter, r *http.Request, c *call) e
 			refused = errRateLimited
 			return nil
 		}
+		// Closed while a delete fences the account (delete.go).
+		if err := fenceRefusal(tx, ch.AccountID); err != nil {
+			refused = err
+			return nil
+		}
 		a, err := tx.Account(ch.AccountID)
 		if err != nil {
 			return err
@@ -400,6 +405,11 @@ func (s *Server) retireProof(w http.ResponseWriter, r *http.Request, c *call) er
 		}
 		if !s.limiter.allow(c.route.pattern+"|account", ch.AccountID.String(), s.rates.Account) {
 			refused = errRateLimited
+			return nil
+		}
+		// Closed while a delete fences the account (delete.go).
+		if err := fenceRefusal(tx, ch.AccountID); err != nil {
+			refused = err
 			return nil
 		}
 		rc, err := tx.Receipt(ch.AccountID, ch.DeviceID)
