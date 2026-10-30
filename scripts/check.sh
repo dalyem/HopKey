@@ -31,8 +31,18 @@ race)
 	# Same as test, under the race detector, for the packages with goroutines.
 	# Race binaries use several times the memory of plain ones; running
 	# packages side by side got the job killed for its memory limit on Kiln
-	# (the daemon package alone is the largest), so they run one at a time.
-	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" go test -race -p 1 ./internal/...
+	# (the daemon package alone is the largest), so they run one at a time,
+	# each in a go test of its own: one go test keeps every package's binary
+	# in its work directory, in /tmp, until it exits, and by the store
+	# package they fill most of the 512 MiB tmpfs.
+	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" sh -c '
+		packages=$(go list ./internal/...) || exit $?
+		[ -n "$packages" ] || { echo "go list found no packages" >&2; exit 1; }
+		status=0
+		for p in $packages; do
+			go test -race -p 1 "$p" || status=1
+		done
+		exit $status'
 	;;
 gofmt)
 	out=$(gofmt -l .)

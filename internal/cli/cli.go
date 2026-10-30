@@ -330,6 +330,7 @@ func init() {
 			" | hop access add LABEL [HOST...] [--alongside] | hop access rm LABEL [HOST...] [--same-machine] [--yes] [--json] | hop access rm LABEL --abandon HOST [--yes]" +
 			" | hop access migrate LABEL HOST [--yes] | hop access forget LABEL [--yes] | hop access ls [LABEL] [--json]" +
 			" | hop access check [LABEL] [--host HOST]... [--all-hosts] [--json]"},
+		"vault": {runVault, vaultForkUsage},
 	}
 }
 
@@ -346,6 +347,7 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop sync [resolve]
        hop auth signup|login|approve|status|devices|logout|rotate|passwd|merge|resume
        hop login | logout       aliases of hop auth login and hop auth logout
+       hop vault fork --local   keep this device's copy as a new local-only vault (account deleted, server gone)
 
 Most commands take --json (not hop <target>, daemon, mcp or passwd). Run "hop <command> -h" for its flags.
 `

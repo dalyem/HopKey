@@ -1,4 +1,4 @@
-// Package filelock takes exclusive advisory locks on files, used to say "a
+// Package filelock takes advisory locks on files, exclusive or shared, used to say "a
 // process owns this directory" (sshagent) or "a process is rewriting this
 // directory" (sshconfig).
 //

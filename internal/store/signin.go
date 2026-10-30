@@ -85,10 +85,7 @@ func signInWith(ctx context.Context, cfg Config, r SignInRemote, p SignInParams,
 		return nil, SignInResult{}, err
 	}
 	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}, testHook: hook}
-	if err := s.l.ensureDirs(); err != nil {
-		return nil, SignInResult{}, err
-	}
-	if err := s.own(); err != nil {
+	if err := s.ownVault(nil); err != nil {
 		return nil, SignInResult{}, err
 	}
 	defer func() {

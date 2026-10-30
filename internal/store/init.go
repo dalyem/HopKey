@@ -46,6 +46,9 @@ var ErrKeychainUnusable = errors.New("store: the OS keychain is not usable")
 // entry, verified with the anchor algorithm. Nothing is written yet.
 func PrepareInit(cfg Config, opts InitOptions) (*PendingInit, error) {
 	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
+	if err := checkForkFence(cfg.DataDir); err != nil {
+		return nil, err
+	}
 	if ok, err := s.l.exists(); err != nil {
 		return nil, err
 	} else if ok {
@@ -164,13 +167,12 @@ func (p *PendingInit) Commit() (st *Store, err error) {
 		return nil, errors.New("store: init already committed")
 	}
 	s := p.s
-	if err := s.l.ensureDirs(); err != nil {
-		return nil, err
-	}
 	if s.owner == nil {
-		if err := s.own(); err != nil {
+		if err := s.ownVault(nil); err != nil {
 			return nil, err
 		}
+	} else if err := s.l.ensureDirs(); err != nil {
+		return nil, err
 	}
 	defer func() {
 		if err != nil {
@@ -189,6 +191,9 @@ func (p *PendingInit) Commit() (st *Store, err error) {
 	}
 	if err := s.deviceStore(p.devCfg).storeDurably(p.rec); err != nil {
 		return nil, fmt.Errorf("store: the device key could not be saved durably: %w", err)
+	}
+	if err := s.hook("init:device-key"); err != nil {
+		return nil, err
 	}
 	if err := s.writeDeviceConfig(p.devCfg); err != nil {
 		return nil, err

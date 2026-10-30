@@ -40,7 +40,13 @@ import (
 // before the logout can finish. Every read-modify-write of
 // predecessor.json runs under predecessor.lock in the data directory, so
 // that a sign-in, a status and a logout in different processes never lose
-// each other's entries. An entry carries "reported", the advice
+// each other's entries. The ones no store owns the vault for (a status
+// or a sign-in settling entries) run inside the data directory's fork
+// gate as well, taken shared first, then predecessor.lock: a fork can't
+// swap a new vault into the data directory while one of them is between
+// its read and its write, and they are refused while a fork is
+// unfinished (ErrForkPending). A logout's own entry is written while its
+// store owns the vault, which a fork can't move. An entry carries "reported", the advice
 // (revoke or rotate) a command has told the user about it; the commands
 // that consume an entry (hop auth status) show the advice first when the
 // one that applies now was never shown.
@@ -172,15 +178,33 @@ func recordPredecessor(dataDir string, p Predecessor) error {
 	return writePredecessors(dataDir, append(entries, p))
 }
 
-// ForgetPredecessor removes the entry for device id, once the old
-// identity is settled (it is revoked, or no longer in the account). An
-// entry that is not there is no error.
-func ForgetPredecessor(dataDir string, id model.ID) error {
+// unownedPredecessorRMW runs f, a read-modify-write of predecessor.json
+// for a caller that does not own the vault, inside the data directory's
+// fork gate (shared, and checked against the fence) and predecessor.lock,
+// in that order.
+func unownedPredecessorRMW(dataDir string, f func() error) error {
+	leave, err := enterGate(dataDir)
+	if err != nil {
+		return err
+	}
+	defer leave()
 	unlock, err := lockPredecessors(dataDir)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	return f()
+}
+
+// ForgetPredecessor removes the entry for device id, once the old
+// identity is settled (it is revoked, or no longer in the account). An
+// entry that is not there is no error. It is refused while a fork of the
+// vault is unfinished (ErrForkPending) or running (ErrVaultBusy).
+func ForgetPredecessor(dataDir string, id model.ID) error {
+	return unownedPredecessorRMW(dataDir, func() error { return forgetPredecessor(dataDir, id) })
+}
+
+func forgetPredecessor(dataDir string, id model.ID) error {
 	entries, err := ReadPredecessors(dataDir)
 	if errors.Is(err, ErrCorrupt) {
 		return writePredecessors(dataDir, nil)
@@ -201,16 +225,16 @@ func ForgetPredecessor(dataDir string, id model.ID) error {
 // MarkPredecessorReported records that the user has been shown advice
 // (AdviceRevoke or AdviceRotate) about the entry for device id, in place
 // of whatever was shown before. No advice, or an entry that is not
-// there, is no error and no change.
+// there, is no error and no change. It is refused as ForgetPredecessor
+// is.
 func MarkPredecessorReported(dataDir string, id model.ID, advice string) error {
 	if advice == "" {
 		return nil
 	}
-	unlock, err := lockPredecessors(dataDir)
-	if err != nil {
-		return err
-	}
-	defer unlock()
+	return unownedPredecessorRMW(dataDir, func() error { return markPredecessorReported(dataDir, id, advice) })
+}
+
+func markPredecessorReported(dataDir string, id model.ID, advice string) error {
 	entries, err := ReadPredecessors(dataDir)
 	if errors.Is(err, ErrCorrupt) {
 		return writePredecessors(dataDir, nil)

@@ -15,3 +15,6 @@ func TryLock(string) (*os.File, error) { return nil, errUnsupported }
 
 // Lock is not implemented on this platform.
 func Lock(string) (*os.File, error) { return nil, errUnsupported }
+
+// TryLockShared is not implemented on this platform.
+func TryLockShared(string) (*os.File, error) { return nil, errUnsupported }

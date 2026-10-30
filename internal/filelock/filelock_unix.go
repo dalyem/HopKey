@@ -19,6 +19,10 @@ func TryLock(path string) (*os.File, error) { return lock(path, unix.LOCK_EX|uni
 // even inside one process, because each opens its own file description.
 func Lock(path string) (*os.File, error) { return lock(path, unix.LOCK_EX) }
 
+// TryLockShared takes a shared lock without waiting: any number of shared
+// holders coexist, and an exclusive holder excludes them (ErrLocked).
+func TryLockShared(path string) (*os.File, error) { return lock(path, unix.LOCK_SH|unix.LOCK_NB) }
+
 func lock(path string, how int) (*os.File, error) {
 	// O_NOFOLLOW: the directory is private, but do not trust that blindly.
 	fd, err := unix.Open(path, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
