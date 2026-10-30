@@ -311,6 +311,9 @@ type Store struct {
 	passphrase atomic.Pointer[[]byte]
 
 	testHook func(stage string) error // simulates crashes in tests
+	// ungated is set on a fork's own stores: the fork holds the data
+	// directory's gate itself (ownVault, fork.go).
+	ungated bool
 	// testSignIn sees a merge sign-in's secrets once its device record is
 	// made, so tests can check they are zeroed.
 	testSignIn func(o *signInSecrets)
@@ -370,17 +373,24 @@ func (s *Store) deviceName() string {
 //
 // The returned Store owns the vault until Close: a second Open, in this
 // process or another, fails with ErrVaultBusy.
-func Open(ctx context.Context, cfg Config) (*Store, error) {
-	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
-	if ok, err := s.l.exists(); err != nil {
-		return nil, err
-	} else if !ok {
-		return nil, ErrNoVault
-	}
-	if err := s.l.ensureDirs(); err != nil {
-		return nil, err
-	}
-	if err := s.own(); err != nil {
+//
+// While a fork of the vault is unfinished past the point where its new
+// vault verified, Open refuses with ErrForkPending (fork.go).
+func Open(ctx context.Context, cfg Config) (*Store, error) { return openStore(ctx, cfg, true) }
+
+// openStore is Open; a fork's own opens are not gated, since the fork
+// holds the gate.
+func openStore(ctx context.Context, cfg Config, gated bool) (*Store, error) {
+	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}, ungated: !gated}
+	err := s.ownVault(func() error {
+		if ok, err := s.l.exists(); err != nil {
+			return err
+		} else if !ok {
+			return ErrNoVault
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	if err := s.Unlock(ctx); err != nil && !errors.Is(err, ErrDeviceKey) && !errors.Is(err, ErrDeviceRevoked) &&
@@ -421,6 +431,31 @@ func Busy(dataDir string) (bool, error) {
 		return false, err
 	}
 	return false, f.Close()
+}
+
+// ownVault makes the data directory's vault directories and takes
+// vault/owner.lock, inside the data directory's gate: no fork is past the
+// point where the vault must not change (ErrForkPending), and none can
+// begin to move the directory before this Store owns it (fork.go). check,
+// if not nil, runs first, inside the gate. Every path that opens or makes
+// a vault takes ownership this way.
+func (s *Store) ownVault(check func() error) error {
+	if !s.ungated {
+		leave, err := enterGate(s.l.data)
+		if err != nil {
+			return err
+		}
+		defer leave()
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	if err := s.l.ensureDirs(); err != nil {
+		return err
+	}
+	return s.own()
 }
 
 // own takes vault/owner.lock without waiting.

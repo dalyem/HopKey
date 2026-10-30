@@ -285,10 +285,7 @@ func beginEnrollment(cfg Config, p EnrollParams, hook func(string) error) (_ *En
 	if err != nil {
 		return nil, crypto.EnrollCommit{}, err
 	}
-	if err := s.l.ensureDirs(); err != nil {
-		return nil, crypto.EnrollCommit{}, err
-	}
-	if err := s.own(); err != nil {
+	if err := s.ownVault(nil); err != nil {
 		return nil, crypto.EnrollCommit{}, err
 	}
 	defer func() {
@@ -399,10 +396,7 @@ func ResumeEnrollment(cfg Config) (*Enrollment, error) {
 
 func resumeEnrollment(cfg Config, hook func(string) error) (_ *Enrollment, err error) {
 	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}, testHook: hook}
-	if err := s.l.ensureDirs(); err != nil {
-		return nil, err
-	}
-	if err := s.own(); err != nil {
+	if err := s.ownVault(nil); err != nil {
 		return nil, err
 	}
 	defer func() {
@@ -617,10 +611,7 @@ func (s *Store) deleteEnroll(ec enrollConfig) error {
 // it only removes what the install left behind.
 func DiscardEnrollment(cfg Config) error {
 	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
-	if err := s.l.ensureDirs(); err != nil {
-		return err
-	}
-	if err := s.own(); err != nil {
+	if err := s.ownVault(nil); err != nil {
 		return err
 	}
 	defer s.Close()

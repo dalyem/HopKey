@@ -2,13 +2,17 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -30,35 +34,55 @@ import (
 // gets a new item ID, and references between items follow. Nothing of the
 // old account's identity, keys or log is reused.
 //
-// Layout, beside the data directory D (resolved through symlinks):
+// Layout, beside the data directory D (resolved through symlinks, the
+// last one included when what it names is gone):
 //
+//	D.lock                         the data directory's gate (below); it is never deleted
 //	D.fork-new/                    the new vault while it is built: a whole data directory
 //	D.fork-new/fork.json           the fork's journal (no secrets), which moves with it to D
 //	D.forked-<date>-<vault8>/      the old data directory, kept as it was (unless --discard-old)
 //
 //	fork.json = {"v":1, "state":"staging"|"verified"|"swapped"|"done", "txn_id":id, "data_dir":str,
-//	             "backup":str, "discard_old":bool, "discarded":bool, "old":{ids}, "new":{ids}, ...counts}
+//	             "backup":str, "discard_old":bool, "discarded":bool, "old":{ids}, "new":{ids},
+//	             "new_store":str, "source":digest, "new_head":head, "new_items":n, ...counts}
+//
+// The gate: everything that opens or makes a vault in D (Open, hop init,
+// a sign-in, an enrollment) takes D.lock shared while it checks the fence
+// and takes vault/owner.lock. A fork holds it exclusive from PrepareFork
+// (or ResumeFork, AbandonFork) to its end. The owner lock can't do this
+// alone: it moves with the old vault when the swap renames D. The fence
+// (forkFence) refuses with ErrForkPending once a fork's new vault has
+// verified and until the fork is done.
 //
 // Steps, each durable before the next:
 //
-//   - staging: D.fork-new and its journal; hop init's commit into it; the
-//     verified items, in batches of entries, then one entry per item a
-//     pending or held change touched, then one entry of the deletes those
-//     changes made. The old vault is only read.
+//   - staging: D.fork-new and its journal, which names the new identity
+//     and where its device key goes before the key is written; hop init's
+//     commit into it; the verified items, in batches of entries, then one
+//     entry per item a pending or held change touched, then the deletes
+//     those changes made. Every entry passes the server's admission. The
+//     old vault is only read; source records a digest of it as read.
 //   - verified: the new vault is opened from disk as hop opens any vault
 //     (the log verified from genesis with the new device key) and its
-//     items must equal what was imported. Only then is the journal set to
-//     verified.
-//   - the swap: D (checked to be the old vault, and taken from any owner)
-//     is renamed to the backup, then D.fork-new to D. swapped is recorded.
-//   - with --discard-old, the backup's device records and then its
-//     directory are deleted. done is recorded, and the journal stays as
-//     the record of the fork.
+//     items must equal what was imported. Its head and item count are
+//     recorded with verified.
+//   - the swap: the new vault in D.fork-new is opened and checked against
+//     the journal again; D (checked to be the old vault, taken from any
+//     owner, and still matching source) is renamed to the backup, then
+//     D.fork-new to D.
+//   - swapped is recorded once the new vault in D checks out. With
+//     --discard-old, the backup's device records and then its directory
+//     are deleted, only after that check. done is recorded, and the
+//     journal stays as the record of the fork.
 //
-// A crash before verified leaves the old vault as it was: the staging
-// directory (and its keychain entry) is deleted, and the fork starts again
-// with a new Emergency Kit. A crash from verified on is finished by
-// ResumeFork.
+// A crash before verified leaves the old vault as it was: the next run
+// deletes the staging directory (and its keychain entry), and the fork
+// starts again with a new Emergency Kit. A crash from verified on is
+// finished by ResumeFork, or given up by AbandonFork while the new vault
+// is not in D yet. Recovery derives every path from the data directory
+// it is given and checks the journal against it: a journal that names
+// other paths or identities, or a vault that does not match it, is
+// refused (ErrForkDamaged), and nothing is deleted.
 
 var (
 	// ErrForkRevoked refuses to fork the vault of a device that left its
@@ -68,9 +92,17 @@ var (
 	// ErrForkRefused means the vault holds something a fork can't carry,
 	// or is in a state that does not allow one.
 	ErrForkRefused = errors.New("store: this vault can't be forked")
-	// ErrForkPending means an interrupted fork is waiting to finish:
-	// hop vault fork --local finishes it.
-	ErrForkPending = errors.New("store: a fork of this vault was interrupted; run hop vault fork --local again to finish it")
+	// ErrForkPending means an interrupted fork is waiting to finish, and
+	// the vault is fenced until it does: hop vault fork --local finishes
+	// it, and hop vault fork --local --abandon gives it up.
+	ErrForkPending = errors.New("store: a fork of this vault was interrupted, and the vault can't be used until it ends; " +
+		"run hop vault fork --local to finish it, or hop vault fork --local --abandon to give it up")
+	// ErrForkStale means the old vault changed after the fork copied it,
+	// so the copy can't replace it.
+	ErrForkStale = errors.New("store: the vault changed after the fork copied it")
+	// ErrForkDamaged means an interrupted fork's journal or vaults are not
+	// what it recorded: nothing more is done with them automatically.
+	ErrForkDamaged = errors.New("store: the interrupted fork's files are not as it left them")
 )
 
 // errForkReported refuses a device the server reported as departed
@@ -84,6 +116,7 @@ const (
 	forkVersion    = 1
 	forkNewSuffix  = ".fork-new"
 	forkBackupStem = ".forked-"
+	forkGateSuffix = ".lock"
 	forkBatch      = 32
 
 	forkStaging  = "staging"
@@ -168,6 +201,17 @@ type forkJournal struct {
 	At         model.Timestamp `json:"at"`
 	Plan       forkPlanRecord  `json:"plan"`
 	New        ForkIDs         `json:"new"`
+	// NewStore is where the new device key goes (keychain or file). It is
+	// journaled with New before the key is written, so the cleanup of an
+	// abandoned fork finds the key whatever device.json says.
+	NewStore string `json:"new_store"`
+	// Source commits to the old vault as the fork read it
+	// (forkSourceDigest): the swap moves it only while it still matches.
+	Source string `json:"source"`
+	// NewHead and NewItems commit to the new vault as it verified. Every
+	// step after verified opens the new vault and checks them first.
+	NewHead  vaultlog.Head `json:"new_head"`
+	NewItems int           `json:"new_items"`
 }
 
 // forkPlanRecord is ForkPlan as the journal keeps it: no warnings, which
@@ -225,25 +269,114 @@ func writeForkJournal(dir string, j *forkJournal) error {
 	return writeFileAtomic(forkJournalFile(dir), b)
 }
 
+// check validates j, a journal found for the fork of data. Recovery uses
+// the paths it derives from data, never the journal's own: one that names
+// another data directory (copied from there), a backup that is not beside
+// it, or identities that are missing, reused or of no known device key
+// store, is refused, as is a journal past staging with no record of what
+// it verified.
+func (j *forkJournal) check(data string) error {
+	bad := func(why string) error {
+		return fmt.Errorf("%w: the fork journal for %s %s; nothing was changed", ErrForkDamaged, data, why)
+	}
+	switch j.State {
+	case forkStaging, forkVerified, forkSwapped, forkDone:
+	default:
+		return bad(fmt.Sprintf("has an unknown state %q", j.State))
+	}
+	if j.DataDir != data {
+		return bad(fmt.Sprintf("names another data directory, %s (was it copied from there?)", j.DataDir))
+	}
+	if !isForkBackup(data, j.Plan.Old.VaultID, j.Backup) {
+		return bad(fmt.Sprintf("names %s as the backup, which is not one beside it", j.Backup))
+	}
+	ids := []model.ID{j.TxnID, j.Plan.Old.AccountID, j.Plan.Old.VaultID, j.Plan.Old.DeviceID, j.New.AccountID, j.New.VaultID, j.New.DeviceID}
+	for i, id := range ids {
+		if id.IsZero() || slices.Contains(ids[:i], id) {
+			return bad("has a missing or repeated ID")
+		}
+	}
+	if j.NewStore != DeviceStoreKeychain && j.NewStore != DeviceStoreFile {
+		return bad(fmt.Sprintf("names no known device key store (%q)", j.NewStore))
+	}
+	if j.State != forkStaging && (j.Source == "" || j.NewHead.Seq == 0 || j.NewItems < 0) {
+		return bad("has no record of the vaults it verified")
+	}
+	return nil
+}
+
+// isForkBackup reports whether backup is the name a fork of vault in data
+// gives its backup: D.forked-<yyyymmdd>-<vault8>, beside D.
+func isForkBackup(data string, vault model.ID, backup string) bool {
+	if vault.IsZero() || filepath.Dir(backup) != filepath.Dir(data) {
+		return false
+	}
+	rest, ok := strings.CutPrefix(filepath.Base(backup), filepath.Base(data)+forkBackupStem)
+	if !ok || len(rest) != 8+1+8 || rest[8] != '-' || rest[9:] != vault.String()[:8] {
+		return false
+	}
+	_, err := time.Parse("20060102", rest[:8])
+	return err == nil
+}
+
+// resolveLoose resolves p through symlinks as far as it exists: every
+// existing ancestor, and the last component too when it is a symlink,
+// even one whose target is gone. What does not exist is joined on as
+// given. A crash between the swap's renames leaves a symlinked data
+// directory dangling, and its fork is still beside the link's target.
+func resolveLoose(p string) (string, error) { return resolveLooseN(p, 0) }
+
+func resolveLooseN(p string, depth int) (string, error) {
+	if depth > 255 {
+		return "", fmt.Errorf("store: %s: too many levels of symbolic links", p)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Dir(abs)
+	if dir == abs {
+		return abs, nil
+	}
+	parent, err := resolveLooseN(dir, depth+1)
+	if err != nil {
+		return "", err
+	}
+	full := filepath.Join(parent, filepath.Base(abs))
+	fi, err := os.Lstat(full)
+	if errors.Is(err, os.ErrNotExist) {
+		return full, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return full, nil
+	}
+	t, err := os.Readlink(full)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(t) {
+		t = filepath.Join(parent, t)
+	}
+	return resolveLooseN(t, depth+1)
+}
+
 // forkPaths resolves the data directory through symlinks (the swap renames
-// the directory itself) and names the staging directory. A data directory
-// that is gone (a crash between the two renames) resolves through its
-// parent.
+// the directory itself) and names the staging directory.
 func forkPaths(dataDir string) (data, staging string, err error) {
-	abs, err := filepath.Abs(dataDir)
+	data, err = resolveLoose(dataDir)
 	if err != nil {
 		return "", "", err
 	}
-	if r, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = r
-	} else if errors.Is(err, os.ErrNotExist) {
-		if p, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
-			abs = filepath.Join(p, filepath.Base(abs))
-		}
-	} else {
-		return "", "", err
-	}
-	return abs, abs + forkNewSuffix, nil
+	return data, data + forkNewSuffix, nil
+}
+
+// within reports whether p is dir or inside it. Both are resolved.
+func within(p, dir string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func pathExists(p string) (bool, error) {
@@ -257,9 +390,102 @@ func pathExists(p string) (bool, error) {
 	return false, err
 }
 
+// gateOptional reports whether err, from taking the gate, means the data
+// directory's parent does not exist or can't be written. No fork can be
+// there (its staging directory would be beside the gate), so there is
+// nothing to fence or exclude.
+func gateOptional(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS)
+}
+
+// enterGate takes the gate of dataDir (see the file comment) shared and
+// checks the fence. The caller calls the returned func once it owns the
+// vault or has given up. A fork running there makes it ErrVaultBusy.
+func enterGate(dataDir string) (func(), error) {
+	data, staging, err := forkPaths(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	f, err := filelock.TryLockShared(data + forkGateSuffix)
+	if errors.Is(err, filelock.ErrLocked) {
+		return nil, ErrVaultBusy
+	}
+	if err != nil && !gateOptional(err) {
+		return nil, err
+	}
+	leave := func() {
+		if f != nil {
+			f.Close()
+		}
+	}
+	if err := forkFence(data, staging); err != nil {
+		leave()
+		return nil, err
+	}
+	return leave, nil
+}
+
+// takeForkGate takes the gate of data exclusive, for a fork. The caller
+// closes the file to give it up. Where the gate can't be made (gateOptional)
+// there is no vault to fork either: it returns a nil file, which closes
+// harmlessly, and the fork fails on what it does not find.
+func takeForkGate(data string) (*os.File, error) {
+	f, err := filelock.TryLock(data + forkGateSuffix)
+	if errors.Is(err, filelock.ErrLocked) {
+		return nil, ErrVaultBusy
+	}
+	if err != nil && gateOptional(err) {
+		return nil, nil
+	}
+	return f, err
+}
+
+// forkFence refuses with ErrForkPending while a fork of data has a new
+// vault that verified and is not done: from then on the old vault must not
+// change (the swap would put the change away in the backup, or delete it
+// with --discard-old), nor the new one before the fork checks it. So it is
+// for any state recovery would not act on by itself. A fork that never
+// verified fences nothing while the old vault is in data: it is still the
+// vault, and the fork's next run deletes the staging directory.
+func forkFence(data, staging string) error {
+	hasStaging, err := pathExists(staging)
+	if err != nil {
+		return err
+	}
+	if hasStaging {
+		j, jerr := readForkJournal(staging)
+		if jerr == nil && (j == nil || j.State == forkStaging) {
+			if ok, err := (layout{data: data}).exists(); err != nil {
+				return err
+			} else if ok {
+				return nil
+			}
+		}
+		return ErrForkPending
+	}
+	j, err := readForkJournal(data)
+	if err != nil {
+		return fmt.Errorf("%w (%v)", ErrForkPending, err)
+	}
+	if j != nil && j.State != forkDone {
+		return ErrForkPending
+	}
+	return nil
+}
+
+// checkForkFence is forkFence for dataDir, outside the gate: an early
+// refusal, before the gate is taken to check it again.
+func checkForkFence(dataDir string) error {
+	data, staging, err := forkPaths(dataDir)
+	if err != nil {
+		return err
+	}
+	return forkFence(data, staging)
+}
+
 // ForkInProgress reports whether a fork of the vault in dataDir has
 // started and not finished: hop init and hop vault fork must not begin
-// anything else there until ResumeFork has run.
+// anything else there until ResumeFork or AbandonFork has run.
 func ForkInProgress(dataDir string) (bool, error) {
 	data, staging, err := forkPaths(dataDir)
 	if err != nil {
@@ -273,6 +499,25 @@ func ForkInProgress(dataDir string) (bool, error) {
 		return true, err
 	}
 	return j != nil && j.State != forkDone, nil
+}
+
+// ForkSealed reports whether the new vault of an interrupted fork keeps
+// its device key in a sealed file: finishing the fork opens that vault,
+// so it needs the device passphrase.
+func ForkSealed(dataDir string) (bool, error) {
+	data, staging, err := forkPaths(dataDir)
+	if err != nil {
+		return false, err
+	}
+	if ok, err := pathExists(staging); err != nil {
+		return false, err
+	} else if ok {
+		return SealedDeviceFile(staging)
+	}
+	if j, err := readForkJournal(data); err != nil || j == nil || j.State == forkDone {
+		return false, err
+	}
+	return SealedDeviceFile(data)
 }
 
 // ForkRecord returns the journal a finished fork left in dataDir, or nil
@@ -289,39 +534,85 @@ func ForkRecord(dataDir string) (*ForkResult, error) {
 	return j.result(), nil
 }
 
+// withPassphrase is cfg with pass, when there is one, as the device
+// passphrase.
+func withPassphrase(cfg Config, pass []byte) Config {
+	if len(pass) == 0 {
+		return cfg
+	}
+	get := cfg.Getenv
+	if get == nil {
+		get = os.Getenv
+	}
+	p := string(pass)
+	cfg.Getenv = func(k string) string {
+		if k == PassphraseEnv {
+			return p
+		}
+		return get(k)
+	}
+	return cfg
+}
+
 // ResumeFork finishes a fork that a crash interrupted. One that had not
 // verified its new vault is abandoned: its staging directory and device
 // record are deleted, the old vault is left as it was, and abandoned is
 // true (the Emergency Kit it showed belongs to no vault). One that had is
-// finished: the swap, the discard if asked for, and done. It returns nil
-// and false when there is nothing to resume.
-func ResumeFork(ctx context.Context, cfg Config) (res *ForkResult, abandoned bool, err error) {
+// finished: the swap, the discard if asked for, and done, each only after
+// the vaults check out against the journal (finishFork). It returns nil
+// and false when there is nothing to resume. opts.Passphrase opens a new
+// vault whose device key file is sealed.
+func ResumeFork(ctx context.Context, cfg Config, opts ForkOptions) (res *ForkResult, abandoned bool, err error) {
 	data, staging, err := forkPaths(cfg.DataDir)
 	if err != nil {
 		return nil, false, err
 	}
+	gate, err := takeForkGate(data)
+	if err != nil {
+		return nil, false, err
+	}
+	defer gate.Close()
+	cfg = withPassphrase(cfg, opts.Passphrase)
+	cfg.DataDir = data
+	var j *forkJournal
 	if ok, err := pathExists(staging); err != nil {
 		return nil, false, err
 	} else if ok {
-		j, jerr := readForkJournal(staging)
-		if jerr != nil || j == nil || j.State != forkVerified {
-			return nil, true, abandonStaging(cfg, staging)
+		var jerr error
+		j, jerr = readForkJournal(staging)
+		if jerr != nil {
+			return nil, false, fmt.Errorf("%w: %w; hop vault fork --local --abandon gives the fork up", ErrForkDamaged, jerr)
 		}
-		if err := finishFork(cfg, j); err != nil {
+		if j != nil {
+			if err := j.check(data); err != nil {
+				return nil, false, err
+			}
+		}
+		if j == nil || j.State == forkStaging {
+			// It never verified: the old vault is still the vault.
+			if ok, err := (layout{data: data}).exists(); err != nil {
+				return nil, false, err
+			} else if !ok {
+				return nil, false, fmt.Errorf("%w: %s holds no vault, and the fork in %s never verified its new one; nothing was deleted",
+					ErrForkDamaged, data, staging)
+			}
+			return nil, true, abandonStaging(cfg, staging, j)
+		}
+		if j.State != forkVerified {
+			return nil, false, fmt.Errorf("%w: the staging directory %s says %q", ErrForkDamaged, staging, j.State)
+		}
+	} else {
+		if j, err = readForkJournal(data); err != nil || j == nil || j.State == forkDone {
 			return nil, false, err
 		}
-		r := j.result()
-		r.Resumed = true
-		return r, false, nil
+		if err := j.check(data); err != nil {
+			return nil, false, err
+		}
+		if j.State != forkVerified && j.State != forkSwapped {
+			return nil, false, fmt.Errorf("%w: the fork journal in %s is %q, with no staging directory", ErrForkDamaged, data, j.State)
+		}
 	}
-	j, err := readForkJournal(data)
-	if err != nil || j == nil || j.State == forkDone {
-		return nil, false, err
-	}
-	if j.State != forkVerified && j.State != forkSwapped {
-		return nil, false, fmt.Errorf("%w: the fork journal in %s is %q, with no staging directory", ErrCorrupt, data, j.State)
-	}
-	if err := finishFork(cfg, j); err != nil {
+	if err := finishFork(ctx, cfg, data, j); err != nil {
 		return nil, false, err
 	}
 	r := j.result()
@@ -329,15 +620,107 @@ func ResumeFork(ctx context.Context, cfg Config) (res *ForkResult, abandoned boo
 	return r, false, nil
 }
 
-// abandonStaging deletes an unverified staging directory: the keychain
-// entry of the device its device.json names first, then the directory.
-func abandonStaging(cfg Config, staging string) error {
+// AbandonFork gives up an interrupted fork whose new vault is not in the
+// data directory yet: the old vault is put back from the backup if the
+// swap had moved it there, then the staging directory and its device key
+// are deleted. The old vault is never changed. A fork whose new vault is
+// in place is not abandoned (ResumeFork finishes it; the old vault is in
+// its backup). It returns false when there is no fork to give up.
+func AbandonFork(ctx context.Context, cfg Config) (bool, error) {
+	data, staging, err := forkPaths(cfg.DataDir)
+	if err != nil {
+		return false, err
+	}
+	gate, err := takeForkGate(data)
+	if err != nil {
+		return false, err
+	}
+	defer gate.Close()
+	cfg.DataDir = data
+	if ok, err := pathExists(staging); err != nil {
+		return false, err
+	} else if !ok {
+		j, err := readForkJournal(data)
+		if err != nil {
+			return false, err
+		}
+		if j != nil && j.State != forkDone {
+			return false, fmt.Errorf("%w: the fork's new vault is in %s already, so it can't be given up; hop vault fork --local finishes it (the old vault is in %s)",
+				ErrForkRefused, data, j.Backup)
+		}
+		return false, nil
+	}
+	j, jerr := readForkJournal(staging)
+	if jerr == nil && j != nil {
+		if err := j.check(data); err != nil {
+			return false, err
+		}
+	}
+	hasVault, err := (layout{data: data}).exists()
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case !hasVault:
+		// The swap had moved the old vault aside: it goes back first.
+		if jerr != nil || j == nil {
+			return false, fmt.Errorf("%w: %s holds no vault, and no journal says where it went; nothing was changed", ErrForkDamaged, data)
+		}
+		if ok, err := pathExists(data); err != nil {
+			return false, err
+		} else if ok {
+			return false, fmt.Errorf("%w: %s holds something that is not the vault; nothing was changed", ErrForkDamaged, data)
+		}
+		if err := isOldVault(cfg, j.Backup, j); err != nil {
+			return false, err
+		}
+		if err := os.Rename(j.Backup, data); err != nil {
+			return false, err
+		}
+		if err := syncDir(filepath.Dir(data)); err != nil {
+			return false, err
+		}
+	case j != nil:
+		if err := isOldVault(cfg, data, j); err != nil {
+			return false, err
+		}
+	}
+	return true, abandonStaging(cfg, staging, j)
+}
+
+// abandonStaging deletes a staging directory whose new vault is not in
+// use: the keychain entries of the device the journal j (if any) names and
+// of those its device.json names first, then the directory. An entry the
+// data directory's own device.json names (the old vault's) is never
+// deleted, whatever the staging directory claims.
+func abandonStaging(cfg Config, staging string, j *forkJournal) error {
 	s := &Store{cfg: cfg, l: layout{data: staging}}
+	keep := map[retireRecord]bool{}
+	old := &Store{cfg: cfg, l: layout{data: strings.TrimSuffix(staging, forkNewSuffix)}}
+	if dc, err := old.readDeviceConfig(); err == nil {
+		for _, r := range retireRecords(dc) {
+			keep[r] = true
+		}
+	}
+	del := func(store string, r retireRecord) error {
+		if keep[r] {
+			return nil
+		}
+		ds := s.deviceStore(deviceConfig{V: 1, Store: store, AccountID: r.AccountID})
+		if err := ds.deleteSlot(r.DeviceID); err != nil {
+			return fmt.Errorf("store: deleting the device key of an abandoned fork: %w", err)
+		}
+		return nil
+	}
+	if j != nil {
+		if err := del(j.NewStore, retireRecord{AccountID: j.New.AccountID, DeviceID: j.New.DeviceID}); err != nil {
+			return err
+		}
+	}
 	if dc, err := s.readDeviceConfig(); err == nil {
 		for _, r := range retireRecords(dc) {
-			ds := s.deviceStore(deviceConfig{V: 1, Store: dc.Store, AccountID: r.AccountID})
-			if err := ds.deleteSlot(r.DeviceID); err != nil {
-				return fmt.Errorf("store: deleting the device key of an abandoned fork: %w", err)
+			if err := del(dc.Store, r); err != nil {
+				return err
 			}
 		}
 	}
@@ -345,6 +728,17 @@ func abandonStaging(cfg Config, staging string) error {
 		return err
 	}
 	return syncDir(filepath.Dir(staging))
+}
+
+// isOldVault requires dir to hold the old vault of the fork j, by its
+// device.json.
+func isOldVault(cfg Config, dir string, j *forkJournal) error {
+	s := &Store{cfg: cfg, l: layout{data: dir}}
+	dc, err := s.readDeviceConfig()
+	if err != nil || dc.AccountID != j.Plan.Old.AccountID || dc.DeviceID != j.Plan.Old.DeviceID {
+		return fmt.Errorf("%w: %s does not hold the vault that was forked; nothing was changed", ErrForkDamaged, dir)
+	}
+	return nil
 }
 
 // ForkOptions are hop vault fork's inputs about the old vault.
@@ -364,6 +758,10 @@ type PendingFork struct {
 	oldCfg  deviceConfig
 	plan    ForkPlan
 	pass    []byte
+	// gate is the data directory's gate, held exclusive until Close.
+	gate *os.File
+	// source is forkSourceDigest of the old vault as read.
+	source string
 
 	// verified and final are the old vault's items by old ID: verified
 	// state, and the overlay (what this device showed), sanitized.
@@ -384,26 +782,37 @@ type PendingFork struct {
 // server's report (ErrForkRevoked); a vault that is local-only already
 // (ErrNotServerBacked); one with a login merge or a publication in
 // progress, with grants or deploy operations, or a key dedicated to a
-// grant (ErrForkRefused); a fork in progress (ErrForkPending). A logout
-// that is pending (RETIRING) is no obstacle: the fork reads the vault in
-// memory, as the logout's own resolution does.
+// grant, or with an item of a type this build does not carry
+// (ErrForkRefused); a fork in progress (ErrForkPending). A logout that is
+// pending (RETIRING) is no obstacle: the fork reads the vault in memory,
+// as the logout's own resolution does.
+//
+// The fork holds the data directory's gate from here until Close, so
+// nothing else opens or makes a vault there meanwhile.
 func PrepareFork(ctx context.Context, cfg Config, opts ForkOptions) (*PendingFork, error) {
 	data, staging, err := forkPaths(cfg.DataDir)
 	if err != nil {
 		return nil, err
 	}
-	if pending, err := ForkInProgress(data); err != nil {
-		return nil, err
-	} else if pending {
-		return nil, ErrForkPending
-	}
-	ocfg := cfg
-	ocfg.DataDir = data
-	src, err := Open(ctx, ocfg)
+	gate, err := takeForkGate(data)
 	if err != nil {
 		return nil, err
 	}
-	p := &PendingFork{cfg: ocfg, src: src, data: data, staging: staging, pass: slices.Clone(opts.Passphrase)}
+	if pending, err := ForkInProgress(data); err != nil || pending {
+		gate.Close()
+		if err == nil {
+			err = ErrForkPending
+		}
+		return nil, err
+	}
+	ocfg := cfg
+	ocfg.DataDir = data
+	src, err := openStore(ctx, ocfg, false)
+	if err != nil {
+		gate.Close()
+		return nil, err
+	}
+	p := &PendingFork{cfg: ocfg, src: src, data: data, staging: staging, pass: slices.Clone(opts.Passphrase), gate: gate}
 	if err := p.read(); err != nil {
 		p.Close()
 		return nil, err
@@ -424,9 +833,30 @@ func (p *PendingFork) Close() {
 		p.src.Close()
 		p.src = nil
 	}
+	if p.gate != nil {
+		p.gate.Close()
+		p.gate = nil
+	}
 	clear(p.verified)
 	clear(p.final)
 	clear(p.pass)
+}
+
+// Touches reports whether path, resolved through symlinks, is in a
+// directory the fork moves or deletes: the data directory (moved into the
+// backup, which --discard-old deletes), the staging directory and the
+// backup. hop vault fork refuses an Emergency Kit file there.
+func (p *PendingFork) Touches(path string) (bool, error) {
+	r, err := resolveLoose(path)
+	if err != nil {
+		return false, err
+	}
+	for _, d := range []string{p.data, p.staging, p.plan.Backup} {
+		if within(r, d) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // read loads the old vault in memory, refuses what can't be forked, and
@@ -497,7 +927,76 @@ func (p *PendingFork) read() error {
 		s.state, s.sec = saved[0].(*vaultlog.State), saved[1].(*vaultlog.Secrets)
 		s.dev, s.rec = saved[2].(*vaultlog.LocalDevice), saved[3].(*deviceRecord)
 	}()
-	return p.readLoaded(v, sf, logout)
+	if err := p.readLoaded(v, sf, logout); err != nil {
+		return err
+	}
+	// What the fork read, under the file lock: the swap moves the old vault
+	// only while it is still this.
+	p.source, err = forkSourceDigest(p.data)
+	return err
+}
+
+// forkCarries reports whether a fork imports items of type t. Any other
+// type (a grant, or one a later revision adds, such as rev 17's access) is
+// refused rather than dropped or carried without its rules.
+func forkCarries(t model.Type) bool {
+	switch t {
+	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypePolicy:
+		return true
+	}
+	return false
+}
+
+// forkSourceDigest commits to the old vault in data: every file of the
+// data directory that says what the vault holds or is, by path and
+// content (device.json and the key file, state.json and the entries'
+// names, the outbox and its held records, the server, revocation, logout,
+// merge and publication files, and the rest), and every directory. Left
+// out are the locks, the objects (the head names them), and the files an
+// open or close rewrites with no change to the vault: contact.json,
+// account.json and sync-notes.json.
+func forkSourceDigest(data string) (string, error) {
+	skip := map[string]bool{
+		"vault/owner.lock": true, "vault/lock": true, "vault/objects": true,
+		"vault/" + contactRel: true, "vault/account.json": true, "vault/" + syncNotesRel: true,
+	}
+	h := sha256.New()
+	err := filepath.WalkDir(data, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(data, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		switch {
+		case skip[rel] && d.IsDir():
+			return filepath.SkipDir
+		case skip[rel]:
+			return nil
+		case d.IsDir():
+			fmt.Fprintf(h, "d %q\n", rel)
+			return nil
+		case !d.Type().IsRegular():
+			fmt.Fprintf(h, "o %q %v\n", rel, d.Type())
+			return nil
+		case strings.HasPrefix(rel, "vault/entries/"):
+			fmt.Fprintf(h, "e %q\n", rel)
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(h, "f %q %d\n", rel, len(b))
+		h.Write(b)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // readLoaded is read once the vault is loaded and installed in s for the
@@ -538,6 +1037,13 @@ func (p *PendingFork) readLoaded(v *loaded, sf *serverFile, logout string) error
 			return err
 		}
 		p.final[id] = pt
+	}
+	for _, m := range []map[model.ID]crypto.Item{p.verified, p.final} {
+		for _, it := range m {
+			if t := header(it).Type; !forkCarries(t) {
+				return fmt.Errorf("%w: it holds an item of type %q, which this version of hop can't carry into a fork", ErrForkRefused, t)
+			}
+		}
 	}
 	plan := ForkPlan{
 		DataDir: p.data, Server: sf.Server, Logout: logout,
@@ -714,27 +1220,15 @@ func (p *PendingFork) Generate(password []byte, deviceStore string) (Kit, error)
 	if deviceStore == "" {
 		deviceStore = p.oldCfg.Store
 	}
-	get := p.cfg.Getenv
-	if get == nil {
-		get = os.Getenv
-	}
-	if len(p.pass) > 0 {
-		pass := string(p.pass)
-		inner := get
-		get = func(k string) string {
-			if k == PassphraseEnv {
-				return pass
-			}
-			return inner(k)
-		}
-	}
-	p.ncfg = p.cfg
+	p.ncfg = withPassphrase(p.cfg, p.pass)
 	p.ncfg.DataDir = p.staging
-	p.ncfg.Getenv = get
 	init, err := PrepareInit(p.ncfg, InitOptions{Password: password, DeviceStore: deviceStore})
 	if err != nil {
 		return Kit{}, err
 	}
+	// The fork holds the gate of the data directory the staging directory
+	// becomes.
+	init.s.ungated = true
 	p.init = init
 	return init.Kit(), nil
 }
@@ -749,14 +1243,18 @@ func (p *PendingFork) Commit(ctx context.Context, discardOld bool) (*ForkResult,
 	j := &forkJournal{
 		V: forkVersion, State: forkStaging, DataDir: p.data, Backup: p.plan.Backup, DiscardOld: discardOld,
 		At: p.src.now(), Plan: p.planRecord(),
-		New: ForkIDs{AccountID: p.init.state.Account.AccountID, VaultID: p.init.state.VaultID, DeviceID: p.init.rec.DeviceID},
+		New:      ForkIDs{AccountID: p.init.state.Account.AccountID, VaultID: p.init.state.VaultID, DeviceID: p.init.rec.DeviceID},
+		NewStore: p.init.devCfg.Store, Source: p.source,
 	}
 	var err error
 	if j.TxnID, err = vaultlog.NewID(); err != nil {
 		return nil, err
 	}
+	if err := j.check(p.data); err != nil {
+		return nil, err
+	}
 	if err := p.stage(ctx, j); err != nil {
-		if aerr := abandonStaging(p.ncfg, p.staging); aerr != nil {
+		if aerr := abandonStaging(p.ncfg, p.staging, j); aerr != nil {
 			err = fmt.Errorf("%w (and its staging directory %s could not be deleted: %v)", err, p.staging, aerr)
 		}
 		return nil, err
@@ -764,10 +1262,11 @@ func (p *PendingFork) Commit(ctx context.Context, discardOld bool) (*ForkResult,
 	p.done = true
 	// The old vault's store lets go before the swap: its paths name the
 	// data directory, which is about to hold the new vault. finishFork
-	// takes the vault from any other owner again before it moves it.
+	// takes the vault's owner lock again before it moves it, and the gate,
+	// still held, keeps every other opener out meanwhile.
 	p.src.Close()
 	p.src = nil
-	if err := finishFork(p.cfg, j); err != nil {
+	if err := finishFork(ctx, withPassphrase(p.cfg, p.pass), p.data, j); err != nil {
 		return nil, err
 	}
 	r := j.result()
@@ -959,22 +1458,23 @@ func sameItem(a, b crypto.Item) bool {
 	return ma.Type() == mb.Type() && ma.Equal(mb)
 }
 
-// forkWrite commits ch as one entry, or, when the server would refuse it
-// as too large (so a later publish could not upload it), as two halves.
-// The caller holds s.mu.
+// forkWrite commits ch as one entry if the server would admit it (so a
+// later publish can upload it), or else split: puts and deletes in
+// halves, until each entry fits. An item that fits no entry by itself is
+// refused by name, before anything of it is committed: an entry is
+// immutable, and one the server refuses would keep the new vault from
+// ever being published. The caller holds s.mu.
 func (s *Store) forkWrite(ch vaultlog.Changes) error {
 	unlock, err := s.lockFile()
 	if err != nil {
 		return err
 	}
 	w, st, sec, err := vaultlog.BuildNormal(s.state, s.sec, s.dev, ch, s.now(), objectDir(s.l.objects()))
-	if err == nil && len(ch.Put) > 1 && errors.Is(admitWire(w), ErrTooLarge) {
-		unlock()
-		half := len(ch.Put) / 2
-		if err := s.forkWrite(vaultlog.Changes{Put: ch.Put[:half]}); err != nil {
-			return err
+	if err == nil {
+		if aerr := admitWire(w); aerr != nil {
+			unlock()
+			return s.forkSplit(ch, aerr)
 		}
-		return s.forkWrite(vaultlog.Changes{Put: ch.Put[half:]})
 	}
 	defer unlock()
 	if err != nil {
@@ -987,51 +1487,97 @@ func (s *Store) forkWrite(ch vaultlog.Changes) error {
 	return nil
 }
 
-// verify opens the staged vault as hop opens any vault, and checks that
-// it is the new account's, local-only, and holds exactly the items
-// imported.
-func (p *PendingFork) verify(ctx context.Context, j *forkJournal) error {
-	ns, err := Open(ctx, p.ncfg)
+// forkSplit is forkWrite of ch, which admission refused with aerr, in two
+// halves.
+func (s *Store) forkSplit(ch vaultlog.Changes, aerr error) error {
+	switch {
+	case !errors.Is(aerr, ErrTooLarge):
+		return aerr
+	case len(ch.Put) > 1:
+		half := len(ch.Put) / 2
+		if err := s.forkWrite(vaultlog.Changes{Put: ch.Put[:half]}); err != nil {
+			return err
+		}
+		return s.forkWrite(vaultlog.Changes{Put: ch.Put[half:]})
+	case len(ch.Delete) > 1:
+		half := len(ch.Delete) / 2
+		if err := s.forkWrite(vaultlog.Changes{Delete: ch.Delete[:half]}); err != nil {
+			return err
+		}
+		return s.forkWrite(vaultlog.Changes{Delete: ch.Delete[half:]})
+	case len(ch.Put) == 1:
+		return fmt.Errorf("%w: %s is larger than a server accepts as one change (%w), so a vault holding it could never be published; "+
+			"make it smaller or delete it in this vault, then fork again", ErrForkRefused, itemLabel(ch.Put[0]), aerr)
+	}
+	return aerr
+}
+
+// forkedVault is what a fork checks of its new vault, opened from disk.
+type forkedVault struct {
+	ids   ForkIDs
+	head  vaultlog.Head
+	items map[model.ID]crypto.Item
+}
+
+// readNewVault opens the vault in cfg.DataDir as hop opens any vault (the
+// log verified from genesis with its device key), outside the gate, which
+// the fork holds, and reads what the fork checks of it: it must unlock and
+// be local-only.
+func readNewVault(ctx context.Context, cfg Config) (*forkedVault, error) {
+	ns, err := openStore(ctx, cfg, false)
 	if err != nil {
-		return fmt.Errorf("store: the new vault does not open: %w", err)
+		return nil, fmt.Errorf("the new vault does not open: %w", err)
 	}
 	defer ns.Close()
-	info := ns.Info()
-	if info.Locked {
-		return fmt.Errorf("store: the new vault does not unlock: %s", info.LockReason)
+	if info := ns.Info(); info.Locked {
+		return nil, fmt.Errorf("the new vault does not unlock: %s", info.LockReason)
 	}
 	if _, err := ns.ServerInfo(); !errors.Is(err, ErrNotServerBacked) {
-		return fmt.Errorf("store: the new vault is not local-only (%v)", err)
+		return nil, fmt.Errorf("the new vault is not local-only (%v)", err)
 	}
 	ns.mu.Lock()
-	vid, aid := ns.state.VaultID, ns.state.Account.AccountID
+	nv := &forkedVault{
+		ids:  ForkIDs{AccountID: ns.state.Account.AccountID, VaultID: ns.state.VaultID, DeviceID: ns.dev.ID},
+		head: ns.state.Head, items: map[model.ID]crypto.Item{},
+	}
 	ns.mu.Unlock()
-	if vid != j.New.VaultID || aid != j.New.AccountID || info.DeviceID != j.New.DeviceID.String() {
-		return errors.New("store: the new vault's identity is not the one generated")
-	}
-	if vid == j.Plan.Old.VaultID || aid == j.Plan.Old.AccountID || j.New.DeviceID == j.Plan.Old.DeviceID {
-		return errors.New("store: the new vault reuses an old identity")
-	}
 	snap, err := ns.Snapshot(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	got := map[model.ID]crypto.Item{}
 	for i := range snap.Hosts {
-		got[snap.Hosts[i].ItemID] = &snap.Hosts[i]
+		nv.items[snap.Hosts[i].ItemID] = &snap.Hosts[i]
 	}
 	for i := range snap.Keys {
-		got[snap.Keys[i].ItemID] = &snap.Keys[i]
+		nv.items[snap.Keys[i].ItemID] = &snap.Keys[i]
 	}
 	for i := range snap.Credentials {
-		got[snap.Credentials[i].ItemID] = &snap.Credentials[i]
+		nv.items[snap.Credentials[i].ItemID] = &snap.Credentials[i]
 	}
 	for i := range snap.Snippets {
-		got[snap.Snippets[i].ItemID] = &snap.Snippets[i]
+		nv.items[snap.Snippets[i].ItemID] = &snap.Snippets[i]
 	}
 	for i := range snap.Policies {
-		got[snap.Policies[i].ItemID] = &snap.Policies[i]
+		nv.items[snap.Policies[i].ItemID] = &snap.Policies[i]
 	}
+	return nv, nil
+}
+
+// verify opens the staged vault as hop opens any vault, checks that it is
+// the new account's, local-only, and holds exactly the items imported,
+// and records its head and item count in j.
+func (p *PendingFork) verify(ctx context.Context, j *forkJournal) error {
+	nv, err := readNewVault(ctx, p.ncfg)
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	if nv.ids != j.New {
+		return errors.New("store: the new vault's identity is not the one generated")
+	}
+	if nv.ids.VaultID == j.Plan.Old.VaultID || nv.ids.AccountID == j.Plan.Old.AccountID || j.New.DeviceID == j.Plan.Old.DeviceID {
+		return errors.New("store: the new vault reuses an old identity")
+	}
+	got := nv.items
 	if len(got) != len(p.final) {
 		return fmt.Errorf("store: the new vault holds %d items, not the %d imported", len(got), len(p.final))
 	}
@@ -1048,31 +1594,62 @@ func (p *PendingFork) verify(ctx context.Context, j *forkJournal) error {
 			return fmt.Errorf("store: %s did not arrive in the new vault as it was", itemLabel(it))
 		}
 	}
+	j.NewHead, j.NewItems = nv.head, len(got)
 	return nil
 }
 
-// finishFork carries a verified fork through the swap, the discard if
-// asked for, and done. Each step checks what is on disk first, so it
-// resumes from wherever a crash stopped it.
-func finishFork(cfg Config, j *forkJournal) error {
-	data, staging := j.DataDir, j.DataDir+forkNewSuffix
+// checkNewVault opens the new vault in dir and requires it to be the one
+// j recorded at verified: its identity, its head and its item count. A
+// fork does nothing past verified (the swap, recording it, deleting the
+// backup) without it.
+func checkNewVault(ctx context.Context, cfg Config, dir string, j *forkJournal) error {
+	ncfg := cfg
+	ncfg.DataDir = dir
+	nv, err := readNewVault(ctx, ncfg)
+	if err == nil && (nv.ids != j.New || nv.head != j.NewHead || len(nv.items) != j.NewItems) {
+		err = fmt.Errorf("it is not the vault the fork verified (head %d, %d items; the fork recorded head %d, %d items)",
+			nv.head.Seq, len(nv.items), j.NewHead.Seq, j.NewItems)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %s: %w; nothing more was changed", ErrForkDamaged, dir, err)
+	}
+	return nil
+}
+
+// finishFork carries a verified fork of data (the resolved data directory,
+// which j was checked against) through the swap, the discard if asked
+// for, and done. Each step checks what is on disk first, so it resumes
+// from wherever a crash stopped it, and the new vault is opened and checked
+// against j before each step that relies on it. The caller holds the gate.
+func finishFork(ctx context.Context, cfg Config, data string, j *forkJournal) error {
+	staging := data + forkNewSuffix
 	parent := filepath.Dir(data)
 	hasStaging, err := pathExists(staging)
 	if err != nil {
 		return err
 	}
 	if hasStaging {
+		if j.State != forkVerified {
+			return fmt.Errorf("%w: the fork journal is %q with the staging directory still there", ErrForkDamaged, j.State)
+		}
+		if err := checkNewVault(ctx, cfg, staging, j); err != nil {
+			return err
+		}
 		hasData, err := pathExists(data)
 		if err != nil {
 			return err
 		}
 		if hasData {
-			if err := moveOld(cfg, j); err != nil {
+			if err := moveOld(cfg, data, j); err != nil {
 				return err
 			}
 			if err := forkStage("fork:moved-old"); err != nil {
 				return err
 			}
+		} else if err := isOldVault(cfg, j.Backup, j); err != nil {
+			// Not in data, not in the backup: where the old vault went is
+			// not known, so nothing takes its place.
+			return err
 		}
 		if err := os.Rename(staging, data); err != nil {
 			return err
@@ -1084,6 +1661,11 @@ func finishFork(cfg Config, j *forkJournal) error {
 			return err
 		}
 	}
+	// The new vault in data must be the one verified before the swap is
+	// recorded or the backup deleted.
+	if err := checkNewVault(ctx, cfg, data, j); err != nil {
+		return err
+	}
 	if j.State == forkVerified {
 		j.State = forkSwapped
 		if err := writeForkJournal(data, j); err != nil {
@@ -1091,7 +1673,7 @@ func finishFork(cfg Config, j *forkJournal) error {
 		}
 	}
 	if j.DiscardOld && !j.Discarded {
-		if err := discardBackup(cfg, j.Backup); err != nil {
+		if err := discardBackup(cfg, j); err != nil {
 			return fmt.Errorf("the new vault is in place, but the old one in %s could not be deleted: %w", j.Backup, err)
 		}
 		if err := forkStage("fork:discarded"); err != nil {
@@ -1104,20 +1686,20 @@ func finishFork(cfg Config, j *forkJournal) error {
 }
 
 // moveOld renames the data directory, which must still be the old vault's,
-// to the backup, while no process owns that vault.
-func moveOld(cfg Config, j *forkJournal) error {
-	data := j.DataDir
-	s := &Store{cfg: cfg, l: layout{data: data}}
-	dc, err := s.readDeviceConfig()
-	if err != nil || dc.AccountID != j.Plan.Old.AccountID || dc.DeviceID != j.Plan.Old.DeviceID {
-		return fmt.Errorf("%w: %s no longer holds the vault being forked; the new one waits in %s", ErrForkRefused, data, data+forkNewSuffix)
+// to the backup, while no process owns that vault, and only while it is as
+// the fork read it (j.Source): a change since (a write, a sync, a
+// revocation recorded) would be put away in the backup, so the fork is
+// refused instead.
+func moveOld(cfg Config, data string, j *forkJournal) error {
+	if err := isOldVault(cfg, data, j); err != nil {
+		return err
 	}
 	if ok, err := pathExists(j.Backup); err != nil {
 		return err
 	} else if ok {
 		return fmt.Errorf("%w: %s already exists", ErrForkRefused, j.Backup)
 	}
-	f, err := filelock.TryLock(s.l.ownerLock())
+	f, err := filelock.TryLock(layout{data: data}.ownerLock())
 	if errors.Is(err, filelock.ErrLocked) {
 		return ErrVaultBusy
 	}
@@ -1125,6 +1707,12 @@ func moveOld(cfg Config, j *forkJournal) error {
 		return err
 	}
 	defer f.Close()
+	if d, err := forkSourceDigest(data); err != nil {
+		return err
+	} else if d != j.Source {
+		return fmt.Errorf("%w: %s is not as the fork read it (a change, a sync or a revocation since?); nothing was moved. "+
+			"hop vault fork --local --abandon gives this fork up, and hop vault fork --local then forks the vault as it is now", ErrForkStale, data)
+	}
 	if err := os.Rename(data, j.Backup); err != nil {
 		return err
 	}
@@ -1133,14 +1721,19 @@ func moveOld(cfg Config, j *forkJournal) error {
 
 // discardBackup deletes the old data directory: the device records its
 // device.json names (keychain entries; device key files go with the
-// directory), then the directory.
-func discardBackup(cfg Config, backup string) error {
+// directory), then the directory. A backup that holds another vault is
+// not touched.
+func discardBackup(cfg Config, j *forkJournal) error {
+	backup := j.Backup
 	if ok, err := pathExists(backup); err != nil || !ok {
 		return err
 	}
 	s := &Store{cfg: cfg, l: layout{data: backup}}
 	dc, err := s.readDeviceConfig()
 	if err == nil {
+		if err := isOldVault(cfg, backup, j); err != nil {
+			return err
+		}
 		for _, r := range retireRecords(dc) {
 			ds := s.deviceStore(deviceConfig{V: 1, Store: dc.Store, AccountID: r.AccountID})
 			if err := ds.deleteSlot(r.DeviceID); err != nil {

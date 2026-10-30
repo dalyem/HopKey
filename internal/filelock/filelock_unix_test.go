@@ -55,3 +55,28 @@ func TestLockWaitsForRelease(t *testing.T) {
 		t.Fatal("Lock did not return after the lock was released")
 	}
 }
+
+func TestTryLockSharedCoexistsAndExcludes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.lock")
+	a, err := TryLockShared(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := TryLockShared(path)
+	if err != nil {
+		t.Fatalf("a second shared lock: %v", err)
+	}
+	if _, err := TryLock(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("an exclusive lock over shared ones: %v, want ErrLocked", err)
+	}
+	a.Close()
+	b.Close()
+	x, err := TryLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TryLockShared(path); !errors.Is(err, ErrLocked) {
+		t.Fatalf("a shared lock over an exclusive one: %v, want ErrLocked", err)
+	}
+	x.Close()
+}

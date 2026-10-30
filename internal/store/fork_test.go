@@ -341,6 +341,8 @@ func TestForkRefusesARevokedDevice(t *testing.T) {
 func noForkFiles(t *testing.T, cfg Config) {
 	t.Helper()
 	matches, _ := filepath.Glob(cfg.DataDir + ".*")
+	// The gate, D.lock, is every open's.
+	matches = slices.DeleteFunc(matches, func(m string) bool { return m == cfg.DataDir+forkGateSuffix })
 	if len(matches) != 0 {
 		t.Errorf("a refused fork wrote %v", matches)
 	}
@@ -419,7 +421,7 @@ func TestForkCrashAtEachStep(t *testing.T) {
 				}
 				release(cfg)
 			}
-			res, abandoned, err := ResumeFork(context.Background(), cfg)
+			res, abandoned, err := ResumeFork(context.Background(), cfg, ForkOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}

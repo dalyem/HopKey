@@ -2,8 +2,10 @@ package cli_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -203,7 +205,8 @@ func TestForkRefusesAReportedRevocation(t *testing.T) {
 	if code != 255 || !strings.Contains(s.stderr.String(), "removed from its account") {
 		t.Errorf("fork of a reported device: exit %d: %s", code, s.stderr.String())
 	}
-	if matches, _ := filepath.Glob(m.data + ".*"); len(matches) != 0 {
+	// m.data.lock is the data directory's gate, which every open takes.
+	if matches, _ := filepath.Glob(m.data + ".*"); len(slices.DeleteFunc(matches, func(p string) bool { return p == m.data+".lock" })) != 0 {
 		t.Errorf("the refused fork wrote %v", matches)
 	}
 	if rec, _ := store.ForkRecord(m.data); rec != nil {
@@ -239,5 +242,35 @@ func TestForkFlags(t *testing.T) {
 	}
 	if v := vaultInfo(t, m); v.Locked {
 		t.Errorf("the vault after a refused fork: %+v", v)
+	}
+}
+
+// --kit-file may not name a file in a directory the fork moves or deletes:
+// the data directory (moved into the backup, deleted by --discard-old),
+// also through a symlinked ancestor. Nothing changes.
+func TestForkRefusesAKitFileItMoves(t *testing.T) {
+	m := signedUp(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(m.data, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, kit := range []string{filepath.Join(m.data, "kit.txt"), filepath.Join(link, "kit.txt"), filepath.Join(m.data, "vault", "kit.txt")} {
+		s := forkSession()
+		code := m.hop(t, s, "vault", "fork", "--local", "--yes", "--discard-old", "--kit-file", kit)
+		if code != 255 || !strings.Contains(s.stderr.String(), "--kit-file") {
+			t.Errorf("kit %s: exit %d: %s", kit, code, s.stderr.String())
+		}
+		if _, err := os.Lstat(kit); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("kit %s was written: %v", kit, err)
+		}
+		if rec, _ := store.ForkRecord(m.data); rec != nil {
+			t.Fatal("the refused fork left a record")
+		}
+		if pending, _ := store.ForkInProgress(m.data); pending {
+			t.Fatal("the refused fork is in progress")
+		}
+	}
+	if v := vaultInfo(t, m); v.Locked {
+		t.Errorf("the vault after the refused forks: %+v", v)
 	}
 }
