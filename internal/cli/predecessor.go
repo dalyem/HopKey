@@ -109,29 +109,37 @@ type oldDeviceReport struct {
 	Command          string `json:"command,omitempty"`
 }
 
-// oldDevices turns the predecessors recorded for accountID into reports,
-// against the devices the verified log lists (active, when known). With
-// no list, an identity whose logout did not tell the server is taken to
-// be still in the account. An entry for another account is left alone and
-// not reported.
+// oldDevice is the report for one recorded identity, against the devices
+// the verified log lists (active, when known). With no list, an identity
+// whose logout did not tell the server is taken to be still in the
+// account.
+func oldDevice(p store.Predecessor, active []store.DeviceListing, known bool) oldDeviceReport {
+	r := oldDeviceReport{DeviceID: p.DeviceID.String(), Outcome: p.Outcome, Why: p.Why, DiscardedChanges: p.Queued, HeldChanges: p.Held}
+	r.StillInAccount = slices.ContainsFunc(active, func(d store.DeviceListing) bool { return d.ID == p.DeviceID })
+	if !known {
+		r.StillInAccount = p.Outcome == store.OutcomeUnknown
+	}
+	switch {
+	case r.StillInAccount:
+		r.Command = "hop auth devices revoke " + r.DeviceID
+	case p.Why != "":
+		// The identity is out of the account, however the logout ended
+		// (a retirement the server committed but did not acknowledge
+		// leaves an unknown outcome): the copy that the lock made
+		// possible still warrants new keys.
+		r.Command = "hop auth rotate"
+	}
+	return r
+}
+
+// oldDevices turns the predecessors recorded for accountID into reports.
+// An entry for another account is left alone and not reported.
 func oldDevices(entries []store.Predecessor, accountID string, active []store.DeviceListing, known bool) []oldDeviceReport {
 	var out []oldDeviceReport
 	for _, p := range entries {
-		if p.AccountID.String() != accountID {
-			continue
+		if p.AccountID.String() == accountID {
+			out = append(out, oldDevice(p, active, known))
 		}
-		r := oldDeviceReport{DeviceID: p.DeviceID.String(), Outcome: p.Outcome, Why: p.Why, DiscardedChanges: p.Queued, HeldChanges: p.Held}
-		r.StillInAccount = slices.ContainsFunc(active, func(d store.DeviceListing) bool { return d.ID == p.DeviceID })
-		if !known {
-			r.StillInAccount = p.Outcome == store.OutcomeUnknown
-		}
-		switch {
-		case r.StillInAccount:
-			r.Command = "hop auth devices revoke " + r.DeviceID
-		case p.Why != "":
-			r.Command = "hop auth rotate"
-		}
-		out = append(out, r)
 	}
 	return out
 }
@@ -163,10 +171,17 @@ func printOldDevices(e *Env, rs []oldDeviceReport) {
 			e.printf("If its files could have been copied while it was locked, cut it off from this device:\n")
 			e.printf("    %s\n", r.Command)
 			e.printf("That replaces every key in the account and shows a new Emergency Kit. If you are sure nobody copied the files, you can leave it: a block can be lifted by the operator, a revocation can't.\n")
-		case r.Outcome == store.OutcomeUnknown:
-			e.printf("That logout did not tell the server, but %s is not in the account now: nothing is left to cut off.\n", id)
 		default:
-			e.printf("That logout removed it from the account.\n")
+			if r.Outcome == store.OutcomeUnknown {
+				e.printf("That logout did not tell the server, but %s is not in the account now", id)
+				if r.Command == "" {
+					e.printf(": nothing is left to cut off.\n")
+				} else {
+					e.printf(".\n")
+				}
+			} else {
+				e.printf("That logout removed it from the account.\n")
+			}
 			if r.Command != "" {
 				e.printf("If its files could have been copied while it was locked, replace every key in the account with:\n    %s\n", r.Command)
 				e.printf("and keep only the devices you trust.\n")
@@ -178,22 +193,23 @@ func printOldDevices(e *Env, rs []oldDeviceReport) {
 	}
 }
 
-// settleOldDevices forgets the recorded identities that need nothing
-// more: every one that is not still in the account. active is the
-// devices the verified log lists now, and ok whether it could be read;
-// without it nothing is forgotten.
+// settleOldDevices is what a command does with the identities it has
+// just reported: it forgets the ones that are not still in the account,
+// and marks the others reported. active is the devices the verified log
+// lists now, and ok whether it could be read; without it nothing is
+// forgotten, only marked.
 func settleOldDevices(dataDir string, entries []store.Predecessor, accountID string, active []store.DeviceListing, ok bool) error {
-	if !ok {
-		return nil
-	}
 	for _, p := range entries {
 		if p.AccountID.String() != accountID {
 			continue
 		}
-		if slices.ContainsFunc(active, func(d store.DeviceListing) bool { return d.ID == p.DeviceID }) {
-			continue
+		var err error
+		if ok && !slices.ContainsFunc(active, func(d store.DeviceListing) bool { return d.ID == p.DeviceID }) {
+			err = store.ForgetPredecessor(dataDir, p.DeviceID)
+		} else {
+			err = store.MarkPredecessorReported(dataDir, p.DeviceID)
 		}
-		if err := store.ForgetPredecessor(dataDir, p.DeviceID); err != nil {
+		if err != nil {
 			return err
 		}
 	}
@@ -201,37 +217,61 @@ func settleOldDevices(dataDir string, entries []store.Predecessor, accountID str
 }
 
 // statusOldDevices is hop auth status's view of the identities this
-// machine left in the account: the ones still listed. Those the log no
-// longer lists are settled and forgotten, when the daemon can list the
-// devices.
-func statusOldDevices(ctx context.Context, e *Env, c *daemon.Client, accountID string, unlocked bool) []oldDeviceReport {
+// machine left behind. It shows the ones still listed in the account, and
+// the ones that left it but whose advice (rotate) no command has shown
+// yet: a sign-in that was cut short between installing the new identity
+// and printing leaves them unreported. An identity with nothing more to
+// say, or whose advice was shown before, is forgotten when the device
+// list could be read. Nothing it returns is consumed here: the returned
+// function marks the shown entries reported, and the caller runs it once
+// they are printed.
+func statusOldDevices(ctx context.Context, e *Env, c *daemon.Client, accountID string, unlocked bool) ([]oldDeviceReport, func()) {
 	dataDir := e.storeConfig().DataDir
 	entries, err := store.ReadPredecessors(dataDir)
 	if err != nil || len(entries) == 0 {
-		return nil
+		return nil, func() {}
 	}
 	var dl daemon.DevicesResult
 	known := unlocked && c.Call(ctx, daemon.OpDevicesList, nil, &dl) == nil
-	_ = settleOldDevices(dataDir, entries, accountID, dl.Devices, known)
+	return reportOldDevices(dataDir, entries, accountID, dl.Devices, known)
+}
+
+// reportOldDevices is statusOldDevices over the entries and the device
+// list it read.
+func reportOldDevices(dataDir string, entries []store.Predecessor, accountID string, active []store.DeviceListing, known bool) ([]oldDeviceReport, func()) {
 	var out []oldDeviceReport
-	for _, r := range oldDevices(entries, accountID, dl.Devices, known) {
-		if r.StillInAccount {
+	var shown []store.Predecessor
+	for _, p := range entries {
+		if p.AccountID.String() != accountID {
+			continue
+		}
+		r := oldDevice(p, active, known)
+		switch {
+		case r.StillInAccount, r.Command != "" && !p.IsReported():
 			out = append(out, r)
+			shown = append(shown, p)
+		case known:
+			_ = store.ForgetPredecessor(dataDir, p.DeviceID)
 		}
 	}
-	return out
+	return out, func() {
+		for _, p := range shown {
+			_ = store.MarkPredecessorReported(dataDir, p.DeviceID)
+		}
+	}
 }
 
 // oldDeviceLines are hop auth status's lines about identities this
-// machine left in the account.
+// machine left behind.
 func oldDeviceLines(rs []oldDeviceReport) []string {
 	var out []string
 	for _, r := range rs {
-		if !r.StillInAccount {
+		id := oneLine(r.DeviceID)
+		if r.StillInAccount {
+			out = append(out, fmt.Sprintf("old device:   %s, this machine's earlier identity, is still in the account (the logout did not tell the server); to cut it off: %s", id, r.Command))
 			continue
 		}
-		out = append(out, fmt.Sprintf("old device:   %s, this machine's earlier identity, is still in the account (the logout did not tell the server); to cut it off: %s",
-			oneLine(r.DeviceID), r.Command))
+		out = append(out, fmt.Sprintf("old device:   %s, this machine's earlier identity, is out of the account, but it was locked out by the operator; if its files could have been copied, replace every key in the account: %s (shown once)", id, r.Command))
 	}
 	return out
 }

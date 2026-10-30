@@ -162,6 +162,10 @@ type LogoutResult struct {
 	// Discarded is the number of queued changes the logout threw away,
 	// as counted when it began.
 	Discarded int `json:"discarded_changes,omitempty"`
+	// Why is AdminDeviceBlocked or AdminAccountDisabled when the
+	// operator's refusal had locked this device, whether the caller knew
+	// it when the logout began or the retirement found it out.
+	Why string `json:"why,omitempty"`
 }
 
 type retireJournal struct {
@@ -524,7 +528,7 @@ func (s *Store) finishLogout(j *retireJournal) (LogoutResult, error) {
 	res := LogoutResult{State: StateRetired, Outcome: j.Outcome, RevokeElsewhere: j.Outcome == OutcomeUnknown}
 	if unlock, err := s.lockFile(); err == nil {
 		if n := s.readRetireNote(); n != nil {
-			res.Discarded = n.Queued
+			res.Discarded, res.Why = n.Queued, n.Why
 		}
 		unlock()
 	}
@@ -811,6 +815,9 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 		case errors.Is(err, ErrSessionEnded), errors.Is(err, ErrAdminRefused):
 			// No session (the operator's refusal included): retire-status
 			// and retire-post stay open to a device that signs.
+			if nerr := s.noteAdminRefusal(err); nerr != nil {
+				return pending, fmt.Errorf("%w: %w", ErrLogoutPending, nerr)
+			}
 			outcome, err := s.retireStatus(ctx, r, auth, j, outside, v, errors.Is(err, ErrAdminRefused))
 			if err != nil {
 				return pending, err
@@ -843,11 +850,17 @@ func (s *Store) resolveRetirement(ctx context.Context, r Retirer, j *retireJourn
 				return err
 			}
 			_, err := r.Post(ctx, auth, w)
-			if errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrAdminRefused) {
-				_, err = r.RetirePost(ctx, auth, w)
-			}
 			return err
 		})
+		if errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrAdminRefused) {
+			if nerr := s.noteAdminRefusal(err); nerr != nil {
+				return pending, fmt.Errorf("%w: %w", ErrLogoutPending, nerr)
+			}
+			err = outside(func() error {
+				_, err := r.RetirePost(ctx, auth, w)
+				return err
+			})
+		}
 		if err != nil && !errors.Is(err, ErrHeadConflict) && !errors.Is(err, ErrSessionEnded) && !errors.Is(err, ErrAdminRefused) {
 			return pending, fmt.Errorf("%w: %w", ErrLogoutPending, err)
 		}
@@ -1007,6 +1020,9 @@ func (s *Store) retireStatus(ctx context.Context, r Retirer, auth DeviceAuth, j 
 		return "", nil
 	}
 	if err := outside(func() error { return r.Reauthenticate(ctx, auth) }); err != nil {
+		if nerr := s.noteAdminRefusal(err); nerr != nil {
+			err = errors.Join(err, nerr)
+		}
 		return "", fmt.Errorf("%w: %w", ErrLogoutPending, err)
 	}
 	return "", nil

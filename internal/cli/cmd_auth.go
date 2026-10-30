@@ -569,9 +569,15 @@ func printLogin(e *Env, asJSON bool, method string, res *authflow.LoginResult) e
 	entries, _ := store.ReadPredecessors(dataDir)
 	devs, devErr := s.Devices()
 	r.OldDevices = oldDevices(entries, r.AccountID, devs, devErr == nil)
-	defer settleOldDevices(dataDir, entries, r.AccountID, devs, devErr == nil)
+	// Settled once the report is out: a sign-in cut short before that
+	// leaves the entries unreported for hop auth status to show.
+	settle := func() { _ = settleOldDevices(dataDir, entries, r.AccountID, devs, devErr == nil) }
 	if asJSON {
-		return printJSON(e, r)
+		if err := printJSON(e, r); err != nil {
+			return err
+		}
+		settle()
+		return nil
 	}
 	e.printf("Signed in to %s as %s.\n", oneLine(r.Server), fmtDevice(name, id))
 	if m := res.Merge; m != nil {
@@ -589,6 +595,7 @@ func printLogin(e *Env, asJSON bool, method string, res *authflow.LoginResult) e
 	}
 	e.printf("The hop daemon keeps this device in sync from now on.\n")
 	printOldDevices(e, r.OldDevices)
+	settle()
 	return nil
 }
 
@@ -761,6 +768,17 @@ type AuthStatus struct {
 }
 
 func runAuthStatus(ctx context.Context, e *Env, args []string) error {
+	var settle func()
+	err := authStatus(ctx, e, args, &settle)
+	if err == nil && settle != nil {
+		settle() // the advice about earlier identities is consumed once it is out
+	}
+	return err
+}
+
+// authStatus is runAuthStatus; it sets *settle to what to run once the
+// report is printed.
+func authStatus(ctx context.Context, e *Env, args []string, settle *func()) error {
 	fs := newFlags(e, "auth status", authCommands["status"].usage)
 	var o authOpts
 	o.jsonFlag(fs)
@@ -842,7 +860,7 @@ func runAuthStatus(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 	if a.AccountID != "" {
-		a.OldDevices = statusOldDevices(ctx, e, c, a.AccountID, !a.Locked)
+		a.OldDevices, *settle = statusOldDevices(ctx, e, c, a.AccountID, !a.Locked)
 	}
 	if o.asJSON {
 		return printJSON(e, a)
@@ -1293,7 +1311,7 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	if res.Discarded > 0 {
 		e.printf("%d queued change(s) were discarded.\n", res.Discarded)
 	}
-	printLogoutNext(e, res, id, lock != nil)
+	printLogoutNext(e, res, id, lock != nil || res.Why != "")
 	return nil
 }
 

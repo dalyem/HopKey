@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/dalyem/hopkey/internal/canonjson"
+	"github.com/dalyem/hopkey/internal/filelock"
 	"github.com/dalyem/hopkey/internal/model"
 )
 
@@ -21,7 +22,7 @@ import (
 //
 //	vault/retire-note.json = JCS({"v":1, "server":s, "email":s, "queued":n, "held":n, "why":""|"device_blocked"|"account_disabled"})
 //	predecessor.json       = JCS({"v":1, "entries":[{"account_id":id, "device_id":id, "server":s, "email":s,
-//	                              "outcome":"committed"|"departed"|"unknown", "queued":n, "held":n, "why":..., "at":ts}]})
+//	                              "outcome":"committed"|"departed"|"unknown", "queued":n, "held":n, "why":..., "reported":""|"yes", "at":ts}]})
 //
 // The note is written in the same commit as the retirement journal, so
 // the journal never exists without it. The cleanup of a RETIRED logout
@@ -32,10 +33,21 @@ import (
 // operator's refusal (LogoutOptions.Why); an ordinary logout leaves none.
 // Both files are plain: they hold what device.json and server.json
 // already hold, and counts.
+//
+// The operator's refusal can also come to light after the logout began
+// (no daemon was running to ask, or the first attempt went to a server
+// that was not refusing): the retirement then records it in the note
+// before the logout can finish. Every read-modify-write of
+// predecessor.json runs under predecessor.lock in the data directory, so
+// that a sign-in, a status and a logout in different processes never lose
+// each other's entries. An entry carries "reported" once a command has
+// told the user about it; the commands that consume an entry
+// (hop auth status) show it first when it was never reported.
 
 const (
 	retireNoteRel      = "retire-note.json"
 	predecessorName    = "predecessor.json"
+	predecessorLock    = "predecessor.lock"
 	predecessorVersion = 1
 	retireNoteVersion  = 1
 	// maxPredecessors bounds the entries kept: the newest win.
@@ -58,7 +70,8 @@ type retireNote struct {
 // told: the device may still be in the account). Queued and Held are the
 // changes the logout discarded, the held ones among them. Why is
 // AdminDeviceBlocked or AdminAccountDisabled when the operator's refusal
-// had locked the device, and "" otherwise.
+// had locked the device, and "" otherwise. Reported is "yes" once a
+// command has shown the user what became of the identity, and "" before.
 type Predecessor struct {
 	AccountID model.ID        `json:"account_id"`
 	DeviceID  model.ID        `json:"device_id"`
@@ -68,7 +81,29 @@ type Predecessor struct {
 	Queued    int             `json:"queued"`
 	Held      int             `json:"held"`
 	Why       string          `json:"why,optional"`
+	Reported  string          `json:"reported,optional"`
 	At        model.Timestamp `json:"at"`
+}
+
+// predecessorReported is the value of Predecessor.Reported.
+const predecessorReported = "yes"
+
+// IsReported says whether the user has been told about this identity.
+func (p Predecessor) IsReported() bool { return p.Reported == predecessorReported }
+
+// predecessorRMWHook is a test seam: it runs between the read and the
+// write of a read-modify-write of predecessor.json, with the lock held.
+var predecessorRMWHook func()
+
+// lockPredecessors takes the lock that serializes every read-modify-write
+// of predecessor.json, across processes. It does not nest: a caller must
+// not hold it already.
+func lockPredecessors(dataDir string) (func(), error) {
+	f, err := filelock.Lock(filepath.Join(dataDir, predecessorLock))
+	if err != nil {
+		return nil, err
+	}
+	return func() { f.Close() }, nil
 }
 
 type predecessorFile struct {
@@ -117,6 +152,11 @@ func writePredecessors(dataDir string, entries []Predecessor) error {
 // record that does not parse is replaced: it must not keep a logout from
 // finishing.
 func recordPredecessor(dataDir string, p Predecessor) error {
+	unlock, err := lockPredecessors(dataDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	entries, err := ReadPredecessors(dataDir)
 	if err != nil && !errors.Is(err, ErrCorrupt) {
 		return err
@@ -129,6 +169,11 @@ func recordPredecessor(dataDir string, p Predecessor) error {
 // identity is settled (it is revoked, or no longer in the account). An
 // entry that is not there is no error.
 func ForgetPredecessor(dataDir string, id model.ID) error {
+	unlock, err := lockPredecessors(dataDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	entries, err := ReadPredecessors(dataDir)
 	if errors.Is(err, ErrCorrupt) {
 		return writePredecessors(dataDir, nil)
@@ -136,11 +181,45 @@ func ForgetPredecessor(dataDir string, id model.ID) error {
 	if err != nil {
 		return err
 	}
+	if predecessorRMWHook != nil {
+		predecessorRMWHook()
+	}
 	kept := slices.DeleteFunc(slices.Clone(entries), func(e Predecessor) bool { return e.DeviceID == id })
 	if len(kept) == len(entries) {
 		return nil
 	}
 	return writePredecessors(dataDir, kept)
+}
+
+// MarkPredecessorReported records that the user has been told about the
+// entry for device id. An entry that is not there is no error.
+func MarkPredecessorReported(dataDir string, id model.ID) error {
+	unlock, err := lockPredecessors(dataDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	entries, err := ReadPredecessors(dataDir)
+	if errors.Is(err, ErrCorrupt) {
+		return writePredecessors(dataDir, nil)
+	}
+	if err != nil {
+		return err
+	}
+	if predecessorRMWHook != nil {
+		predecessorRMWHook()
+	}
+	changed := false
+	for i := range entries {
+		if entries[i].DeviceID == id && !entries[i].IsReported() {
+			entries[i].Reported = predecessorReported
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return writePredecessors(dataDir, entries)
 }
 
 func knownWhy(why string) string {
@@ -188,6 +267,38 @@ func (s *Store) readRetireNote() *retireNote {
 	return &n
 }
 
+// noteAdminRefusal records, in the note of the logout under way, that the
+// server's operator refused this device (err matches ErrAdminRefused),
+// when the note does not say so already. The refusal may be found after
+// the logout began: with no daemon running, nothing could say it at the
+// start. A note that is gone or unreadable is left alone. It is its own
+// commit, durable before the retirement goes on, so that the cleanup moves
+// it into predecessor.json whatever happens next. The caller holds s.mu.
+func (s *Store) noteAdminRefusal(err error) error {
+	var a *AdminRefusal
+	if !errors.As(err, &a) || knownWhy(a.Code) == "" {
+		return nil
+	}
+	unlock, err := s.lockFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	n := s.readRetireNote()
+	if n == nil || n.Why != "" {
+		return nil
+	}
+	n.Why = a.Code
+	if err := s.hook("retire:note"); err != nil {
+		return err
+	}
+	t := &txn{}
+	if err := putRetireNote(t, *n); err != nil {
+		return err
+	}
+	return s.commitTxn(t)
+}
+
 // recordLogoutPredecessor moves the note of RETIRED logout j into
 // predecessor.json, if the logout earns one: the server was not told, or
 // the operator's refusal had locked the device. It is idempotent, and
@@ -197,6 +308,9 @@ func (s *Store) recordLogoutPredecessor(j *retireJournal) error {
 	n := s.readRetireNote()
 	if n == nil || (j.Outcome != OutcomeUnknown && n.Why == "") {
 		return nil
+	}
+	if err := s.hook("retire:predecessor"); err != nil {
+		return err
 	}
 	return recordPredecessor(s.l.data, Predecessor{
 		AccountID: j.AccountID, DeviceID: j.DeviceID, Server: n.Server, Email: n.Email,

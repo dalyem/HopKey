@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/vaultlog"
@@ -159,7 +161,7 @@ func TestPendingLogoutKeepsItsNoteThroughLocalOnly(t *testing.T) {
 // exactly one note: it is written before the first thing is deleted, and
 // the resumed cleanup rewrites it without duplicating it.
 func TestPredecessorSurvivesACrashInTheCleanup(t *testing.T) {
-	for _, stage := range []string{"retire:outbox", "retire:cache", "retire:device", "retire:journal"} {
+	for _, stage := range []string{"retire:predecessor", "retire:outbox", "retire:cache", "retire:device", "retire:journal"} {
 		t.Run(stage, func(t *testing.T) {
 			ctx := context.Background()
 			f, _ := retireFixture(t)
@@ -288,5 +290,245 @@ func TestHeldChangesAreCountedAndRecorded(t *testing.T) {
 	loggedOut(t, p.a.cfg, who)
 	if got := onlyPredecessor(t, p.a.cfg); got.Queued != 2 || got.Held != 1 {
 		t.Errorf("predecessor %+v", got)
+	}
+}
+
+// The operator's refusal can be found by the retirement itself: with no
+// daemon running, nothing told the logout (Why is empty). The retirement
+// records it in the note before it goes on, so the cleanup moves it into
+// predecessor.json.
+func TestRefusalFoundByTheRetirementIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	f, srv := retireFixture(t)
+	who := idsOf(t, f.cfg)
+	newCredential(t, f.s, "queued")
+	res, err := f.s.Logout(ctx, blockedRetirer{retirer{srv}}, LogoutOptions{DiscardPending: true})
+	if err != nil || !res.Done || res.Outcome != OutcomeCommitted || res.Why != AdminDeviceBlocked {
+		t.Fatalf("logout: %+v, %v", res, err)
+	}
+	loggedOut(t, f.cfg, who)
+	if p := onlyPredecessor(t, f.cfg); p.Why != AdminDeviceBlocked || p.Outcome != OutcomeCommitted || p.Queued != 1 || p.DeviceID != who.dev {
+		t.Errorf("predecessor %+v; want the refusal the retirement met", p)
+	}
+}
+
+// The same when the first attempt could not reach the server and the
+// refusal comes on a later one, from a new process.
+func TestRefusalMetOnAResumedLogoutIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	f, srv := retireFixture(t)
+	who := idsOf(t, f.cfg)
+	srv.down = errDown
+	if _, err := f.s.Logout(ctx, retirer{srv}, LogoutOptions{}); !errors.Is(err, ErrLogoutPending) {
+		t.Fatalf("logout with the server down: %v", err)
+	}
+	srv.down = nil
+	s, err := tryOpen(t, f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, err := s.Logout(ctx, blockedRetirer{retirer{srv}}, LogoutOptions{}); err != nil || !res.Done || res.Outcome != OutcomeCommitted {
+		t.Fatalf("resumed logout: %+v, %v", res, err)
+	}
+	loggedOut(t, f.cfg, who)
+	if p := onlyPredecessor(t, f.cfg); p.Why != AdminDeviceBlocked || p.Outcome != OutcomeCommitted {
+		t.Errorf("predecessor %+v", p)
+	}
+}
+
+// postRefusedRetirer reads history normally and refuses only the post of
+// the retirement, as a disabled account does after the session was
+// granted.
+type postRefusedRetirer struct{ retirer }
+
+func (p postRefusedRetirer) Post(context.Context, DeviceAuth, *vaultlog.Wire) (vaultlog.Head, error) {
+	return vaultlog.Head{}, &AdminRefusal{Code: AdminAccountDisabled}
+}
+
+func TestRefusalOnThePostIsRecorded(t *testing.T) {
+	ctx := context.Background()
+	f, srv := retireFixture(t)
+	who := idsOf(t, f.cfg)
+	res, err := f.s.Logout(ctx, postRefusedRetirer{retirer{srv}}, LogoutOptions{})
+	if err != nil || !res.Done || res.Outcome != OutcomeCommitted {
+		t.Fatalf("logout: %+v, %v", res, err)
+	}
+	loggedOut(t, f.cfg, who)
+	if p := onlyPredecessor(t, f.cfg); p.Why != AdminAccountDisabled || p.Outcome != OutcomeCommitted {
+		t.Errorf("predecessor %+v", p)
+	}
+}
+
+// lostAckRetirer is a blocked device whose retirement the server commits
+// and whose acknowledgement is lost.
+type lostAckRetirer struct{ blockedRetirer }
+
+func (l lostAckRetirer) RetirePost(ctx context.Context, auth DeviceAuth, w *vaultlog.Wire) (vaultlog.Head, error) {
+	if _, err := l.blockedRetirer.retirer.RetirePost(ctx, auth, w); err != nil {
+		return vaultlog.Head{}, err
+	}
+	return vaultlog.Head{}, errLostResponse
+}
+
+// The server commits the retirement and the answer is lost; the user
+// finishes with --local-only. The outcome is unknown, yet the device is
+// gone from the account and the refusal the retirement met is still
+// recorded, so the next sign-in can say to rotate.
+func TestCommittedRetirementWithALostAnswerThenLocalOnlyKeepsTheRefusal(t *testing.T) {
+	ctx := context.Background()
+	f, srv := retireFixture(t)
+	who := idsOf(t, f.cfg)
+	if _, err := f.s.Logout(ctx, lostAckRetirer{blockedRetirer{retirer{srv}}}, LogoutOptions{}); !errors.Is(err, ErrLogoutPending) || !errors.Is(err, errLostResponse) {
+		t.Fatalf("logout with a lost answer: %v", err)
+	}
+	if how := retiredOnServer(t, srv, who.dev); how != "retired" {
+		t.Fatalf("the server says %q; the retirement was committed", how)
+	}
+	s, err := tryOpen(t, f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Logout(ctx, nil, LogoutOptions{LocalOnly: true})
+	if err != nil || !res.Done || res.Outcome != OutcomeUnknown {
+		t.Fatalf("--local-only: %+v, %v", res, err)
+	}
+	loggedOut(t, f.cfg, who)
+	if p := onlyPredecessor(t, f.cfg); p.Outcome != OutcomeUnknown || p.Why != AdminDeviceBlocked {
+		t.Errorf("predecessor %+v; want unknown, device_blocked", p)
+	}
+}
+
+// crashAfterNote fails stage the first time it is reached after the
+// refusal began to be recorded, or the recording itself when stage is
+// retire:note.
+func crashAfterNote(stage string) func(string) error {
+	armed, done := false, false
+	return func(s string) error {
+		if done {
+			return nil
+		}
+		if s == "retire:note" {
+			armed = true
+			if stage == s {
+				done = true
+				return errCrash
+			}
+			return nil
+		}
+		if armed && s == stage {
+			done = true
+			return errCrash
+		}
+		return nil
+	}
+}
+
+// A crash or a failed fsync anywhere in the commit that records the
+// refusal leaves the logout pending, not finished and not corrupt: the
+// next attempt, from a new process, replays what was journaled, meets the
+// refusal again and ends with it recorded.
+func TestCrashWhileRecordingTheRefusalIsResumed(t *testing.T) {
+	for _, stage := range []string{"retire:note", "wal:before", "wal:install", "wal:install:sync", "wal:written",
+		"wal:op:0", "wal:op:0:sync", "wal:applied", "wal:removed"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx := context.Background()
+			f, srv := retireFixture(t)
+			who := idsOf(t, f.cfg)
+			f.s.testHook = crashAfterNote(stage)
+			if _, err := f.s.Logout(ctx, blockedRetirer{retirer{srv}}, LogoutOptions{}); !errors.Is(err, errCrash) || !errors.Is(err, ErrLogoutPending) {
+				t.Fatalf("logout: %v; want the crash to leave it pending", err)
+			}
+			s, err := tryOpen(t, f.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res, err := s.Logout(ctx, blockedRetirer{retirer{srv}}, LogoutOptions{}); err != nil || !res.Done || res.Outcome != OutcomeCommitted {
+				t.Fatalf("resumed logout: %+v, %v", res, err)
+			}
+			loggedOut(t, f.cfg, who)
+			if p := onlyPredecessor(t, f.cfg); p.Why != AdminDeviceBlocked || p.DeviceID != who.dev {
+				t.Errorf("predecessor %+v", p)
+			}
+		})
+	}
+}
+
+// Every read-modify-write of predecessor.json is serialized, so a forget
+// that read the record before another process appended an entry cannot
+// write it back without that entry. The hook runs a concurrent append
+// between the forget's read and its write: the append must wait for the
+// forget and land after it.
+func TestPredecessorWritesAreSerialized(t *testing.T) {
+	acct := model.ID{1}
+	mk := func(n byte) Predecessor {
+		return Predecessor{AccountID: acct, DeviceID: model.ID{2, n}, Server: "https://hop.example", Email: "a@example.com",
+			Outcome: OutcomeUnknown, Why: AdminDeviceBlocked, At: model.Timestamp(1000 + int64(n))}
+	}
+	for name, op := range map[string]func(dir string, old Predecessor) error{
+		"forget": func(dir string, old Predecessor) error { return ForgetPredecessor(dir, old.DeviceID) },
+		"mark":   func(dir string, old Predecessor) error { return MarkPredecessorReported(dir, old.DeviceID) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			oldE, newE := mk(1), mk(2)
+			if err := recordPredecessor(dir, oldE); err != nil {
+				t.Fatal(err)
+			}
+			finished := make(chan struct{})
+			var appendErr error
+			predecessorRMWHook = func() {
+				predecessorRMWHook = nil
+				go func() {
+					appendErr = recordPredecessor(dir, newE)
+					close(finished)
+				}()
+				// Unserialized, the append is done well within this.
+				select {
+				case <-finished:
+				case <-time.After(300 * time.Millisecond):
+				}
+			}
+			t.Cleanup(func() { predecessorRMWHook = nil })
+			if err := op(dir, oldE); err != nil {
+				t.Fatal(err)
+			}
+			<-finished
+			if appendErr != nil {
+				t.Fatal(appendErr)
+			}
+			got, err := ReadPredecessors(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(got, func(e Predecessor) bool { return e.DeviceID == newE.DeviceID }) {
+				t.Errorf("the entry appended during the %s was lost: %+v", name, got)
+			}
+		})
+	}
+}
+
+// An entry is unreported until a command has shown it; marking is
+// idempotent, an entry that is not there is no error, and a record
+// written before the mark existed still parses.
+func TestPredecessorReportedMark(t *testing.T) {
+	dir := t.TempDir()
+	p := Predecessor{AccountID: model.ID{1}, DeviceID: model.ID{2, 1}, Server: "https://hop.example", Email: "a@example.com",
+		Outcome: OutcomeUnknown, Why: AdminDeviceBlocked, At: 1000}
+	if err := recordPredecessor(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ReadPredecessors(dir); len(got) != 1 || got[0].IsReported() {
+		t.Fatalf("a new entry: %+v", got)
+	}
+	for i := 0; i < 2; i++ {
+		if err := MarkPredecessorReported(dir, p.DeviceID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := MarkPredecessorReported(dir, model.ID{9}); err != nil {
+		t.Errorf("marking an unknown device: %v", err)
+	}
+	if got, _ := ReadPredecessors(dir); len(got) != 1 || !got[0].IsReported() || got[0].Why != AdminDeviceBlocked {
+		t.Errorf("after marking: %+v", got)
 	}
 }

@@ -425,3 +425,42 @@ func TestSealedDeviceKeyLogoutOfABlockedDevice(t *testing.T) {
 		t.Fatalf("after the logout: vault %v, predecessors %+v", hasVault(t, m), ps)
 	}
 }
+
+// The operator blocks the device while no daemon runs, so nothing meets
+// the refusal before the logout and the CLI has no lock to record. The
+// retirement meets it, records it in the note, and the logout still
+// leaves the rotate advice for the next sign-in.
+func TestBlockedDeviceLogoutWithNoDaemonStillAdvisesRotate(t *testing.T) {
+	m, sk := signedUpWithKey(t)
+	w := m.w
+	old := m.authStatus(t).DeviceID
+	waitFor(t, 20*time.Second, "the queue drains", func() bool { return m.syncState(t).Pending == 0 })
+	blockOnServer(t, w, old)
+	m.mu.Lock()
+	if m.d != nil {
+		m.d.Close()
+	}
+	m.mu.Unlock()
+	m.noDaemon.Store(true)
+
+	s := &session{}
+	if code := m.hop(t, s, "logout", "--yes"); code != 0 {
+		t.Fatalf("logout: exit %d: %s", code, s.stderr.String())
+	}
+	mustContain(t, "the logout", s.stdout.String(), "Logged out", "hop auth login", "hop auth rotate")
+	ps := predecessors(t, m)
+	if len(ps) != 1 || ps[0].DeviceID.String() != old || ps[0].Outcome != store.OutcomeCommitted || ps[0].Why != store.AdminDeviceBlocked {
+		t.Fatalf("predecessors %+v; the refusal the retirement met was not kept", ps)
+	}
+
+	m.noDaemon.Store(false)
+	login, run := passwordLogin(m, sk, "fresh")
+	if code := run(t); code != 0 {
+		t.Fatalf("login: exit %d: %s", code, login.stderr.String())
+	}
+	mustContain(t, "the login", login.stdout.String(), "Before this sign-in, this machine was device "+old, "blocked by the server's operator",
+		"That logout removed it from the account", "hop auth rotate", "hop key rotate")
+	if ps := predecessors(t, m); len(ps) != 0 {
+		t.Errorf("the note was not consumed: %+v", ps)
+	}
+}

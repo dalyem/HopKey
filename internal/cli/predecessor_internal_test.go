@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,16 +128,7 @@ func TestSettleOldDevices(t *testing.T) {
 	still, gone := predecessorOf(1, store.OutcomeUnknown, "", 0, 0), predecessorOf(2, store.OutcomeCommitted, store.AdminDeviceBlocked, 0, 0)
 	other := predecessorOf(3, store.OutcomeUnknown, "", 0, 0)
 	other.AccountID = model.ID{9}
-	b, err := canonjson.Marshal(struct {
-		V       int                 `json:"v"`
-		Entries []store.Predecessor `json:"entries"`
-	}{1, []store.Predecessor{still, gone, other}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "predecessor.json"), b, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writePredecessorFile(t, dir, still, gone, other)
 	entries, _ := store.ReadPredecessors(dir)
 	active := []store.DeviceListing{{ID: still.DeviceID}}
 	if err := settleOldDevices(dir, entries, model.ID{1}.String(), active, false); err != nil {
@@ -151,5 +143,155 @@ func TestSettleOldDevices(t *testing.T) {
 	got, _ := store.ReadPredecessors(dir)
 	if len(got) != 2 || got[0].DeviceID != still.DeviceID || got[1].DeviceID != other.DeviceID {
 		t.Fatalf("after settling: %+v", got)
+	}
+	// What stays has been reported; another account's entry was not.
+	if !got[0].IsReported() || got[1].IsReported() {
+		t.Errorf("reported marks after settling: %+v", got)
+	}
+}
+
+func writePredecessorFile(t *testing.T, dir string, entries ...store.Predecessor) {
+	t.Helper()
+	b, err := canonjson.Marshal(struct {
+		V       int                 `json:"v"`
+		Entries []store.Predecessor `json:"entries"`
+	}{1, entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "predecessor.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The server committed the old device's retirement but the answer was
+// lost, and the logout was finished with --local-only: the outcome is
+// unknown, the device is gone from the account, and the operator had
+// locked it out. The sign-in still says to rotate, in text and in JSON,
+// and does not claim nothing is left to do.
+func TestOldDeviceGoneAfterALostAnswerStillAdvisesRotate(t *testing.T) {
+	acct := model.ID{1}.String()
+	p := predecessorOf(1, store.OutcomeUnknown, store.AdminDeviceBlocked, 2, 0)
+	rs := oldDevices([]store.Predecessor{p}, acct, []store.DeviceListing{{ID: model.ID{7}, This: true}}, true)
+	if len(rs) != 1 || rs[0].StillInAccount || rs[0].Command != "hop auth rotate" || rs[0].Outcome != store.OutcomeUnknown || rs[0].Why != store.AdminDeviceBlocked {
+		t.Fatalf("report %+v", rs)
+	}
+	var out strings.Builder
+	printOldDevices(&Env{Stdout: &out}, rs)
+	got := out.String()
+	for _, w := range []string{"is not in the account now", "    hop auth rotate\n", "keep only the devices you trust", "hop key rotate", "The 2 change(s) it had queued"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("the text lacks %q:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "nothing is left to cut off") {
+		t.Errorf("the text says nothing is left to do:\n%s", got)
+	}
+	b, err := json.Marshal(loginReport{OldDevices: rs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []string{`"outcome":"unknown"`, `"why":"device_blocked"`, `"still_in_account":false`, `"command":"hop auth rotate"`} {
+		if !strings.Contains(string(b), w) {
+			t.Errorf("the JSON lacks %s: %s", w, b)
+		}
+	}
+	// With no reason on record the same absent device needs nothing.
+	q := predecessorOf(2, store.OutcomeUnknown, "", 0, 0)
+	if rs := oldDevices([]store.Predecessor{q}, acct, nil, true); len(rs) != 1 || rs[0].Command != "" {
+		t.Errorf("an absent device with no reason: %+v", rs)
+	}
+}
+
+// hop auth status shows the advice for a retired old device before it
+// consumes the entry: a sign-in that installed the new identity and
+// stopped before it printed leaves the entry unreported, and the status
+// that follows shows it, once. Entries with nothing to say, or already
+// shown, are forgotten once the device list is known; nothing is
+// forgotten without it.
+func TestStatusShowsUnreportedAdviceBeforeConsumingIt(t *testing.T) {
+	dir := t.TempDir()
+	acct := model.ID{1}.String()
+	active := []store.DeviceListing{{ID: model.ID{7}, This: true}}
+	retired := predecessorOf(1, store.OutcomeUnknown, store.AdminDeviceBlocked, 0, 0)
+	writePredecessorFile(t, dir, retired)
+	entries, _ := store.ReadPredecessors(dir)
+
+	// Without the device list nothing is forgotten (the entry shows,
+	// because the logout did not tell the server).
+	if _, done := reportOldDevices(dir, entries, acct, nil, false); done == nil {
+		t.Fatal("no settle function")
+	}
+	if got, _ := store.ReadPredecessors(dir); len(got) != 1 {
+		t.Fatalf("an entry was forgotten without a device list: %+v", got)
+	}
+
+	// The sign-in was interrupted before it reported: status shows it and
+	// still keeps it until the output is out.
+	shown, done := reportOldDevices(dir, entries, acct, active, true)
+	if len(shown) != 1 || shown[0].Command != "hop auth rotate" || shown[0].StillInAccount {
+		t.Fatalf("status shows %+v; want the rotate advice", shown)
+	}
+	if lines := strings.Join(oldDeviceLines(shown), "\n"); !strings.Contains(lines, "hop auth rotate") || !strings.Contains(lines, retired.DeviceID.String()) {
+		t.Errorf("status lines:\n%s", lines)
+	}
+	if got, _ := store.ReadPredecessors(dir); len(got) != 1 || got[0].IsReported() {
+		t.Fatalf("status consumed the entry before showing it: %+v", got)
+	}
+	// If the output never made it, the next status shows it again.
+	if again, _ := reportOldDevices(dir, entries, acct, active, true); len(again) != 1 {
+		t.Fatalf("a status that never printed consumed the advice: %+v", again)
+	}
+	done()
+	if got, _ := store.ReadPredecessors(dir); len(got) != 1 || !got[0].IsReported() {
+		t.Fatalf("after printing: %+v", got)
+	}
+	// Shown once: the next status forgets it without showing it.
+	entries, _ = store.ReadPredecessors(dir)
+	if again, _ := reportOldDevices(dir, entries, acct, active, true); len(again) != 0 {
+		t.Errorf("the advice is shown twice: %+v", again)
+	}
+	if got, _ := store.ReadPredecessors(dir); len(got) != 0 {
+		t.Errorf("the reported entry was not forgotten: %+v", got)
+	}
+
+	// An absent identity with nothing to say is forgotten at once; one
+	// still in the account is shown every time and kept.
+	plain, still := predecessorOf(2, store.OutcomeUnknown, "", 0, 0), predecessorOf(3, store.OutcomeUnknown, store.AdminDeviceBlocked, 0, 0)
+	writePredecessorFile(t, dir, plain, still)
+	entries, _ = store.ReadPredecessors(dir)
+	for i := 0; i < 2; i++ {
+		shown, done := reportOldDevices(dir, entries, acct, append(active, store.DeviceListing{ID: still.DeviceID}), true)
+		if len(shown) != 1 || !shown[0].StillInAccount || shown[0].DeviceID != still.DeviceID.String() {
+			t.Fatalf("round %d: status shows %+v", i, shown)
+		}
+		done()
+		entries, _ = store.ReadPredecessors(dir)
+		if len(entries) != 1 || entries[0].DeviceID != still.DeviceID {
+			t.Fatalf("round %d: kept %+v", i, entries)
+		}
+	}
+}
+
+// The sign-in's own settling marks what it printed reported and forgets
+// the identities that are out of the account, so the status that follows
+// does not repeat the advice.
+func TestLoginSettlingMarksWhatItPrinted(t *testing.T) {
+	dir := t.TempDir()
+	acct := model.ID{1}.String()
+	retired := predecessorOf(1, store.OutcomeUnknown, store.AdminDeviceBlocked, 0, 0)
+	still := predecessorOf(2, store.OutcomeUnknown, "", 0, 0)
+	writePredecessorFile(t, dir, retired, still)
+	entries, _ := store.ReadPredecessors(dir)
+	active := []store.DeviceListing{{ID: still.DeviceID}}
+	if err := settleOldDevices(dir, entries, acct, active, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.ReadPredecessors(dir)
+	if len(got) != 1 || got[0].DeviceID != still.DeviceID || !got[0].IsReported() {
+		t.Fatalf("after the login: %+v", got)
+	}
+	if shown, _ := reportOldDevices(dir, got, acct, active, true); len(shown) != 1 || !shown[0].StillInAccount {
+		t.Errorf("status after the login shows %+v", shown)
 	}
 }
