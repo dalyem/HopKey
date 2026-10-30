@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"modernc.org/sqlite"
@@ -21,7 +22,7 @@ import (
 
 // schemaVersion is stored in meta; Open refuses a database from a newer
 // server and moves an older one forward (migrate).
-const schemaVersion = "4"
+const schemaVersion = "5"
 
 // schema is the multi-tenant SQLite schema. IDs and digests are BLOBs of
 // their raw bytes; times are Unix seconds.
@@ -171,7 +172,7 @@ CREATE TABLE IF NOT EXISTS enroll_messages (
 	body      BLOB NOT NULL,
 	PRIMARY KEY (enroll_id, n)
 ) STRICT;
-` + schemaV3 + schemaV4
+` + schemaV3 + schemaV4 + schemaV5
 
 // schemaV3 is what version 3 added: the admin audit trail. account_id is
 // not a foreign key, so a row outlives its account.
@@ -207,6 +208,56 @@ CREATE TABLE IF NOT EXISTS device_blocks (
 	reason     TEXT NOT NULL,
 	PRIMARY KEY (account_id, device_id)
 ) STRICT;
+`
+
+// schemaV5 is what version 5 added: account delete. A delete_fences row
+// is a delete in progress (hop-server accounts delete): from the fence to
+// the delete, the account's head stays where the fence recorded it. Once
+// an account is deleted, its account and vault IDs stay in deleted_ids
+// for good: the triggers refuse an account or vault row with a deleted
+// account or vault ID on every insertion path, so an ID is never reused.
+// Neither table is a foreign key.
+const schemaV5 = `
+CREATE TABLE IF NOT EXISTS delete_fences (
+	account_id BLOB PRIMARY KEY,
+	fence_id   BLOB NOT NULL,
+	vault_id   BLOB NOT NULL,
+	fenced_at  INTEGER NOT NULL,
+	head_seq   INTEGER NOT NULL,
+	head_h     BLOB NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS deleted_ids (
+	kind       TEXT NOT NULL,
+	id         BLOB NOT NULL,
+	account_id BLOB NOT NULL,
+	deleted_at INTEGER NOT NULL,
+	PRIMARY KEY (kind, id, account_id)
+) STRICT;
+
+CREATE TRIGGER IF NOT EXISTS accounts_insert_deleted BEFORE INSERT ON accounts
+WHEN EXISTS (SELECT 1 FROM deleted_ids WHERE kind IN ('account', 'vault') AND id IN (NEW.account_id, NEW.vault_id))
+BEGIN
+	SELECT RAISE(ABORT, 'the ID of a deleted account or vault');
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounts_update_deleted BEFORE UPDATE OF account_id, vault_id ON accounts
+WHEN EXISTS (SELECT 1 FROM deleted_ids WHERE kind IN ('account', 'vault') AND id IN (NEW.account_id, NEW.vault_id))
+BEGIN
+	SELECT RAISE(ABORT, 'the ID of a deleted account or vault');
+END;
+
+CREATE TRIGGER IF NOT EXISTS vaults_insert_deleted BEFORE INSERT ON vaults
+WHEN EXISTS (SELECT 1 FROM deleted_ids WHERE kind IN ('account', 'vault') AND id IN (NEW.vault_id, NEW.account_id))
+BEGIN
+	SELECT RAISE(ABORT, 'the ID of a deleted account or vault');
+END;
+
+CREATE TRIGGER IF NOT EXISTS vaults_update_deleted BEFORE UPDATE OF vault_id, account_id ON vaults
+WHEN EXISTS (SELECT 1 FROM deleted_ids WHERE kind IN ('account', 'vault') AND id IN (NEW.vault_id, NEW.account_id))
+BEGIN
+	SELECT RAISE(ABORT, 'the ID of a deleted account or vault');
+END;
 `
 
 // SQLite is the Store backed by one SQLite database in WAL mode. Writes go
@@ -253,11 +304,12 @@ func OpenSQLite(path string) (*SQLite, error) {
 
 // migrate creates any missing table and records or checks the schema
 // version, in one write transaction, so two processes opening the same file
-// cannot both migrate it. Every table is CREATE IF NOT EXISTS: a version 2
-// database gains admin_audit and the version 4 tables and moves to version
-// 4, and no existing row changes. A database from a newer server is refused before anything is
-// created. A version 3 database gains account_admin and device_blocks the
-// same way. An older server refuses a migrated file; a hop-server backup
+// cannot both migrate it. Every table, index and trigger is CREATE IF NOT
+// EXISTS: a version 2, 3 or 4 database gains what the later versions added
+// (admin_audit; account_admin and device_blocks; delete_fences,
+// deleted_ids and its triggers) and moves to version 5, and no existing
+// row changes. A database from a newer server is refused before anything
+// is created. An older server refuses a migrated file; a hop-server backup
 // taken before upgrading is the way back.
 func (s *SQLite) migrate() error {
 	tx, err := s.w.Begin() // BEGIN IMMEDIATE (_txlock)
@@ -274,7 +326,7 @@ func (s *SQLite) migrate() error {
 	case errors.Is(err, sql.ErrNoRows):
 		_, err = tx.Exec(`INSERT INTO meta (k, v) VALUES ('schema_version', ?)`, []byte(schemaVersion))
 	case err != nil:
-	case string(v) == "2", string(v) == "3":
+	case string(v) == "2", string(v) == "3", string(v) == "4":
 		_, err = tx.Exec(`UPDATE meta SET v = ? WHERE k = 'schema_version'`, []byte(schemaVersion))
 	case string(v) != schemaVersion:
 		err = fmt.Errorf("server: database schema version %q is not %q", v, schemaVersion)
@@ -313,17 +365,48 @@ func (s *SQLite) Update(ctx context.Context, fn func(Tx) error) error {
 	return tx.Commit()
 }
 
-// Backup writes a consistent snapshot with VACUUM INTO.
-func (s *SQLite) Backup(ctx context.Context, path string) error {
+// Backup writes a consistent snapshot with VACUUM INTO, to a new file of
+// mode 0600 (it holds every account), and syncs it to disk, which VACUUM
+// INTO does not. A path that exists is refused; a backup that fails
+// removes what it wrote.
+func (s *SQLite) Backup(ctx context.Context, path string) (err error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Lstat(abs); err == nil {
+	// VACUUM INTO accepts an empty file, and keeps its mode.
+	f, err := os.OpenFile(abs, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("server: backup target %s exists", abs)
 	}
-	_, err = s.w.ExecContext(ctx, `VACUUM INTO ?`, abs)
-	return err
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			os.Remove(abs)
+		}
+	}()
+	if _, err = s.w.ExecContext(ctx, `VACUUM INTO ?`, abs); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(abs))
+}
+
+// syncDir makes a new entry in dir durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 type sqliteTx struct {
@@ -341,7 +424,9 @@ func (t *sqliteTx) row(q string, args ...any) *sql.Row {
 }
 
 // mapErr turns a uniqueness violation into ErrDuplicate and a missing row
-// into ErrNotFound.
+// into ErrNotFound. A deleted account's or vault's ID is unique for good
+// (deleted_ids and its triggers), so a trigger refusing one is a
+// uniqueness violation too.
 func mapErr(err error) error {
 	var se *sqlite.Error
 	switch {
@@ -349,7 +434,8 @@ func mapErr(err error) error {
 		return nil
 	case errors.Is(err, sql.ErrNoRows):
 		return ErrNotFound
-	case errors.As(err, &se) && (se.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE || se.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY):
+	case errors.As(err, &se) && (se.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE || se.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY ||
+		se.Code() == sqlite3.SQLITE_CONSTRAINT_TRIGGER):
 		return fmt.Errorf("%w: %v", ErrDuplicate, err)
 	}
 	return err
@@ -414,7 +500,9 @@ func (t *sqliteTx) AccountTaken(id model.ID, email string, vaultID model.ID) (bo
 	var n int
 	err := t.row(`SELECT
 		(SELECT COUNT(*) FROM accounts WHERE account_id = ? OR email = ? OR vault_id = ?) +
-		(SELECT COUNT(*) FROM vaults WHERE vault_id = ?)`, id[:], email, vaultID[:], vaultID[:]).Scan(&n)
+		(SELECT COUNT(*) FROM vaults WHERE vault_id = ?) +
+		(SELECT COUNT(*) FROM deleted_ids WHERE kind IN ('account', 'vault') AND id IN (?, ?))`,
+		id[:], email, vaultID[:], vaultID[:], id[:], vaultID[:]).Scan(&n)
 	return n > 0, mapErr(err)
 }
 
@@ -538,10 +626,15 @@ func (t *sqliteTx) PutDevice(d *Device) error {
 		d.AccountID[:], d.DeviceID[:], d.SigPK, d.Active, d.AddedSeq)
 }
 
+// SetDeviceSeen writes only for a device that has a devices row: the
+// server writes last seen times later, in the background, and one for an
+// account deleted meanwhile (by another process) must not bring rows of
+// it back.
 func (t *sqliteTx) SetDeviceSeen(accountID, deviceID model.ID, at time.Time) error {
-	return t.exec(`INSERT INTO device_seen (account_id, device_id, seen_at) VALUES (?, ?, ?)
+	return t.exec(`INSERT INTO device_seen (account_id, device_id, seen_at)
+		SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM devices WHERE account_id = ? AND device_id = ?)
 		ON CONFLICT (account_id, device_id) DO UPDATE SET seen_at = max(seen_at, excluded.seen_at)`,
-		accountID[:], deviceID[:], at.Unix())
+		accountID[:], deviceID[:], at.Unix(), accountID[:], deviceID[:])
 }
 
 func (t *sqliteTx) DevicesSeen(accountID model.ID) (map[model.ID]time.Time, error) {
@@ -845,9 +938,10 @@ func (t *sqliteTx) AccountSummaries(only *model.ID) ([]*AccountSummary, error) {
 		(SELECT COUNT(*) FROM devices d WHERE d.account_id = a.account_id AND d.active = 1),
 		(SELECT COUNT(*) FROM devices d WHERE d.account_id = a.account_id),
 		(SELECT MAX(seen_at) FROM device_seen s WHERE s.account_id = a.account_id),
-		x.disabled_at, coalesce(x.disabled_reason, '')
+		x.disabled_at, coalesce(x.disabled_reason, ''), f.fenced_at
 		FROM accounts a LEFT JOIN vaults v ON v.vault_id = a.vault_id
-		LEFT JOIN account_admin x ON x.account_id = a.account_id `+where+`
+		LEFT JOIN account_admin x ON x.account_id = a.account_id
+		LEFT JOIN delete_fences f ON f.account_id = a.account_id `+where+`
 		ORDER BY a.created_at, a.email`, args...)
 	if err != nil {
 		return nil, err
@@ -858,14 +952,17 @@ func (t *sqliteTx) AccountSummaries(only *model.ID) ([]*AccountSummary, error) {
 		var a AccountSummary
 		var id, vid []byte
 		var created int64
-		var seen, disabled sql.NullInt64
+		var seen, disabled, fenced sql.NullInt64
 		var reason string
 		if err := rows.Scan(&id, &a.Email, &vid, &a.UsedBytes, &a.QuotaBytes, &a.Reserve, &created,
-			&a.HeadSeq, &a.LastBootstrap, &a.LastCheckpoint, &a.ActiveDevices, &a.AllDevices, &seen, &disabled, &reason); err != nil {
+			&a.HeadSeq, &a.LastBootstrap, &a.LastCheckpoint, &a.ActiveDevices, &a.AllDevices, &seen, &disabled, &reason, &fenced); err != nil {
 			return nil, err
 		}
 		if disabled.Valid {
 			a.Disabled = &AdminBlock{At: fromUnix(disabled.Int64), Reason: reason}
+		}
+		if fenced.Valid {
+			a.Deleting = fromUnix(fenced.Int64)
 		}
 		if err := errors.Join(scanID(id, &a.ID), scanID(vid, &a.VaultID)); err != nil {
 			return nil, err
@@ -1095,4 +1192,99 @@ func (t *sqliteTx) SetDeviceBlock(accountID, deviceID model.ID, b *AdminBlock) e
 
 func (t *sqliteTx) DeleteLoginTokens(accountID model.ID) error {
 	return t.exec(`DELETE FROM login_tokens WHERE account_id = ?`, accountID[:])
+}
+
+// --- account delete (hop-server accounts delete) ---
+
+func (t *sqliteTx) DeleteFence(accountID model.ID) (*DeleteFence, error) {
+	f := DeleteFence{AccountID: accountID}
+	var id, vid, h []byte
+	var at int64
+	err := t.row(`SELECT fence_id, vault_id, fenced_at, head_seq, head_h FROM delete_fences WHERE account_id = ?`,
+		accountID[:]).Scan(&id, &vid, &at, &f.Head.Seq, &h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	f.At = fromUnix(at)
+	return &f, errors.Join(scanID(id, &f.ID), scanID(vid, &f.VaultID), scanHash(h, &f.Head.H))
+}
+
+func (t *sqliteTx) SetDeleteFence(accountID model.ID, f *DeleteFence) error {
+	if f == nil {
+		return t.exec(`DELETE FROM delete_fences WHERE account_id = ?`, accountID[:])
+	}
+	return t.exec(`INSERT INTO delete_fences (account_id, fence_id, vault_id, fenced_at, head_seq, head_h) VALUES (?, ?, ?, ?, ?, ?)`,
+		f.AccountID[:], f.ID[:], f.VaultID[:], unix(f.At), f.Head.Seq, f.Head.H[:])
+}
+
+// accountRows are an account's rows, table by table, in an order its
+// foreign keys allow deleting them in: what hop-server accounts delete
+// removes. Each where takes one parameter, the account ID or, when
+// byVault, its vault ID. admin_audit and deleted_ids are kept; the
+// registrations kept are the invites the account did not use, and the
+// enrollment mailboxes kept are those it never claimed.
+var accountRows = []struct {
+	table, where string
+	byVault      bool
+}{
+	{"enroll_messages", `enroll_id IN (SELECT enroll_id FROM enrollments WHERE account_id = ?)`, false},
+	{"enrollments", `account_id = ?`, false},
+	{"registrations", `ack_account_id = ?`, false},
+	{"challenges", `account_id = ?`, false},
+	{"login_tokens", `account_id = ?`, false},
+	{"sessions", `account_id = ?`, false},
+	{"device_seen", `account_id = ?`, false},
+	{"device_blocks", `account_id = ?`, false},
+	{"receipts", `account_id = ?`, false},
+	{"devices", `account_id = ?`, false},
+	{"account_admin", `account_id = ?`, false},
+	{"delete_fences", `account_id = ?`, false},
+	{"objects", `vault_id = ?`, true},
+	{"log", `vault_id = ?`, true},
+	{"vaults", `vault_id = ?`, true},
+	{"accounts", `account_id = ?`, false},
+}
+
+func (t *sqliteTx) AccountRows(accountID, vaultID model.ID) (map[string]int, error) {
+	out := map[string]int{}
+	for _, r := range accountRows {
+		id := accountID
+		if r.byVault {
+			id = vaultID
+		}
+		var n int
+		if err := t.row(`SELECT COUNT(*) FROM `+r.table+` WHERE `+r.where, id[:]).Scan(&n); err != nil {
+			return nil, mapErr(err)
+		}
+		out[r.table] = n
+	}
+	return out, nil
+}
+
+func (t *sqliteTx) DeleteAccountRows(accountID, vaultID model.ID) (map[string]int, error) {
+	out := map[string]int{}
+	for _, r := range accountRows {
+		id := accountID
+		if r.byVault {
+			id = vaultID
+		}
+		res, err := t.tx.ExecContext(t.ctx, `DELETE FROM `+r.table+` WHERE `+r.where, id[:])
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		out[r.table] = int(n)
+	}
+	return out, nil
+}
+
+func (t *sqliteTx) InsertDeleted(kind DeletedKind, id, accountID model.ID, at time.Time) error {
+	return t.exec(`INSERT INTO deleted_ids (kind, id, account_id, deleted_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT (kind, id, account_id) DO NOTHING`, string(kind), id[:], accountID[:], unix(at))
 }

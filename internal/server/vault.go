@@ -661,7 +661,8 @@ func (s *Server) postTx(tx Tx, tok crypto.Hash, vaultID model.ID, okV bool, pw *
 // after the transaction commits. A commit that would invalidate
 // credentials fails with errNeedsAccountLock unless locked reports that
 // the caller holds the account's admission lock. Every *apiError it
-// returns (head_conflict, invalid_entry, quota_exhausted) comes before its
+// returns (head_conflict, invalid_entry, quota_exhausted, and
+// account_disabled while a delete fences the account) comes before its
 // first write, so a caller may still commit its own writes after one
 // (retirePost does).
 func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared, locked bool) (vaultlog.Head, bool, error) {
@@ -670,6 +671,10 @@ func (s *Server) commit(tx Tx, accountID, vaultID model.ID, pw *prepared, locked
 		return vaultlog.Head{Seq: old.Seq, H: old.H}, false, nil
 	}
 	if !errors.Is(err, ErrNotFound) {
+		return vaultlog.Head{}, false, err
+	}
+	// The head a delete fenced stays the head (delete.go).
+	if err := fenceRefusal(tx, accountID); err != nil {
 		return vaultlog.Head{}, false, err
 	}
 	v, err := tx.Vault(vaultID)

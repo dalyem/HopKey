@@ -10,6 +10,9 @@
 //	hop-server accounts show ACCOUNT_ID|EMAIL [--json] --data DIR
 //	hop-server accounts disable ACCOUNT_ID|EMAIL [--reason TEXT] [--dry-run] [--yes] [--json] --data DIR
 //	hop-server accounts enable ACCOUNT_ID|EMAIL [--dry-run] [--yes] [--json] --data DIR
+//	hop-server accounts delete ACCOUNT_ID|EMAIL [--confirm EMAIL] [--backup-dir DIR | --no-backup]
+//	                           [--min-disabled DURATION] [--dry-run] [--yes] [--json] --data DIR
+//	hop-server accounts delete --cancel ACCOUNT_ID|EMAIL [--dry-run] [--yes] [--json] --data DIR
 //	hop-server devices block ACCOUNT_ID|EMAIL DEVICE_ID...|--all [--reason TEXT] [--dry-run] [--yes] [--json] --data DIR
 //	hop-server devices unblock ACCOUNT_ID|EMAIL DEVICE_ID...|--all [--dry-run] [--yes] [--json] --data DIR
 //	hop-server sessions revoke ACCOUNT_ID|EMAIL [--device DEVICE_ID] [--dry-run] [--yes] [--json] --data DIR
@@ -20,9 +23,9 @@
 //
 // Every command but serve and version opens the database file directly,
 // while serve may be running: an admin is whoever can write the data
-// directory. invite, quota, invites revoke and reissue, accounts disable
-// and enable, devices block and unblock, and sessions revoke write a row
-// to the admin audit trail; audit reads it.
+// directory. invite, quota, invites revoke and reissue, accounts disable,
+// enable and delete, devices block and unblock, and sessions revoke write
+// a row to the admin audit trail; audit reads it.
 package main
 
 import (
