@@ -223,7 +223,8 @@ type forkJournal struct {
 	// only with a backup whose paths are all listed, unchanged: what a
 	// deletion cut short leaves. A journal of an earlier build, with
 	// Discarding and no manifest (its discard_files left out the entries'
-	// contents and the objects), resumes only on the whole backup.
+	// contents and the objects), never deletes a backup still there: the
+	// resume refuses until the backup is moved away, then finishes.
 	DiscardManifest map[string]string `json:"discard_manifest,omitempty"`
 	Discarded       bool              `json:"discarded"`
 	// BackupMissing is ForkResult's.

@@ -13,7 +13,8 @@ import (
 // a manifest of every path in it, the entries' and the objects' contents
 // too, even where the source digest, which leaves them out, still
 // matches; a symbolic link is refused; and a journal of an earlier build,
-// with no manifest, goes on only with the whole backup.
+// with no manifest, deletes nothing: it refuses while the backup is there
+// and finishes once it is moved away.
 
 // discardingFork crashes a fork of a forkFixture vault, with --discard-old,
 // once its deletion of the backup is recorded and before anything of it
@@ -196,8 +197,8 @@ func TestForkRefusesSymlinks(t *testing.T) {
 }
 
 // A journal of an earlier build records the deletion as begun with no
-// manifest: the deletion goes on with the whole backup as the fork read
-// it, and with nothing less (P1).
+// manifest: nothing shows the backup unchanged, so the resume refuses
+// while it is there, whole or not, and finishes once it is moved away.
 func TestForkResumedDeletionWithoutAManifest(t *testing.T) {
 	legacy := func(t *testing.T, cfg Config) {
 		t.Helper()
