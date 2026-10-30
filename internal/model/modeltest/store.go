@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dalyem/hopkey/internal/access"
 	"github.com/dalyem/hopkey/internal/crypto"
@@ -27,6 +28,10 @@ type Store struct {
 	// DeviceID is the device the store stamps on access records (by).
 	// Zero means DefaultDeviceID.
 	DeviceID model.ID
+
+	// PutAccessHook, if set, sees each PutAccess first; an error it
+	// returns fails the put, as a vault that refuses a write does.
+	PutAccessHook atomic.Pointer[func(model.Access) error]
 
 	mu     sync.Mutex
 	snap   model.Snapshot
@@ -278,6 +283,11 @@ func cloneSnapshot(s model.Snapshot) model.Snapshot {
 // PutAccess creates or replaces an access record, stamped with DeviceID,
 // after the schema and V_access (crypto spec rev 17, §5.1).
 func (s *Store) PutAccess(_ context.Context, a model.Access) (model.Access, error) {
+	if f := s.PutAccessHook.Load(); f != nil {
+		if err := (*f)(a); err != nil {
+			return model.Access{}, err
+		}
+	}
 	a = *access.Clone(&a)
 	a.By = s.DeviceID
 	if a.By.IsZero() {
@@ -292,15 +302,19 @@ func (s *Store) PutAccess(_ context.Context, a model.Access) (model.Access, erro
 		return model.Access{}, err
 	}
 	var cur *model.Access
-	if !a.ItemID.IsZero() {
-		s.mu.Lock()
-		for i := range s.snap.Access {
-			if s.snap.Access[i].ItemID == a.ItemID {
-				cur = access.Clone(&s.snap.Access[i])
-			}
+	s.mu.Lock()
+	for i := range s.snap.Access {
+		o := &s.snap.Access[i]
+		switch {
+		case !a.ItemID.IsZero() && o.ItemID == a.ItemID:
+			cur = access.Clone(o)
+		case model.NameKey(o.Label) == model.NameKey(a.Label):
+			// Labels are unique among live records under K_alias (§5.1).
+			s.mu.Unlock()
+			return model.Access{}, fmt.Errorf("modeltest: another hop access record has the label %q", o.Label)
 		}
-		s.mu.Unlock()
 	}
+	s.mu.Unlock()
 	if err := access.Check(cur, &a, access.PathWrite); err != nil {
 		return model.Access{}, err
 	}

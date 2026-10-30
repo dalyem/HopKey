@@ -33,6 +33,11 @@ const hostKeyMarker = "Server host key:"
 // the log, so no prefix proves a line is ssh's own; with
 // StrictHostKeyChecking and only the pins known, the connection succeeded
 // against a pin anyway, and this only selects which one.
+//
+// The format is OpenSSH's. It is tested against the log of OpenSSH 9.2p1
+// (Debian 12, the check image's client, and a fixture in the tests); other
+// versions are untested. A version that logs the key differently fails
+// closed: the target isn't added.
 func BoundKey(log string, exited0 bool, pins []ssh.PublicKey) (ssh.PublicKey, error) {
 	if !exited0 || !strings.HasSuffix(log, "\n") {
 		return nil, ErrUnbound

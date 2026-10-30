@@ -34,9 +34,13 @@ const akCheckScript = `d="$HOME/.ssh/` + akLockDir + `"; u=$(id -un) || exit 84;
 
 // AccessFinding is one finding of hop access check.
 type AccessFinding struct {
-	Kind        string `json:"kind"`
-	Host        string `json:"host"`
-	User        string `json:"user,omitempty"`
+	Kind   string `json:"kind"`
+	Host   string `json:"host"`
+	HostID string `json:"host_id,omitempty"`
+	User   string `json:"user,omitempty"`
+	// Binding is the target's bound host key, for a finding about a
+	// target.
+	Binding     string `json:"binding,omitempty"`
 	Line        int    `json:"line,omitempty"`
 	Text        string `json:"text,omitempty"`
 	Label       string `json:"label,omitempty"`
@@ -193,8 +197,11 @@ func (k *accessCheck) fileFindings(host string, r checkRead, key string) {
 		if !ok || !kl.Marked {
 			continue
 		}
-		rid := strings.TrimPrefix(kl.Comment, access.MarkerPrefix)
-		if kl.CertCA || kl.Marker == "" || kl.Comment != access.MarkerPrefix+rid {
+		// A managed line's comment is exactly the marker: hop-access: and
+		// the validated record ID. A longer comment, another case, or a
+		// second marker is no single record's line.
+		rid := kl.Marker
+		if kl.CertCA || rid == "" || kl.Comment != access.MarkerPrefix+rid {
 			k.add(AccessFinding{Kind: findMalformed, Host: host, User: r.user, Line: n, Text: l,
 				Message: "a hop access marker no single record manages", Fix: safef("fix or delete line %d by hand", n)})
 			continue
@@ -223,7 +230,7 @@ func (k *accessCheck) fileFindings(host string, r checkRead, key string) {
 func (k *accessCheck) targetFindings(a *model.Access, t model.AccessTarget, host string, r checkRead) {
 	f := access.FactsOf(r.content, a)
 	rid := a.RecordID.String()
-	base := AccessFinding{Host: host, User: t.User, Label: a.Label, RecordID: rid, TargetState: t.State}
+	base := AccessFinding{Host: host, HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP, Label: a.Label, RecordID: rid, TargetState: t.State}
 	with := func(kind, msg, fix string, line int) {
 		x := base
 		x.Kind, x.Message, x.Fix, x.Line = kind, msg, fix, line
@@ -307,7 +314,8 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if !al.Local {
-		if err := v.pull(ctx); err != nil {
+		// Read-only: the pull journals and posts nothing (§7.8).
+		if err := v.pullOnly(ctx); err != nil {
 			fmt.Fprintln(e.Stderr, "comparing with your local copy of the vault, which may be out of date")
 		} else if al, err = v.list(ctx); err != nil {
 			return err
@@ -331,7 +339,7 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 	targeted := map[model.ID]bool{}
 	for i := range al.Access {
 		a := &al.Access[i]
-		if len(pos) > 0 && !slices.Contains(pos, a.Label) {
+		if len(pos) > 0 && !slices.ContainsFunc(pos, func(p string) bool { return model.NameKey(p) == model.NameKey(a.Label) }) {
 			continue
 		}
 		for _, t := range a.Targets {
@@ -340,18 +348,27 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 			if len(hostsFlag.vals) > 0 && !slices.Contains(hostsFlag.vals, name) {
 				continue
 			}
+			cantRead := func(why, fix string) {
+				unread = true
+				k.add(AccessFinding{Kind: findCantRead, Host: name, HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP,
+					Label: a.Label, RecordID: a.RecordID.String(), TargetState: t.State, Message: why, Fix: fix, Unread: true})
+			}
 			h, ok := k.ix.byID(t.HostItemID)
 			pin := boundPin(h, t.ServerKeyFP)
 			if !ok || pin == nil {
-				why := unbound(t, a.Label, name)
-				if !ok {
+				// Terminal targets too: a removed target's line can come
+				// back, and check couldn't look (exit status 2).
+				why, fix := unbound(t, a.Label, name), ""
+				switch {
+				case !ok && model.AccessTerminal(t.State):
+					why = "the host was deleted, so hop can't read the file of this " + t.State + " target"
+				case !ok:
 					why = "the host was deleted; hop access rm " + a.Label + " --abandon " + t.HostItemID.String()
+				case model.AccessTerminal(t.State):
+					why = safef("the host's pinned keys no longer include %s, the key this %s target is bound to, so hop can't read its file", t.ServerKeyFP, t.State)
+					fix = "hop trust " + name + " if the machine still presents " + t.ServerKeyFP
 				}
-				if model.AccessTerminal(t.State) {
-					continue // nothing to read it through, and nothing left to do
-				}
-				unread = true
-				k.add(AccessFinding{Kind: findCantRead, Host: name, User: t.User, Label: a.Label, TargetState: t.State, Message: why, Unread: true})
+				cantRead(why, fix)
 				continue
 			}
 			key := t.HostItemID.String() + " " + t.ServerKeyFP
@@ -360,19 +377,29 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 				r.why = "the host now logs in as " + r.user + ", not " + t.User
 			}
 			if r.why != "" {
-				unread = true
-				k.add(AccessFinding{Kind: findCantRead, Host: name, User: t.User, Label: a.Label, TargetState: t.State, Message: r.why, Unread: true,
-					Fix: "hop trust " + name + ", hop access migrate " + a.Label + " " + name + " or hop access rm " + a.Label + " --abandon " + name})
+				cantRead(r.why, "hop trust "+name+", hop access migrate "+a.Label+" "+name+" or hop access rm "+a.Label+" --abandon "+name)
 				continue
 			}
 			k.fileFindings(name, r, key)
 			k.targetFindings(a, t, name, r)
 			// A known shared pin: the same file through every other host
-			// record that pins the key (§7.4).
+			// record that pins the key (§7.4). A read that fails there is
+			// a file check couldn't read.
 			for _, o := range k.ix.sharedPins(t.ServerKeyFP, t.HostItemID) {
 				or := readAs(o, []ssh.PublicKey{pin}, o.ItemID.String()+" "+t.ServerKeyFP)
-				if or.why == "" && !bytes.Equal(or.content, r.content) {
-					k.add(AccessFinding{Kind: findSharedDifferent, Host: name, User: t.User, Label: a.Label, TargetState: t.State,
+				if or.why == "" && or.user != t.User {
+					or.why = "it logs in as " + or.user + ", not " + t.User
+				}
+				switch {
+				case or.why != "":
+					unread = true
+					k.add(AccessFinding{Kind: findCantRead, Host: o.Name, HostID: o.ItemID.String(), User: t.User, Binding: t.ServerKeyFP,
+						Label: a.Label, RecordID: a.RecordID.String(), TargetState: t.State, Unread: true,
+						Message: safef("hop can't read the file through %s, which pins the same key as %s: %s", o.Name, name, or.why),
+						Fix:     "until it can, hop can't tell whether " + o.Name + " and " + name + " reach the same file"})
+				case !bytes.Equal(or.content, r.content):
+					k.add(AccessFinding{Kind: findSharedDifferent, Host: name, HostID: t.HostItemID.String(), User: t.User, Binding: t.ServerKeyFP,
+						Label: a.Label, RecordID: a.RecordID.String(), TargetState: t.State,
 						Message: safef("these host records reach different machines or accounts with the same host key: %s and %s", name, o.Name),
 						Fix:     "for a removal, hop access rm " + a.Label + " --abandon " + name + ", never --same-machine"})
 				}
@@ -391,7 +418,7 @@ func runAccessCheck(ctx context.Context, e *Env, args []string) error {
 			r := readAs(h, pins, h.ItemID.String()+" all")
 			if r.why != "" {
 				unread = true
-				k.add(AccessFinding{Kind: findCantRead, Host: h.Name, Message: r.why, Unread: true})
+				k.add(AccessFinding{Kind: findCantRead, Host: h.Name, HostID: h.ItemID.String(), Message: r.why, Unread: true})
 				continue
 			}
 			k.fileFindings(h.Name, r, h.ItemID.String()+" all")

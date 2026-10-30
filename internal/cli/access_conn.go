@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -113,8 +114,10 @@ func boundPin(h model.Host, fp string) ssh.PublicKey {
 
 // preflight connects with every pin of the host, -vv -E to a new private
 // log, runs the read script, and returns the pin the server presented
-// (access.BoundKey) and what the read found: the file, or the read
-// script's refusal (81, 82). Nothing is written anywhere.
+// (access.BoundKey) and what the read found: the file, or why it can't be
+// edited (81, a symbolic link; 82, missing; over 1 MiB), with the key
+// still returned, since 81 and 82 are the script's own exits after ssh
+// logged the key. Nothing is written anywhere.
 func (c *accessConn) preflight(ctx context.Context, pins []ssh.PublicKey) (ssh.PublicKey, []byte, string) {
 	logPath := filepath.Join(c.dir, "preflight.log")
 	out := &capBuffer{max: akMaxSize}
@@ -199,6 +202,7 @@ func (c *accessConn) session(ctx context.Context, decide func(user string, conte
 	outW.Close()
 	inR.CloseWithError(io.ErrClosedPipe)
 	<-protoDone
+	outR.Close()
 	end.code, end.exited = res.ExitCode, err == nil && res.exited
 	if !end.exited || res.ExitCode != 0 {
 		end.why = sshFailure(res, err)
@@ -207,23 +211,37 @@ func (c *accessConn) session(ctx context.Context, decide func(user string, conte
 }
 
 // protocol reads the header and the file, gets the decision, and sends
-// it. It records what it sent in end.
+// it. It records what it sent in end. Whatever it stops on, the rest of
+// the host's output is read and discarded until it ends: the copy from
+// ssh's stdout into out must never block, or ssh's end (and a timeout's
+// kill) would wait for it.
 func (c *accessConn) protocol(out io.Reader, in *io.PipeWriter, decide func(string, []byte) sessionDecision, end *sessionEnd) {
 	br := bufio.NewReaderSize(out, 256)
+	drain := sync.OnceFunc(func() { go io.Copy(io.Discard, br) })
+	defer drain()
+	abort := func(why string) {
+		drain()
+		end.abortWhy = why
+		fmt.Fprint(in, "abort\n")
+		end.sent = sentAbort
+	}
 	line, err := br.ReadSlice('\n')
-	if err != nil {
+	switch {
+	case errors.Is(err, bufio.ErrBufferFull):
+		// More than 256 bytes without a newline: not a header.
+		abort("the host's answer is not a hop session header")
+		return
+	case err != nil:
 		return // no header: the script stopped before it (81-85), or the connection did
 	}
 	f := strings.Fields(string(line))
 	if len(f) != 5 || f[0] != "hop-session" || f[1] != "1" {
-		end.abortWhy = "the host's answer is not a hop session header"
+		abort("the host's answer is not a hop session header")
 		return
 	}
 	size, serr := strconv.ParseInt(f[4], 10, 64)
 	if serr != nil || size < 0 || size > akMaxSize {
-		end.abortWhy = akFile + " is larger than 1 MiB"
-		fmt.Fprint(in, "abort\n")
-		end.sent = sentAbort
+		abort(akFile + " is larger than 1 MiB")
 		return
 	}
 	content := make([]byte, size)
@@ -233,11 +251,10 @@ func (c *accessConn) protocol(out io.Reader, in *io.PipeWriter, decide func(stri
 	if cksum(content) != f[3]+" "+f[4] {
 		// Only a writer that ignores the lock changes the file between
 		// the two commands.
-		end.abortWhy = akFile + " changed while hop was reading it"
-		fmt.Fprint(in, "abort\n")
-		end.sent = sentAbort
+		abort(akFile + " changed while hop was reading it")
 		return
 	}
+	drain()
 	end.gotHeader, end.user, end.content = true, f[2], content
 	deadline := time.Now().Add(accessDecisionDeadline)
 	ch := make(chan sessionDecision, 1)
@@ -246,9 +263,7 @@ func (c *accessConn) protocol(out io.Reader, in *io.PipeWriter, decide func(stri
 	select {
 	case d = <-ch:
 	case <-time.After(time.Until(deadline)):
-		end.abortWhy = errSessionDeadline.Error()
-		fmt.Fprint(in, "abort\n")
-		end.sent = sentAbort
+		abort(errSessionDeadline.Error())
 		return
 	}
 	if d.to == nil {
@@ -257,9 +272,7 @@ func (c *accessConn) protocol(out io.Reader, in *io.PipeWriter, decide func(stri
 		return
 	}
 	if time.Until(deadline) <= 0 {
-		end.abortWhy = errSessionDeadline.Error()
-		fmt.Fprint(in, "abort\n")
-		end.sent = sentAbort
+		abort(errSessionDeadline.Error())
 		return
 	}
 	stop := time.AfterFunc(time.Until(deadline), func() { in.CloseWithError(errSessionDeadline) })

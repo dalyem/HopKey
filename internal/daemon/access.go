@@ -19,6 +19,9 @@ const (
 	// OpAccessCapabilities checks that the server takes access records
 	// (GET /v1/capabilities, §5.3). The answer is never cached.
 	OpAccessCapabilities = "access.capabilities"
+	// OpAccessReviewAck acknowledges access-review notes hop access ls
+	// has shown (§7.5).
+	OpAccessReviewAck = "access.review_ack"
 )
 
 // CodeAccessUnsupported: the server doesn't list access among its item
@@ -36,6 +39,34 @@ type AccessListResult struct {
 	Retired []string `json:"retired,omitempty"`
 	// Local is true for a vault with no server.
 	Local bool `json:"local"`
+	// Reviews are the access-review notes not yet acknowledged: a
+	// checkpoint revoked the devices that last changed these records.
+	// ReviewsEvicted counts older ones dropped undelivered.
+	Reviews        []AccessReview `json:"reviews,omitempty"`
+	ReviewsEvicted uint64         `json:"reviews_evicted,omitempty"`
+}
+
+// AccessReview is one access-review note.
+type AccessReview struct {
+	ID            uint64             `json:"id"`
+	CheckpointSeq uint64             `json:"checkpoint_seq"`
+	Devices       []string           `json:"devices"`
+	Items         []AccessReviewItem `json:"items"`
+	// Text is the note as hop status shows it.
+	Text string `json:"text"`
+}
+
+// AccessReviewItem is a record an AccessReview names.
+type AccessReviewItem struct {
+	ItemID string `json:"item_id"`
+	Label  string `json:"label"`
+}
+
+// AccessReviewAckParams acknowledges the notes of one AccessListResult:
+// exactly those IDs, and the evicted count it reported.
+type AccessReviewAckParams struct {
+	IDs     []uint64 `json:"ids"`
+	Evicted uint64   `json:"evicted,omitempty"`
 }
 
 // AccessPutParams is the request of OpAccessPut.
@@ -44,10 +75,12 @@ type AccessPutParams struct {
 }
 
 // AccessDeleteParams is the request of OpAccessDelete. Forget deletes a
-// record with abandoned targets.
+// record with abandoned targets. RecordID, when set, must be the record
+// ID of item ID: a run deletes only the record it acted for.
 type AccessDeleteParams struct {
-	ID     string `json:"id"`
-	Forget bool   `json:"forget"`
+	ID       string `json:"id"`
+	RecordID string `json:"record_id,omitempty"`
+	Forget   bool   `json:"forget"`
 }
 
 // AccessCapabilitiesResult answers OpAccessCapabilities when access
@@ -88,6 +121,12 @@ func (d *Daemon) dispatchAccess(ctx context.Context, req Request, decode func(an
 	case OpAccessCapabilities:
 		res, err := d.accessCapabilities(ctx)
 		return res, true, err
+	case OpAccessReviewAck:
+		var p AccessReviewAckParams
+		if err := decode(&p); err != nil {
+			return nil, true, err
+		}
+		return nil, true, d.opAccessReviewAck(p)
 	}
 	return nil, false, nil
 }
@@ -124,7 +163,39 @@ func (d *Daemon) opAccessList(ctx context.Context) (*AccessListResult, error) {
 			out.Retired = append(out.Retired, id.String())
 		}
 	}
+	if d.sync != nil {
+		if ns, err := d.sync.st.SyncNotes(); err == nil {
+			out.ReviewsEvicted = ns.Evicted[store.NoteAccessReview]
+			for _, r := range ns.AccessReviews {
+				v := AccessReview{ID: r.ID, CheckpointSeq: r.CheckpointSeq, Devices: []string{}, Items: []AccessReviewItem{}, Text: AccessReviewText(r)}
+				for _, id := range r.Devices {
+					v.Devices = append(v.Devices, id.String())
+				}
+				for _, it := range r.Items {
+					v.Items = append(v.Items, AccessReviewItem{ItemID: it.ItemID.String(), Label: it.Label})
+				}
+				out.Reviews = append(out.Reviews, v)
+			}
+		}
+	}
 	return out, nil
+}
+
+func (d *Daemon) opAccessReviewAck(p AccessReviewAckParams) error {
+	if d.sync == nil || (len(p.IDs) == 0 && p.Evicted == 0) {
+		return nil
+	}
+	n := store.SyncNotes{}
+	for _, id := range p.IDs {
+		n.AccessReviews = append(n.AccessReviews, store.AccessReviewNote{ID: id})
+	}
+	if p.Evicted > 0 {
+		n.Evicted = map[string]uint64{store.NoteAccessReview: p.Evicted}
+	}
+	if err := d.sync.st.AckSyncNotes(n); err != nil {
+		return storeError(err)
+	}
+	return nil
 }
 
 func (d *Daemon) opAccessPut(ctx context.Context, p AccessPutParams) (*model.Access, error) {
@@ -160,6 +231,20 @@ func (d *Daemon) opAccessDelete(ctx context.Context, p AccessDeleteParams) error
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if p.RecordID != "" {
+		rid, err := model.ParseID(p.RecordID)
+		if err != nil {
+			return invalidf("%v", err)
+		}
+		snap, err := d.store.Snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		i := slices.IndexFunc(snap.Access, func(a model.Access) bool { return a.ItemID == id })
+		if i < 0 || snap.Access[i].RecordID != rid {
+			return storeError(model.ErrNotFound)
+		}
+	}
 	if err := as.DeleteAccess(ctx, id, p.Forget); err != nil {
 		return storeError(err)
 	}

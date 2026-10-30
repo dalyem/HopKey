@@ -59,6 +59,10 @@ type akServer struct {
 	// onAuth, if set, sees each key a client offers before the server
 	// decides on it.
 	onAuth func(c ssh.ConnMetadata, k ssh.PublicKey)
+	// onStdin, if set, copies the client's input into the command instead
+	// of io.Copy: it returns true to have the connection dropped at once,
+	// with the command's stdin closed (a lost connection mid-session).
+	onStdin func(command string, stdin io.Writer, client io.Reader) (drop bool)
 	// path, if set, is the PATH commands run with.
 	path string
 }
@@ -105,6 +109,12 @@ func (s *akServer) setOnAuth(f func(c ssh.ConnMetadata, k ssh.PublicKey)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onAuth = f
+}
+
+func (s *akServer) setOnStdin(f func(command string, stdin io.Writer, client io.Reader) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onStdin = f
 }
 
 func (s *akServer) setPath(path string) {
@@ -218,7 +228,7 @@ func (s *akServer) session(conn ssh.Conn, ch ssh.Channel, reqs <-chan *ssh.Reque
 		}
 		req.Reply(true, nil)
 		s.mu.Lock()
-		hook, path := s.onExec, s.path
+		hook, path, inHook := s.onExec, s.path, s.onStdin
 		s.mu.Unlock()
 		if path == "" {
 			path = os.Getenv("PATH")
@@ -242,7 +252,17 @@ func (s *akServer) session(conn ssh.Conn, ch ssh.Channel, reqs <-chan *ssh.Reque
 		if err != nil {
 			return
 		}
-		go func() { io.Copy(stdin, ch); stdin.Close() }()
+		go func() {
+			if inHook != nil && inHook(p.Command, stdin, ch) {
+				stdin.Close()
+				conn.Close()
+				return
+			}
+			if inHook == nil {
+				io.Copy(stdin, ch)
+			}
+			stdin.Close()
+		}()
 		status := uint32(0)
 		if err := cmd.Run(); err != nil {
 			status = 1

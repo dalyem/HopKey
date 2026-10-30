@@ -56,8 +56,9 @@ type AccessTargetResult struct {
 	Binding string `json:"binding,omitempty"`
 	State   string `json:"state"`
 	Gen     uint64 `json:"gen,omitempty"`
-	// Recorded says the run stored a result for the target. When it is
-	// false, Message says why nothing was stored.
+	// State is what the run found or did on the host. Recorded says the
+	// put that stores it was journaled; when it is false, Message says
+	// why nothing was stored, and the run exits non-zero.
 	Recorded bool     `json:"recorded"`
 	Message  string   `json:"message,omitempty"`
 	Lines    []string `json:"lines,omitempty"`
@@ -100,8 +101,9 @@ func (v *accessVault) list(ctx context.Context) (*daemon.AccessListResult, error
 	return &r, nil
 }
 
-// pull pulls (and pushes) in a server-backed vault.
-func (v *accessVault) pull(ctx context.Context) error {
+// sync pulls and pushes in a server-backed vault: the planners' commits
+// and fences (§7.1, §7.7).
+func (v *accessVault) sync(ctx context.Context) error {
 	if v.local {
 		return nil
 	}
@@ -109,16 +111,53 @@ func (v *accessVault) pull(ctx context.Context) error {
 	return call(ctx, v.e, daemon.OpSyncNow, nil, &st)
 }
 
-// record returns the live record labelled label, as the vault shows it,
-// and whether a queued change marks it.
-func (v *accessVault) record(ctx context.Context, label string) (*model.Access, bool, error) {
+// pullOnly pulls and verifies in a server-backed vault, and never pushes:
+// hop access check journals and posts nothing (§7.8).
+func (v *accessVault) pullOnly(ctx context.Context) error {
+	if v.local {
+		return nil
+	}
+	var st daemon.SyncStatusResult
+	return call(ctx, v.e, daemon.OpSyncPull, nil, &st)
+}
+
+// lookup resolves label to a live record, once, when a command starts.
+// Labels compare under K_alias (model.NameKey), and a label that two live
+// records match is refused rather than guessed. From then on the command
+// names the record by its item ID and record ID (byID): a label may name
+// another record by the time a run records its results.
+func (v *accessVault) lookup(ctx context.Context, label string) (*model.Access, error) {
+	l, err := v.list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var found *model.Access
+	for i := range l.Access {
+		if model.NameKey(l.Access[i].Label) != model.NameKey(label) {
+			continue
+		}
+		if found != nil {
+			return nil, failf("two hop access records match the label %s (%s and %s); hop won't guess which one you mean", label, found.RecordID, l.Access[i].RecordID)
+		}
+		found = &l.Access[i]
+	}
+	return found, nil
+}
+
+// byID returns the live record with item ID id and record ID rid, as the
+// vault shows it, and whether a queued change marks it; nil when there is
+// none.
+func (v *accessVault) byID(ctx context.Context, id, rid model.ID) (*model.Access, bool, error) {
 	l, err := v.list(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	for i := range l.Access {
-		if l.Access[i].Label == label {
-			_, marked := l.Marks[l.Access[i].ItemID.String()]
+		if l.Access[i].ItemID == id {
+			if l.Access[i].RecordID != rid {
+				return nil, false, nil
+			}
+			_, marked := l.Marks[id.String()]
 			return &l.Access[i], marked, nil
 		}
 	}
@@ -127,19 +166,44 @@ func (v *accessVault) record(ctx context.Context, label string) (*model.Access, 
 
 // commit writes a and waits until it is in verified state (§7.1): in a
 // local-only vault that is the write itself; in a published one the
-// outbox record must commit. It returns the committed record.
+// outbox record must commit. It returns the committed record, found by
+// the item ID the write was given (a create's is new) and a's record ID.
 func (v *accessVault) commit(ctx context.Context, a model.Access) (*model.Access, error) {
 	var saved model.Access
 	if err := call(ctx, v.e, daemon.OpAccessPut, daemon.AccessPutParams{Access: a}, &saved); err != nil {
 		return nil, err
 	}
+	if saved.ItemID.IsZero() || saved.RecordID != a.RecordID {
+		return nil, errNotCommitted
+	}
 	if v.local {
 		return &saved, nil
 	}
-	if err := v.pull(ctx); err != nil {
+	if err := v.sync(ctx); err != nil {
 		return nil, errNotCommitted
 	}
-	cur, marked, err := v.record(ctx, a.Label)
+	cur, marked, err := v.byID(ctx, saved.ItemID, saved.RecordID)
+	if err != nil || cur == nil || marked {
+		return nil, errNotCommitted
+	}
+	return cur, nil
+}
+
+// committed returns a as verified state holds it, with no queued change,
+// syncing first if it has one. A run that resumes a target commits
+// nothing first (§7.1), but it still acts only on committed state: a
+// queued create that Take theirs may yet discard authorizes no write.
+func (v *accessVault) committed(ctx context.Context, a *model.Access) (*model.Access, error) {
+	if v.local {
+		return a, nil
+	}
+	if cur, marked, err := v.byID(ctx, a.ItemID, a.RecordID); err == nil && cur != nil && !marked {
+		return cur, nil
+	}
+	if err := v.sync(ctx); err != nil {
+		return nil, errNotCommitted
+	}
+	cur, marked, err := v.byID(ctx, a.ItemID, a.RecordID)
 	if err != nil || cur == nil || marked {
 		return nil, errNotCommitted
 	}
@@ -267,7 +331,7 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	ix := hostIndex{l.Hosts}
-	rec, _, err := v.record(ctx, label)
+	rec, err := v.lookup(ctx, label)
 	if err != nil {
 		return err
 	}
@@ -368,6 +432,15 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 			return err
 		}
 		next = committed
+		// The commit pulled: the host records may have changed since the
+		// list above, and the binding check reads the current pins.
+		if l, err = listAll(ctx, e); err != nil {
+			return err
+		}
+	} else if len(act) > 0 {
+		if next, err = v.committed(ctx, next); err != nil {
+			return failf("%v", err)
+		}
 	}
 	res.RecordID = next.RecordID.String()
 	var results []access.Result
@@ -376,6 +449,7 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 		if t == nil || t.State != model.AccessPending {
 			continue
 		}
+		accessTestHook("before-session", next)
 		tr, r := e.addOne(ctx, v, l, next, *t)
 		tr.Warnings = append(warnings[hid], tr.Warnings...)
 		res.Targets = append(res.Targets, tr)
@@ -383,9 +457,14 @@ func runAccessAdd(ctx context.Context, e *Env, args []string) error {
 			results = append(results, *r)
 		}
 	}
-	e.recordResults(ctx, v, label, results, res)
+	e.recordResults(ctx, v, next, results, res)
 	return e.finishAccessRun(res, o.asJSON)
 }
+
+// accessTestHook is called at points of a planner run (before-session,
+// before-record) with the record the run acts for. Tests replace it to
+// interleave runs.
+var accessTestHook = func(point string, a *model.Access) {}
 
 // newAccessRecord builds a new record from the input policy of §6.2.
 func newAccessRecord(e *Env, label string, o *accessAddOpts, l *daemon.ListResult, first bool) (*model.Access, error) {
@@ -477,7 +556,13 @@ func accessKeyInput(in string) (string, string, error) {
 
 // accessBind runs the binding preflight for a new target of a on h
 // (§7.6). It refuses a host with no pins, a key it can't name, a user it
-// can't tell, and a binding the record already has (N8).
+// can't tell, and a binding the record already has (N8). It also refuses
+// a host whose ~/.ssh/authorized_keys the read script refuses (81, a
+// symbolic link; 82, missing) or that is over 1 MiB: the log still names
+// the key, but an add couldn't write there, so nothing is committed and
+// the run reports why. A file that becomes a link or goes missing after
+// its target was added is the session's 81 or 82: the add records failed,
+// a removal stays removing with the advice of §7.3.
 func (e *Env) accessBind(ctx context.Context, h model.Host, l *daemon.ListResult, a *model.Access) (*model.AccessTarget, string) {
 	pins, _ := parsePins(h.HostKeys)
 	c, why := e.accessConnect(ctx, h, l, pins)
@@ -538,7 +623,7 @@ func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, 
 			userChanged = true
 			return sessionDecision{}
 		}
-		if !e.accessFence(ctx, v, a.Label, t, model.AccessPending) {
+		if !e.accessFence(ctx, v, a, t, model.AccessPending) {
 			fenced = true
 			return sessionDecision{}
 		}
@@ -548,10 +633,12 @@ func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, 
 		}
 		return sessionDecision{}
 	})
+	// The host's outcome; recordResults marks it recorded once the put
+	// that stores it is journaled.
 	res := func(state, errText string) *access.Result {
-		tr.State, tr.Recorded, tr.Message = state, true, errText
+		tr.State, tr.Message = state, errText
 		tr.ok = state == model.AccessInstalled
-		return &access.Result{Host: t.HostItemID, FP: t.ServerKeyFP, From: model.AccessPending, Gen: t.Gen, State: state, Error: storedError(errText)}
+		return &access.Result{ItemID: a.ItemID, RecordID: a.RecordID, Host: t.HostItemID, FP: t.ServerKeyFP, From: model.AccessPending, Gen: t.Gen, State: state, Error: storedError(errText)}
 	}
 	notApplied := func(why string) (AccessTargetResult, *access.Result) {
 		tr.Message = "not applied: " + why
@@ -605,14 +692,15 @@ func (e *Env) addOne(ctx context.Context, v *accessVault, l *daemon.ListResult, 
 }
 
 // accessFence is the pull under the lock (§7.2 step 3, §7.3 step 3): the
-// newest verified state must still hold the record with t in state at
-// t's gen, with the same binding, user and alongside. A pull that fails,
-// or a record with a queued change, fails the fence.
-func (e *Env) accessFence(ctx context.Context, v *accessVault, label string, t model.AccessTarget, state string) bool {
-	if err := v.pull(ctx); err != nil {
+// newest verified state must still hold the record a (the same item ID and
+// record ID) with t in state at t's gen, with the same binding, user and
+// alongside. A pull that fails, or a record with a queued change, fails
+// the fence. The pull pushes nothing.
+func (e *Env) accessFence(ctx context.Context, v *accessVault, a *model.Access, t model.AccessTarget, state string) bool {
+	if err := v.pullOnly(ctx); err != nil {
 		return false
 	}
-	cur, marked, err := v.record(ctx, label)
+	cur, marked, err := v.byID(ctx, a.ItemID, a.RecordID)
 	if err != nil || cur == nil || marked {
 		return false
 	}
@@ -625,41 +713,61 @@ func (e *Env) accessFence(ctx context.Context, v *accessVault, label string, t m
 }
 
 // recordResults writes the run's results in one put, built against the
-// newest verified state (§7.1); results whose target moved on are dropped.
-func (e *Env) recordResults(ctx context.Context, v *accessVault, label string, results []access.Result, res *AccessRunResult) *model.Access {
+// newest verified state of the record the run acted for, a (§7.1);
+// results whose target moved on are dropped. A target's report says
+// recorded only once the put that stores its result is journaled; every
+// other target that has a result is reported not recorded, which fails
+// the run. It returns the record as written, or nil when nothing was.
+func (e *Env) recordResults(ctx context.Context, v *accessVault, a *model.Access, results []access.Result, res *AccessRunResult) *model.Access {
 	if len(results) == 0 {
 		return nil
 	}
-	if err := v.pull(ctx); err != nil {
-		res.Notes = append(res.Notes, safef("could not sync before recording the results (%v); the results are queued", err))
+	accessTestHook("before-record", a)
+	notRecorded := func(why string) {
+		for i := range res.Targets {
+			tr := &res.Targets[i]
+			if slices.ContainsFunc(results, func(r access.Result) bool { return r.Host.String() == tr.HostID && r.FP == tr.Binding }) {
+				tr.Recorded, tr.ok = false, false
+				tr.Message = strings.TrimPrefix(tr.Message+"; ", "; ") + "not recorded: " + why
+			}
+		}
 	}
-	cur, _, err := v.record(ctx, label)
+	if err := v.pullOnly(ctx); err != nil {
+		res.Notes = append(res.Notes, safef("could not sync before recording the results (%v); they are built on the local copy of the vault", err))
+	}
+	cur, _, err := v.byID(ctx, a.ItemID, a.RecordID)
 	if err != nil || cur == nil {
-		res.Notes = append(res.Notes, "the record is gone; nothing was recorded")
+		if err != nil {
+			notRecorded(safef("%v", err))
+		} else {
+			notRecorded("the record is gone")
+		}
 		return nil
 	}
 	next, kept := access.ApplyResults(cur, results, e.now64())
 	if len(kept) == 0 || !access.Substantive(cur, next) {
-		res.Notes = append(res.Notes, "nothing to record: another run owns these targets")
+		notRecorded("another run owns this target now")
 		return nil
 	}
 	var saved model.Access
 	if err := call(ctx, v.e, daemon.OpAccessPut, daemon.AccessPutParams{Access: *next}, &saved); err != nil {
-		res.Notes = append(res.Notes, safef("could not record the results: %v", err))
+		notRecorded(safef("%v", err))
 		return nil
 	}
-	if !v.local {
-		if err := v.pull(ctx); err != nil {
-			res.Notes = append(res.Notes, "the results are queued and go to the server on the next sync")
-		} else if _, marked, _ := v.record(ctx, label); marked {
-			res.Notes = append(res.Notes, "the results are held: another device changed the record meanwhile, so the hosts may now disagree with it. Run hop sync resolve, then hop access check")
+	for i := range res.Targets {
+		tr := &res.Targets[i]
+		if slices.ContainsFunc(kept, func(r access.Result) bool { return r.Host.String() == tr.HostID && r.FP == tr.Binding }) {
+			tr.Recorded = true
+		} else if slices.ContainsFunc(results, func(r access.Result) bool { return r.Host.String() == tr.HostID && r.FP == tr.Binding }) {
+			tr.Recorded, tr.ok = false, false
+			tr.Message = strings.TrimPrefix(tr.Message+"; ", "; ") + "not recorded: another run owns this target now"
 		}
 	}
-	for i := range res.Targets {
-		if !slices.ContainsFunc(kept, func(r access.Result) bool { return r.Host.String() == res.Targets[i].HostID }) && res.Targets[i].Recorded {
-			res.Targets[i].Recorded = false
-			res.Targets[i].ok = false
-			res.Targets[i].Message = "not recorded: another run owns this target now"
+	if !v.local {
+		if err := v.sync(ctx); err != nil {
+			res.Notes = append(res.Notes, "the results are queued and go to the server on the next sync")
+		} else if _, marked, _ := v.byID(ctx, a.ItemID, a.RecordID); marked {
+			res.Notes = append(res.Notes, "the results are held: another device changed the record meanwhile, so the hosts may now disagree with it. Run hop sync resolve, then hop access check")
 		}
 	}
 	return &saved
@@ -735,7 +843,7 @@ func runAccessRm(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	ix := hostIndex{l.Hosts}
-	rec, _, err := v.record(ctx, label)
+	rec, err := v.lookup(ctx, label)
 	if err != nil {
 		return err
 	}
@@ -805,6 +913,13 @@ func runAccessRm(ctx context.Context, e *Env, args []string) error {
 			return err
 		}
 		next = committed
+		if l, err = listAll(ctx, e); err != nil {
+			return err
+		}
+	} else if len(act) > 0 {
+		if next, err = v.committed(ctx, next); err != nil {
+			return failf("%v", err)
+		}
 	}
 	var results []access.Result
 	for _, hid := range act {
@@ -812,13 +927,14 @@ func runAccessRm(ctx context.Context, e *Env, args []string) error {
 		if t == nil || t.State != model.AccessRemoving {
 			continue
 		}
+		accessTestHook("before-session", next)
 		tr, r := e.rmOne(ctx, v, l, next, *t)
 		res.Targets = append(res.Targets, tr)
 		if r != nil {
 			results = append(results, *r)
 		}
 	}
-	if saved := e.recordResults(ctx, v, label, results, res); saved != nil {
+	if saved := e.recordResults(ctx, v, next, results, res); saved != nil {
 		e.closeRecord(ctx, v, saved, res)
 	}
 	if !o.asJSON && len(res.Targets) > 0 {
@@ -827,9 +943,10 @@ func runAccessRm(ctx context.Context, e *Env, args []string) error {
 	return e.finishAccessRun(res, o.asJSON)
 }
 
-// closeRecord deletes the record once every target is removed (§5.1).
+// closeRecord deletes the record a (its item ID and record ID) once every
+// target is removed (§5.1).
 func (e *Env) closeRecord(ctx context.Context, v *accessVault, a *model.Access, res *AccessRunResult) {
-	cur, _, err := v.record(ctx, a.Label)
+	cur, _, err := v.byID(ctx, a.ItemID, a.RecordID)
 	if err != nil || cur == nil {
 		return
 	}
@@ -843,7 +960,7 @@ func (e *Env) closeRecord(ctx context.Context, v *accessVault, a *model.Access, 
 	case abandoned:
 		res.Notes = append(res.Notes, "abandoned targets remain; hop access forget "+a.Label+" deletes the record")
 	default:
-		if err := call(ctx, e, daemon.OpAccessDelete, daemon.AccessDeleteParams{ID: cur.ItemID.String()}, nil); err != nil {
+		if err := call(ctx, e, daemon.OpAccessDelete, daemon.AccessDeleteParams{ID: cur.ItemID.String(), RecordID: cur.RecordID.String()}, nil); err != nil {
 			res.Notes = append(res.Notes, safef("could not delete the record: %v", err))
 			return
 		}
@@ -931,8 +1048,11 @@ func (e *Env) accessAbandon(ctx context.Context, v *accessVault, ix hostIndex, a
 	if ok, err := confirmCtxYes(ctx, e, o.yes, q); err != nil || !ok {
 		return errors.Join(err, failf("nothing was changed"))
 	}
-	t.State, t.Gen, t.Time = model.AccessAbandoned, t.Gen+1, e.now64()
-	if _, err := v.commit(ctx, *next); err != nil {
+	// An abandoned target has no error (§5.1): what failed before is
+	// superseded by the user's statement.
+	t.State, t.Gen, t.Error, t.Time = model.AccessAbandoned, t.Gen+1, "", e.now64()
+	committed, err := v.commit(ctx, *next)
+	if err != nil {
 		if errors.Is(err, errNotCommitted) {
 			return failf("%v", err)
 		}
@@ -942,7 +1062,7 @@ func (e *Env) accessAbandon(ctx context.Context, v *accessVault, ix hostIndex, a
 		Host: ix.name(hid), HostID: hid.String(), User: t.User, Binding: t.ServerKeyFP, State: model.AccessAbandoned, Gen: t.Gen,
 		Recorded: true, ok: true, Message: "abandoned: the line may remain on the machine that presents " + t.ServerKeyFP,
 	}}}
-	e.closeRecord(ctx, v, next, res)
+	e.closeRecord(ctx, v, committed, res)
 	return e.finishAccessRun(res, o.asJSON)
 }
 
@@ -972,7 +1092,7 @@ func (e *Env) rmOne(ctx context.Context, v *accessVault, l *daemon.ListResult, a
 			userChanged = true
 			return sessionDecision{}
 		}
-		if !e.accessFence(ctx, v, a.Label, t, model.AccessRemoving) {
+		if !e.accessFence(ctx, v, a, t, model.AccessRemoving) {
 			fenced = true
 			return sessionDecision{}
 		}
@@ -986,11 +1106,16 @@ func (e *Env) rmOne(ctx context.Context, v *accessVault, l *daemon.ListResult, a
 		tr.Warnings = append(tr.Warnings, d.Warn)
 	}
 	stay := func(errText string) *access.Result {
-		tr.State, tr.Recorded, tr.Message = model.AccessRemoving, true, errText
-		return &access.Result{Host: t.HostItemID, FP: t.ServerKeyFP, From: model.AccessRemoving, Gen: t.Gen, State: model.AccessRemoving, Error: storedError(errText)}
+		tr.State, tr.Message = model.AccessRemoving, errText
+		return &access.Result{ItemID: a.ItemID, RecordID: a.RecordID, Host: t.HostItemID, FP: t.ServerKeyFP, From: model.AccessRemoving, Gen: t.Gen, State: model.AccessRemoving, Error: storedError(errText)}
 	}
 	removed := func() *access.Result {
-		// A known shared pin needs a matching statement (§7.3 step 6).
+		// A known shared pin needs a matching statement (§7.3 step 6). H
+		// is computed now, from the host records as they are after the
+		// session's pull.
+		if fresh, err := listAll(ctx, e); err == nil {
+			ix = hostIndex{fresh.Hosts}
+		}
 		H := ix.sharedPins(t.ServerKeyFP, t.HostItemID)
 		if len(H) > 0 {
 			sm := t.SameMachine
@@ -1008,8 +1133,8 @@ func (e *Env) rmOne(ctx context.Context, v *accessVault, l *daemon.ListResult, a
 			}
 			tr.Warnings = append(tr.Warnings, "removed, on your statement that "+strings.Join(names, ", ")+" reach the same machine and account as "+name)
 		}
-		tr.State, tr.Recorded, tr.ok = model.AccessRemoved, true, true
-		return &access.Result{Host: t.HostItemID, FP: t.ServerKeyFP, From: model.AccessRemoving, Gen: t.Gen, State: model.AccessRemoved}
+		tr.State, tr.ok = model.AccessRemoved, true
+		return &access.Result{ItemID: a.ItemID, RecordID: a.RecordID, Host: t.HostItemID, FP: t.ServerKeyFP, From: model.AccessRemoving, Gen: t.Gen, State: model.AccessRemoved}
 	}
 	notApplied := func(why string) (AccessTargetResult, *access.Result) {
 		tr.Message = "not applied: " + why
@@ -1083,7 +1208,7 @@ func runAccessMigrate(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	ix := hostIndex{l.Hosts}
-	rec, _, err := v.record(ctx, label)
+	rec, err := v.lookup(ctx, label)
 	if err != nil {
 		return err
 	}
@@ -1115,7 +1240,9 @@ func runAccessMigrate(ctx context.Context, e *Env, args []string) error {
 	if old.State == model.AccessRemoving {
 		nt.State = model.AccessRemoving
 	}
-	old.State, old.Gen, old.Time = model.AccessAbandoned, old.Gen+1, e.now64()
+	// The old target is abandoned, and an abandoned target has no error
+	// (§5.1).
+	old.State, old.Gen, old.Error, old.Time = model.AccessAbandoned, old.Gen+1, "", e.now64()
 	next.Targets = append(next.Targets, *nt)
 	sortAccessTargets(next.Targets)
 	committed, err := v.commit(ctx, *next)
@@ -1127,8 +1254,19 @@ func runAccessMigrate(ctx context.Context, e *Env, args []string) error {
 	}
 	res := &AccessRunResult{Label: label, RecordID: committed.RecordID.String()}
 	t := targetFor(committed, h.ItemID)
+	if t == nil || t.ServerKeyFP != nt.ServerKeyFP {
+		res.Notes = append(res.Notes, "the migrated target changed before hop could act on it: run hop access ls "+label)
+		if err := e.finishAccessRun(res, *asJSON); err != nil {
+			return err
+		}
+		return silent(1)
+	}
+	if l, err = listAll(ctx, e); err != nil {
+		return err
+	}
 	var tr AccessTargetResult
 	var r *access.Result
+	accessTestHook("before-session", committed)
 	if t.State == model.AccessRemoving {
 		tr, r = e.rmOne(ctx, v, l, committed, *t)
 	} else {
@@ -1139,7 +1277,7 @@ func runAccessMigrate(ctx context.Context, e *Env, args []string) error {
 	if r != nil {
 		results = append(results, *r)
 	}
-	if saved := e.recordResults(ctx, v, label, results, res); saved != nil && t.State == model.AccessRemoving {
+	if saved := e.recordResults(ctx, v, committed, results, res); saved != nil && t.State == model.AccessRemoving {
 		e.closeRecord(ctx, v, saved, res)
 	}
 	return e.finishAccessRun(res, *asJSON)
@@ -1166,7 +1304,7 @@ func runAccessForget(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	ix := hostIndex{l.Hosts}
-	rec, _, err := v.record(ctx, pos[0])
+	rec, err := v.lookup(ctx, pos[0])
 	if err != nil {
 		return err
 	}
@@ -1189,7 +1327,7 @@ func runAccessForget(ctx context.Context, e *Env, args []string) error {
 	if ok, err := confirmCtxYes(ctx, e, *yes, q); err != nil || !ok {
 		return errors.Join(err, failf("nothing was changed"))
 	}
-	if err := call(ctx, e, daemon.OpAccessDelete, daemon.AccessDeleteParams{ID: rec.ItemID.String(), Forget: true}, nil); err != nil {
+	if err := call(ctx, e, daemon.OpAccessDelete, daemon.AccessDeleteParams{ID: rec.ItemID.String(), RecordID: rec.RecordID.String(), Forget: true}, nil); err != nil {
 		return err
 	}
 	e.printf("record %s forgotten\n", oneLine(rec.Label))
@@ -1241,7 +1379,7 @@ func runAccessLs(ctx context.Context, e *Env, args []string) error {
 	ix := hostIndex{l.Hosts}
 	var out []AccessView
 	for _, a := range al.Access {
-		if len(pos) > 0 && !slices.Contains(pos, a.Label) {
+		if len(pos) > 0 && !slices.ContainsFunc(pos, func(p string) bool { return model.NameKey(p) == model.NameKey(a.Label) }) {
 			continue
 		}
 		av := AccessView{Label: a.Label, RecordID: a.RecordID.String(), Fingerprint: a.Fingerprint, Options: access.Render(a.Options),
@@ -1268,6 +1406,22 @@ func runAccessLs(ctx context.Context, e *Env, args []string) error {
 			av.Targets = append(av.Targets, tv)
 		}
 		out = append(out, av)
+	}
+	// Notes of checkpoints that revoked the devices which last changed
+	// records (§7.5): shown here, on stderr, and then acknowledged. Until
+	// then hop status shows them too, after every restart.
+	if len(al.Reviews) > 0 || al.ReviewsEvicted > 0 {
+		ack := daemon.AccessReviewAckParams{Evicted: al.ReviewsEvicted}
+		for _, r := range al.Reviews {
+			fmt.Fprintf(e.Stderr, "note: %s\n", oneLine(r.Text))
+			ack.IDs = append(ack.IDs, r.ID)
+		}
+		if al.ReviewsEvicted > 0 {
+			fmt.Fprintf(e.Stderr, "note: %d older notes of hop access records to review were dropped before they were shown\n", al.ReviewsEvicted)
+		}
+		if err := call(ctx, e, daemon.OpAccessReviewAck, ack, nil); err != nil {
+			fmt.Fprintf(e.Stderr, "warning: could not mark these notes as shown (%v); they will be shown again\n", err)
+		}
 	}
 	if *asJSON {
 		if out == nil {

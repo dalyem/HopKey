@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"os"
 	"strings"
@@ -203,6 +204,13 @@ type syncer struct {
 	// noteMu makes each noteReplaced's read, record and acknowledgement
 	// one step, so no note is recorded twice.
 	noteMu sync.Mutex
+	// reviewsShown are the access-review notes already shown in status
+	// and the log by this daemon. They are acknowledged only by hop
+	// access ls (OpAccessReviewAck), so each daemon shows them once.
+	reviewsShown map[uint64]bool
+	// reviewsEvicted: the count of access-review notes dropped
+	// undelivered was logged.
+	reviewsEvicted bool
 	// retired is the server's word that this device left the account
 	// (reportedLocked), and whether its proof wiped the device.
 	retired *ServerRetirement
@@ -718,7 +726,33 @@ func (e *syncer) noteSyncNotes() error {
 	if err != nil || ns.Empty() {
 		return err
 	}
+	// Access-review notes stay until hop access ls shows them (and
+	// acknowledges them), across restarts; this daemon shows each once.
+	reviews := ns.AccessReviews
+	ns.AccessReviews = nil
+	if c, ok := ns.Evicted[store.NoteAccessReview]; ok {
+		ev := maps.Clone(ns.Evicted)
+		delete(ev, store.NoteAccessReview)
+		ns.Evicted = ev
+		if len(ev) == 0 {
+			ns.Evicted = nil
+		}
+		if !e.reviewsEvicted {
+			e.reviewsEvicted = true
+			e.d.logf("sync: %d older notes of hop access records to review were dropped before they were shown", c)
+		}
+	}
 	var msgs []string
+	for _, r := range reviews {
+		if e.reviewsShown[r.ID] {
+			continue
+		}
+		if e.reviewsShown == nil {
+			e.reviewsShown = map[uint64]bool{}
+		}
+		e.reviewsShown[r.ID] = true
+		msgs = append(msgs, AccessReviewText(r))
+	}
 	if ns.Discarded {
 		msgs = append(msgs, "sync notes from before this device's local key was replaced were discarded")
 	}
@@ -745,7 +779,27 @@ func (e *syncer) noteSyncNotes() error {
 			}
 		})
 	}
+	if ns.Empty() {
+		return nil
+	}
 	return e.st.AckSyncNotes(ns)
+}
+
+// AccessReviewText is how an access-review note is shown: a checkpoint
+// revoked the devices that last changed these hop access records (crypto
+// spec rev 17, §7.5).
+func AccessReviewText(r store.AccessReviewNote) string {
+	devs := make([]string, len(r.Devices))
+	for i, d := range r.Devices {
+		devs[i] = d.String()
+	}
+	labels := make([]string, len(r.Items))
+	for i, it := range r.Items {
+		labels[i] = fmt.Sprintf("%q", it.Label)
+	}
+	return fmt.Sprintf("the checkpoint at seq %d revoked device(s) %s, which last changed the hop access record(s) %s. "+
+		"Revoking a device revokes no colleague: review them with hop access ls and hop access check",
+		r.CheckpointSeq, strings.Join(devs, ", "), strings.Join(labels, ", "))
 }
 
 func (e *syncer) noteHalt(why string, equivocation bool) {

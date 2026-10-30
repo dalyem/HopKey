@@ -1738,6 +1738,9 @@ func (s *Store) checkPut(it crypto.Item, isNew bool) error {
 		if err := checkAccessWrite(cur, a); err != nil {
 			return err
 		}
+		if taken := s.verifiedLabelTaken(h.ItemID, a.Label); taken != "" {
+			return labelErr(taken)
+		}
 	}
 	if host, ok := it.(*model.Host); ok {
 		seen := map[model.ID]bool{host.ItemID: true}

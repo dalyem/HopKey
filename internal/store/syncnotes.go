@@ -14,6 +14,7 @@ import (
 	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/merge"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/vaultlog"
 )
 
 // The sync notes of a server-backed vault (crypto spec rev 17 amendment,
@@ -58,10 +59,15 @@ const (
 	// NoteCombined is the kind of a note of a write that combined changes
 	// rev 16 would have held.
 	NoteCombined = "combined"
+	// NoteAccessReview is the kind of a note of a checkpoint that revoked
+	// devices which last changed live hop access records (rev 17 Part 2,
+	// §7.5). It settles nothing: it is added ready in the commit that
+	// verifies the checkpoint.
+	NoteAccessReview = "access-review"
 )
 
 // knownNoteKind reports whether this build reads notes of kind k.
-func knownNoteKind(k string) bool { return k == NoteCombined }
+func knownNoteKind(k string) bool { return k == NoteCombined || k == NoteAccessReview }
 
 func (l layout) syncNotesFile() string { return filepath.Join(l.vault(), syncNotesRel) }
 
@@ -124,6 +130,66 @@ type combinedBody struct {
 	Name   string     `json:"name"`
 	Local  []string   `json:"local"`
 	Remote []string   `json:"remote"`
+}
+
+// accessReviewBody is an access-review note's body (§3.2 as Part 2 extends
+// it): the checkpoint, the devices it revoked, and the live records whose
+// by is one of them, sorted by item ID.
+type accessReviewBody struct {
+	CheckpointSeq uint64             `json:"checkpoint_seq,string"`
+	Devices       []model.ID         `json:"devices"`
+	Items         []accessReviewItem `json:"items"`
+}
+
+type accessReviewItem struct {
+	ItemID model.ID `json:"item_id"`
+	Label  string   `json:"label"`
+}
+
+func parseAccessReview(body canonjson.Raw) (accessReviewBody, bool) {
+	var b accessReviewBody
+	if canonjson.Unmarshal(body, &b) != nil || len(b.Devices) == 0 || len(b.Items) == 0 {
+		return b, false
+	}
+	for _, it := range b.Items {
+		if it.ItemID.IsZero() || len([]rune(it.Label)) > 64 {
+			return b, false
+		}
+	}
+	return b, true
+}
+
+// accessReviewNote is the note for a checkpoint w that revokes devices
+// (verified Retired.DeviceIDs grows from pre to post) when some live
+// access record in sec has its by among them; nil otherwise.
+func accessReviewNote(w *vaultlog.Wire, pre, post *vaultlog.State, sec *vaultlog.Secrets) (*syncNoteJSON, error) {
+	if w.Entry.Kind != vaultlog.KindCheckpoint || pre == nil || post == nil || sec == nil {
+		return nil, nil
+	}
+	var revoked []model.ID
+	for _, id := range post.Retired.DeviceIDs {
+		if !slices.Contains(pre.Retired.DeviceIDs, id) {
+			revoked = append(revoked, id)
+		}
+	}
+	if len(revoked) == 0 {
+		return nil, nil
+	}
+	body := accessReviewBody{CheckpointSeq: w.Entry.Seq, Devices: revoked, Items: []accessReviewItem{}}
+	for id, it := range sec.Items {
+		if a, ok := it.Item.(*model.Access); ok && slices.Contains(revoked, a.By) {
+			body.Items = append(body.Items, accessReviewItem{ItemID: id, Label: a.Label})
+		}
+	}
+	if len(body.Items) == 0 {
+		return nil, nil
+	}
+	slices.SortFunc(body.Items, func(a, b accessReviewItem) int { return bytes.Compare(a.ItemID[:], b.ItemID[:]) })
+	b, err := canonjson.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return &syncNoteJSON{Kind: NoteAccessReview, Body: b}, nil
 }
 
 func emptySyncNotes() syncNotesJSON {
@@ -236,6 +302,11 @@ func validSyncNotes(n syncNotesJSON) bool {
 		}
 		if x.Kind == NoteCombined {
 			if _, ok := parseCombined(x.Body); !ok {
+				return false
+			}
+		}
+		if x.Kind == NoteAccessReview {
+			if _, ok := parseAccessReview(x.Body); !ok {
 				return false
 			}
 		}
@@ -396,16 +467,25 @@ func (s *Store) journalSyncNote(t *txn, rec *deviceRecord, vaultID model.ID, seq
 // settleSyncNotes adds to t what verified history up to head decides for
 // the pending notes: a note whose candidate is the verified entry at its
 // seq is ready, any other at a seq ≤ head is dropped. It runs whether or
-// not the outbox is empty. The caller holds s.mu and the file lock.
-func (s *Store) settleSyncNotes(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, error), rec *deviceRecord, vaultID model.ID) error {
-	if _, err := os.Lstat(s.l.syncNotesFile()); errors.Is(err, os.ErrNotExist) {
+// not the outbox is empty. ready are notes that settle nothing, added
+// ready in the same commit (the access-review note of the checkpoint this
+// commit verifies). The caller holds s.mu and the file lock.
+func (s *Store) settleSyncNotes(t *txn, head uint64, hashAt func(uint64) (crypto.Hash, error), rec *deviceRecord, vaultID model.ID, ready ...syncNoteJSON) error {
+	if _, err := os.Lstat(s.l.syncNotesFile()); errors.Is(err, os.ErrNotExist) && len(ready) == 0 {
 		return nil
-	} else if err != nil {
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	what := ""
+	if len(ready) > 0 {
+		what = "a note of hop access records to review"
+	}
 	var herr error
-	err := s.updateSyncNotes(t, rec, vaultID, "", func(n *syncNotesJSON) bool {
-		changed := false
+	err := s.updateSyncNotes(t, rec, vaultID, what, func(n *syncNotesJSON) bool {
+		changed := len(ready) > 0
+		for _, note := range ready {
+			addReady(n, note)
+		}
 		kept := n.Pending[:0:0]
 		for _, p := range n.Pending {
 			if p.Seq > head {
@@ -469,9 +549,26 @@ type CombinedNote struct {
 	Remote []string // the members the other device changed
 }
 
+// AccessReviewNote says that a checkpoint revoked devices that were the
+// last to change live hop access records (§7.5): the user should review
+// those records. It names records by item ID and label.
+type AccessReviewNote struct {
+	ID            uint64
+	CheckpointSeq uint64
+	Devices       []model.ID
+	Items         []AccessReviewItem
+}
+
+// AccessReviewItem is one record an AccessReviewNote names.
+type AccessReviewItem struct {
+	ItemID model.ID
+	Label  string
+}
+
 // SyncNotes are the ready sync notes, as one delivery to acknowledge.
 type SyncNotes struct {
-	Combined []CombinedNote
+	Combined      []CombinedNote
+	AccessReviews []AccessReviewNote
 	// Evicted counts, per kind, the older notes dropped undelivered.
 	Evicted map[string]uint64
 	// Discarded: notes sealed under an earlier local_key of this device
@@ -484,7 +581,7 @@ type SyncNotes struct {
 
 // Empty reports whether n holds nothing to show.
 func (n SyncNotes) Empty() bool {
-	return len(n.Combined) == 0 && len(n.Evicted) == 0 && !n.Discarded && len(n.Dropped) == 0
+	return len(n.Combined) == 0 && len(n.AccessReviews) == 0 && len(n.Evicted) == 0 && !n.Discarded && len(n.Dropped) == 0
 }
 
 // SyncNotes returns the ready notes of the kinds this build knows, with
@@ -515,11 +612,18 @@ func (s *Store) SyncNotes() (SyncNotes, error) {
 		}
 	}
 	for _, r := range f.notes.Ready {
-		if r.Note.Kind != NoteCombined {
-			continue
+		switch r.Note.Kind {
+		case NoteCombined:
+			c, _ := parseCombined(r.Note.Body)
+			out.Combined = append(out.Combined, CombinedNote{ID: r.ID, ItemID: c.ItemID, Type: c.Type, Name: c.Name, Local: c.Local, Remote: c.Remote})
+		case NoteAccessReview:
+			b, _ := parseAccessReview(r.Note.Body)
+			n := AccessReviewNote{ID: r.ID, CheckpointSeq: b.CheckpointSeq, Devices: b.Devices}
+			for _, it := range b.Items {
+				n.Items = append(n.Items, AccessReviewItem{ItemID: it.ItemID, Label: it.Label})
+			}
+			out.AccessReviews = append(out.AccessReviews, n)
 		}
-		c, _ := parseCombined(r.Note.Body)
-		out.Combined = append(out.Combined, CombinedNote{ID: r.ID, ItemID: c.ItemID, Type: c.Type, Name: c.Name, Local: c.Local, Remote: c.Remote})
 	}
 	return out, nil
 }
@@ -559,6 +663,9 @@ func (s *Store) AckSyncNotes(d SyncNotes) error {
 	}
 	ids := map[uint64]bool{}
 	for _, c := range d.Combined {
+		ids[c.ID] = true
+	}
+	for _, c := range d.AccessReviews {
 		ids[c.ID] = true
 	}
 	n := f.notes

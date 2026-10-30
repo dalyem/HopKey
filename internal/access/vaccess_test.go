@@ -121,8 +121,8 @@ func TestApplyResultsFences(t *testing.T) {
 	s := record(t, model.AccessPending, 4, model.AccessPending, 2)
 	fp := s.Targets[0].ServerKeyFP
 	next, kept := ApplyResults(s, []Result{
-		{Host: hostA, FP: fp, From: model.AccessPending, Gen: 3, State: model.AccessInstalled},
-		{Host: hostB, FP: fp, From: model.AccessPending, Gen: 2, State: model.AccessFailed, Error: "no"},
+		{ItemID: s.ItemID, RecordID: s.RecordID, Host: hostA, FP: fp, From: model.AccessPending, Gen: 3, State: model.AccessInstalled},
+		{ItemID: s.ItemID, RecordID: s.RecordID, Host: hostB, FP: fp, From: model.AccessPending, Gen: 2, State: model.AccessFailed, Error: "no"},
 	}, 200)
 	if len(kept) != 1 || kept[0].Host != hostB {
 		t.Fatalf("kept %+v", kept)
@@ -134,11 +134,35 @@ func TestApplyResultsFences(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Every observation dropped: nothing to record.
-	none, kept := ApplyResults(s, []Result{{Host: hostA, FP: fp, From: model.AccessPending, Gen: 3, State: model.AccessInstalled}}, 200)
+	none, kept := ApplyResults(s, []Result{{ItemID: s.ItemID, RecordID: s.RecordID, Host: hostA, FP: fp, From: model.AccessPending, Gen: 3, State: model.AccessInstalled}}, 200)
 	if len(kept) != 0 || Substantive(s, stamp(none)) {
 		t.Fatal("a put with every observation dropped is substantive")
 	}
 	wantRefused(t, Check(s, none, PathWrite), RuleNothing)
+}
+
+// An observation is for the record it was made for, never for another
+// record that has the same label now (review P1): record B reused A's
+// label, and its target on the same host, bound to the same key, is in
+// the state and gen A's run acted under.
+func TestApplyResultsNeedTheSameRecord(t *testing.T) {
+	a := record(t, model.AccessRemoving, 2, model.AccessRemoved, 2)
+	b := record(t, model.AccessRemoving, 2, model.AccessRemoved, 2)
+	b.ItemID, b.RecordID = tid(3), tid(4)
+	fp := a.Targets[0].ServerKeyFP
+	obs := Result{ItemID: a.ItemID, RecordID: a.RecordID, Host: hostA, FP: fp, From: model.AccessRemoving, Gen: 2, State: model.AccessRemoved}
+	if next, kept := ApplyResults(b, []Result{obs}, 200); len(kept) != 0 || Substantive(b, next) {
+		t.Fatalf("A's observation was applied to B: kept %+v", kept)
+	}
+	// The same item with another record ID is not A either.
+	c := Clone(b)
+	c.ItemID = a.ItemID
+	if _, kept := ApplyResults(c, []Result{obs}, 200); len(kept) != 0 {
+		t.Fatalf("applied across record IDs: %+v", kept)
+	}
+	if _, kept := ApplyResults(a, []Result{obs}, 200); len(kept) != 1 {
+		t.Fatal("A's own observation was dropped")
+	}
 }
 
 func TestCheckDelete(t *testing.T) {

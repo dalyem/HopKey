@@ -312,6 +312,9 @@ func (s *Store) queuePut(it crypto.Item, isNew bool, cond *hostKeyWrite) error {
 		if err := checkAccessWrite(cur, a); err != nil {
 			return err
 		}
+		if taken := overlayLabelTaken(ov.items, h.ItemID, a.Label); taken != "" {
+			return labelErr(taken)
+		}
 	}
 	if err := checkRefs(it, ov.items); err != nil {
 		return err

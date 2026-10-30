@@ -259,26 +259,39 @@ func jsonEqual(a, b any) bool {
 }
 
 // Result is what a planner run observed for one target it acted on: the
-// state the target was in and its gen when the run acted, and the state
-// and error to record.
+// record it acted for (its item ID and record ID, fixed when the command
+// started; a label can name another record later), the state the target
+// was in and its gen when the run acted, and the state and error to
+// record.
 type Result struct {
-	Host  model.ID
-	FP    string
-	From  string // pending or removing
-	Gen   uint64
-	State string
-	Error string
+	ItemID   model.ID
+	RecordID model.ID
+	Host     model.ID
+	FP       string
+	From     string // pending or removing
+	Gen      uint64
+	State    string
+	Error    string
+}
+
+// Same reports whether a is the record r was observed for.
+func (r Result) Same(a *model.Access) bool {
+	return a != nil && a.ItemID == r.ItemID && a.RecordID == r.RecordID
 }
 
 // ApplyResults builds a result put from s, the newest verified state
-// (§7.1): each result is recorded only if its target is still in From with
-// Gen; a target that moved on belongs to the newer operation, and its
-// result is dropped (§5.1 rule 4). It returns the put and the results it
-// kept. The put's by is not stamped.
+// (§7.1): each result is recorded only if s is the record it was observed
+// for and its target is still in From with Gen; a target that moved on
+// belongs to the newer operation, and its result is dropped (§5.1 rule 4).
+// It returns the put and the results it kept. The put's by is not
+// stamped.
 func ApplyResults(s *model.Access, rs []Result, now model.Timestamp) (*model.Access, []Result) {
 	next := Clone(s)
 	var kept []Result
 	for _, r := range rs {
+		if !r.Same(s) {
+			continue
+		}
 		t := vaultlog.AccessTargetOf(next, r.Host, r.FP)
 		if t == nil || t.State != r.From || t.Gen != r.Gen {
 			continue

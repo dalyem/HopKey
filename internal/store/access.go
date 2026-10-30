@@ -16,6 +16,55 @@ import (
 // (§5.0, §5.1): when it is journaled, on every rebase, and in every
 // resolution that writes.
 
+// ErrAccessLabelTaken is a write that would give two live access records
+// the same label under K_alias (§5.1 writer rule).
+var ErrAccessLabelTaken = errors.New("store: another hop access record has that label")
+
+// labelTaken returns the label of another live access item (not self) in
+// items whose label equals label under K_alias (model.NameKey), the
+// function host lookup uses; "" when there is none.
+func labelTaken[T any](items map[model.ID]T, plain func(T) (*model.Access, bool), self model.ID, label string) string {
+	want := model.NameKey(label)
+	for id, it := range items {
+		if id == self {
+			continue
+		}
+		if a, ok := plain(it); ok && model.NameKey(a.Label) == want {
+			return a.Label
+		}
+	}
+	return ""
+}
+
+func labelErr(taken string) error {
+	return fmt.Errorf("%w: %q (labels compare without case and a trailing dot)", ErrAccessLabelTaken, taken)
+}
+
+// verifiedLabelTaken is labelTaken over verified state. The caller holds
+// s.mu.
+func (s *Store) verifiedLabelTaken(self model.ID, label string) string {
+	return labelTaken(s.sec.Items, func(it vaultlog.PlainItem) (*model.Access, bool) {
+		a, ok := it.Item.(*model.Access)
+		return a, ok
+	}, self, label)
+}
+
+// overlayLabelTaken is labelTaken over the overlay: verified state with
+// this device's queued changes.
+func overlayLabelTaken(items map[model.ID]*merge.Item, self model.ID, label string) string {
+	return labelTaken(items, func(it *merge.Item) (*model.Access, bool) {
+		if it == nil || it.Type() != model.TypeAccess {
+			return nil, false
+		}
+		p, err := plainOf(it)
+		if err != nil {
+			return nil, false
+		}
+		a, ok := p.(*model.Access)
+		return a, ok
+	}, self, label)
+}
+
 // ErrNothingToRecord is a resolution of an access item whose result
 // changes nothing but by (§5.1 rule 6).
 var ErrNothingToRecord = errors.New("store: nothing to record: use --take-theirs")
@@ -145,6 +194,11 @@ func (s *Store) accessRebase(in merge.Intent, res merge.Result) merge.Result {
 	}
 	if err := access.Check(cur, next, access.PathWrite); err != nil {
 		return merge.Result{Kind: merge.KindHold, Cause: merge.CauseRuleFailure, Err: err}
+	}
+	// Labels are unique among live records, against current state too:
+	// another device may have created one with this label meanwhile.
+	if taken := s.verifiedLabelTaken(in.ItemID, next.Label); taken != "" {
+		return merge.Result{Kind: merge.KindHold, Cause: merge.CauseRuleFailure, Err: labelErr(taken)}
 	}
 	res.Plaintext = stamped
 	return res

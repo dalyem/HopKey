@@ -21,7 +21,7 @@ import (
 // dispatchSync handles the sync ops. handled is false for any other op.
 func (d *Daemon) dispatchSync(ctx context.Context, req Request) (result any, handled bool, err error) {
 	switch req.Op {
-	case OpSyncStatus, OpSyncNow, OpSyncHeld, OpSyncProposal, OpSyncResolve, OpDevicesList:
+	case OpSyncStatus, OpSyncNow, OpSyncPull, OpSyncHeld, OpSyncProposal, OpSyncResolve, OpDevicesList:
 	default:
 		return nil, false, nil
 	}
@@ -39,6 +39,16 @@ func (d *Daemon) dispatchSync(ctx context.Context, req Request) (result any, han
 			return nil, true, err
 		}
 		if err := d.sync.request(ctx, reqSyncNow); err != nil {
+			return nil, true, syncError(err)
+		}
+		return d.syncStatus(true), true, nil
+	case OpSyncPull:
+		if err := noParams(req); err != nil {
+			return nil, true, err
+		}
+		pctx, cancel := context.WithTimeout(ctx, syncNowTimeout)
+		defer cancel()
+		if err := d.sync.request(pctx, reqPull); err != nil {
 			return nil, true, syncError(err)
 		}
 		return d.syncStatus(true), true, nil
