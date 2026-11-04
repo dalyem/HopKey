@@ -21,27 +21,21 @@
 #     asks twice.
 #   - A tag ruleset (repository settings, Rules) that blocks updating and
 #     deleting the tags v*, so that a released version stays what it was.
-#   - A classic personal access token with only the write:packages scope, saved
-#     as the secret GHCR_TOKEN of the release environment, never of the
-#     repository. Only a job that passes the environment's approval can read it.
-#   - The ghcr.io package hop-server is created private by the first release, and
-#     stays open to this repository's workflows until these steps, in this order,
-#     in the package's settings: clear "Inherit access from repository" and leave
-#     this repository out of "Manage Actions access"; check that the package
-#     holds only the expected version, with the digest in the run's log; then
-#     make it public, or nobody else can pull it.
+#   - The ghcr.io package hop-server is created private by its first push. After
+#     the first release, make it public in the package's settings, or nobody else
+#     can pull it.
 #   - Tag rulesets: nobody can update or delete the tags v*, and only admins can
 #     create them.
 #
-# Why a token and not GITHUB_TOKEN: GHCR grants a repository's workflows write
-# to a package it is linked to, whatever environment they run in, and a workflow
-# edited on a tagged commit could drop environment:. With the repository's
-# access removed, the only write credential a workflow here can reach is the one
-# the environment holds. The token's owner can still push from outside Actions.
-# npm is limited the same way by binding its trusted publisher to the environment.
+# Known limit: the environment does not limit ghcr. GHCR gives this repository's
+# workflows write to the package whatever environment they run in, so anyone with
+# write access could push an image from a workflow on any branch, with no tag and
+# no approval. npm is protected, because its trusted publisher is bound to the
+# environment. Before adding a collaborator with write access, move the push to a
+# token held only by the environment, and remove the repository's access to the
+# package.
 #
-# Approving a release trusts the workflow on the tagged commit, which could read
-# the environment's secret. Before approving, check the commit the run names, and
+# Approving a release trusts the workflow on the tagged commit. Before approving, check the commit the run names, and
 # what changed in .github/workflows since the last release. An approval is only a
 # person's decision if their GitHub credential is out of reach of automation.
 #
@@ -287,6 +281,7 @@ jobs:
     environment: release
     permissions:
       contents: read
+      packages: write
     env:
       IMAGE: ghcr.io/dalyem/hop-server
     steps:
@@ -328,8 +323,8 @@ jobs:
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       # A re-run after a partial failure may find the version already pushed.
       # It is the same release if it was built from this commit, and then
