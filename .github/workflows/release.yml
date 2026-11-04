@@ -1,0 +1,270 @@
+# Release pipeline: pushing a tag vMAJOR.MINOR.PATCH (or with a -PRERELEASE
+# suffix) checks the code, builds the binaries, pushes the hop-server image to
+# ghcr.io/dalyem/hop-server, publishes the hop CLI to npm as hopkey, and
+# creates the GitHub Release.
+#
+# One-time setup this file depends on:
+#   - The package hopkey must already exist on npm, with a trusted publisher
+#     for the repository dalyem/HopKey and the workflow file release.yml (npm
+#     package settings, "Trusted publisher"). Publishing uses that OIDC trust;
+#     there is no npm token, and none must be added. npm only lets a package
+#     that exists have a trusted publisher, so the first version is published
+#     by hand.
+#   - The ghcr.io package hop-server is created private by its first push.
+#     After the first release, make it public in the package's settings (and
+#     link it to the repository), or nobody else can pull it.
+#
+# The workflow file name matters: npm checks it against the trusted publisher.
+# Don't rename release.yml without changing that setting.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+# One release per tag at a time, and a running release is never cancelled:
+# half a publish is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      minor: ${{ steps.tag.outputs.minor }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Check the tag
+        id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?'
+          if ! printf '%s\n' "$TAG" | grep -Eq "^v$semver\$"; then
+            echo "::error::the tag '$TAG' is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE"
+            exit 1
+          fi
+          version=${TAG#v}
+          case "$version" in
+          *-*) prerelease=true ;;
+          *) prerelease=false ;;
+          esac
+          {
+            echo "version=$version"
+            echo "minor=$(printf '%s\n' "$version" | cut -d. -f1,2)"
+            echo "prerelease=$prerelease"
+          } >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # Not the race check: three known tests are flaky under load, and it takes
+      # long. check.sh test needs the runner's ssh client (HOPKEY_REQUIRE_SSH=1).
+      - run: sh scripts/check.sh gofmt
+      - run: sh scripts/check.sh vet
+      - run: sh scripts/check.sh test
+      - name: npm package tests
+        run: node --test npm/test/*.test.js
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Build the binaries and SHA256SUMS
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: sh scripts/release-build.sh "$VERSION" dist
+      # Upload and download drop file modes; the jobs that need them back
+      # set them again.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/dalyem/hop-server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          # The exact version always; latest and MAJOR.MINOR only for a
+          # release that is not a prerelease.
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.version }}
+            type=raw,value=${{ needs.verify.outputs.minor }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+
+      # Build for the runner's own platform first and run it, before anything
+      # is pushed.
+      - name: Build amd64 for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          tags: hop-server:smoke
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+      - name: Smoke test the image
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: sh scripts/image-smoke.sh hop-server:smoke "$VERSION"
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The build stage cross-compiles, so arm64 needs no emulation. The
+      # amd64 layers come from the build above.
+      - name: Build and push amd64 and arm64
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+
+  npm:
+    needs: [verify, build, image]
+    # Trusted publishing refuses self-hosted runners.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 and Node 22.14.0. Node 24 comes
+      # with a new enough npm; the upgrade is for the day it does not.
+      - name: Check the npm and Node versions
+        run: |
+          set -eu
+          at_least() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
+          node_v=$(node --version | sed 's/^v//')
+          at_least "$node_v" 22.14.0 || { echo "::error::Node $node_v is older than 22.14.0"; exit 1; }
+          if ! at_least "$(npm --version)" 11.5.1; then
+            npm install --global npm@11.21.1
+            hash -r
+          fi
+          at_least "$(npm --version)" 11.5.1 || { echo "::error::npm is older than 11.5.1"; exit 1; }
+          echo "node $node_v, npm $(npm --version)"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Stage and pack the package
+        id: pack
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          chmod +x dist/hop-*
+          sh scripts/npm-stage.sh "$VERSION" dist stage
+          mkdir tarball
+          (cd stage && npm pack --silent --pack-destination ../tarball)
+          echo "tarball=$PWD/tarball/hopkey-$VERSION.tgz" >>"$GITHUB_OUTPUT"
+      # Install the tarball that is about to be published and run its binary.
+      - name: Test the staged package
+        env:
+          HOPKEY_NPM_TARBALL: ${{ steps.pack.outputs.tarball }}
+          HOPKEY_NPM_VERSION: ${{ needs.verify.outputs.version }}
+        run: node --test npm/test/staged.test.js
+      # A re-run after a partial failure must not fail on a version that is
+      # already there. The read is anonymous: it leaves out the .npmrc that
+      # setup-node wrote, whose token is a placeholder.
+      - name: Check whether this version is published
+        id: exists
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          NPM_CONFIG_USERCONFIG: /dev/null
+        run: |
+          set -u
+          if out=$(npm view "hopkey@$VERSION" version --registry https://registry.npmjs.org/ 2>&1); then
+            echo "::notice::hopkey@$VERSION is already on npm; not publishing it again"
+            echo "published=true" >>"$GITHUB_OUTPUT"
+          elif printf '%s\n' "$out" | grep -q 'E404'; then
+            echo "published=false" >>"$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$out" >&2
+            echo "::error::could not tell whether hopkey@$VERSION is on npm"
+            exit 1
+          fi
+      # No NODE_AUTH_TOKEN, no token: npm exchanges this job's OIDC identity
+      # for a short-lived publish credential, and attaches provenance.
+      - name: Publish to npm
+        if: steps.exists.outputs.published != 'true'
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          NPM_TAG: ${{ needs.verify.outputs.prerelease == 'true' && 'next' || 'latest' }}
+        run: npm publish "$TARBALL" --access public --provenance --tag "$NPM_TAG"
+
+  release:
+    needs: [verify, build, image, npm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/hop-*
+            dist/SHA256SUMS
