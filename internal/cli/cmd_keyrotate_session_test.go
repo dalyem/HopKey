@@ -131,8 +131,9 @@ func requireFakeBins(t *testing.T, sh akShell, name string) {
 }
 
 // shellRunsFake runs sh with a fake of name first on PATH and reports whether
-// the fake ran. The fake only leaves a marker; the call is made in an empty
-// directory, with an argument no real command can do anything with.
+// the fake ran. The fake only leaves a marker. The call is made in an empty
+// temporary directory, where whatever a real command does with the argument
+// (mkdir makes a directory) is thrown away.
 func shellRunsFake(t *testing.T, sh akShell, name string) bool {
 	t.Helper()
 	marker := filepath.Join(t.TempDir(), "ran")
@@ -143,7 +144,7 @@ func shellRunsFake(t *testing.T, sh akShell, name string) bool {
 	cmd := exec.Command(sh.path, "-c", name+" probe-argument")
 	cmd.Dir = t.TempDir()
 	cmd.Env = []string{"HOME=" + cmd.Dir, "PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH")}
-	cmd.Run() // a real command given the argument fails, and that is no matter
+	cmd.Run() // only the marker counts, not how the command exited
 	_, err := os.Stat(marker)
 	return err == nil
 }
