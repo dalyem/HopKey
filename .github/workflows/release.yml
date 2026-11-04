@@ -21,14 +21,21 @@
 #     asks twice.
 #   - A tag ruleset (repository settings, Rules) that blocks updating and
 #     deleting the tags v*, so that a released version stays what it was.
-#   - The ghcr.io package hop-server is created private by its first push.
-#     After the first release, make it public in the package's settings (and
-#     link it to the repository), or nobody else can pull it.
+#   - A classic personal access token with only the write:packages scope, saved
+#     as the secret GHCR_TOKEN of the release environment, never of the
+#     repository. Only a job that passes the environment's approval can read it.
+#   - The ghcr.io package hop-server is created private by its first push. After
+#     the first push, in the package's settings: clear "Inherit access from
+#     repository", leave this repository out of "Manage Actions access", and
+#     make the package public, or nobody else can pull it.
+#   - Tag rulesets: nobody can update or delete the tags v*, and only admins can
+#     create them.
 #
-# Known residual risk: the GitHub environment does not limit ghcr. A workflow
-# edited on a tagged commit could drop environment: and still push an image,
-# because GHCR grants write to the repository, not to the environment. npm is
-# protected because its trusted publisher is bound to the environment.
+# Why a token and not GITHUB_TOKEN: GHCR grants a repository's workflows write
+# to a package it is linked to, whatever environment they run in, and a workflow
+# edited on a tagged commit could drop environment:. With the repository's
+# access removed, the only write credential is the one the environment holds. npm
+# is limited the same way by binding its trusted publisher to the environment.
 #
 # The workflow file name matters: npm checks it against the trusted publisher.
 # Don't rename release.yml without changing that setting.
@@ -269,7 +276,6 @@ jobs:
     environment: release
     permissions:
       contents: read
-      packages: write
     env:
       IMAGE: ghcr.io/dalyem/hop-server
     steps:
@@ -311,8 +317,8 @@ jobs:
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       # A re-run after a partial failure may find the version already pushed.
       # It is the same release if it was built from this commit, and then
