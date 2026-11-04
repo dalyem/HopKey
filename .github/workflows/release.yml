@@ -1,8 +1,9 @@
-# Release pipeline: pushing a tag vMAJOR.MINOR.PATCH (or with a -PRERELEASE
-# suffix) checks the code, builds the binaries, pushes the hop-server image to
-# ghcr.io/dalyem/hop-server, publishes the hop CLI to npm as @dalyem/hopkey, and
-# creates the GitHub Release. A stable tag must be on main; a prerelease tag may
-# be on any branch.
+# Release pipeline: pushing a tag checks the code, builds the binaries, pushes
+# the hop-server image to ghcr.io/dalyem/hop-server, publishes the hop CLI to
+# npm as @dalyem/hopkey, and creates the GitHub Release. A tag is
+# vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-(alpha|beta|rc).N, with N a
+# non-negative integer without a leading zero; any other v* tag fails the first
+# job. A stable tag must be on main; a prerelease tag may be on any branch.
 #
 # One-time setup this file depends on:
 #   - The package @dalyem/hopkey must already exist on npm, with a trusted publisher
@@ -15,13 +16,19 @@
 #     accepted. A new publisher must complete a publish within two days.
 #   - A GitHub environment release (repository settings, Environments) with a
 #     required reviewer and a deployment rule that allows only the tags v*. The
-#     jobs that publish (image-push and npm-publish) wait for it together, and
-#     one approval covers both.
+#     jobs that publish (image-push and npm-publish) normally wait for it
+#     together, so one approval usually covers both; approve each if GitHub
+#     asks twice.
 #   - A tag ruleset (repository settings, Rules) that blocks updating and
 #     deleting the tags v*, so that a released version stays what it was.
 #   - The ghcr.io package hop-server is created private by its first push.
 #     After the first release, make it public in the package's settings (and
 #     link it to the repository), or nobody else can pull it.
+#
+# Known residual risk: the GitHub environment does not limit ghcr. A workflow
+# edited on a tagged commit could drop environment: and still push an image,
+# because GHCR grants write to the repository, not to the environment. npm is
+# protected because its trusted publisher is bound to the environment.
 #
 # The workflow file name matters: npm checks it against the trusted publisher.
 # Don't rename release.yml without changing that setting.
@@ -50,6 +57,7 @@ jobs:
       version: ${{ steps.tag.outputs.version }}
       minor: ${{ steps.tag.outputs.minor }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
+      attempt: ${{ github.run_attempt }}
       npm_tag: ${{ steps.rolling.outputs.npm_tag }}
       docker_latest: ${{ steps.rolling.outputs.docker_latest }}
       docker_minor: ${{ steps.rolling.outputs.docker_minor }}
@@ -70,9 +78,9 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -eu
-          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?'
+          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?'
           if ! printf '%s\n' "$TAG" | grep -Eq "^v$semver\$"; then
-            echo "::error::the tag '$TAG' is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE"
+            echo "::error::the tag '$TAG' is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-(alpha|beta|rc).N"
             exit 1
           fi
           version=${TAG#v}
@@ -253,7 +261,7 @@ jobs:
           retention-days: 7
 
   # image-push and npm-publish have the same needs on purpose: both reach the
-  # release environment at the same moment, so one approval covers both.
+  # release environment at the same moment, so they normally wait together.
   image-push:
     needs: [verify, build, image-smoke, npm-pack]
     runs-on: ubuntu-latest
@@ -265,6 +273,21 @@ jobs:
     env:
       IMAGE: ghcr.io/dalyem/hop-server
     steps:
+      # The release decisions (version, rolling tags, npm-pack's published
+      # answer) were made in verify and npm-pack. "Re-run failed jobs" keeps
+      # their old outputs, so a retried publish could move latest backward
+      # after a newer release shipped. Only a run where all of them ran in
+      # this attempt is trusted: use "Re-run all jobs".
+      - name: Check that the release decisions are from this attempt
+        env:
+          DECIDED: ${{ needs.verify.outputs.attempt }}
+          NOW: ${{ github.run_attempt }}
+        run: |
+          set -eu
+          if [ "$DECIDED" != "$NOW" ]; then
+            echo "::error::the release decisions were made in attempt $DECIDED, and this is attempt $NOW; use \"Re-run all jobs\""
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -294,11 +317,11 @@ jobs:
       # A re-run after a partial failure may find the version already pushed.
       # It is the same release if it was built from this commit, and then
       # there is nothing to push; from another commit, or unreadable, it is
-      # an error. ghcr may answer a package that does not exist yet with
-      # "denied" rather than "not found", so both mean push: this job's token
-      # can write the package, so if it exists and the read was truly denied,
-      # the push is refused too. Inline shell: no repository script runs while
-      # the registry token is in place.
+      # an error. Only "not found" means push. If ghcr answers a package's
+      # first push differently, this fails closed and prints the real answer,
+      # and a new prerelease tag can follow once the pattern is corrected.
+      # Inline shell: no repository script runs while the registry token is in
+      # place.
       - name: Check whether this version is already pushed
         id: exists
         env:
@@ -320,7 +343,7 @@ jobs:
               echo "::error::$ref exists and was built from '$rev', not from $GITHUB_SHA"
               exit 1
             fi
-          elif grep -Eqi ': not found$|denied' "$tmp/err"; then
+          elif grep -Eqi ': not found$' "$tmp/err"; then
             echo "present=false" >>"$GITHUB_OUTPUT"
           else
             cat "$tmp/err" >&2
@@ -358,22 +381,33 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # The release decisions (version, rolling tags, npm-pack's published
+      # answer) were made in verify and npm-pack. "Re-run failed jobs" keeps
+      # their old outputs, so a retried publish could move latest backward
+      # after a newer release shipped. Only a run where all of them ran in
+      # this attempt is trusted: use "Re-run all jobs".
+      - name: Check that the release decisions are from this attempt
+        env:
+          DECIDED: ${{ needs.verify.outputs.attempt }}
+          NOW: ${{ github.run_attempt }}
+        run: |
+          set -eu
+          if [ "$DECIDED" != "$NOW" ]; then
+            echo "::error::the release decisions were made in attempt $DECIDED, and this is attempt $NOW; use \"Re-run all jobs\""
+            exit 1
+          fi
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      # Trusted publishing needs npm 11.5.1 and Node 22.14.0. Node 24 comes
-      # with a new enough npm; the upgrade is for the day it does not.
+      # Trusted publishing needs npm 11.5.1 and Node 22.14.0. This job holds the
+      # publish identity, so it installs nothing: an old npm fails the job.
       - name: Check the npm and Node versions
         run: |
           set -eu
           at_least() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$2" ]; }
           node_v=$(node --version | sed 's/^v//')
           at_least "$node_v" 22.14.0 || { echo "::error::Node $node_v is older than 22.14.0"; exit 1; }
-          if ! at_least "$(npm --version)" 11.5.1; then
-            npm install --global npm@11.21.1
-            hash -r
-          fi
           at_least "$(npm --version)" 11.5.1 || { echo "::error::npm is older than 11.5.1"; exit 1; }
           echo "node $node_v, npm $(npm --version)"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

@@ -17,8 +17,10 @@ version=$1
 bindir=$2
 out=$3
 
-# Anything else in the version would land in package.json as it is.
-if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+# Anything else in the version would land in package.json as it is. The same
+# format as the release tags: MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-(alpha|
+# beta|rc).N, N without a leading zero.
+if ! printf '%s\n' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$'; then
 	echo "npm-stage: not a version: $version" >&2
 	exit 2
 fi

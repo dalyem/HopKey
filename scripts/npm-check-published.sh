@@ -11,6 +11,12 @@
 # prints the differing files to stderr and exits 1. Any other answer from the
 # registry exits 1: an unknown answer is never "not published".
 #
+# Both tarballs are listed before anything is extracted. Only regular files
+# and directories under package/ are accepted; a symlink, a hard link, a
+# device, a path outside package/ or one with a .. component exits 1 and names
+# the entry. diff then cannot compare a link's target in place of its content,
+# and tar cannot write outside the work directory.
+#
 # The read is anonymous: it leaves out the .npmrc that setup-node wrote. The
 # registry's tarball is fetched with npm pack, which installs nothing and runs
 # no scripts.
@@ -50,6 +56,33 @@ if [ $# -ne 1 ] || [ ! -f "$1" ]; then
 	echo "::error::npm pack $package@$version did not leave exactly one tarball" >&2
 	exit 1
 fi
+# check_entries FILE refuses a tarball with an entry that is not a regular file
+# or a directory, or whose path is not under package/ or has a .. component.
+# The verbose listing starts each line with the type and mode; a line that does
+# not (a name with a newline in it) is refused too.
+check_entries() {
+	tar -tvzf "$1" >"$work/list.txt" 2>"$work/list.err" || {
+		cat "$work/list.err" >&2
+		echo "::error::cannot list $1" >&2
+		return 1
+	}
+	if grep -Ev '^[-d][-rwxsStT]{9} ' "$work/list.txt" >"$work/entry.txt"; then
+		echo "::error::$1 has an entry that is not a regular file or a directory: $(head -n 1 "$work/entry.txt")" >&2
+		return 1
+	fi
+	tar -tzf "$1" >"$work/names.txt" 2>"$work/list.err" || {
+		cat "$work/list.err" >&2
+		echo "::error::cannot list $1" >&2
+		return 1
+	}
+	if grep -Ev '^package/' "$work/names.txt" >"$work/entry.txt" ||
+		grep -E '(^|/)\.\.(/|$)' "$work/names.txt" >"$work/entry.txt"; then
+		echo "::error::$1 has a path outside package/ or with a '..' component: $(head -n 1 "$work/entry.txt")" >&2
+		return 1
+	fi
+}
+check_entries "$1"
+check_entries "$tarball"
 tar -xzf "$1" -C "$work/registry"
 tar -xzf "$tarball" -C "$work/local"
 
@@ -62,7 +95,7 @@ modes "$work/registry" >"$work/registry.modes"
 modes "$work/local" >"$work/local.modes"
 
 bad=0
-if ! diff -rq "$work/registry" "$work/local" >"$work/diff.txt" 2>&1; then
+if ! diff -rq --no-dereference "$work/registry" "$work/local" >"$work/diff.txt" 2>&1; then
 	bad=1
 fi
 if ! diff -u "$work/registry.modes" "$work/local.modes" >"$work/modes.txt" 2>&1; then

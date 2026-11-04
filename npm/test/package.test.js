@@ -19,7 +19,7 @@ let tarball;
 
 before(() => {
   assert.ok(PLATFORM in VENDOR, `these tests need linux or darwin on x64 or arm64, not ${PLATFORM}`);
-  tarball = h.pack(h.stagePackage(root, '1.2.3-test.1'), path.join(root, 'tarball'));
+  tarball = h.pack(h.stagePackage(root, '1.2.3-rc.1'), path.join(root, 'tarball'));
 });
 // Processes the tests start and may leave running when one fails.
 const started = new Set();

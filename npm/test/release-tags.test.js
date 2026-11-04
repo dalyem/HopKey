@@ -1,7 +1,10 @@
 'use strict';
 // scripts/release-tags.sh decides which rolling tags (npm latest, Docker
 // latest and MAJOR.MINOR) a release may move. These run it as the workflow
-// does: the existing tags on stdin, the version as the argument.
+// does: the existing tags on stdin, the version as the argument. A release
+// version is MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-(alpha|beta|rc).N; within
+// that format the script's sort -V agrees with SemVer order, which "SemVer
+// order" below checks against an implementation of the SemVer rules.
 
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
@@ -23,6 +26,32 @@ function run(version, tags) {
   }
   assert.deepEqual(Object.keys(out), ['npm_tag', 'docker_latest', 'docker_minor']);
   return out;
+}
+
+// semverCompare implements SemVer 2.0.0 precedence (section 11) for any
+// version, not only the release format: negative if a < b, 0 if equal.
+function semverCompare(a, b) {
+  const parse = (v) => {
+    const [core, pre] = v.split(/-(.*)/s);
+    return { nums: core.split('.').map(Number), pre: pre === undefined ? null : pre.split('.') };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < 3; i++) {
+    if (x.nums[i] !== y.nums[i]) return x.nums[i] < y.nums[i] ? -1 : 1;
+  }
+  if (x.pre === null || y.pre === null) return x.pre === y.pre ? 0 : x.pre === null ? 1 : -1;
+  for (let i = 0; i < Math.min(x.pre.length, y.pre.length); i++) {
+    const p = x.pre[i];
+    const q = y.pre[i];
+    if (p === q) continue;
+    const pn = /^[0-9]+$/.test(p);
+    const qn = /^[0-9]+$/.test(q);
+    if (pn && qn) return Number(p) < Number(q) ? -1 : 1;
+    if (pn !== qn) return pn ? -1 : 1;
+    return p < q ? -1 : 1;
+  }
+  return Math.sign(x.pre.length - y.pre.length);
 }
 
 const latest = { npm_tag: 'latest', docker_latest: 'true', docker_minor: 'true' };
@@ -110,6 +139,55 @@ describe('a prerelease', () => {
   });
 });
 
+describe('SemVer order', () => {
+  // Ascending, by the SemVer rules (checked below, not assumed).
+  const ascending = [
+    '1.0.0-alpha.1',
+    '1.0.0-alpha.2',
+    '1.0.0-alpha.10',
+    '1.0.0-beta.1',
+    '1.0.0-rc.1',
+    '1.0.0-rc.2',
+    '1.0.0-rc.10',
+    '1.9.0-rc.1',
+    '1.10.0-rc.1',
+    '2.0.0-rc.1',
+    '10.0.0-rc.1',
+  ];
+
+  test('the table is in SemVer order', () => {
+    for (let i = 1; i < ascending.length; i++) {
+      assert.ok(semverCompare(ascending[i - 1], ascending[i]) < 0, `${ascending[i - 1]} < ${ascending[i]}`);
+    }
+    // And the comparator is not the script's: it knows rc.a10 < rc.a2.
+    assert.ok(semverCompare('1.0.0-rc.a10', '1.0.0-rc.a2') < 0);
+  });
+
+  test('the script agrees for every pair: a prerelease is next only if it is the newer', () => {
+    for (let i = 0; i < ascending.length; i++) {
+      for (let j = 0; j < ascending.length; j++) {
+        if (i === j) continue;
+        const got = run(ascending[i], ['v' + ascending[i], 'v' + ascending[j]]).npm_tag;
+        const want = semverCompare(ascending[i], ascending[j]) > 0 ? 'next' : 'prerelease-old';
+        assert.equal(got, want, `${ascending[i]} against ${ascending[j]}`);
+      }
+    }
+  });
+
+  test('the newest of the whole table is next, and no other is', () => {
+    const tags = ascending.map((v) => 'v' + v);
+    for (const v of ascending) {
+      assert.equal(run(v, tags).npm_tag, v === ascending[ascending.length - 1] ? 'next' : 'prerelease-old', v);
+    }
+  });
+
+  test('1.9.0-rc.1 is older than 1.10.0-rc.1, and 2.0.0-rc.1 older than 10.0.0-rc.1', () => {
+    assert.equal(run('1.9.0-rc.1', ['v1.10.0-rc.1']).npm_tag, 'prerelease-old');
+    assert.equal(run('1.10.0-rc.1', ['v1.9.0-rc.1']).npm_tag, 'next');
+    assert.equal(run('2.0.0-rc.1', ['v10.0.0-rc.1']).npm_tag, 'prerelease-old');
+  });
+});
+
 describe('the tag list', () => {
   test('lines that are not release tags are ignored', () => {
     const junk = ['', 'latest', 'v1', 'v1.2', 'v1.2.3.4', 'v01.2.3', 'v9.9.9-', '1.9.9', 'vx.y.z', 'release-9.9', 'v9.9.9 ', 'v9.9.9\r', 'refs/tags/v9.9.9'];
@@ -123,11 +201,40 @@ describe('the tag list', () => {
     assert.equal(res.stdout, 'npm_tag=latest\ndocker_latest=true\ndocker_minor=true\n');
   });
 
+  // Valid SemVer, but not a format a release may use: its order would not be
+  // the one sort -V gives.
+  const refused = [
+    '1.0.0-rc.a10',
+    '1.0.0-denied',
+    '1.0.0-rc',
+    '1.0.0-rc.01',
+    '1.0.0-rc.1.1',
+    '1.0.0-RC.1',
+    '1.0.0-alpha',
+    '1.0.0-rc.-1',
+    '1.0.0-rc.1-x',
+    '1.0.0-gamma.1',
+    '1.0.0-foo',
+    '1.0.0-0',
+    '1.0.0+build.1',
+    '1.0.0-rc.1+build.1',
+    '01.0.0',
+    '1.0.0-',
+  ];
+
   test('a version that is not one is refused', () => {
-    for (const bad of ['', 'v1.0.0', '1.0', '1.0.0; echo x']) {
+    for (const bad of ['', 'v1.0.0', '1.0', '1.0.0; echo x', ...refused]) {
       const res = spawnSync('sh', [SCRIPT, bad], { input: '', encoding: 'utf8' });
       assert.equal(res.status, 2, `${bad}: ${res.stdout}`);
       assert.equal(res.stdout, '');
     }
+  });
+
+  test('a tag of a refused format is ignored, whatever it would sort as', () => {
+    const tags = refused.map((v) => 'v' + v);
+    assert.deepEqual(run('1.0.0', tags), latest);
+    assert.deepEqual(run('1.0.0-rc.1', tags), { npm_tag: 'next', docker_latest: 'false', docker_minor: 'false' });
+    // rc.1.1 would sort above rc.99 under sort -V; it must not count.
+    assert.equal(run('1.0.0-rc.99', ['v1.0.0-rc.1.1']).npm_tag, 'next');
   });
 });

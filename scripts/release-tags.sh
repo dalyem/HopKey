@@ -4,10 +4,12 @@
 #
 #   sh scripts/release-tags.sh VERSION <tags
 #
-# VERSION is the release version without the leading v. Stdin holds the
-# repository's existing release tags, one per line (vMAJOR.MINOR.PATCH, with
-# or without a -PRERELEASE suffix). Other lines are ignored, and VERSION's own
-# tag may or may not be among them. It prints lines for $GITHUB_OUTPUT:
+# VERSION is the release version without the leading v: MAJOR.MINOR.PATCH or
+# MAJOR.MINOR.PATCH-(alpha|beta|rc).N, N a non-negative integer without a
+# leading zero. Any other VERSION exits 2. Stdin holds the repository's
+# existing release tags, one per line, in the same format with the v. Lines
+# that do not match are ignored, and VERSION's own tag may or may not be among
+# them. It prints lines for $GITHUB_OUTPUT:
 #
 #   npm_tag=latest | release-MAJOR.MINOR | next | prerelease-old
 #   docker_latest=true | false
@@ -19,8 +21,10 @@
 # it is at least the highest prerelease. Prereleases never count against a
 # stable release, nor stable releases against a prerelease.
 #
-# Versions are compared with GNU sort -V, which orders 1.10.0 after 1.9.0 and
-# rc.10 after rc.2 (npm/test/release-tags.test.js checks both).
+# Versions are compared with GNU sort -V. That is not SemVer order in general
+# (rc.a10 sorts after rc.a2), but within the format above it agrees: the
+# numbers compare as numbers, and alpha, beta and rc sort in that order.
+# npm/test/release-tags.test.js checks this against SemVer order.
 set -eu
 
 if [ $# -ne 1 ]; then
@@ -29,7 +33,7 @@ if [ $# -ne 1 ]; then
 fi
 version=$1
 
-semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?'
+semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?'
 if ! printf '%s\n' "$version" | grep -Eq "^$semver\$"; then
 	echo "release-tags: not a version: $version" >&2
 	exit 2
