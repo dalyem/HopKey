@@ -366,6 +366,24 @@ jobs:
           build-args: |
             VERSION=${{ needs.verify.outputs.version }}
 
+      # An earlier attempt may have pushed the exact version and failed before
+      # the rolling tags. Point the ones this release may move at that image.
+      - name: Repair the rolling tags of an image already pushed
+        if: steps.exists.outputs.present == 'true'
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          MINOR: ${{ needs.verify.outputs.minor }}
+          DOCKER_MINOR: ${{ needs.verify.outputs.docker_minor }}
+          DOCKER_LATEST: ${{ needs.verify.outputs.docker_latest }}
+        run: |
+          set -eu
+          if [ "$DOCKER_MINOR" = true ]; then
+            docker buildx imagetools create --tag "$IMAGE:$MINOR" "$IMAGE:$VERSION"
+          fi
+          if [ "$DOCKER_LATEST" = true ]; then
+            docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$VERSION"
+          fi
+
   # Publishes the tarball that npm-pack tested, and nothing else. It checks out
   # no repository code and runs none, because this is the one job that holds
   # the npm publish identity (id-token). It is skipped when the version is

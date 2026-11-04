@@ -6,11 +6,11 @@ The repository holds both. Phase 1 is the local `hop` CLI and daemon with the en
 
 ## Installing
 
-`hop` runs on Linux and macOS, on x64 and arm64. Releases are tagged `vMAJOR.MINOR.PATCH`.
+`hop` runs on Linux and macOS, on x64 and arm64. Releases are tagged `vMAJOR.MINOR.PATCH`, and prereleases `vMAJOR.MINOR.PATCH-(alpha|beta|rc).N`.
 
 - **npm.** `npm i -g @dalyem/hopkey` installs the `hop` command; `npm i -g @dalyem/hopkey@next` installs the latest prerelease. The package carries the native binaries for all four platforms and downloads nothing at install time. Its postinstall puts the one for your platform at `hop`, so no Node runs when you use it. If your package manager skips install scripts (`--ignore-scripts`, or pnpm and bun by default), `hop` runs through a small Node launcher instead: same exit codes and output, but a `nohup hop` that is meant to ignore hangups does not.
 - **GitHub Release.** Each release has `hop-<os>-<arch>` and `hop-server-linux-<arch>` binaries and a `SHA256SUMS` file. Check the sum, then `chmod +x` the file and put it on your PATH as `hop`.
-- **Server.** `docker pull ghcr.io/dalyem/hop-server` (`:latest`, or a version such as `:1.2.3`; amd64 and arm64). See "Running hop-server" below and the `Dockerfile`.
+- **Server.** `docker pull ghcr.io/dalyem/hop-server:1.2.3`, for amd64 and arm64. `:latest` and `:1.2` follow stable releases, so until the first stable release there are only prerelease versions such as `:0.1.0-rc.1`. See "Running hop-server" below and the `Dockerfile`.
 
 **After an upgrade.** A running `hop daemon` keeps the code it started with: replacing the `hop` file does not restart it, and the new `hop` talks to the old daemon as it is (hop checks no versions; an operation the old daemon lacks is refused with `unknown op`, and a field it does not know can be ignored). Run `hop daemon stop` after upgrading; the next hop command starts the new daemon, and `hop daemon` shows which version is running. The login service (`hop setup --service`) and the entries `hop mcp install` writes name the path of the `hop` file. If the install path changes, for example when you switch Node versions under nvm and so get another npm prefix, run `hop setup --service` and `hop mcp install` again.
 

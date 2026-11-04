@@ -7,7 +7,7 @@ npm i -g @dalyem/hopkey          # a release
 npm i -g @dalyem/hopkey@next     # the latest prerelease
 ```
 
-Linux and macOS, on x64 and arm64, with Node 18 or later for the install. The package holds all four builds and downloads nothing when it installs. The server, `hop-server`, is a Docker image: `docker pull ghcr.io/dalyem/hop-server`.
+Linux and macOS, on x64 and arm64, with Node 18 or later for the install. The package holds all four builds and downloads nothing when it installs. The server, `hop-server`, is a Docker image: `docker pull ghcr.io/dalyem/hop-server:VERSION`.
 
 ## What `hop` is after the install
 
