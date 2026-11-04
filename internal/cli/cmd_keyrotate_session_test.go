@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -19,8 +20,12 @@ import (
 // a hard-link probe before anything is written, and a cleanup that trusts
 // only the exit statuses of rm and rmdir (spec rev 17, §7.5 and §7.7).
 
-// akShell is a shell the write script runs under, as sh.
-type akShell struct{ name, path string }
+// akShell is a shell the write script runs under, as sh. A required shell is
+// one that must be tested wherever HOPKEY_REQUIRE_SSH is set.
+type akShell struct {
+	name, path string
+	required   bool
+}
 
 // akInterpreters are the shells on this machine that hosts run as sh. Each
 // is started through a link named sh, so bash and busybox act as sh does.
@@ -60,15 +65,20 @@ func akInterpreters(t *testing.T) []akShell {
 		if err := os.Symlink(p, link); err != nil {
 			t.Fatal(err)
 		}
-		out = append(out, akShell{c.name, link})
+		out = append(out, akShell{c.name, link, c.required})
 	}
 	return out
 }
 
 // fakeBin is a directory of commands that stand in for the real ones,
-// to put first on PATH. Each body is a sh script.
-func fakeBin(t *testing.T, bodies map[string]string) string {
+// to put first on PATH. Each body is a sh script. It stops the test when sh
+// would not run them (see requireFakeBins), so that no test that needs a fake
+// can run without being able to use it.
+func fakeBin(t *testing.T, sh akShell, bodies map[string]string) string {
 	t.Helper()
+	for name := range bodies {
+		requireFakeBins(t, sh, name)
+	}
 	dir := t.TempDir()
 	for name, body := range bodies {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
@@ -76,6 +86,66 @@ func fakeBin(t *testing.T, bodies map[string]string) string {
 		}
 	}
 	return dir + string(os.PathListSeparator) + os.Getenv("PATH")
+}
+
+// fakeBinRuns remembers, for each shell binary and command name, whether the
+// shell ran a command of that name found first on PATH.
+var fakeBinRuns struct {
+	sync.Mutex
+	ran map[string]bool
+}
+
+// requireFakeBins stops the test unless sh runs name from the first directory
+// of PATH. Some shells prefer their own applet of that name (the busybox-static
+// of Ubuntu does, for ln, mv and mkdir), and then a fake placed first on PATH
+// never runs, so a test that relies on one has nothing to test. The test is
+// skipped; for a required shell under HOPKEY_REQUIRE_SSH it fails, so that the
+// coverage of dash and bash cannot vanish without a sign. The answer is found
+// once per shell binary and command.
+func requireFakeBins(t *testing.T, sh akShell, name string) {
+	t.Helper()
+	bin, err := filepath.EvalSymlinks(sh.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bin + "\x00" + name
+	ran := func() bool {
+		fakeBinRuns.Lock()
+		defer fakeBinRuns.Unlock()
+		if ran, known := fakeBinRuns.ran[key]; known {
+			return ran
+		}
+		if fakeBinRuns.ran == nil {
+			fakeBinRuns.ran = map[string]bool{}
+		}
+		fakeBinRuns.ran[key] = shellRunsFake(t, sh, name)
+		return fakeBinRuns.ran[key]
+	}()
+	if ran {
+		return
+	}
+	if sh.required && os.Getenv("HOPKEY_REQUIRE_SSH") != "" {
+		t.Fatalf("%s ignores a %s placed first on PATH: a test that needs a fake %[2]s cannot run, and %[1]s must be tested", sh.name, name)
+	}
+	t.Skipf("%s prefers its own %s applet to a %[2]s first on PATH, so the fake this test relies on never runs", sh.name, name)
+}
+
+// shellRunsFake runs sh with a fake of name first on PATH and reports whether
+// the fake ran. The fake only leaves a marker; the call is made in an empty
+// directory, with an argument no real command can do anything with.
+func shellRunsFake(t *testing.T, sh akShell, name string) bool {
+	t.Helper()
+	marker := filepath.Join(t.TempDir(), "ran")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n: > '"+marker+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(sh.path, "-c", name+" probe-argument")
+	cmd.Dir = t.TempDir()
+	cmd.Env = []string{"HOME=" + cmd.Dir, "PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH")}
+	cmd.Run() // a real command given the argument fails, and that is no matter
+	_, err := os.Stat(marker)
+	return err == nil
 }
 
 func runAKIn(t *testing.T, shell, home, path, script string, stdin []byte) (int, string) {
@@ -147,11 +217,12 @@ func TestAKWriteScriptUnderEachShell(t *testing.T) {
 		t.Skip("no shell to test with")
 	}
 	for _, sh := range shells {
-		t.Run(sh.name, func(t *testing.T) { akScriptCases(t, sh.path) })
+		t.Run(sh.name, func(t *testing.T) { akScriptCases(t, sh) })
 	}
 }
 
-func akScriptCases(t *testing.T, shell string) {
+func akScriptCases(t *testing.T, sh akShell) {
+	shell := sh.path
 	orig, next := []byte("a\n"), []byte("a\nb\n")
 	path := os.Getenv("PATH")
 	script := func() string { return akWriteScript(cksum(orig), cksum(next)) }
@@ -199,7 +270,7 @@ func akScriptCases(t *testing.T, shell string) {
 	t.Run("84 hard-link probe refused", func(t *testing.T) {
 		h, f := home(t)
 		ran := filepath.Join(t.TempDir(), "mv-ran")
-		p := fakeBin(t, map[string]string{
+		p := fakeBin(t, sh, map[string]string{
 			"ln": "exit 1",
 			"mv": `: > "` + ran + `"; exit 1`,
 		})
@@ -267,7 +338,7 @@ func akScriptCases(t *testing.T, shell string) {
 	})
 	t.Run("86 mv failed", func(t *testing.T) {
 		h, f := home(t)
-		code, stderr := runAKIn(t, shell, h, fakeBin(t, map[string]string{"mv": "exit 1"}), script(), next)
+		code, stderr := runAKIn(t, shell, h, fakeBin(t, sh, map[string]string{"mv": "exit 1"}), script(), next)
 		if code != akExitUncertain || akRefused(code) {
 			t.Errorf("exit %d %q, want %d", code, stderr, akExitUncertain)
 		}
@@ -349,7 +420,7 @@ func akScriptCases(t *testing.T, shell string) {
 	} {
 		t.Run("86 TERM right after the mkdir of "+c.name, func(t *testing.T) {
 			h, f := home(t)
-			p := fakeBin(t, map[string]string{
+			p := fakeBin(t, sh, map[string]string{
 				"mkdir": `'` + realMkdir + `' "$@" || exit; case "$1" in ` + c.pattern + `) kill -TERM $PPID ;; esac; exit 0`,
 			})
 			code, stderr := runAKIn(t, shell, h, p, script(), next)
@@ -371,7 +442,7 @@ func akScriptCases(t *testing.T, shell string) {
 		}
 		dir := t.TempDir()
 		started, release := filepath.Join(dir, "mv-started"), filepath.Join(dir, "release")
-		p := fakeBin(t, map[string]string{
+		p := fakeBin(t, sh, map[string]string{
 			"mv": `: > '` + started + `'; until [ -e '` + release + `' ]; do sleep 0.02; done; exec '` + realMv + `' "$@"`,
 		})
 		w := startAKIn(t, shell, h, p, script())
