@@ -1,7 +1,8 @@
-# Only go.mod, go.sum, cmd/ and internal/ go into the build.
+# Only go.mod, go.sum, LICENSE, cmd/ and internal/ go into the build.
 *
 !go.mod
 !go.sum
+!LICENSE
 !cmd/
 !internal/
 **/*_test.go

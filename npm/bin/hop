@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+'use strict';
+// Fallback for installs whose postinstall did not run; see lib/shim.js.
+require('../lib/shim.js').run({
+  platform: process.platform,
+  arch: process.arch,
+  argv: process.argv.slice(2),
+});

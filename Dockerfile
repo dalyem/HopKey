@@ -1,6 +1,14 @@
 # hop-server, the HopKey sync server.
 #
+# Released images are published at ghcr.io/dalyem/hop-server (docker pull
+# ghcr.io/dalyem/hop-server:1.2.3, or :latest), for amd64 and arm64. To build
+# the image yourself instead:
+#
 #   docker build -t hop-server .
+#
+# Either way, run it as below (a pulled image goes by its ghcr.io name where
+# hop-server is the image):
+#
 #   docker network create --internal --subnet 172.30.0.0/24 \
 #       -o com.docker.network.bridge.inhibit_ipv4=true hop-net
 #   docker run -d --name hop --network hop-net --ip 172.30.0.3 -v hop-data:/data \
@@ -46,21 +54,29 @@
 #   docker exec <container> hop-server backup /data/backup.db --data /data
 # Health: GET /v1/healthz.
 
-FROM golang:1.27-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS build
+# The build stage runs on the machine doing the build and cross-compiles, so
+# an arm64 image needs no emulation.
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+COPY LICENSE ./LICENSE
 COPY cmd ./cmd
 COPY internal ./internal
 ARG VERSION=dev
+ARG TARGETOS TARGETARCH
 # modernc.org/sqlite is pure Go, so the binary is static with cgo off.
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
         -ldflags "-s -w -X github.com/dalyem/hopkey/internal/version.Version=${VERSION}" \
         -o /out/hop-server ./cmd/hop-server \
     && mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+LABEL org.opencontainers.image.source="https://github.com/dalyem/HopKey"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only AND MIT"
 COPY --from=build /out/hop-server /usr/local/bin/hop-server
+COPY --from=build /src/cmd/hop-server/LICENSE /usr/share/doc/hop-server/LICENSE
+COPY --from=build /src/LICENSE /usr/share/doc/hop-server/LICENSE.MIT
 # The volume starts owned by the nonroot user (65532), which the server
 # runs as.
 COPY --from=build --chown=65532:65532 /out/data /data
