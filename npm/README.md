@@ -1,10 +1,10 @@
-# hopkey
+# @dalyem/hopkey
 
 The `hop` command of [HopKey](https://github.com/dalyem/HopKey), an end-to-end encrypted vault for SSH hosts and keys. `hop` is a Go program; this package is only a way to get it.
 
 ```
-npm i -g hopkey          # a release
-npm i -g hopkey@next     # the latest prerelease
+npm i -g @dalyem/hopkey          # a release
+npm i -g @dalyem/hopkey@next     # the latest prerelease
 ```
 
 Linux and macOS, on x64 and arm64, with Node 18 or later for the install. The package holds all four builds and downloads nothing when it installs. The server, `hop-server`, is a Docker image: `docker pull ghcr.io/dalyem/hop-server`.

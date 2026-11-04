@@ -1,5 +1,5 @@
 #!/bin/sh
-# Assembles the publishable hopkey npm package.
+# Assembles the publishable @dalyem/hopkey npm package.
 #
 #   sh scripts/npm-stage.sh VERSION BINDIR OUTDIR
 #
@@ -37,7 +37,7 @@ if ! grep -q "^  \"version\": \"$version\",\$" "$out/package.json" || grep -q '"
 	exit 1
 fi
 
-cp "$src/install.js" "$src/README.md" "$out/"
+cp "$src/install.js" "$src/README.md" "$src/../LICENSE" "$out/"
 cp -R "$src/lib/." "$out/lib/"
 cp "$src/bin/hop" "$out/bin/hop"
 chmod 0755 "$out/bin/hop"
@@ -55,4 +55,4 @@ for pair in linux-amd64:linux-x64 linux-arm64:linux-arm64 darwin-amd64:darwin-x6
 	# Artifacts come back from upload and download without their modes.
 	chmod 0755 "$to/hop"
 done
-echo "staged hopkey $version in $out"
+echo "staged @dalyem/hopkey $version in $out"

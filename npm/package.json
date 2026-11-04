@@ -1,5 +1,5 @@
 {
-  "name": "hopkey",
+  "name": "@dalyem/hopkey",
   "version": "0.0.0-template",
   "private": true,
   "description": "HopKey: an end-to-end encrypted vault for SSH hosts and keys (the hop CLI)",
@@ -17,7 +17,7 @@
     "type": "git",
     "url": "git+https://github.com/dalyem/HopKey.git"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "bin": {
     "hop": "bin/hop"
   },

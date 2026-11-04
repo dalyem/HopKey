@@ -60,6 +60,7 @@ FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:972b4110ba0f47539a975
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+COPY LICENSE ./LICENSE
 COPY cmd ./cmd
 COPY internal ./internal
 ARG VERSION=dev
@@ -72,7 +73,10 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 LABEL org.opencontainers.image.source="https://github.com/dalyem/HopKey"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only AND MIT"
 COPY --from=build /out/hop-server /usr/local/bin/hop-server
+COPY --from=build /src/cmd/hop-server/LICENSE /usr/share/doc/hop-server/LICENSE
+COPY --from=build /src/LICENSE /usr/share/doc/hop-server/LICENSE.MIT
 # The volume starts owned by the nonroot user (65532), which the server
 # runs as.
 COPY --from=build --chown=65532:65532 /out/data /data

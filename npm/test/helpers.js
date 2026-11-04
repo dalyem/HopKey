@@ -69,7 +69,7 @@ function install(tarball, root, { ignoreScripts }) {
   const args = ['install', '--global', '--prefix', prefix, tarball];
   if (ignoreScripts) args.push('--ignore-scripts');
   const out = npm(args, { env: { npm_config_cache: path.join(root, 'npm-cache') } });
-  const pkg = path.join(prefix, 'lib', 'node_modules', 'hopkey');
+  const pkg = path.join(prefix, 'lib', 'node_modules', '@dalyem', 'hopkey');
   return {
     prefix,
     pkg,

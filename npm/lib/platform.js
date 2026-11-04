@@ -15,7 +15,7 @@ const ARCHES = ['x64', 'arm64'];
 function resolveBinary({ root, platform, arch }) {
   if (!PLATFORMS.includes(platform) || !ARCHES.includes(arch)) {
     return {
-      error: `hop: no hop binary for ${platform}-${arch}; the hopkey package ships linux and darwin, on x64 and arm64`,
+      error: `hop: no hop binary for ${platform}-${arch}; the @dalyem/hopkey package ships linux and darwin, on x64 and arm64`,
     };
   }
   const file = path.join(root, 'vendor', `${platform}-${arch}`, 'hop');
@@ -26,7 +26,7 @@ function resolveBinary({ root, platform, arch }) {
     st = null;
   }
   if (!st || !st.isFile()) {
-    return { error: `hop: the binary for ${platform}-${arch} is missing from this install (${file}); reinstall the hopkey package` };
+    return { error: `hop: the binary for ${platform}-${arch} is missing from this install (${file}); reinstall the @dalyem/hopkey package` };
   }
   return { path: file };
 }

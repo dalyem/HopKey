@@ -1,10 +1,10 @@
 # Release pipeline: pushing a tag vMAJOR.MINOR.PATCH (or with a -PRERELEASE
 # suffix) checks the code, builds the binaries, pushes the hop-server image to
-# ghcr.io/dalyem/hop-server, publishes the hop CLI to npm as hopkey, and
+# ghcr.io/dalyem/hop-server, publishes the hop CLI to npm as @dalyem/hopkey, and
 # creates the GitHub Release.
 #
 # One-time setup this file depends on:
-#   - The package hopkey must already exist on npm, with a trusted publisher
+#   - The package @dalyem/hopkey must already exist on npm, with a trusted publisher
 #     for the repository dalyem/HopKey and the workflow file release.yml (npm
 #     package settings, "Trusted publisher"). Publishing uses that OIDC trust;
 #     there is no npm token, and none must be added. npm only lets a package
@@ -77,6 +77,15 @@ jobs:
       - run: sh scripts/check.sh gofmt
       - run: sh scripts/check.sh vet
       - run: sh scripts/check.sh test
+      # The CLI is MIT and the server AGPL; the CLI must not take in server code.
+      - name: Check that hop does not import the server
+        run: |
+          set -eu
+          deps=$(go list -deps ./cmd/hop)
+          if printf '%s\n' "$deps" | grep -q '/internal/server$'; then
+            echo "::error::cmd/hop imports internal/server, which is under the AGPL"
+            exit 1
+          fi
       - name: npm package tests
         run: node --test npm/test/*.test.js
 
@@ -213,7 +222,7 @@ jobs:
           sh scripts/npm-stage.sh "$VERSION" dist stage
           mkdir tarball
           (cd stage && npm pack --silent --pack-destination ../tarball)
-          echo "tarball=$PWD/tarball/hopkey-$VERSION.tgz" >>"$GITHUB_OUTPUT"
+          echo "tarball=$PWD/tarball/dalyem-hopkey-$VERSION.tgz" >>"$GITHUB_OUTPUT"
       # Install the tarball that is about to be published and run its binary.
       - name: Test the staged package
         env:
@@ -230,14 +239,14 @@ jobs:
           NPM_CONFIG_USERCONFIG: /dev/null
         run: |
           set -u
-          if out=$(npm view "hopkey@$VERSION" version --registry https://registry.npmjs.org/ 2>&1); then
-            echo "::notice::hopkey@$VERSION is already on npm; not publishing it again"
+          if out=$(npm view "@dalyem/hopkey@$VERSION" version --registry https://registry.npmjs.org/ 2>&1); then
+            echo "::notice::@dalyem/hopkey@$VERSION is already on npm; not publishing it again"
             echo "published=true" >>"$GITHUB_OUTPUT"
           elif printf '%s\n' "$out" | grep -q 'E404'; then
             echo "published=false" >>"$GITHUB_OUTPUT"
           else
             printf '%s\n' "$out" >&2
-            echo "::error::could not tell whether hopkey@$VERSION is on npm"
+            echo "::error::could not tell whether @dalyem/hopkey@$VERSION is on npm"
             exit 1
           fi
       # No NODE_AUTH_TOKEN, no token: npm exchanges this job's OIDC identity

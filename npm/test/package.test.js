@@ -189,7 +189,7 @@ describe('an install the postinstall cannot finish', () => {
     const r = spawnSync(inst.link, ['exit', '0'], { env: inst.env, encoding: 'utf8' });
     assert.equal(r.status, 255);
     assert.equal(r.stdout, '');
-    assert.match(r.stderr, new RegExp(`^hop: the binary for ${PLATFORM} is missing from this install \\(.*\\); reinstall the hopkey package\\n$`));
+    assert.match(r.stderr, new RegExp(`^hop: the binary for ${PLATFORM} is missing from this install \\(.*\\); reinstall the @dalyem/hopkey package\\n$`));
   });
 
   test('install() leaves bin/hop alone when the vendored file is not a file', () => {
