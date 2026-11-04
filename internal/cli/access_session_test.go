@@ -88,7 +88,7 @@ func TestAccessSessionScript(t *testing.T) {
 			})
 			t.Run("ln fails", func(t *testing.T) {
 				home, file := akHome(t, old)
-				code, _, errOut := runSession(t, sh.path, home, fakeBin(t, map[string]string{"ln": "exit 1"}), script, append(bytes.Clone(write), next...))
+				code, _, errOut := runSession(t, sh.path, home, fakeBin(t, sh, map[string]string{"ln": "exit 1"}), script, append(bytes.Clone(write), next...))
 				got, _ := os.ReadFile(file)
 				if code != akExitWrite || !bytes.Equal(got, old) || !strings.Contains(errOut, "can't be hard-linked") {
 					t.Fatalf("exit %d, file %q, stderr %q", code, got, errOut)
@@ -97,7 +97,7 @@ func TestAccessSessionScript(t *testing.T) {
 			})
 			t.Run("mv fails", func(t *testing.T) {
 				home, _ := akHome(t, old)
-				code, _, _ := runSession(t, sh.path, home, fakeBin(t, map[string]string{"mv": "exit 1"}), script, append(bytes.Clone(write), next...))
+				code, _, _ := runSession(t, sh.path, home, fakeBin(t, sh, map[string]string{"mv": "exit 1"}), script, append(bytes.Clone(write), next...))
 				if code != akExitUncertain || akSessionRefused(code) {
 					t.Fatalf("exit %d", code)
 				}

@@ -6,6 +6,12 @@
 # entry, so the ssh integration tests need nss_wrapper there. On a normal
 # machine this script just execs the command.
 #
+# HOPKEY_PASSWD_SHIM=always installs the shim even when the uid has a passwd
+# entry. The ssh integration tests (internal/sshconfig) move ssh's home
+# directory by rewriting the shim's passwd file, so they need the shim, and
+# fail under HOPKEY_REQUIRE_SSH without it. A GitHub Actions runner has a passwd
+# entry for its uid, so without this variable that test fails there.
+#
 # Kiln cannot run a check in a custom image (`kiln image build` keeps images on
 # the build worker and runtime.image must come from a public registry), so the
 # library is fetched here. Everything lives in a private mktemp directory that
@@ -15,7 +21,7 @@
 # version, the download is refused until these are updated.
 set -eu
 
-if id -un >/dev/null 2>&1; then
+if [ "${HOPKEY_PASSWD_SHIM:-}" != always ] && id -un >/dev/null 2>&1; then
 	exec "$@"
 fi
 

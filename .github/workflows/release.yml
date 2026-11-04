@@ -142,6 +142,8 @@ jobs:
       - run: sh scripts/check.sh gofmt
       - run: sh scripts/check.sh vet
       - run: sh scripts/check.sh test
+        env:
+          HOPKEY_PASSWD_SHIM: always
       # The CLI is MIT and the server AGPL; the CLI must not take in server code.
       - name: Check that hop does not import the server
         run: |
