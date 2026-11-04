@@ -13,7 +13,7 @@ Linux and macOS, on x64 and arm64, with Node 18 or later for the install. The pa
 
 The package's postinstall copies the build for your platform over `bin/hop`, so `hop` on your PATH is the native binary: no Node when it runs, and its signals and exit codes are its own. The package contains a small Node launcher at `bin/hop` for installs that skip postinstall scripts (`npm i -g --ignore-scripts`, pnpm and bun by default). The launcher starts `vendor/<os>-<arch>/hop`, passes stdin, stdout and stderr straight through, and exits with hop's exit code, or with hop's signal. It forwards SIGTERM. It does not forward SIGINT or SIGHUP: the terminal already sends those to hop, and a second one makes hop quit at once.
 
-One thing the launcher cannot do: a `nohup hop ...` that should ignore hangups does not, because Node starts its child with default signal handling. If that matters, run the native binary: reinstall without `--ignore-scripts`, or run `vendor/<os>-<arch>/hop` from the package directory (`$(npm root -g)/hopkey`).
+One thing the launcher cannot do: a `nohup hop ...` that should ignore hangups does not, because Node starts its child with default signal handling. If that matters, run the native binary: reinstall without `--ignore-scripts`, or run `vendor/<os>-<arch>/hop` from the package directory (`$(npm root -g)/@dalyem/hopkey`).
 
 If the postinstall cannot replace `bin/hop` for any reason, it says nothing, the install still succeeds, and the launcher stays.
 

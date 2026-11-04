@@ -1,15 +1,24 @@
 # Release pipeline: pushing a tag vMAJOR.MINOR.PATCH (or with a -PRERELEASE
 # suffix) checks the code, builds the binaries, pushes the hop-server image to
 # ghcr.io/dalyem/hop-server, publishes the hop CLI to npm as @dalyem/hopkey, and
-# creates the GitHub Release.
+# creates the GitHub Release. A stable tag must be on main; a prerelease tag may
+# be on any branch.
 #
 # One-time setup this file depends on:
 #   - The package @dalyem/hopkey must already exist on npm, with a trusted publisher
-#     for the repository dalyem/HopKey and the workflow file release.yml (npm
-#     package settings, "Trusted publisher"). Publishing uses that OIDC trust;
-#     there is no npm token, and none must be added. npm only lets a package
-#     that exists have a trusted publisher, so the first version is published
-#     by hand.
+#     for the repository dalyem/HopKey, the workflow file release.yml and the
+#     environment release (npm package settings, "Trusted publisher"). Publishing
+#     uses that OIDC trust; there is no npm token, and none must be added. npm
+#     only lets a package that exists have a trusted publisher, so the first
+#     version is published by hand. npm sets a new publisher to staged
+#     publishing only; allow direct npm publish, or the publish here is not
+#     accepted. A new publisher must complete a publish within two days.
+#   - A GitHub environment release (repository settings, Environments) with a
+#     required reviewer and a deployment rule that allows only the tags v*. The
+#     jobs that publish (image-push and npm-publish) wait for it together, and
+#     one approval covers both.
+#   - A tag ruleset (repository settings, Rules) that blocks updating and
+#     deleting the tags v*, so that a released version stays what it was.
 #   - The ghcr.io package hop-server is created private by its first push.
 #     After the first release, make it public in the package's settings (and
 #     link it to the repository), or nobody else can pull it.
@@ -25,10 +34,12 @@ on:
 permissions:
   contents: read
 
-# One release per tag at a time, and a running release is never cancelled:
-# half a publish is worse than a slow one.
+# One release at a time, for all tags, and a running release is never
+# cancelled: half a publish is worse than a slow one. This also serialises
+# promotion across releases, so that two tags pushed together cannot each
+# decide that they are the newest and move latest backward.
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -39,7 +50,20 @@ jobs:
       version: ${{ steps.tag.outputs.version }}
       minor: ${{ steps.tag.outputs.minor }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
+      npm_tag: ${{ steps.rolling.outputs.npm_tag }}
+      docker_latest: ${{ steps.rolling.outputs.docker_latest }}
+      docker_minor: ${{ steps.rolling.outputs.docker_minor }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
       - name: Check the tag
         id: tag
         env:
@@ -62,15 +86,36 @@ jobs:
             echo "prerelease=$prerelease"
           } >>"$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
+      # A stable release comes from main. A prerelease may come from any
+      # branch: the first test release is cut from an unmerged one.
+      - name: Check that a stable tag is on main
+        if: steps.tag.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+          case "$status" in
+          behind | identical) ;;
+          *)
+            echo "::error::the stable tag $GITHUB_REF_NAME ($GITHUB_SHA) is not on main (compare says '$status'); a stable release must be an ancestor of main"
+            exit 1
+            ;;
+          esac
+
+      # latest, MAJOR.MINOR and the npm tag never move backward: releasing an
+      # older version leaves them where they are.
+      - name: Decide the rolling tags
+        id: rolling
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -eu
+          refs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref')
+          out=$(printf '%s\n' "$refs" | sed 's#^refs/tags/##' | sh scripts/release-tags.sh "$VERSION")
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" >>"$GITHUB_OUTPUT"
 
       # Not the race check: three known tests are flaky under load, and it takes
       # long. check.sh test needs the runner's ssh client (HOPKEY_REQUIRE_SSH=1).
@@ -113,36 +158,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  image:
+  # Builds the image for the runner's own platform and runs it. Nothing here
+  # logs in to a registry or can push.
+  image-smoke:
     needs: [verify, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      packages: write
-    env:
-      IMAGE: ghcr.io/dalyem/hop-server
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        id: meta
-        with:
-          images: ${{ env.IMAGE }}
-          # The exact version always; latest and MAJOR.MINOR only for a
-          # release that is not a prerelease.
-          flavor: latest=false
-          tags: |
-            type=raw,value=${{ needs.verify.outputs.version }}
-            type=raw,value=${{ needs.verify.outputs.minor }},enable=${{ needs.verify.outputs.prerelease == 'false' }}
-            type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}
-          labels: |
-            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
-
-      # Build for the runner's own platform first and run it, before anything
-      # is pushed.
       - name: Build amd64 for the smoke test
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -158,14 +184,153 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
         run: sh scripts/image-smoke.sh hop-server:smoke "$VERSION"
 
+  # Stages, packs and tests the npm package, and sets the tarball aside:
+  # npm-publish publishes exactly this file, in a job that runs none of the
+  # repository's code. No job-level token beyond contents: read.
+  npm-pack:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.sum.outputs.sha256 }}
+      published: ${{ steps.exists.outputs.published }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Stage and pack the package
+        id: pack
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          chmod +x dist/hop-*
+          sh scripts/npm-stage.sh "$VERSION" dist stage
+          mkdir tarball
+          (cd stage && npm pack --silent --pack-destination ../tarball)
+          echo "tarball=dalyem-hopkey-$VERSION.tgz" >>"$GITHUB_OUTPUT"
+      # Install the tarball that is about to be published and run its binary.
+      - name: Test the staged package
+        env:
+          HOPKEY_NPM_TARBALL: ${{ github.workspace }}/tarball/${{ steps.pack.outputs.tarball }}
+          HOPKEY_NPM_VERSION: ${{ needs.verify.outputs.version }}
+        run: node --test npm/test/staged.test.js
+      # A re-run after a partial failure must not fail on a version that is
+      # already there, and must not skip a version that is there with other
+      # contents. The script fails on anything it cannot tell.
+      - name: Check whether this version is published
+        id: exists
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARBALL: ${{ github.workspace }}/tarball/${{ steps.pack.outputs.tarball }}
+        run: |
+          set -eu
+          out=$(sh scripts/npm-check-published.sh @dalyem/hopkey "$VERSION" "$TARBALL")
+          printf '%s\n' "$out" >>"$GITHUB_OUTPUT"
+          case "$out" in
+          published=true) echo "::notice::@dalyem/hopkey@$VERSION is already on npm with these contents; not publishing it again" ;;
+          esac
+      - name: Hash the tarball
+        id: sum
+        env:
+          TARBALL: tarball/${{ steps.pack.outputs.tarball }}
+        run: |
+          set -eu
+          echo "sha256=$(sha256sum "$TARBALL" | cut -d' ' -f1)" >>"$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-tarball
+          path: tarball/
+          if-no-files-found: error
+          retention-days: 7
+
+  # image-push and npm-publish have the same needs on purpose: both reach the
+  # release environment at the same moment, so one approval covers both.
+  image-push:
+    needs: [verify, build, image-smoke, npm-pack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/dalyem/hop-server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          # The exact version always; latest and MAJOR.MINOR only for a
+          # stable release that is not older than the one they point at.
+          # The action also labels the image org.opencontainers.image.revision
+          # with the commit; the existing-image check below reads it.
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ needs.verify.outputs.version }}
+            type=raw,value=${{ needs.verify.outputs.minor }},enable=${{ needs.verify.outputs.docker_minor == 'true' }}
+            type=raw,value=latest,enable=${{ needs.verify.outputs.docker_latest == 'true' }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # The build stage cross-compiles, so arm64 needs no emulation. The
-      # amd64 layers come from the build above.
+
+      # A re-run after a partial failure may find the version already pushed.
+      # It is the same release if it was built from this commit, and then
+      # there is nothing to push; from another commit, or unreadable, it is
+      # an error. ghcr may answer a package that does not exist yet with
+      # "denied" rather than "not found", so both mean push: this job's token
+      # can write the package, so if it exists and the read was truly denied,
+      # the push is refused too. Inline shell: no repository script runs while
+      # the registry token is in place.
+      - name: Check whether this version is already pushed
+        id: exists
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -eu
+          ref="$IMAGE:$VERSION"
+          tmp=$(mktemp -d)
+          if docker buildx imagetools inspect "$ref" --format '{{json .Image}}' >"$tmp/image.json" 2>"$tmp/err"; then
+            # One config per platform. Both must carry the same revision.
+            rev=$(jq -r 'if type == "object" and has("linux/amd64") and has("linux/arm64") then [.[] | .config.Labels["org.opencontainers.image.revision"]] | unique | join(",") else "" end' "$tmp/image.json")
+            if [ "$rev" = "$GITHUB_SHA" ]; then
+              echo "::notice::$ref is already pushed from this commit; not pushing it again"
+              echo "present=true" >>"$GITHUB_OUTPUT"
+            elif [ -z "$rev" ]; then
+              echo "::error::$ref exists, and its org.opencontainers.image.revision label could not be read"
+              exit 1
+            else
+              echo "::error::$ref exists and was built from '$rev', not from $GITHUB_SHA"
+              exit 1
+            fi
+          elif grep -Eqi ': not found$|denied' "$tmp/err"; then
+            echo "present=false" >>"$GITHUB_OUTPUT"
+          else
+            cat "$tmp/err" >&2
+            echo "::error::could not tell whether $ref exists"
+            exit 1
+          fi
+
+      # The build stage cross-compiles, so arm64 needs no emulation.
       - name: Build and push amd64 and arm64
+        if: steps.exists.outputs.present != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -178,18 +343,21 @@ jobs:
           build-args: |
             VERSION=${{ needs.verify.outputs.version }}
 
-  npm:
-    needs: [verify, build, image]
+  # Publishes the tarball that npm-pack tested, and nothing else. It checks out
+  # no repository code and runs none, because this is the one job that holds
+  # the npm publish identity (id-token). It is skipped when the version is
+  # already on npm with these contents.
+  npm-publish:
+    needs: [verify, build, image-smoke, npm-pack]
+    if: needs.npm-pack.outputs.published != 'true'
     # Trusted publishing refuses self-hosted runners.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment: release
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -210,56 +378,42 @@ jobs:
           echo "node $node_v, npm $(npm --version)"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: dist
-          path: dist
-      - name: Stage and pack the package
-        id: pack
+          name: npm-tarball
+          path: npm-tarball
+      # The file is the one npm-pack hashed. Anything else is not published.
+      - name: Check the tarball
         env:
-          VERSION: ${{ needs.verify.outputs.version }}
+          NAME: ${{ needs.npm-pack.outputs.tarball }}
+          SHA256: ${{ needs.npm-pack.outputs.sha256 }}
         run: |
           set -eu
-          chmod +x dist/hop-*
-          sh scripts/npm-stage.sh "$VERSION" dist stage
-          mkdir tarball
-          (cd stage && npm pack --silent --pack-destination ../tarball)
-          echo "tarball=$PWD/tarball/dalyem-hopkey-$VERSION.tgz" >>"$GITHUB_OUTPUT"
-      # Install the tarball that is about to be published and run its binary.
-      - name: Test the staged package
-        env:
-          HOPKEY_NPM_TARBALL: ${{ steps.pack.outputs.tarball }}
-          HOPKEY_NPM_VERSION: ${{ needs.verify.outputs.version }}
-        run: node --test npm/test/staged.test.js
-      # A re-run after a partial failure must not fail on a version that is
-      # already there. The read is anonymous: it leaves out the .npmrc that
-      # setup-node wrote, whose token is a placeholder.
-      - name: Check whether this version is published
-        id: exists
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-          NPM_CONFIG_USERCONFIG: /dev/null
-        run: |
-          set -u
-          if out=$(npm view "@dalyem/hopkey@$VERSION" version --registry https://registry.npmjs.org/ 2>&1); then
-            echo "::notice::@dalyem/hopkey@$VERSION is already on npm; not publishing it again"
-            echo "published=true" >>"$GITHUB_OUTPUT"
-          elif printf '%s\n' "$out" | grep -q 'E404'; then
-            echo "published=false" >>"$GITHUB_OUTPUT"
-          else
-            printf '%s\n' "$out" >&2
-            echo "::error::could not tell whether @dalyem/hopkey@$VERSION is on npm"
+          case "$NAME" in
+          '' | */* | .*) echo "::error::'$NAME' is not a tarball name"; exit 1 ;;
+          esac
+          got=$(sha256sum "npm-tarball/$NAME" | cut -d' ' -f1)
+          if [ -z "$SHA256" ] || [ "$got" != "$SHA256" ]; then
+            echo "::error::npm-tarball/$NAME has SHA-256 $got, but npm-pack hashed '$SHA256'"
             exit 1
           fi
       # No NODE_AUTH_TOKEN, no token: npm exchanges this job's OIDC identity
       # for a short-lived publish credential, and attaches provenance.
       - name: Publish to npm
-        if: steps.exists.outputs.published != 'true'
         env:
-          TARBALL: ${{ steps.pack.outputs.tarball }}
-          NPM_TAG: ${{ needs.verify.outputs.prerelease == 'true' && 'next' || 'latest' }}
-        run: npm publish "$TARBALL" --access public --provenance --tag "$NPM_TAG"
+          TARBALL: npm-tarball/${{ needs.npm-pack.outputs.tarball }}
+          NPM_TAG: ${{ needs.verify.outputs.npm_tag }}
+        run: npm publish "$TARBALL" --access public --provenance --ignore-scripts --tag "$NPM_TAG"
 
+  # Runs when the image was pushed (or was already there) and the package was
+  # published (or was already there, and npm-publish was skipped), and never
+  # after a failure or a cancellation.
   release:
-    needs: [verify, build, image, npm]
+    needs: [verify, build, image-push, npm-publish]
+    if: >-
+      ${{ !cancelled()
+      && needs.verify.result == 'success'
+      && needs.build.result == 'success'
+      && needs.image-push.result == 'success'
+      && (needs.npm-publish.result == 'success' || needs.npm-publish.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
