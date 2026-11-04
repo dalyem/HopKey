@@ -465,7 +465,8 @@ jobs:
       # for a short-lived publish credential, and attaches provenance.
       - name: Publish to npm
         env:
-          TARBALL: npm-tarball/${{ needs.npm-pack.outputs.tarball }}
+          # The ./ matters: npm reads a bare a/b.tgz as the GitHub repository a/b.tgz.
+          TARBALL: ./npm-tarball/${{ needs.npm-pack.outputs.tarball }}
           NPM_TAG: ${{ needs.verify.outputs.npm_tag }}
         run: npm publish "$TARBALL" --access public --provenance --ignore-scripts --tag "$NPM_TAG"
 
