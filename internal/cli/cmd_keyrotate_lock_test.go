@@ -70,6 +70,22 @@ type akWriter struct {
 	err   bytes.Buffer
 }
 
+// stop sends SIGTERM to the writer's process group until the writer ends, and
+// returns its exit code. A signal sent just as the script starts its next
+// command misses that command, and the shell waits for it, which on the
+// script's read of stdin lasts until the connection ends. What is tested is how
+// the script ends, so the signal is sent again.
+func (w *akWriter) stop() int {
+	for {
+		syscall.Kill(-w.cmd.Process.Pid, syscall.SIGTERM)
+		select {
+		case code := <-w.done:
+			return code
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func startAKWriter(t *testing.T, home, path, script string) *akWriter {
 	t.Helper()
 	return startAKShell(t, home, path, sh(script))
@@ -359,8 +375,7 @@ func TestAKWriteScriptTrapsKeepAnotherOwnersLock(t *testing.T) {
 		a := startAKShell(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)))
 		waitFor(t, "the writer to take the lock", func() bool { return held(home) })
 		takeOver(t, home)
-		syscall.Kill(-a.cmd.Process.Pid, syscall.SIGTERM)
-		if code := <-a.done; code != akExitCleanup {
+		if code := a.stop(); code != akExitCleanup {
 			t.Errorf("exit %d %s, want %d", code, a.err.String(), akExitCleanup)
 		}
 		if lockOwner(home) != theirs {
@@ -384,8 +399,7 @@ func TestAKWriteScriptTrapsKeepAnotherOwnersLock(t *testing.T) {
 		home, f := akHome(t, orig)
 		a := startAKShell(t, home, os.Getenv("PATH"), akWriteScript(cksum(orig), cksum(next)))
 		waitFor(t, "the writer to take the lock", func() bool { return held(home) })
-		syscall.Kill(-a.cmd.Process.Pid, syscall.SIGTERM)
-		if code := <-a.done; code != 86 {
+		if code := a.stop(); code != 86 {
 			t.Errorf("exit %d %s, want 86", code, a.err.String())
 		}
 		if entries, _ := os.ReadDir(filepath.Join(home, ".ssh")); len(entries) != 1 {

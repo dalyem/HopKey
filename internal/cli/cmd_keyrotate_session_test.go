@@ -479,20 +479,7 @@ func akScriptCases(t *testing.T, sh akShell) {
 	t.Run("86 TERM past the lock", func(t *testing.T) {
 		h, f := home(t)
 		w := start(t, h, script())
-		// A signal sent just as the script starts its next command misses
-		// that command, and the shell waits for it, which on this script's
-		// read of stdin lasts until the connection ends. So send it until
-		// the script ends: what is tested is how it ends.
-		var code int
-		for ended := false; !ended; {
-			syscall.Kill(-w.cmd.Process.Pid, syscall.SIGTERM)
-			select {
-			case code = <-w.done:
-				ended = true
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-		if code != akExitUncertain {
+		if code := w.stop(); code != akExitUncertain {
 			t.Errorf("exit %d %q, want %d", code, w.err.String(), akExitUncertain)
 		}
 		unchanged(t, f)
