@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -178,5 +182,125 @@ func TestChangePasswordWithPassphraseSealsTheFileAgain(t *testing.T) {
 	track(t, cfg, s2)
 	if err := s2.UnlockWithPassphrase(ctx, []byte(sealPass)); err != nil {
 		t.Fatalf("a fresh process cannot unlock with the passphrase: %v", err)
+	}
+}
+
+// A device passphrase counts as the process's own only if it can seal a key
+// file: the master password's rules apply to it.
+func TestHasDevicePassphraseNeedsAUsableValue(t *testing.T) {
+	for _, tc := range []struct {
+		name, value string
+		want        bool
+	}{
+		{"unset", "", false},
+		{"one byte", "x", false},
+		{"seven bytes", "1234567", false},
+		{"eight bytes", "12345678", true},
+		{"not utf-8", "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8", false},
+		{"unassigned code point", "abcdefg\U000e0080", false},
+		{"too long", strings.Repeat("a", 1025), false},
+		{"normal", sealPass, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Store{cfg: Config{Getenv: func(k string) string {
+				if k == PassphraseEnv {
+					return tc.value
+				}
+				return ""
+			}}}
+			if got := s.HasDevicePassphrase(); got != tc.want {
+				t.Errorf("HasDevicePassphrase() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// filesIn reads every file under dir, by path.
+func filesIn(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		out[path] = string(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// hop unlock --password on a sealed key file saves the new key sealed with
+// the process's own passphrase, at the very end. One the sealing rules
+// refuse is met before the first write, with the CLI bypassed or the
+// process's state changed since it checked: no pending device, no bootstrap,
+// no change to device.json or the log.
+func TestUnlockWithPasswordRefusesAnUnusablePassphraseBeforeWriting(t *testing.T) {
+	ctx := context.Background()
+	cfg := testConfig(t)
+	sealed := cfg
+	sealed.Getenv = func(k string) string {
+		if k == PassphraseEnv {
+			return sealPass
+		}
+		return ""
+	}
+	p, err := PrepareInit(sealed, InitOptions{Password: []byte(testPassword), DeviceStore: DeviceStoreFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kit := p.Kit()
+	first, err := p.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	release(sealed)
+
+	for _, bad := range []string{"x", "1234567", "\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8"} {
+		t.Run(fmt.Sprintf("%q", bad), func(t *testing.T) {
+			daemon := cfg
+			daemon.Getenv = func(k string) string {
+				if k == PassphraseEnv {
+					return bad
+				}
+				return ""
+			}
+			s, err := tryOpen(t, daemon)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Lock()
+			before := filesIn(t, cfg.DataDir)
+			err = s.UnlockWithPassword(ctx, []byte(testPassword), kit.SecretKey)
+			if err == nil {
+				t.Fatal("the unlock went on with a passphrase that can't seal a key file")
+			}
+			if !strings.Contains(err.Error(), PassphraseEnv) {
+				t.Errorf("the refusal does not name %s: %v", PassphraseEnv, err)
+			}
+			if !s.Info().Locked {
+				t.Error("the store is unlocked")
+			}
+			after := filesIn(t, cfg.DataDir)
+			if !maps.Equal(before, after) {
+				for path := range after {
+					if before[path] != after[path] {
+						t.Errorf("%s changed", path)
+					}
+				}
+				for path := range before {
+					if _, ok := after[path]; !ok {
+						t.Errorf("%s is gone", path)
+					}
+				}
+			}
+		})
 	}
 }

@@ -594,14 +594,28 @@ func (s *Store) Generation() uint64 { return s.gen.Load() }
 func (s *Store) DataDir() string { return s.cfg.DataDir }
 
 // HasDevicePassphrase reports whether this process has a device passphrase
-// of its own, in HOP_DEVICE_PASSPHRASE, to seal a device key file with. One
-// handed over for a single unlock is not counted: it is not kept.
+// of its own, in HOP_DEVICE_PASSPHRASE, that can seal a device key file: one
+// the master password's rules refuse (too short, not text) counts as none.
+// One handed over for a single unlock is not counted: it is not kept.
 func (s *Store) HasDevicePassphrase() bool {
 	get := s.cfg.Getenv
 	if get == nil {
 		get = os.Getenv
 	}
-	return get(PassphraseEnv) != ""
+	return usablePassphrase(get(PassphraseEnv))
+}
+
+// usablePassphrase reports whether pass satisfies the sealing rules
+// (crypto.NormalizePassword). It keeps and returns nothing of it.
+func usablePassphrase(pass string) bool {
+	if pass == "" {
+		return false
+	}
+	b := []byte(pass)
+	n, err := crypto.NormalizePassword(b)
+	clear(b)
+	clear(n)
+	return err == nil
 }
 
 // IsRevoked reports, without the store's mutex, whether this device is

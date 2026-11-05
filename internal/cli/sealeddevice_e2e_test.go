@@ -424,10 +424,18 @@ func TestNoSecretReachesADaemonOfAnotherVault(t *testing.T) {
 			if code := m.hop(t, u, "unlock"); code != 255 || !strings.Contains(u.stderr.String(), "no device passphrase was sent") {
 				t.Errorf("unlock: exit %d: %s", code, u.stderr.String())
 			}
-			// hop unlock asking for it on a terminal.
+			// hop unlock asking for it on a terminal. A daemon that names
+			// another vault is refused before the question, with nothing to
+			// send yet; one that names none is let through until a passphrase
+			// is typed, and that one is not sent.
 			u = &session{tty: true, secrets: map[string]string{askOldPass: devPass}}
-			if code := m.hop(t, u, "unlock"); code != 255 || !strings.Contains(u.stderr.String(), "no device passphrase was sent") {
-				t.Errorf("unlock on a terminal: exit %d: %s", code, u.stderr.String())
+			code := m.hop(t, u, "unlock")
+			want, asked := "no device passphrase was sent", 1
+			if name == "another vault" {
+				want, asked = "nothing was sent or changed", 0
+			}
+			if code != 255 || !strings.Contains(u.stderr.String(), want) || len(u.order) != asked {
+				t.Errorf("unlock on a terminal: exit %d, asked %v, want %q: %s", code, u.order, want, u.stderr.String())
 			}
 			// hop passwd, which sends it with its request.
 			p := &session{tty: true, secrets: map[string]string{

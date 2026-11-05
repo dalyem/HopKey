@@ -53,16 +53,16 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 	defer c.Close()
 	pass := e.devicePassphraseForDaemon()
 	defer clear(pass)
-	if len(pass) > 0 {
-		st, err := servesThisVault(ctx, e, c)
-		if err != nil {
-			return failf("%v; no device passphrase was sent. %s", err, elsewhereAdvice)
-		}
-		if st.Vault != nil && st.Vault.Locked {
-			// What hop unlock would do, with the passphrase just typed.
-			if err := sendDevicePassphrase(ctx, e, c, false, pass); err != nil {
-				return failf("%v", err)
-			}
+	// The master passwords go to this daemon, a device passphrase with
+	// them: whatever the device key's store, it must be this vault's.
+	st, err := servesThisVault(ctx, e, c)
+	if err != nil {
+		return failf("%v; %s", err, wrongDaemonSent(len(pass) > 0))
+	}
+	if len(pass) > 0 && st.Vault != nil && st.Vault.Locked {
+		// What hop unlock would do, with the passphrase just typed.
+		if err := sendDevicePassphrase(ctx, e, c, false, pass); err != nil {
+			return failf("%v", err)
 		}
 	}
 

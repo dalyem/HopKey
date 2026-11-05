@@ -396,8 +396,24 @@ func sameDir(a, b string) bool {
 	return errA == nil && errB == nil && ra == rb
 }
 
-// elsewhereAdvice is what to do about a daemon of another vault.
-const elsewhereAdvice = "run hop daemon stop, then hop unlock"
+// elsewhereAdvice is what to do about a daemon of another vault. Stopping
+// it locks the vault it serves, which its owner may have open.
+const elsewhereAdvice = "hop daemon stop ends that daemon and locks the vault it serves, and hop unlock then opens this one"
+
+// wrongDaemonSent says what a refusal to use the daemon of another vault
+// kept from it: the device passphrase, when there was one to send, and
+// otherwise that nothing was changed.
+func wrongDaemonSent(passphrase bool) string {
+	if passphrase {
+		return "no device passphrase was sent; " + elsewhereAdvice
+	}
+	return "nothing was sent or changed; " + elsewhereAdvice
+}
+
+// daemonKeepsPassphrase ends the steps hop unlock --password gives for a
+// sealed key file: the daemon they start keeps the passphrase in its
+// environment, and opens the vault with it until it is stopped.
+const daemonKeepsPassphrase = "When it is done, run hop daemon stop and then unset " + store.PassphraseEnv + ", so later unlocks ask for the passphrase."
 
 // sendDevicePassphrase opens the vault in the daemon on c with pass, for
 // this unlock only, once the daemon is known to serve this vault.

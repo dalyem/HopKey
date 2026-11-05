@@ -1247,13 +1247,16 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	// A sealed device key opens with its passphrase, which a logout that
 	// tells the server needs to sign the retirement.
 	defer e.clearDevicePass()
-	if !*localOnly && e.Getenv(store.PassphraseEnv) == "" && canAskPassphrase(e) {
-		// A key file that can't be read has no passphrase to ask for.
+	// Settled before the daemon is stopped, with the variable or without,
+	// at a terminal or not: a key file that can't be read, or a passphrase
+	// that doesn't open it, fails here and leaves the vault open. A vault
+	// that is not signed in has no logout to sign, and says so below.
+	if !*localOnly && sealedKeyFile(e.storeConfig().DataDir) && serverBacked(e) {
 		if err := store.CheckDevicePassphrase(e.storeConfig().DataDir, nil); errors.Is(err, store.ErrDeviceKey) {
 			return failf("%v. A logout that tells the server signs with the device key; hop auth logout --local-only needs no key", err)
 		}
-		if err := e.askDevicePassphrase(true); err != nil {
-			return err
+		if err := requireDevicePassphrase(e, o.asJSON); err != nil {
+			return failf("%v. A logout that tells the server signs with the device key; hop auth logout --local-only needs no key", err)
 		}
 	}
 	// A logout that is refused or declined before it begins leaves the

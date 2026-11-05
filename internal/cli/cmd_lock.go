@@ -132,7 +132,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 				if len(pass) == 0 && !(errors.As(err, &other) && other.dir != "") {
 					return nil
 				}
-				return failf("%v; no device passphrase was sent. %s", err, elsewhereAdvice)
+				return failf("%v; %s", err, wrongDaemonSent(len(pass) > 0))
 			}
 			checked = true
 			return nil
@@ -167,7 +167,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	if e.ReadPassword == nil {
 		return failf("hop unlock --password needs a terminal to ask for your master password and Secret Key; run it in an interactive terminal")
 	}
-	if err := sealedNeedsDaemonPassphrase(ctx, e, c); err != nil {
+	if err := passwordUnlockPreflight(ctx, e, c); err != nil {
 		return err
 	}
 	fmt.Fprintln(e.Stderr, "This opens the vault with your master password and Secret Key, and gives this machine a new device key.")
@@ -199,20 +199,24 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	return done(true)
 }
 
-// sealedNeedsDaemonPassphrase refuses hop unlock --password, before any
-// secret is asked, when it would fail at the end: the daemon saves the new
-// device key, and a sealed key file needs a device passphrase that only the
-// daemon's own HOP_DEVICE_PASSPHRASE supplies, whatever this command has.
-// The daemon of another vault is refused too, as the other paths do.
-func sealedNeedsDaemonPassphrase(ctx context.Context, e *Env, c *daemon.Client) error {
-	if !sealedKeyFile(e.storeConfig().DataDir) {
-		return nil
-	}
+// passwordUnlockPreflight refuses hop unlock --password, before any secret
+// is asked, when it would send the master password and Secret Key to the
+// wrong place or fail at the end. It confirms that the daemon serves this
+// vault, for every kind of device key store, and fails closed: a daemon of
+// another vault, one that names no vault and one that does not answer the
+// status are all refused.
+//
+// A sealed device key file needs more: the daemon saves the new device key,
+// and the file needs a device passphrase that only the daemon's own
+// HOP_DEVICE_PASSPHRASE supplies, whatever this command has. One that the
+// sealing rules refuse would fail at the end, so it counts as none
+// (daemon.StatusResult.HasDevicePassphrase).
+func passwordUnlockPreflight(ctx context.Context, e *Env, c *daemon.Client) error {
 	st, err := servesThisVault(ctx, e, c)
 	if err != nil {
-		return failf("%v; nothing was changed. %s", err, elsewhereAdvice)
+		return failf("%v; %s", err, wrongDaemonSent(false))
 	}
-	if st.HasDevicePassphrase {
+	if !sealedKeyFile(e.storeConfig().DataDir) || st.HasDevicePassphrase {
 		return nil
 	}
 	steps := "run hop daemon stop, then hop unlock --password again; the daemon starts with the " + store.PassphraseEnv +
@@ -221,8 +225,9 @@ func sealedNeedsDaemonPassphrase(ctx context.Context, e *Env, c *daemon.Client) 
 		steps = "run hop daemon stop; set " + store.PassphraseEnv + " to a new device passphrase of at least 8 characters, which seals the new key file " +
 			"(read -rs " + store.PassphraseEnv + "; export " + store.PassphraseEnv + " keeps it out of your shell history); then run hop unlock --password again"
 	}
-	return failf("this device's key file is sealed with a device passphrase, and the running hop daemon, which saves the new key, was started without %s "+
-		"(setting it for this command does not reach the daemon). Nothing was changed. To go on, %s", store.PassphraseEnv, steps)
+	return failf("this device's key file is sealed with a device passphrase, and the running hop daemon, which saves the new key, has no usable one: "+
+		"it was started without %s, or with a value that is under 8 characters or not valid text (setting it for this command does not reach the daemon). "+
+		"Nothing was changed. To go on, %s. %s", store.PassphraseEnv, steps, daemonKeepsPassphrase)
 }
 
 // refusedUnlock is the message for an unlock that no passphrase or

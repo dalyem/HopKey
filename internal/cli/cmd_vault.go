@@ -80,12 +80,24 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 	// Registered before the hold's release, which runs after it: the
 	// release opens the vault in the daemon with the passphrase typed here.
 	defer e.clearDevicePass()
-	h, err := holdVault(ctx, e, *asJSON)
+	cfg := e.storeConfig()
+	// A fork decrypts this device's copy with its key, so a sealed key file
+	// that can't be read fails before the daemon is stopped, which an open
+	// vault would not survive. An interrupted fork is about other files.
+	if !*abandon && sealedKeyFile(cfg.DataDir) {
+		if pending, err := store.ForkInProgress(cfg.DataDir); err == nil && !pending {
+			if err := store.CheckDevicePassphrase(cfg.DataDir, nil); errors.Is(err, store.ErrDeviceKey) {
+				return forkFailure(err)
+			}
+		}
+	}
+	// Until the fork begins, release opens the vault again if it was open,
+	// as a command that changes nothing does (keepOpen).
+	h, err := holdVaultKeeping(ctx, e, *asJSON, !*abandon)
 	if err != nil {
 		return err
 	}
 	defer h.release(ctx)
-	cfg := e.storeConfig()
 
 	if *abandon {
 		if !*yes {
@@ -151,6 +163,9 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 
 	var res *store.ForkResult
 	var abandoned bool
+	if pending {
+		h.keepOpen = false // an interrupted fork is being finished
+	}
 	err = retryBusy(ctx, func() (err error) {
 		res, abandoned, err = store.ResumeFork(ctx, cfg, store.ForkOptions{Passphrase: pass, KeepOld: *keepOld})
 		return err
@@ -246,6 +261,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		}
 		return failf("%v; nothing was changed", err)
 	}
+	h.keepOpen = false // begun: the vault is leaving
 	res, err = p.Commit(ctx, *discardOld)
 	if err != nil {
 		// The kit file is deleted only when the new account is known to

@@ -118,6 +118,14 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	if cfg, err = s.promoteNext(cfg); err != nil {
 		return err
 	}
+	// The new key file is sealed with this process's device passphrase when
+	// the old one was, and only at the very end. One the rules refuse fails
+	// there, after the log and device.json changed: so before any write.
+	if cfg.Store == DeviceStoreFile && cfg.Sealed {
+		if err := s.deviceStore(cfg).probe(); err != nil {
+			return fmt.Errorf("store: this process's device passphrase can't seal the new key file, so nothing was changed: %w", err)
+		}
+	}
 	// The device key this device has now, if it can still be read: the
 	// record of the device device.json names, or of its pending
 	// replacement (load). A tombstone of either is a revocation whose
