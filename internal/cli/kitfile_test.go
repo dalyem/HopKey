@@ -280,6 +280,9 @@ func TestInitWarnsAboutAnUnsealedDeviceKeyFile(t *testing.T) {
 				wantStore = "Device key: file, sealed with the device passphrase."
 			} else if !strings.Contains(stderr.String(), want) {
 				t.Errorf("stderr %q\nwant it to contain %q", stderr.String(), want)
+			} else if !strings.Contains(stderr.String(), "run this on a terminal and say yes when it asks") {
+				// Nobody was asked here, so a terminal is a way forward.
+				t.Errorf("stderr %q\nwant it to offer a terminal", stderr.String())
 			}
 			if !strings.Contains(stdout.String(), wantStore) {
 				t.Errorf("stdout does not say %q:\n%s", wantStore, stdout.String())

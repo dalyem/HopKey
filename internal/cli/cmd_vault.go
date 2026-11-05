@@ -234,7 +234,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		return forkFailure(err)
 	}
 	if path, unsealed := p.UnsealedFile(); unsealed {
-		fmt.Fprint(e.Stderr, unsealedWarning(path))
+		fmt.Fprint(e.Stderr, unsealedWarning(path, e.canAsk(*asJSON)))
 	}
 	fmt.Fprintln(out, "\nThe new vault is a new account. This is its Emergency Kit; the old account's kit does not open it.")
 	if err := showKitTo(e, out, kit, *kitFile); err != nil {

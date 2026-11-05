@@ -178,6 +178,192 @@ func TestSubprocessAuthEndToEnd(t *testing.T) {
 	waitUntil(t, 30*time.Second, "cache on b", func() bool { return b.hasHost(t, "cache") })
 }
 
+// buildSubBinaries builds hop and hop-server into a directory of their own.
+func buildSubBinaries(t *testing.T) (hopBin, serverBin string) {
+	t.Helper()
+	bins := t.TempDir()
+	hopBin, serverBin = filepath.Join(bins, "hop"), filepath.Join(bins, "hop-server")
+	for _, b := range []struct{ out, pkg string }{
+		{hopBin, "github.com/dalyem/hopkey/cmd/hop"},
+		{serverBin, "github.com/dalyem/hopkey/cmd/hop-server"},
+	} {
+		cmd := exec.Command(goTool(t), "build", "-o", b.out, b.pkg)
+		cmd.Dir = "../.."
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go build %s: %v\n%s", b.pkg, err, out)
+		}
+	}
+	return hopBin, serverBin
+}
+
+// A machine with no keychain whose device key file is sealed with a typed
+// passphrase, with no HOP_DEVICE_PASSPHRASE anywhere: the commands that
+// open the vault themselves ask for the passphrase on a terminal, once,
+// and the vault is open in the daemon afterwards, however they end. The
+// passphrase never reaches the daemon's environment.
+func TestSubprocessSealedDeviceNeedsNoVariable(t *testing.T) {
+	if _, err := os.Stat("/proc/self/environ"); err != nil {
+		t.Skip("no /proc to read a daemon's environment from")
+	}
+	hopBin, serverBin := buildSubBinaries(t)
+	base, err := os.MkdirTemp("", "hk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	certFile, keyFile, pool := writeTestCert(t, base)
+	origin := startServer(t, serverBin, base, certFile, keyFile, pool)
+	inviteCode := strings.TrimSpace(mustRun(t, serverBin, "invite", subEmail, "--data", filepath.Join(base, "server")))
+	a := newSubHome(t, hopBin, base, "a", certFile)
+	const devicePass = "a typed device passphrase"
+	asksDevicePass := "Device passphrase (this machine's key file, not your master password): "
+	secrets := []string{"HOP_PASSWORD=" + subPassword}
+
+	// No keychain here, so a file store is the choice; the question comes
+	// first and yes seals it.
+	p := a.startPTY(t, nil, "init", "--device-key-store", "file")
+	p.expect(t, "Protect it with a device passphrase? (recommended) [Y/n] ")
+	p.send("y")
+	p.expect(t, "New device passphrase: ")
+	p.send(devicePass)
+	p.expect(t, "Repeat the device passphrase: ")
+	p.send(devicePass)
+	p.expect(t, "Master password: ")
+	p.send(subPassword)
+	p.expect(t, "Repeat it: ")
+	p.send(subPassword)
+	out := p.expect(t, "Type the last group of your Secret Key: ")
+	sk, rk := subKitKeys(t, out)
+	p.send(store.LastGroup(sk))
+	p.expect(t, "Type the last group of your Recovery Key: ")
+	p.send(store.LastGroup(rk))
+	if code := p.wait(t, 60*time.Second); code != 0 {
+		t.Fatalf("hop init: exit %d\n%s", code, p.output())
+	}
+	secrets = append(secrets, "HOP_SECRET_KEY="+sk)
+	a.must(t, nil, "add", "web", "--address", "203.0.113.10", "--user", "deploy")
+
+	// Signup of the sealed local vault asks for the passphrase once.
+	p = a.startPTY(t, secrets, "auth", "signup",
+		"--server", origin, "--email", subEmail, "--code", inviteCode)
+	p.expect(t, asksDevicePass)
+	p.send(devicePass)
+	if code := p.wait(t, 60*time.Second); code != 0 {
+		t.Fatalf("hop auth signup: exit %d\n%s", code, p.output())
+	}
+	// The hand-off opened it: a command that needs the vault asks nothing.
+	if !a.hasHost(t, "web") {
+		t.Fatal("the vault is not open in the daemon after signup")
+	}
+
+	// A command that opens the vault itself, with no variable: it asks once,
+	// before anything else, and the vault is open afterwards.
+	p = a.startPTY(t, secrets, "auth", "resume")
+	p.expect(t, asksDevicePass)
+	p.send(devicePass)
+	p.expect(t, "Nothing is pending.")
+	if code := p.wait(t, 60*time.Second); code != 0 {
+		t.Fatalf("hop auth resume: exit %d\n%s", code, p.output())
+	}
+	if n := strings.Count(p.output(), asksDevicePass); n != 1 {
+		t.Errorf("hop auth resume asked for the device passphrase %d times", n)
+	}
+	if !a.hasHost(t, "web") {
+		t.Fatal("the vault is locked after hop auth resume")
+	}
+	a.checkNoPassphrase(t, devicePass)
+
+	// A wrong passphrase three times: it asks again, then fails, and the
+	// daemon that was running is the one still running, with the vault open.
+	before := a.daemonPID(t)
+	p = a.startPTY(t, secrets, "auth", "resume")
+	for range 3 {
+		p.expect(t, asksDevicePass)
+		p.send("not the device passphrase")
+	}
+	if code := p.wait(t, 60*time.Second); code != 255 {
+		t.Errorf("hop auth resume with a wrong passphrase: exit %d\n%s", code, p.output())
+	}
+	if pid := a.daemonPID(t); pid != before {
+		t.Errorf("the daemon changed from %d to %d on a passphrase that does not open the key file", before, pid)
+	}
+	if !a.hasHost(t, "web") {
+		t.Error("the vault was locked by a wrong passphrase")
+	}
+
+	// A command that fails after the prompt leaves the vault open: the
+	// daemon it stopped comes back, unlocked, with no variable to open it.
+	p = a.startPTY(t, secrets, "auth", "devices", "revoke", "no-such-device")
+	p.expect(t, asksDevicePass)
+	p.send(devicePass)
+	if code := p.wait(t, 60*time.Second); code != 255 {
+		t.Errorf("hop auth devices revoke: exit %d\n%s", code, p.output())
+	}
+	waitUntil(t, 30*time.Second, "the daemon to run again", func() bool { return a.daemonPID(t) != 0 })
+	if !a.hasHost(t, "web") {
+		t.Error("the vault is locked after a command that failed")
+	}
+	a.checkNoPassphrase(t, devicePass)
+
+	// Without a terminal nothing is asked, and the daemon is not touched.
+	before = a.daemonPID(t)
+	code, _, stderr := a.hop(t, secrets, "auth", "resume")
+	if code != 255 || !strings.Contains(stderr, store.PassphraseEnv) {
+		t.Errorf("hop auth resume with no terminal: exit %d, %q", code, stderr)
+	}
+	if pid := a.daemonPID(t); pid != before || !a.hasHost(t, "web") {
+		t.Errorf("a refused command changed the daemon: %d, then %d", before, pid)
+	}
+
+	// The key change leaves a file the same passphrase opens: lock, unlock.
+	p = a.startPTY(t, secrets, "auth", "rotate")
+	p.expect(t, asksDevicePass)
+	p.send(devicePass)
+	p.expect(t, "Enter keeps only this device): ")
+	p.send("")
+	p.expect(t, "[y/N] ")
+	p.send("y")
+	out = p.expect(t, "Type the last group of your Secret Key: ")
+	sk2, rk2 := subKitKeys(t, out)
+	p.send(store.LastGroup(sk2))
+	p.expect(t, "Type the last group of your Recovery Key: ")
+	p.send(store.LastGroup(rk2))
+	if code := p.wait(t, 60*time.Second); code != 0 {
+		t.Fatalf("hop auth rotate: exit %d\n%s", code, p.output())
+	}
+	if !a.hasHost(t, "web") {
+		t.Fatal("the vault is locked after hop auth rotate")
+	}
+	a.must(t, nil, "lock")
+	p = a.startPTY(t, nil, "unlock")
+	p.expect(t, asksDevicePass)
+	p.send(devicePass)
+	if code := p.wait(t, 60*time.Second); code != 0 {
+		t.Fatalf("hop unlock after the rotation: exit %d\n%s", code, p.output())
+	}
+	if !a.hasHost(t, "web") {
+		t.Fatal("the vault is locked after hop unlock")
+	}
+	a.checkNoPassphrase(t, devicePass)
+}
+
+// checkNoPassphrase fails the test if the running daemon's environment
+// holds the device passphrase, or the variable that carries it.
+func (h *subHome) checkNoPassphrase(t *testing.T, pass string) {
+	t.Helper()
+	pid := h.daemonPID(t)
+	if pid == 0 {
+		t.Fatalf("%s: no daemon is running", h.name)
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(b, []byte(pass)) || bytes.Contains(b, []byte(store.PassphraseEnv)) {
+		t.Errorf("%s: the daemon's environment holds the device passphrase", h.name)
+	}
+}
+
 // subHome is one machine: a home and XDG directories of its own.
 type subHome struct {
 	bin, name, home, run, state string

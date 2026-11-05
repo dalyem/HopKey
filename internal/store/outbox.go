@@ -536,6 +536,13 @@ func (l layout) serverBacked() (bool, error) {
 	return f != nil, err
 }
 
+// ServerBackedDir reports whether the vault in dataDir syncs with a
+// server. It reads vault/server.json and nothing else, so it works while a
+// daemon owns the vault and while the vault is locked.
+func ServerBackedDir(dataDir string) (bool, error) {
+	return layout{data: dataDir}.serverBacked()
+}
+
 // serverModeOps adds the switch to server-backed mode, with f's server and
 // sign-in, to t. The publication and the sign-ins commit it together with
 // their own files.

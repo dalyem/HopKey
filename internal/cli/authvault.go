@@ -100,6 +100,14 @@ type vaultHold struct {
 	// the daemon it starts with the device passphrase typed for the
 	// command (handDevicePassphrase).
 	handPass bool
+	// keepOpen is for a command on a vault that already exists: release
+	// opens the vault in the daemon it starts with the typed device
+	// passphrase however the command ended, unless the daemon it stopped
+	// had the vault locked (wasLocked), so an open vault stays open.
+	keepOpen bool
+	// wasLocked says the daemon holdVault stopped had the vault locked,
+	// which a command does not undo.
+	wasLocked bool
 }
 
 // holdMarkerName is the marker's name in the run directory.
@@ -220,11 +228,23 @@ func (h *vaultHold) unmark() {
 // holdVault stops the daemon so this process can own the vault. asJSON
 // is the command's output mode.
 func holdVault(ctx context.Context, e *Env, asJSON bool) (*vaultHold, error) {
+	return holdVaultKeeping(ctx, e, asJSON, false)
+}
+
+// holdVaultKeeping is holdVault for a command on a vault that exists, when
+// keep is set: it notes whether the daemon has the vault locked before it
+// stops it, and release opens the vault in the daemon it starts again with
+// the device passphrase typed for the command, however the command ends,
+// unless the vault was locked.
+func holdVaultKeeping(ctx context.Context, e *Env, asJSON, keep bool) (*vaultHold, error) {
 	h := &vaultHold{e: e, cfg: e.storeConfig(), asJSON: asJSON}
 	if err := h.mark(); err != nil {
 		return nil, err
 	}
 	e.setHold(h)
+	if keep {
+		h.keepOpen, h.wasLocked = true, daemonVaultLocked(ctx, e)
+	}
 	if _, err := shutdownDaemon(ctx, e); err != nil {
 		if e.daemonGone() {
 			// The daemon stopped although the request failed (a signal
@@ -238,6 +258,36 @@ func holdVault(ctx context.Context, e *Env, asJSON bool) (*vaultHold, error) {
 		return nil, err
 	}
 	return h, nil
+}
+
+// holdVaultWithKey is holdVault for a command that opens the vault itself
+// on a vault that exists, and so needs the passphrase of a sealed device
+// key file (requireDevicePassphrase). The passphrase is settled first: a
+// failure there leaves the daemon as it was. However the command ends, the
+// vault is open in the daemon afterwards if it was open before.
+func holdVaultWithKey(ctx context.Context, e *Env, asJSON bool) (*vaultHold, error) {
+	if err := requireDevicePassphrase(e, asJSON); err != nil {
+		e.clearDevicePass()
+		return nil, err
+	}
+	h, err := holdVaultKeeping(ctx, e, asJSON, true)
+	if err != nil {
+		e.clearDevicePass()
+		return nil, err
+	}
+	return h, nil
+}
+
+// daemonVaultLocked reports whether a running daemon has the vault locked.
+// A daemon that is not running, or does not answer, has nothing locked.
+func daemonVaultLocked(ctx context.Context, e *Env) bool {
+	c, err := dialExisting(ctx, e)
+	if err != nil || c == nil {
+		return false
+	}
+	defer c.Close()
+	var st daemon.StatusResult
+	return c.Call(ctx, daemon.OpStatus, nil, &st) == nil && st.Vault != nil && st.Vault.Locked
 }
 
 func (e *Env) setHold(h *vaultHold) {
@@ -323,10 +373,11 @@ func (h *vaultHold) release(ctx context.Context) {
 		}
 		if err := startDaemon(context.WithoutCancel(ctx), h.e); err != nil {
 			warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (hop sync starts it): "+err.Error())
-		} else if h.handPass {
+		} else if h.handPass || (h.keepOpen && !h.wasLocked) {
 			handDevicePassphrase(ctx, h.e, h.asJSON)
 		}
 	})
+	h.e.clearDevicePass()
 	h.e.setHold(nil)
 }
 
@@ -436,11 +487,11 @@ func (h *vaultHold) vaultOf(s *store.Store) (*authflow.Vault, error) {
 		return nil, err
 	}
 	if s.Info().Locked {
-		hint := "run hop unlock first"
-		if sealed, err := store.SealedDeviceFile(h.cfg.DataDir); err == nil && sealed {
-			hint = "its device key file is sealed, so set " + store.PassphraseEnv + " to the device passphrase and run this again"
+		// The reason says what to do about it, where anything can be done.
+		if why := s.Info().LockReason; why != "" {
+			return nil, failf("the vault is locked (%s)", why)
 		}
-		return nil, failf("the vault is locked (%s); %s", s.Info().LockReason, hint)
+		return nil, failf("the vault is locked; run hop unlock first")
 	}
 	v, err := authflow.NewVault(h.cfg, s, c)
 	if err != nil {
@@ -476,7 +527,11 @@ func authFailure(err error) error {
 	if errors.As(err, &ee) {
 		return err
 	}
+	var interrupted *authflow.EnrollInterruptedError
 	switch {
+	case errors.As(err, &interrupted) && errors.Is(err, context.Canceled):
+		// The error quotes the enrollment's URL, which the user need not see.
+		return failf("the sign-in was cancelled")
 	case errors.Is(err, authflow.ErrLocalVault):
 		return failf("this device has a local-only vault: hop auth login --merge (with --method password or recovery) merges it into the account, or hop auth signup publishes it")
 	case errors.Is(err, authflow.ErrSignedIn):

@@ -249,9 +249,11 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if choice.unsealed {
-		fmt.Fprint(e.Stderr, unsealedWarning(store.DeviceKeyFile(e.storeConfig().DataDir)))
+		fmt.Fprint(e.Stderr, unsealedWarning(store.DeviceKeyFile(e.storeConfig().DataDir), true))
 	}
-	h, err := holdVault(ctx, e, o.asJSON)
+	// A vault with a sealed key file that signup publishes was open in the
+	// daemon, and stays open if signup fails.
+	h, err := holdVaultKeeping(ctx, e, o.asJSON, sealedKeyFile(e.storeConfig().DataDir))
 	if err != nil {
 		return err
 	}
@@ -410,6 +412,17 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	if err := o.checkKitFile(); err != nil {
 		return err
 	}
+	// Before the server URL, the email or the device passphrase is asked: a
+	// device that is signed in has nothing to sign in to. A recovery on a
+	// device whose recovery checkpoint is unfinished goes on instead.
+	if *method != methodRecovery {
+		if in, err := store.SignedInDir(e.storeConfig().DataDir); err == nil && in {
+			if lock := daemonAdminLock(ctx, e); lock != nil {
+				return failf("%s", loginAdminHint(lock))
+			}
+			return authFailure(authflow.ErrSignedIn)
+		}
+	}
 	ctx, stopWatch := hangupContext(ctx, e)
 	defer stopWatch()
 	u := o.ui(e)
@@ -443,12 +456,13 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	if choice.unsealed {
-		fmt.Fprint(e.Stderr, unsealedWarning(store.DeviceKeyFile(e.storeConfig().DataDir)))
+		fmt.Fprint(e.Stderr, unsealedWarning(store.DeviceKeyFile(e.storeConfig().DataDir), true))
 	}
 	// Asked before the daemon stops: the operator's refusal lives in its
 	// memory only.
 	lock := daemonAdminLock(ctx, e)
-	h, err := holdVault(ctx, e, o.asJSON)
+	// A vault with a sealed key file that this login fails on stays open.
+	h, err := holdVaultKeeping(ctx, e, o.asJSON, sealedKeyFile(e.storeConfig().DataDir))
 	if err != nil {
 		return err
 	}
@@ -660,7 +674,8 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 	defer stopWatch()
 	u := o.ui(e)
 	u.role, u.sas = roleApprove, *sas
-	h, err := holdVault(ctx, e, o.asJSON)
+	defer e.clearDevicePass()
+	h, err := holdVaultWithKey(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
@@ -1051,7 +1066,8 @@ func runCheckpoint(ctx context.Context, e *Env, name string, args []string, extr
 		return err
 	}
 	u := o.ui(e)
-	h, err := holdVault(ctx, e, o.asJSON)
+	defer e.clearDevicePass()
+	h, err := holdVaultWithKey(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
@@ -1145,7 +1161,8 @@ func runAuthResume(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	u := o.ui(e)
-	h, err := holdVault(ctx, e, o.asJSON)
+	defer e.clearDevicePass()
+	h, err := holdVaultWithKey(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
@@ -1223,27 +1240,19 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	lock := daemonAdminLock(ctx, e)
 	// A sealed device key opens with its passphrase, which a logout that
 	// tells the server needs to sign the retirement.
-	var pass []byte
+	defer e.clearDevicePass()
 	if !*localOnly && e.Getenv(store.PassphraseEnv) == "" && canAskPassphrase(e) {
-		if pass, err = e.ReadPassword(devicePassphrasePrompt); err != nil {
-			return failf("reading the device passphrase: %v", err)
+		if err := e.askDevicePassphrase(true); err != nil {
+			return err
 		}
-		defer clear(pass)
 	}
-	h, err := holdVault(ctx, e, o.asJSON)
+	// A logout that is refused or declined before it begins leaves the
+	// vault, which stays open.
+	h, err := holdVaultKeeping(ctx, e, o.asJSON, true)
 	if err != nil {
 		return err
 	}
 	defer h.release(ctx)
-	if len(pass) > 0 {
-		getenv := h.cfg.Getenv
-		h.cfg.Getenv = func(k string) string {
-			if k == store.PassphraseEnv {
-				return string(pass)
-			}
-			return getenv(k)
-		}
-	}
 	s, err := h.open(ctx)
 	if err != nil {
 		return err
@@ -1311,6 +1320,7 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 			return failf("not logged out")
 		}
 	}
+	h.keepOpen = false // begun: the vault is leaving
 	res, err := authflow.Logout(ctx, env, s, store.LogoutOptions{DiscardPending: *discard, LocalOnly: *localOnly, Why: adminLockWhy(lock)})
 	if errors.Is(err, store.ErrLogoutPending) && errors.Is(err, syncclient.ErrUnauthorized) {
 		// The server doesn't know this device (401): a deleted account's
@@ -1484,7 +1494,8 @@ func runAuthMerge(ctx context.Context, e *Env, args []string) error {
 		return failf("--confirm goes with --discard")
 	}
 	u := o.ui(e)
-	h, err := holdVault(ctx, e, o.asJSON)
+	defer e.clearDevicePass()
+	h, err := holdVaultWithKey(ctx, e, o.asJSON)
 	if err != nil {
 		return err
 	}
@@ -1793,7 +1804,8 @@ func runAuthPolicy(ctx context.Context, e *Env, args []string) error {
 		case daemon.IsCode(err, daemon.CodeRevoked):
 			return failf("this device was revoked from the account; hop auth status says more")
 		case daemon.IsCode(err, daemon.CodeLocked):
-			return failf("%v; run hop unlock first", err)
+			// The daemon's message already says to run hop unlock.
+			return failf("%v", err)
 		}
 		return err
 	}

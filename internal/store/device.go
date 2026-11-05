@@ -432,6 +432,46 @@ func SealedDeviceFile(dataDir string) (bool, error) {
 	return c.Store == DeviceStoreFile && c.Sealed, nil
 }
 
+// ErrWrongDevicePassphrase means the device passphrase does not open the
+// sealed device key file.
+var ErrWrongDevicePassphrase = errors.New("the device passphrase does not open the device key file")
+
+// CheckDevicePassphrase reports whether pass opens the sealed device key
+// file in dataDir. It only reads: nothing is written, no daemon or lock is
+// involved, and a wrong passphrase wraps ErrWrongDevicePassphrase. The
+// caller zeroes pass. A file that is not sealed, or cannot be read, is an
+// error of another kind.
+func CheckDevicePassphrase(dataDir string, pass []byte) error {
+	path := layout{data: dataDir}.deviceKeyFile()
+	b, err := readKeyFile(path)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDeviceKey, err)
+	}
+	var f deviceKeyFile
+	if err := canonjson.Unmarshal(b, &f); err != nil || f.V != 1 {
+		return fmt.Errorf("%w: %s does not parse", ErrDeviceKey, path)
+	}
+	if f.KDFVersion != crypto.KDFv1.Version || len(f.Salt) != crypto.SaltSize {
+		return fmt.Errorf("%w: %s is not sealed with a device passphrase", ErrDeviceKey, path)
+	}
+	env, err := crypto.ParseAEADEnvelope(f.Key)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrDeviceKey, path, err)
+	}
+	key, err := crypto.DevicePassphraseKey(pass, f.Salt, f.DeviceID)
+	if err != nil {
+		// A passphrase the rules refuse cannot be the one that sealed it.
+		return fmt.Errorf("%w: %v", ErrWrongDevicePassphrase, err)
+	}
+	pt, err := crypto.OpenAEAD(key, env, crypto.DeviceKeyFileAAD(f.DeviceID))
+	key.Zero()
+	if err != nil {
+		return ErrWrongDevicePassphrase
+	}
+	clear(pt)
+	return nil
+}
+
 // KeychainProblem says why the OS keychain can't hold a device key, or is
 // nil when it can. It is the probe hop init runs before it commits to the
 // keychain: one entry written, read back and deleted at once, so it makes

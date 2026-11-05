@@ -564,8 +564,21 @@ func (s *Store) bootstrapRemote(ctx context.Context, r Remote, fl *fileHold, gen
 // written; the returned kit comes from a candidate verified as committed
 // in the log (§5.4). The kit stays pending until AckKit.
 func (s *Store) ChangePassword(ctx context.Context, current, next []byte) (Kit, error) {
+	return s.ChangePasswordWithPassphrase(ctx, current, next, nil)
+}
+
+// ChangePasswordWithPassphrase is ChangePassword with the passphrase of a
+// sealed device key file, for a process whose own environment has none (a
+// daemon that hop mcp or the login service started): the device key is
+// saved again, sealed with it. It is used in place of HOP_DEVICE_PASSPHRASE
+// for this call only, and is not kept; the caller zeroes it.
+func (s *Store) ChangePasswordWithPassphrase(ctx context.Context, current, next, passphrase []byte) (Kit, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.setPassphrase(passphrase); err != nil {
+		return Kit{}, err
+	}
+	defer s.passphrase.Store(nil)
 	if s.sec == nil {
 		return Kit{}, s.lockedErr()
 	}
@@ -700,13 +713,40 @@ func (s *Store) PendingKit() *Kit {
 	return &k
 }
 
+// setPassphrase makes pass stand for HOP_DEVICE_PASSPHRASE for the call
+// that holds s.mu, for a store whose device key is a sealed file. A
+// passphrase that does not open that file is refused: saving the key file
+// with it would seal the file with a passphrase nobody has. No passphrase
+// changes nothing. The caller holds s.mu and clears it again.
+func (s *Store) setPassphrase(pass []byte) error {
+	if len(pass) == 0 {
+		return nil
+	}
+	if s.devCfg.Store == DeviceStoreFile && s.devCfg.Sealed {
+		if err := CheckDevicePassphrase(s.cfg.DataDir, pass); err != nil {
+			return err
+		}
+	}
+	s.passphrase.Store(&pass)
+	return nil
+}
+
 // AckKit records that the user has the pending kit: its Secret Key is
 // durably in the device key store (stored, or made durable, again if an
 // earlier attempt failed), and then its journal is deleted. It refuses,
 // and the kit stays pending, while the Secret Key cannot be stored durably.
-func (s *Store) AckKit() error {
+func (s *Store) AckKit() error { return s.AckKitWithPassphrase(nil) }
+
+// AckKitWithPassphrase is AckKit with the passphrase of a sealed device key
+// file, which saving the Secret Key seals the file with. Like
+// ChangePasswordWithPassphrase it is used for this call only.
+func (s *Store) AckKitWithPassphrase(passphrase []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.setPassphrase(passphrase); err != nil {
+		return err
+	}
+	defer s.passphrase.Store(nil)
 	if s.state == nil {
 		return s.lockedErr()
 	}

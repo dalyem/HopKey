@@ -191,3 +191,93 @@ func TestEncryptedVaultOps(t *testing.T) {
 	}
 	s2.Close()
 }
+
+// A daemon with no device passphrase of its own, over a sealed key file,
+// changes the master password and confirms the kit when each request
+// carries the passphrase, and keeps nothing: the next request without it
+// fails again. Its status names the data directory it serves.
+func TestPasswdWithADevicePassphraseOnTheRequest(t *testing.T) {
+	base := shortDir(t)
+	const devicePass = "a device passphrase"
+	const password = "a master password"
+	cfg := store.Config{DataDir: filepath.Join(base, "data"), Getenv: func(string) string { return "" }}
+	sealedCfg := cfg
+	sealedCfg.Getenv = func(k string) string {
+		if k == store.PassphraseEnv {
+			return devicePass
+		}
+		return ""
+	}
+	p, err := store.PrepareInit(sealedCfg, store.InitOptions{Password: []byte(password), DeviceStore: store.DeviceStoreFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s0, err := p.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s0.Close()
+
+	ctx := context.Background()
+	s, err := store.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := Start(Options{Paths: Paths{RunDir: filepath.Join(base, "run"), ConfigDir: filepath.Join(base, "cfg")}, Store: s, Tailscale: fakeTS{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	c, err := Dial(ctx, d.ControlSocket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	var st StatusResult
+	if err := c.Call(ctx, OpStatus, nil, &st); err != nil || st.DataDir != cfg.DataDir {
+		t.Fatalf("status names data dir %q (%v), want %q", st.DataDir, err, cfg.DataDir)
+	}
+	if err := c.Call(ctx, OpUnlock, UnlockParams{DevicePassphrase: devicePass}, nil); err != nil {
+		t.Fatalf("unlock with the passphrase: %v", err)
+	}
+	// Without the passphrase the key file cannot be saved, and nothing changes.
+	if err := c.Call(ctx, OpPasswd, PasswdParams{Current: password, New: "another password"}, nil); err == nil {
+		t.Fatal("passwd saved a sealed key file with no passphrase")
+	}
+	var kr KitResult
+	if err := c.Call(ctx, OpKit, nil, &kr); err != nil || kr.Kit != nil {
+		t.Fatalf("a failed change left a kit: %v %+v", err, kr.Kit)
+	}
+	// A passphrase that does not open the file is refused, not used to seal
+	// it anew: nobody would have the one that does.
+	if err := c.Call(ctx, OpPasswd, PasswdParams{Current: password, New: "another password", DevicePassphrase: "not the passphrase"}, nil); err == nil {
+		t.Fatal("passwd went on with a passphrase that does not open the key file")
+	}
+	if err := store.CheckDevicePassphrase(cfg.DataDir, []byte(devicePass)); err != nil {
+		t.Fatalf("a refused passphrase changed the key file: %v", err)
+	}
+	if err := c.Call(ctx, OpPasswd, PasswdParams{Current: password, New: "another password", DevicePassphrase: devicePass}, &kr); err != nil || kr.Kit == nil {
+		t.Fatalf("passwd with the passphrase: %v %+v", err, kr)
+	}
+	if err := c.Call(ctx, OpKitDone, nil, nil); err == nil {
+		t.Fatal("confirming the kit saved a sealed key file with no passphrase")
+	}
+	if err := c.Call(ctx, OpKitDone, KitDoneParams{DevicePassphrase: devicePass}, nil); err != nil {
+		t.Fatalf("confirming the kit with the passphrase: %v", err)
+	}
+	if err := store.CheckDevicePassphrase(cfg.DataDir, []byte(devicePass)); err != nil {
+		t.Fatalf("the passphrase no longer opens the key file: %v", err)
+	}
+	// And the daemon kept nothing: lock, and only a request that carries
+	// the passphrase unlocks it again.
+	if err := c.Call(ctx, OpLock, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Call(ctx, OpUnlock, nil, nil); err == nil {
+		t.Fatal("the daemon kept the device passphrase")
+	}
+	if err := c.Call(ctx, OpUnlock, UnlockParams{DevicePassphrase: devicePass}, nil); err != nil {
+		t.Fatalf("unlock with the passphrase after the change: %v", err)
+	}
+}

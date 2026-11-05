@@ -339,6 +339,16 @@ func TestInitNoKeychainWithTheEnvironmentPassphraseConfirmsTheFile(t *testing.T)
 	if code := m2.hop(t, s2, "init"); code != 255 {
 		t.Fatalf("init declining the file: exit %d", code)
 	}
+	// It says what to unset to get an unsealed file, not what the keychain
+	// error says to set.
+	for _, want := range []string{"unset " + store.PassphraseEnv, "unsealed file"} {
+		if !strings.Contains(s2.stderr.String(), want) {
+			t.Errorf("declining the file does not say %q:\n%s", want, s2.stderr.String())
+		}
+	}
+	if strings.Contains(s2.stderr.String(), "--device-key-store=file") {
+		t.Errorf("declining the file sends the user to the flag they just declined:\n%s", s2.stderr.String())
+	}
 	nothingWritten(t, m2)
 }
 
@@ -506,6 +516,10 @@ func TestLoginByApprovalWithNoKeychainFollowsItsRecord(t *testing.T) {
 	cancel()
 	if code := <-done; code == 0 {
 		t.Fatal("the cancelled login succeeded")
+	}
+	// The user is told it was cancelled, not shown the enrollment's URL.
+	if out := first.stderr.String(); !strings.Contains(out, "the sign-in was cancelled") || strings.Contains(out, "/v1/enroll") || strings.Contains(out, "context canceled") {
+		t.Errorf("the cancelled login says:\n%s", out)
 	}
 	if q, rc := strings.Index(first.stderr.String(), "Protect it"), strings.Index(first.stderr.String(), "hop auth approve "); q < 0 || q > rc {
 		t.Errorf("the question must come before the routing code:\n%s", first.stderr.String())

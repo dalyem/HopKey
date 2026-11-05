@@ -40,6 +40,13 @@ type Vault interface {
 	AckKit() error
 }
 
+// passphraseVault is a Vault that can save its sealed device key file with
+// a device passphrase it is given for one call (store.Store does).
+type passphraseVault interface {
+	ChangePasswordWithPassphrase(ctx context.Context, current, next, passphrase []byte) (store.Kit, error)
+	AckKitWithPassphrase(passphrase []byte) error
+}
+
 // LockParams is the request for OpLock. EndSessions also ends the ssh
 // sessions hop started (sessions.go), which a lock by itself leaves
 // running.
@@ -65,10 +72,22 @@ type UnlockParams struct {
 	DevicePassphrase string `json:"device_passphrase,omitempty"`
 }
 
-// PasswdParams is the request for OpPasswd.
+// PasswdParams is the request for OpPasswd. DevicePassphrase seals the
+// device key file again when it is sealed, in place of the daemon's own
+// HOP_DEVICE_PASSPHRASE, which a daemon started by hop mcp, the login
+// service or an earlier hop command does not have; it is used for this
+// change and not kept.
 type PasswdParams struct {
-	Current string `json:"current"`
-	New     string `json:"new"`
+	Current          string `json:"current"`
+	New              string `json:"new"`
+	DevicePassphrase string `json:"device_passphrase,omitempty"`
+}
+
+// KitDoneParams is the request for OpKitDone. DevicePassphrase is as in
+// PasswdParams: confirming the kit saves its Secret Key in the device key
+// file.
+type KitDoneParams struct {
+	DevicePassphrase string `json:"device_passphrase,omitempty"`
 }
 
 // KitResult answers OpPasswd and OpKit. Kit is nil when none is pending.
@@ -133,7 +152,17 @@ func (d *Daemon) dispatchVault(ctx context.Context, req Request, decode func(any
 		}
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		kit, err := v.ChangePassword(ctx, []byte(p.Current), []byte(p.New))
+		var kit store.Kit
+		var err error
+		if p.DevicePassphrase == "" {
+			kit, err = v.ChangePassword(ctx, []byte(p.Current), []byte(p.New))
+		} else if pv, ok := v.(passphraseVault); ok {
+			pass := []byte(p.DevicePassphrase)
+			defer clear(pass)
+			kit, err = pv.ChangePasswordWithPassphrase(ctx, []byte(p.Current), []byte(p.New), pass)
+		} else {
+			err = invalidf("this vault store cannot take a device passphrase")
+		}
 		if err != nil {
 			return nil, true, err
 		}
@@ -144,7 +173,22 @@ func (d *Daemon) dispatchVault(ctx context.Context, req Request, decode func(any
 	case OpKit:
 		return &KitResult{Kit: v.PendingKit()}, true, nil
 	case OpKitDone:
-		return nil, true, v.AckKit()
+		var p KitDoneParams
+		if len(req.Params) > 0 && string(req.Params) != "null" {
+			if err := decode(&p); err != nil {
+				return nil, true, err
+			}
+		}
+		if p.DevicePassphrase == "" {
+			return nil, true, v.AckKit()
+		}
+		pv, ok := v.(passphraseVault)
+		if !ok {
+			return nil, true, invalidf("this vault store cannot take a device passphrase")
+		}
+		pass := []byte(p.DevicePassphrase)
+		defer clear(pass)
+		return nil, true, pv.AckKitWithPassphrase(pass)
 	}
 	return nil, false, nil
 }

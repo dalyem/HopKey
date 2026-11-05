@@ -250,13 +250,17 @@ type StatusResult struct {
 	ConfigDir     string    `json:"config_dir"`
 	AgentSocket   string    `json:"agent_socket"`
 	ControlSocket string    `json:"control_socket"`
-	Hosts         int       `json:"hosts"`
-	Keys          int       `json:"keys"`        // in the vault
-	KeysInAgent   int       `json:"keys_loaded"` // served on the agent socket
-	SSHHosts      int       `json:"ssh_hosts"`   // vault hosts with a Host block
-	Warnings      []string  `json:"warnings,omitempty"`
-	LoadedAt      time.Time `json:"loaded_at"`
-	LastError     string    `json:"last_error,omitempty"` // the last reload that failed, if any
+	// DataDir is the data directory of the vault the daemon serves, so a
+	// command can tell that this is the daemon of its own vault before it
+	// sends one a secret. Empty for a store that has none.
+	DataDir     string    `json:"data_dir,omitempty"`
+	Hosts       int       `json:"hosts"`
+	Keys        int       `json:"keys"`        // in the vault
+	KeysInAgent int       `json:"keys_loaded"` // served on the agent socket
+	SSHHosts    int       `json:"ssh_hosts"`   // vault hosts with a Host block
+	Warnings    []string  `json:"warnings,omitempty"`
+	LoadedAt    time.Time `json:"loaded_at"`
+	LastError   string    `json:"last_error,omitempty"` // the last reload that failed, if any
 	// Vault describes the encrypted store: locked or not, the device key
 	// store in use and the log head. Nil for other stores.
 	Vault *store.Info `json:"vault,omitempty"`

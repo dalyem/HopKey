@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -122,12 +123,9 @@ func settleDeviceKey(e *Env, flagStore string, interactive, early bool) (deviceK
 			choice.store = plan.Store
 		}
 		if plan.Store == store.DeviceStoreFile && plan.Sealed && interactive && !e.hasDevicePassphrase() {
-			pass, err := e.ReadPassword(devicePassphrasePrompt)
-			if err != nil {
-				return choice, failf("reading the device passphrase: %v", err)
+			if err := e.askDevicePassphrase(sealedKeyFile(cfg.DataDir)); err != nil {
+				return choice, err
 			}
-			e.setDevicePass(pass)
-			clear(pass)
 		}
 		return choice, nil
 	}
@@ -153,7 +151,8 @@ func settleDeviceKey(e *Env, flagStore string, interactive, early bool) (deviceK
 				return choice, err
 			}
 			if !ok {
-				return choice, failf("%v", store.KeychainUnusable(cfg, cause))
+				return choice, failf("nothing was created: you declined to seal the key file with %s, and the OS keychain is not usable (%v); "+
+					"unset %s and run this again to type a device passphrase or keep an unsealed file", store.PassphraseEnv, cause, store.PassphraseEnv)
 			}
 			return choice, nil
 		}
@@ -218,7 +217,7 @@ func askSeal(e *Env) (bool, error) {
 		case !same:
 			e.say("The two device passphrases differ. Try again.\n")
 		case !validPassphrase(pass):
-			e.say("A device passphrase is %d to %d characters of valid text. Try again.\n", crypto.MinPasswordBytes, crypto.MaxPasswordBytes)
+			e.say("A device passphrase needs at least 8 characters, and only valid text. Try again.\n")
 		default:
 			e.setDevicePass(pass)
 			clear(pass)
@@ -260,12 +259,157 @@ func askYesNo(e *Env, question string) (bool, error) {
 	return false, failf("no yes or no answer; nothing was created")
 }
 
+// sealedKeyFile reports whether dataDir's device.json says the device key
+// is a sealed file, so there is a file whose passphrase can be checked. A
+// restarted enrollment has only enroll.json, and no such file yet.
+func sealedKeyFile(dataDir string) bool {
+	sealed, err := store.SealedDeviceFile(dataDir)
+	return err == nil && sealed
+}
+
+// askDevicePassphrase asks for the passphrase of the sealed device key file
+// and keeps the one typed (setDevicePass). With check, a passphrase that
+// does not open the file is asked for again, up to maxAsks times, before
+// anything changes; the failure after that changes nothing either.
+func (e *Env) askDevicePassphrase(check bool) error {
+	dir := e.storeConfig().DataDir
+	for try := range maxAsks {
+		pass, err := e.ReadPassword(devicePassphrasePrompt)
+		if err != nil {
+			return failf("reading the device passphrase: %v", err)
+		}
+		if check {
+			err = store.CheckDevicePassphrase(dir, pass)
+		}
+		switch {
+		case err == nil:
+			e.setDevicePass(pass)
+			clear(pass)
+			return nil
+		case errors.Is(err, store.ErrWrongDevicePassphrase):
+			if try < maxAsks-1 {
+				e.say("That device passphrase does not open this machine's key file. Try again.\n")
+			}
+		default:
+			clear(pass)
+			return failf("%v", err)
+		}
+		clear(pass)
+	}
+	return failf("none of %d device passphrases opened %s; nothing was changed", maxAsks, store.DeviceKeyFile(dir))
+}
+
+// errSealedNeedsVariable is what a command that opens a sealed device key
+// file itself says when it has no passphrase and may not ask for one.
+const errSealedNeedsVariable = "this device's key file is sealed with a device passphrase, and hop can ask for it only on a terminal without --json: " +
+	"set " + store.PassphraseEnv + " to it and run this again"
+
+// requireDevicePassphrase makes sure a command that opens the vault itself
+// has the passphrase of a sealed device key file, and that it opens the
+// file, before the command stops the daemon or asks for any other secret:
+// a wrong one then changes nothing, and an open vault stays open. At a
+// terminal, with none at hand, it asks (askDevicePassphrase); without a
+// terminal, or with --json, it never asks. A device key that is not a
+// sealed file needs nothing.
+func requireDevicePassphrase(e *Env, asJSON bool) error {
+	dir := e.storeConfig().DataDir
+	if !sealedKeyFile(dir) {
+		return nil
+	}
+	if !e.hasDevicePassphrase() {
+		if !e.canAsk(asJSON) {
+			return failf("%s", errSealedNeedsVariable)
+		}
+		return e.askDevicePassphrase(true)
+	}
+	pass := []byte(e.storeGetenv()(store.PassphraseEnv))
+	defer clear(pass)
+	if err := store.CheckDevicePassphrase(dir, pass); errors.Is(err, store.ErrWrongDevicePassphrase) {
+		if len(e.typedPass()) > 0 {
+			return failf("that device passphrase does not open %s", store.DeviceKeyFile(dir))
+		}
+		return failf("the device passphrase in %s does not open %s", store.PassphraseEnv, store.DeviceKeyFile(dir))
+	}
+	return nil
+}
+
+// devicePassphraseForDaemon is the device passphrase a command sends a
+// daemon for one operation, or nil: the one typed for this command, or the
+// caller's HOP_DEVICE_PASSPHRASE, and only when the device key is a sealed
+// file. The caller zeroes it.
+func (e *Env) devicePassphraseForDaemon() []byte {
+	if !sealedKeyFile(e.storeConfig().DataDir) {
+		return nil
+	}
+	return []byte(e.storeGetenv()(store.PassphraseEnv))
+}
+
+// daemonElsewhere is the finding that the running daemon serves another
+// vault than this command's.
+type daemonElsewhere struct {
+	// dir is the data directory the daemon serves, "" for a daemon that
+	// does not say.
+	dir  string
+	here string
+}
+
+func (d *daemonElsewhere) Error() string {
+	if d.dir == "" {
+		return "the running hop daemon does not say which vault it serves, so it may not be the one in " + oneLine(d.here)
+	}
+	return "the running hop daemon serves the vault in " + oneLine(d.dir) + ", not the one in " + oneLine(d.here)
+}
+
+// servesThisVault asks the daemon on c, before any secret is sent to it,
+// which vault it serves, and fails with *daemonElsewhere unless that is the
+// one in this command's data directory. The control socket does not depend
+// on the data directory, so a daemon of another vault, or one too old to
+// say, can be the one a command reaches.
+func servesThisVault(ctx context.Context, e *Env, c *daemon.Client) (daemon.StatusResult, error) {
+	var st daemon.StatusResult
+	if err := c.Call(ctx, daemon.OpStatus, nil, &st); err != nil {
+		return st, cleanErr(err)
+	}
+	here := e.storeConfig().DataDir
+	if st.DataDir == "" || !sameDir(st.DataDir, here) {
+		return st, &daemonElsewhere{dir: st.DataDir, here: here}
+	}
+	return st, nil
+}
+
+// sameDir reports whether a and b name the same directory, through
+// symbolic links when they exist.
+func sameDir(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if a == b {
+		return true
+	}
+	ra, errA := filepath.EvalSymlinks(a)
+	rb, errB := filepath.EvalSymlinks(b)
+	return errA == nil && errB == nil && ra == rb
+}
+
+// elsewhereAdvice is what to do about a daemon of another vault.
+const elsewhereAdvice = "run hop daemon stop, then hop unlock"
+
+// sendDevicePassphrase opens the vault in the daemon on c with pass, for
+// this unlock only, once the daemon is known to serve this vault.
+func sendDevicePassphrase(ctx context.Context, e *Env, c *daemon.Client, asJSON bool, pass []byte) error {
+	if _, err := servesThisVault(ctx, e, c); err != nil {
+		return err
+	}
+	w, err := c.CallWarn(ctx, daemon.OpUnlock, daemon.UnlockParams{DevicePassphrase: string(pass)}, nil)
+	return changeWarning(e, asJSON, w, err)
+}
+
 // handDevicePassphrase opens the vault in the daemon with the device
 // passphrase typed for this command, so the user can use the vault they
-// just made or signed in to without typing it again. The daemon takes it
-// for this unlock only and keeps nothing; a daemon that was not running is
-// started. Where that fails the vault is fine and stays locked, and the
-// warning says what to run.
+// just made or signed in to, or the one a command found open, without
+// typing it again. The daemon takes it for this unlock only and keeps
+// nothing; a daemon that was not running is started. It is sent only to a
+// daemon that says it serves this data directory: a daemon of another
+// vault gets nothing. Where that fails the vault is fine and stays locked,
+// and the warning says what to run.
 func handDevicePassphrase(ctx context.Context, e *Env, asJSON bool) {
 	pass := e.typedPass()
 	if len(pass) == 0 {
@@ -282,11 +426,15 @@ func handDevicePassphrase(ctx context.Context, e *Env, asJSON bool) {
 	}
 	if err == nil && c != nil {
 		defer c.Close()
-		var w *daemon.Error
-		w, err = c.CallWarn(ctx, daemon.OpUnlock, daemon.UnlockParams{DevicePassphrase: string(pass)}, nil)
-		err = changeWarning(e, asJSON, w, err)
+		err = sendDevicePassphrase(ctx, e, c, asJSON, pass)
 	}
-	if err != nil {
-		warn(e, asJSON, "the vault is locked: the hop daemon did not open it ("+err.Error()+"); run hop unlock, which asks for the device passphrase")
+	if err == nil {
+		return
 	}
+	var other *daemonElsewhere
+	if errors.As(err, &other) {
+		warn(e, asJSON, "the vault is locked, and the device passphrase was not sent: "+other.Error()+"; "+elsewhereAdvice)
+		return
+	}
+	warn(e, asJSON, "the vault is locked: the hop daemon did not open it ("+err.Error()+"); run hop unlock, which asks for the device passphrase")
 }

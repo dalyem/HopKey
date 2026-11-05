@@ -38,11 +38,33 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 			return failf("%s already exists; give --kit-file a new file", *kitFile)
 		}
 	}
+	// The daemon saves the key file again, sealed, so it needs the device
+	// passphrase of a sealed one: settled before the daemon is reached and
+	// before the passwords are asked, and sent with each request that saves
+	// the key, never kept by the daemon.
+	defer e.clearDevicePass()
+	if err := requireDevicePassphrase(e, false); err != nil {
+		return err
+	}
 	c, err := connect(ctx, e)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
+	pass := e.devicePassphraseForDaemon()
+	defer clear(pass)
+	if len(pass) > 0 {
+		st, err := servesThisVault(ctx, e, c)
+		if err != nil {
+			return failf("%v; no device passphrase was sent. %s", err, elsewhereAdvice)
+		}
+		if st.Vault != nil && st.Vault.Locked {
+			// What hop unlock would do, with the passphrase just typed.
+			if err := sendDevicePassphrase(ctx, e, c, false, pass); err != nil {
+				return failf("%v", err)
+			}
+		}
+	}
 
 	var pending daemon.KitResult
 	if err := c.Call(ctx, daemon.OpKit, nil, &pending); err != nil {
@@ -50,7 +72,7 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 	}
 	if pending.Kit != nil {
 		fmt.Fprintln(e.Stderr, "hop: an earlier password change is done, but its new Emergency Kit was never confirmed. Here it is.")
-		return confirmKit(ctx, e, c, *pending.Kit, *kitFile)
+		return confirmKit(ctx, e, c, *pending.Kit, *kitFile, pass)
 	}
 
 	fmt.Fprintln(e.Stderr, "A new master password also makes a new Secret Key, a new Recovery Key and a new Emergency Kit.")
@@ -66,7 +88,7 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 	defer clear(next)
 	fmt.Fprintln(e.Stderr, "Re-keying the vault...")
 	var res daemon.KitResult
-	err = c.Call(ctx, daemon.OpPasswd, daemon.PasswdParams{Current: string(cur), New: string(next)}, &res)
+	err = c.Call(ctx, daemon.OpPasswd, daemon.PasswdParams{Current: string(cur), New: string(next), DevicePassphrase: string(pass)}, &res)
 	if daemon.IsCode(err, daemon.CodeWrongPassword) {
 		return failf("the current master password is wrong; nothing changed")
 	}
@@ -78,19 +100,20 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 	}
 	e.printf("Your master password has changed. Your Secret Key and Recovery Key have\n")
 	e.printf("changed with it; the old ones no longer work. Every token was revoked.\n")
-	return confirmKit(ctx, e, c, *res.Kit, *kitFile)
+	return confirmKit(ctx, e, c, *res.Kit, *kitFile, pass)
 }
 
 // confirmKit prints a committed change's kit, has it typed back and then
-// tells the daemon the user has it.
-func confirmKit(ctx context.Context, e *Env, c *daemon.Client, kit store.Kit, kitFile string) error {
+// tells the daemon the user has it. pass is the device passphrase of a
+// sealed key file, which saving the kit's Secret Key seals it with.
+func confirmKit(ctx context.Context, e *Env, c *daemon.Client, kit store.Kit, kitFile string, pass []byte) error {
 	if err := showKit(e, kit, kitFile); err != nil {
 		return err
 	}
 	if err := typeBack(e, kit); err != nil {
 		return failf("%v. The password change is done; run hop passwd again to see the kit", err)
 	}
-	if err := c.Call(ctx, daemon.OpKitDone, nil, nil); err != nil {
+	if err := c.Call(ctx, daemon.OpKitDone, daemon.KitDoneParams{DevicePassphrase: string(pass)}, nil); err != nil {
 		return failf("%v", err)
 	}
 	e.printf("Emergency Kit confirmed.\n")

@@ -97,6 +97,24 @@ const (
 
 func (l layout) retireFile() string { return filepath.Join(l.vault(), retireRel) }
 
+// SignedInDir reports whether the vault in dataDir is signed in to a
+// server and is not logging out of it. It reads vault/server.json and
+// vault/retire.json and nothing else, so it works while a daemon owns the
+// vault and while the vault is locked.
+func SignedInDir(dataDir string) (bool, error) {
+	l := layout{data: dataDir}
+	server, err := l.serverBacked()
+	if err != nil || !server {
+		return false, err
+	}
+	if _, err := os.Lstat(l.retireFile()); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	return true, nil
+}
+
 // Retirer is the server as a logout uses it (§9, §11.1; plan /v1/vaults,
 // /v1/retire-status). Slice E implements it over HTTP. Every call that
 // needs it authenticates with auth, which signs as the retiring device;

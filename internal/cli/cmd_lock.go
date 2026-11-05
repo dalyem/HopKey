@@ -79,6 +79,15 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	if len(pos) != 0 {
 		return failf("usage: %s", commands["unlock"].usage)
 	}
+	// Before the daemon is reached and any secret is asked: a signed-in
+	// vault needs the server, which the daemon's unlock does not use.
+	if *usePassword {
+		if server, err := store.ServerBackedDir(e.storeConfig().DataDir); err == nil && server {
+			return failf("hop unlock --password works only on a vault that is not signed in to a server, because a signed-in vault needs the server to unlock with the password. " +
+				"To replace a lost device key or a forgotten device passphrase, run hop auth logout --local-only (with --discard-pending if it says changes are queued), " +
+				"then hop auth login, then hop auth devices revoke OLD-ID from another device, using the old device ID hop auth login prints")
+		}
+	}
 	c, err := connect(ctx, e)
 	if err != nil {
 		return err
@@ -106,7 +115,22 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 			}
 			return c.CallWarn(ctx, daemon.OpUnlock, p, nil)
 		}
+		// A passphrase goes only to the daemon of this vault.
+		checked := false
+		guard := func(pass []byte) error {
+			if len(pass) == 0 || checked {
+				return nil
+			}
+			if _, err := servesThisVault(ctx, e, c); err != nil {
+				return failf("%v; no device passphrase was sent. %s", err, elsewhereAdvice)
+			}
+			checked = true
+			return nil
+		}
 		pass := []byte(e.Getenv(store.PassphraseEnv))
+		if err := guard(pass); err != nil {
+			return err
+		}
 		w, err := unlock(pass)
 		if err := refusedUnlock(err); err != nil {
 			return err
@@ -117,6 +141,9 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 				return failf("reading the device passphrase: %v", err)
 			}
 			defer clear(pass)
+			if err := guard(pass); err != nil {
+				return err
+			}
 			w, err = unlock(pass)
 			if err := refusedUnlock(err); err != nil {
 				return err

@@ -290,6 +290,9 @@ func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 		Warnings: slices.Clone(st.warnings), LoadedAt: st.loadedAt, LastError: st.lastError,
 		Vault: d.vaultStatus(),
 	}
+	if dd, ok := d.store.(interface{ DataDir() string }); ok {
+		out.DataDir = dd.DataDir()
+	}
 	if why := d.pendingClear(); why != "" {
 		out.Warnings = append(out.Warnings, d.clearWarning(why))
 	}

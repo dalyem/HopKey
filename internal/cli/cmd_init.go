@@ -86,7 +86,7 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 		}
 	}()
 	if path, unsealed := p.UnsealedFile(); unsealed {
-		fmt.Fprint(e.Stderr, unsealedWarning(path))
+		fmt.Fprint(e.Stderr, unsealedWarning(path, e.canAsk(*asJSON)))
 	}
 	kit := p.Kit()
 	// The kit is for the person at the terminal. With --json, stdout holds
@@ -133,13 +133,19 @@ type InitReport struct {
 }
 
 // unsealedWarning is what hop init says before it keeps the device key in
-// an unsealed file (§11, rev 15).
-func unsealedWarning(path string) string {
+// an unsealed file (§11, rev 15). asked says a person at a terminal was
+// asked about sealing it and said no, so the way to a sealed file is only
+// the variable; without a terminal nobody was asked, and a terminal is
+// the other way.
+func unsealedWarning(path string, asked bool) string {
+	way := "set " + store.PassphraseEnv + " to one and start again, or run this on a terminal and say yes when it asks"
+	if asked {
+		way = "set " + store.PassphraseEnv + " to one and start again"
+	}
 	return safef("warning: %s is not set, so this device's private keys and the Secret Key will be stored "+
 		"unencrypted on disk in %s, protected only by its file permissions (0600). "+
-		"Anyone who can read that file as you can use them. To seal the file with a device passphrase, "+
-		"set %s to one and start again, or run this on a terminal and say yes when it asks.\n",
-		store.PassphraseEnv, path, store.PassphraseEnv)
+		"Anyone who can read that file as you can use them. To seal the file with a device passphrase, %s.\n",
+		store.PassphraseEnv, path, way)
 }
 
 // deviceKeyWords says where the device key is, in the words of this

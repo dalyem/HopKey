@@ -590,6 +590,9 @@ func (s *Store) dropLocked(reason error) {
 // complete; every call that starts after is refused.
 func (s *Store) Generation() uint64 { return s.gen.Load() }
 
+// DataDir is the data directory this store owns.
+func (s *Store) DataDir() string { return s.cfg.DataDir }
+
 // IsRevoked reports, without the store's mutex, whether this device is
 // known to be revoked (ErrDeviceRevoked).
 func (s *Store) IsRevoked() bool { return s.isRevoked.Load() }

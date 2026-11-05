@@ -179,6 +179,13 @@ func stopDaemon(ctx context.Context, e *Env, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The daemon removes its sockets before it closes the vault, which waits
+	// for its sync to stop. The command that follows starts a daemon at once,
+	// and one that finds the vault still owned exits: so stop returns when
+	// the vault is free, not when the sockets are gone.
+	if running && !waitVaultFree(e.storeConfig().DataDir) {
+		return failf("the hop daemon stopped answering, but it still has the vault after %s; run hop daemon stop again, or end the hop daemon process", releaseBusyWait)
+	}
 	if *asJSON {
 		return printJSON(e, StopReport{WasRunning: running})
 	}
