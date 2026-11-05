@@ -99,6 +99,20 @@ func TestCheckDevicePassphraseOtherFailures(t *testing.T) {
 	}
 }
 
+// A revoked device's key file holds its tombstone, not a key a passphrase
+// opens: the check says the device was revoked, as the store does, and not
+// that the file is damaged.
+func TestCheckDevicePassphraseOfARevokedDevicesFile(t *testing.T) {
+	cfg, _ := sealedFixture(t)
+	tomb := tombstoneOf(t, randomID(t), randomID(t))
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, "device.key"), []byte(tomb), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckDevicePassphrase(cfg.DataDir, []byte(sealPass)); !errors.Is(err, ErrDeviceRevoked) || errors.Is(err, ErrDeviceKey) {
+		t.Errorf("a tombstone: %v", err)
+	}
+}
+
 // A process with no passphrase of its own changes the master password when
 // it is given one for that call: the key file is saved again, sealed with
 // the same passphrase, and the process keeps nothing.

@@ -241,6 +241,12 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 			return failf("%s", errSignupNeedsTerminal)
 		}
 	}
+	// Before the device passphrase is asked: a device that is signed in has
+	// nothing to publish. A publication that is pending is signed in only
+	// partway (server.json comes with its last step), and goes on.
+	if in, err := store.SignedInDir(e.storeConfig().DataDir); err == nil && in {
+		return authFailure(authflow.ErrSignedIn)
+	}
 	// Before the daemon stops and before any secret: a new vault on a
 	// machine with no keychain is found out now.
 	defer e.clearDevicePass()
@@ -1242,6 +1248,10 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	// tells the server needs to sign the retirement.
 	defer e.clearDevicePass()
 	if !*localOnly && e.Getenv(store.PassphraseEnv) == "" && canAskPassphrase(e) {
+		// A key file that can't be read has no passphrase to ask for.
+		if err := store.CheckDevicePassphrase(e.storeConfig().DataDir, nil); errors.Is(err, store.ErrDeviceKey) {
+			return failf("%v. A logout that tells the server signs with the device key; hop auth logout --local-only needs no key", err)
+		}
 		if err := e.askDevicePassphrase(true); err != nil {
 			return err
 		}

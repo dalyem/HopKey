@@ -1,7 +1,9 @@
 package cli_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -515,8 +517,12 @@ func TestUnlockPasswordOnASignedInVaultRefusesBeforeAnySecret(t *testing.T) {
 	if strings.Contains(s.stderr.String(), "This opens the vault") || strings.Contains(s.stderr.String(), "store:") {
 		t.Errorf("the intro line, or the store's own refusal:\n%s", s.stderr.String())
 	}
-	// A local vault still gets it.
-	l := sealedLocal(t)
+	// A local vault still gets it. (One with a sealed key file is refused
+	// earlier still: TestUnlockPasswordOnASealedLocalVault.)
+	l := newMachine(t, &authWorld{}, "local")
+	if code := l.hop(t, &session{secrets: initSecrets()}, "init"); code != 0 {
+		t.Fatalf("init: exit %d", code)
+	}
 	l.must(t, nil, "lock")
 	s = &session{tty: true, failAt: masterPrmpt} // Ctrl-C at the first question
 	l.hop(t, s, "unlock", "--password")
@@ -563,4 +569,305 @@ func TestStatusNamesTheDataDirectory(t *testing.T) {
 	} else if b, err := os.Stat(m.data); err != nil || !os.SameFile(a, b) {
 		t.Errorf("data_dir %q is not %q", got, m.data)
 	}
+}
+
+// A key file that is missing or damaged fails every command that opens the
+// vault itself before the daemon stops, whatever the passphrase: the vault
+// open in the daemon is the one working copy, and a daemon that starts
+// again can't open the file.
+func TestBrokenKeyFileFailsBeforeTheDaemonStops(t *testing.T) {
+	_, m := sealedAccount(t)
+	good, err := os.ReadFile(keyFileOf(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := daemonStarted(t, m)
+	damages := []struct {
+		name string
+		do   func() error
+	}{
+		{"missing", func() error { return os.Remove(keyFileOf(m)) }},
+		{"damaged", func() error { return os.WriteFile(keyFileOf(m), []byte("not a key file"), 0o600) }},
+	}
+	passwords := map[string]string{"HOP_PASSWORD": resolvePassword, store.PassphraseEnv: devPass}
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"auth rotate", []string{"auth", "rotate"}},
+		{"auth passwd", []string{"auth", "passwd"}},
+		{"auth devices revoke", []string{"auth", "devices", "revoke", "no-such-device"}},
+		{"auth resume", []string{"auth", "resume"}},
+		{"auth approve", []string{"auth", "approve"}},
+		{"auth merge", []string{"auth", "merge"}},
+		{"passwd", []string{"passwd"}},
+	}
+	for _, d := range damages {
+		for _, tc := range cases {
+			t.Run(d.name+"/"+tc.name, func(t *testing.T) {
+				if err := d.do(); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.WriteFile(keyFileOf(m), good, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}()
+				// With a terminal, so that hop passwd gets as far as the key.
+				s := &session{tty: true, env: passwords}
+				if code := m.hop(t, s, tc.args...); code != 255 {
+					t.Fatalf("exit %d: %s", code, s.stderr.String())
+				}
+				if !strings.Contains(s.stderr.String(), "the device key is unavailable") {
+					t.Errorf("stderr does not say the key is unavailable:\n%s", s.stderr.String())
+				}
+				if len(s.order) != 0 {
+					t.Errorf("asked: %v", s.order)
+				}
+				if got := daemonStarted(t, m); !got.Equal(started) {
+					t.Error("the daemon was stopped and started again")
+				}
+				vaultOpen(t, m)
+			})
+		}
+	}
+}
+
+// hop passwd on a local vault checks the key file too, before it connects.
+func TestPasswdOnABrokenKeyFileChangesNothing(t *testing.T) {
+	m := sealedLocal(t)
+	started := daemonStarted(t, m)
+	if err := os.Remove(keyFileOf(m)); err != nil {
+		t.Fatal(err)
+	}
+	s := &session{tty: true, env: map[string]string{store.PassphraseEnv: devPass}}
+	if code := m.hop(t, s, "passwd"); code != 255 || !strings.Contains(s.stderr.String(), "the device key is unavailable") {
+		t.Fatalf("exit %d: %s", code, s.stderr.String())
+	}
+	if len(s.order) != 0 {
+		t.Errorf("asked: %v", s.order)
+	}
+	if got := daemonStarted(t, m); !got.Equal(started) {
+		t.Error("the daemon was stopped and started again")
+	}
+}
+
+// hop auth logout is the way out of a device whose key file is gone, and it
+// says so wherever it stops: hop auth logout --local-only needs no key.
+func TestLogoutOnABrokenKeyFileNamesLocalOnly(t *testing.T) {
+	_, m := sealedAccount(t)
+	started := daemonStarted(t, m)
+	if err := os.Remove(keyFileOf(m)); err != nil {
+		t.Fatal(err)
+	}
+	// At a terminal: no passphrase is asked for a file that can't be read.
+	s := &session{tty: true, secrets: map[string]string{askOldPass: devPass}}
+	if code := m.hop(t, s, "auth", "logout", "--yes"); code != 255 {
+		t.Fatalf("logout at a terminal: exit %d: %s", code, s.stderr.String())
+	}
+	if !strings.Contains(s.stderr.String(), "hop auth logout --local-only") {
+		t.Errorf("the failure does not name --local-only:\n%s", s.stderr.String())
+	}
+	if len(s.order) != 0 {
+		t.Errorf("asked: %v", s.order)
+	}
+	if got := daemonStarted(t, m); !got.Equal(started) {
+		t.Error("the daemon was stopped")
+	}
+	vaultOpen(t, m)
+	// With the passphrase in the environment.
+	s = &session{env: map[string]string{store.PassphraseEnv: devPass}}
+	if code := m.hop(t, s, "auth", "logout", "--yes"); code != 255 {
+		t.Fatalf("logout with the variable: exit %d: %s", code, s.stderr.String())
+	}
+	if !strings.Contains(s.stderr.String(), "hop auth logout --local-only") {
+		t.Errorf("the failure does not name --local-only:\n%s", s.stderr.String())
+	}
+	// And --local-only works.
+	s = &session{}
+	if code := m.hop(t, s, "auth", "logout", "--local-only", "--yes"); code != 0 {
+		t.Fatalf("logout --local-only: exit %d: %s", code, s.stderr.String())
+	}
+	if ok, err := store.Exists(m.data); err != nil || ok {
+		t.Errorf("the vault is still there after --local-only (%v)", err)
+	}
+}
+
+// hop unlock says "vault unlocked" only of the vault in its own data
+// directory. A daemon that serves another vault is reported as such even
+// when no passphrase would be sent; one that names no data directory (a
+// store that has none, or an older daemon) is taken as it is.
+func TestUnlockOfAnotherVaultsDaemonIsNotSuccess(t *testing.T) {
+	a := sealedLocal(t)
+	b := newMachine(t, &authWorld{}, "other")
+	b.paths, b.home = a.paths, a.home // the same sockets, a data directory of its own
+	s := &session{}
+	code := b.hop(t, s, "unlock")
+	if code != 255 {
+		t.Fatalf("exit %d, want 255: %s", code, s.stderr.String())
+	}
+	if strings.Contains(s.stdout.String(), "vault unlocked") {
+		t.Errorf("said the vault was unlocked: %q", s.stdout.String())
+	}
+	for _, want := range []string{a.data, b.data, "hop daemon stop"} {
+		if !strings.Contains(s.stderr.String(), want) {
+			t.Errorf("stderr does not say %q:\n%s", want, s.stderr.String())
+		}
+	}
+	if a.authStatus(t).Locked {
+		t.Error("the other vault's daemon was locked")
+	}
+
+	// The same vault, and a daemon that says nothing about its directory.
+	if s := (&session{}); a.hop(t, s, "unlock") != 0 || !strings.Contains(s.stdout.String(), "vault unlocked") {
+		t.Errorf("unlock of its own vault: %s %s", s.stdout.String(), s.stderr.String())
+	}
+	f := newFakeDaemon(t)
+	f.reply(daemon.OpStatus, map[string]any{"version": "test", "vault": map[string]any{"locked": true}})
+	f.reply(daemon.OpUnlock, nil)
+	f.reply(daemon.OpKit, daemon.KitResult{})
+	n := noKeychain(t)
+	n.paths = f.paths
+	s = &session{}
+	if code := n.hop(t, s, "unlock"); code != 0 || !strings.Contains(s.stdout.String(), "vault unlocked") {
+		t.Errorf("unlock by a daemon with no data directory: exit %d: %s %s", code, s.stdout.String(), s.stderr.String())
+	}
+}
+
+// hop passwd on a locked vault that was never signed in asks for the
+// passwords, as it does on an open one. A locked vault's sync state reads
+// "paused", which is not a sign-in. A signed-in vault, open or locked, still
+// goes through the server.
+func TestPasswdOnALockedLocalVault(t *testing.T) {
+	m := sealedLocal(t)
+	m.must(t, nil, "lock")
+	s := &session{tty: true, secrets: map[string]string{
+		askOldPass: devPass, "Current master password: ": resolvePassword, "New master password: ": newPassword, "Repeat it: ": newPassword}}
+	if code := m.hop(t, s, "passwd"); code != 0 {
+		t.Fatalf("passwd on a locked local vault: exit %d: %s", code, s.stderr.String())
+	}
+	if strings.Contains(s.stderr.String(), "local-only") || !strings.Contains(s.stdout.String(), "Emergency Kit confirmed") {
+		t.Errorf("stdout: %s\nstderr: %s", s.stdout.String(), s.stderr.String())
+	}
+	asksOnce(t, s)
+
+	_, a := sealedAccount(t)
+	for _, locked := range []bool{false, true} {
+		cur, next := resolvePassword, newPassword
+		if locked {
+			cur, next = newPassword, resolvePassword
+			a.must(t, nil, "lock")
+		}
+		s := &session{tty: true, env: map[string]string{"HOP_PASSWORD": cur, "HOP_NEW_PASSWORD": next}, secrets: map[string]string{askOldPass: devPass}}
+		if code := a.hop(t, s, "passwd"); code != 0 {
+			t.Fatalf("passwd on a signed-in vault (locked: %v): exit %d: %s", locked, code, s.stderr.String())
+		}
+		if !strings.Contains(s.stdout.String(), "Your new Emergency Kit") {
+			t.Errorf("passwd on a signed-in vault (locked: %v) did not go through the server:\n%s", locked, s.stdout.String())
+		}
+	}
+}
+
+// hop unlock --password on a sealed key file can't save the new key through
+// a daemon that has no device passphrase of its own, and the variable on
+// this command does not reach it. It says so before it asks for a secret,
+// and the steps it names work.
+func TestUnlockPasswordOnASealedLocalVault(t *testing.T) {
+	m := noKeychain(t)
+	i := &session{tty: true, secrets: initSecrets(), onSecret: typedTwice(devPass), answer: func(string) string { return "y" }}
+	if code := m.hop(t, i, "init"); code != 0 {
+		t.Fatalf("init: exit %d: %s", code, i.stderr.String())
+	}
+	sk, _ := kitKeys(t, i.stdout.String())
+	m.must(t, nil, "lock")
+	secrets := map[string]string{masterPrmpt: resolvePassword, "Secret Key (": sk}
+	started := daemonStarted(t, m)
+
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want []string
+	}{
+		{"no variable", nil, []string{"hop daemon stop", "read -rs " + store.PassphraseEnv, "export " + store.PassphraseEnv, "hop unlock --password again", "Nothing was changed"}},
+		{"variable set here", map[string]string{store.PassphraseEnv: otherPass}, []string{"hop daemon stop", "does not reach the daemon", "set here"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &session{tty: true, env: tc.env, secrets: secrets}
+			if code := m.hop(t, s, "unlock", "--password"); code != 255 {
+				t.Fatalf("exit %d: %s", code, s.stderr.String())
+			}
+			if len(s.order) != 0 {
+				t.Errorf("asked before refusing: %v", s.order)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(s.stderr.String(), want) {
+					t.Errorf("stderr does not say %q:\n%s", want, s.stderr.String())
+				}
+			}
+			if strings.Contains(s.stderr.String(), "store:") || strings.Contains(s.stderr.String(), "This opens the vault") {
+				t.Errorf("the store's own refusal, or the intro line:\n%s", s.stderr.String())
+			}
+			if got := daemonStarted(t, m); !got.Equal(started) {
+				t.Error("the daemon was stopped")
+			}
+		})
+	}
+	before, err := os.ReadFile(keyFileOf(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The steps: stop the daemon, start one with a new device passphrase
+	// (the variable is what the daemon the command starts inherits), and
+	// run the command again.
+	m.must(t, nil, "daemon", "stop")
+	np := otherPass
+	m.daemonPass.Store(&np)
+	s := &session{tty: true, env: map[string]string{store.PassphraseEnv: np}, secrets: secrets}
+	if code := m.hop(t, s, "unlock", "--password"); code != 0 {
+		t.Fatalf("unlock --password after the steps: exit %d: %s", code, s.stderr.String())
+	}
+	if !strings.Contains(s.stdout.String(), "vault unlocked with the master password") {
+		t.Errorf("stdout: %s", s.stdout.String())
+	}
+	if a := m.authStatus(t); a.Locked {
+		t.Error("still locked")
+	}
+	after, err := os.ReadFile(keyFileOf(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before, after) {
+		t.Error("the key file was not replaced")
+	}
+	if err := store.CheckDevicePassphrase(m.data, []byte(np)); err != nil {
+		t.Errorf("the new device passphrase does not open the new key file: %v", err)
+	}
+	if err := store.CheckDevicePassphrase(m.data, []byte(devPass)); !errors.Is(err, store.ErrWrongDevicePassphrase) {
+		t.Errorf("the old device passphrase still opens it: %v", err)
+	}
+	if strings.Contains(s.stdout.String()+s.stderr.String(), np) {
+		t.Error("the device passphrase was printed")
+	}
+}
+
+// hop auth signup on a device that is signed in says so before it asks for
+// the device passphrase.
+func TestSignupWhileSignedInAsksNothing(t *testing.T) {
+	w, m := sealedAccount(t)
+	started := daemonStarted(t, m)
+	s := &session{tty: true, secrets: map[string]string{askOldPass: devPass}}
+	if code := m.hop(t, s, "auth", "signup", "--server", w.origin, "--email", authEmail, "--code", w.invite(t)); code != 255 {
+		t.Fatalf("exit %d: %s", code, s.stderr.String())
+	}
+	if len(s.order) != 0 {
+		t.Errorf("asked: %v", s.order)
+	}
+	if !strings.Contains(s.stderr.String(), "already signed in") {
+		t.Errorf("stderr: %s", s.stderr.String())
+	}
+	if got := daemonStarted(t, m); !got.Equal(started) {
+		t.Error("the daemon was stopped")
+	}
+	vaultOpen(t, m)
 }

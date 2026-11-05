@@ -448,6 +448,31 @@ func TestPublishCrashAtEachState(t *testing.T) {
 	}
 }
 
+// A publication that is pending is not a sign-in: vault/server.json comes
+// with its last step, so SignedInDir says no until it is resolved, and a
+// command that checks it first (hop auth signup) lets it go on.
+func TestSignedInDirDuringAPendingPublication(t *testing.T) {
+	ctx := context.Background()
+	f, srv := publishFixture(t)
+	f.s.testHook = crashAt("publish:post")
+	if _, err := f.s.Publish(ctx, publisher{srv}, pubOpts); !errors.Is(err, errCrash) {
+		t.Fatalf("publish: %v", err)
+	}
+	s := open(t, f.cfg)
+	if p, err := s.Publication(); err != nil || p == nil {
+		t.Fatalf("publication %+v %v; want it pending", p, err)
+	}
+	if in, err := SignedInDir(f.cfg.DataDir); err != nil || in {
+		t.Errorf("SignedInDir with a pending publication: %v %v", in, err)
+	}
+	if _, err := s.ResumePublish(ctx, publisher{srv}); err != nil {
+		t.Fatal(err)
+	}
+	if in, err := SignedInDir(f.cfg.DataDir); err != nil || !in {
+		t.Errorf("SignedInDir after it finished: %v %v", in, err)
+	}
+}
+
 // Preflight (§4.3, plan R9, R14): a checkpoint journal or an
 // unacknowledged kit, a published vault, a bad email and an upload past
 // the limits are refused before anything is journaled.

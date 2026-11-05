@@ -18,7 +18,7 @@ import (
 // For a vault on a server it is hop auth passwd, which changes the
 // password through the server.
 func runPasswd(ctx context.Context, e *Env, args []string) error {
-	if !slices.ContainsFunc(args, func(a string) bool { return a == "-h" || a == "-help" || a == "--help" }) && serverBacked(ctx, e) {
+	if !slices.ContainsFunc(args, func(a string) bool { return a == "-h" || a == "-help" || a == "--help" }) && serverBacked(e) {
 		return runAuthPasswd(ctx, e, args)
 	}
 	fs := newFlags(e, "passwd", commands["passwd"].usage)
@@ -120,14 +120,11 @@ func confirmKit(ctx context.Context, e *Env, c *daemon.Client, kit store.Kit, ki
 	return nil
 }
 
-// serverBacked reports whether the daemon's vault syncs with a server. A
-// daemon that can't be reached says no; the local path then reports why.
-func serverBacked(ctx context.Context, e *Env) bool {
-	c, err := connect(ctx, e)
-	if err != nil {
-		return false
-	}
-	defer c.Close()
-	var st daemon.StatusResult
-	return c.Call(ctx, daemon.OpStatus, nil, &st) == nil && st.Sync != nil && st.Sync.State != daemon.SyncOff
+// serverBacked reports whether the vault syncs with a server, from the
+// files in the data directory: the daemon's sync state says "locked" for a
+// local-only vault too, while the vault is locked. A directory that can't be
+// read says no; the local path then reports why.
+func serverBacked(e *Env) bool {
+	server, err := store.ServerBackedDir(e.storeConfig().DataDir)
+	return err == nil && server
 }

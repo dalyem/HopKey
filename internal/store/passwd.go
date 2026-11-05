@@ -312,7 +312,7 @@ func (s *Store) unlockWithPassword(ctx context.Context, r Remote, password []byt
 	}
 	// The new record is used only once it is durable (§11).
 	if err := s.deviceStore(cfg).storeDurably(rec); err != nil {
-		return fmt.Errorf("store: the new device key was not saved: %w", err)
+		return fmt.Errorf("the new device key was not saved: %w", err)
 	}
 	return s.install(next, rec, dev, oldID, st, sec, repaired, server)
 }

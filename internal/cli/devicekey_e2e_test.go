@@ -200,6 +200,20 @@ func TestInitDevicePassphraseIsAskedAgainUntilItMatches(t *testing.T) {
 		t.Errorf("the master password was asked for: %v", s2.order)
 	}
 	nothingWritten(t, m2)
+	// Too short and mismatched entries end the same way, in words true of both.
+	for name, tries := range map[string][][2]string{
+		"short":      {{"short", "short"}},
+		"mismatched": {{"first one 123", "other one 456"}},
+	} {
+		m3 := noKeychain(t)
+		s3 := &session{tty: true, secrets: initSecrets(), answer: func(string) string { return "y" }, onSecret: typed(tries)}
+		if code := m3.hop(t, s3, "init"); code != 255 {
+			t.Fatalf("init, %s: exit %d", name, code)
+		}
+		if !strings.Contains(s3.stderr.String(), "no usable device passphrase after 3 tries; nothing was created") {
+			t.Errorf("%s: stderr: %s", name, s3.stderr.String())
+		}
+	}
 }
 
 // An explicit --device-key-store keychain is binding: the keychain is

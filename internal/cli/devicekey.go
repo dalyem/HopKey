@@ -225,7 +225,7 @@ func askSeal(e *Env) (bool, error) {
 		}
 		clear(pass)
 	}
-	return false, failf("no matching device passphrase after %d tries; nothing was created", maxAsks)
+	return false, failf("no usable device passphrase after %d tries; nothing was created", maxAsks)
 }
 
 // validPassphrase reports whether pass can seal a device key file: the
@@ -309,7 +309,8 @@ const errSealedNeedsVariable = "this device's key file is sealed with a device p
 // file, before the command stops the daemon or asks for any other secret:
 // a wrong one then changes nothing, and an open vault stays open. At a
 // terminal, with none at hand, it asks (askDevicePassphrase); without a
-// terminal, or with --json, it never asks. A device key that is not a
+// terminal, or with --json, it never asks. A key file that cannot be read
+// fails the same way, whatever the passphrase. A device key that is not a
 // sealed file needs nothing.
 func requireDevicePassphrase(e *Env, asJSON bool) error {
 	dir := e.storeConfig().DataDir
@@ -324,13 +325,19 @@ func requireDevicePassphrase(e *Env, asJSON bool) error {
 	}
 	pass := []byte(e.storeGetenv()(store.PassphraseEnv))
 	defer clear(pass)
-	if err := store.CheckDevicePassphrase(dir, pass); errors.Is(err, store.ErrWrongDevicePassphrase) {
+	err := store.CheckDevicePassphrase(dir, pass)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrWrongDevicePassphrase):
 		if len(e.typedPass()) > 0 {
 			return failf("that device passphrase does not open %s", store.DeviceKeyFile(dir))
 		}
 		return failf("the device passphrase in %s does not open %s", store.PassphraseEnv, store.DeviceKeyFile(dir))
 	}
-	return nil
+	// The key file is missing, unreadable or damaged: the open vault in the
+	// daemon is the one working copy, and stopping the daemon would lose it.
+	return failf("%v", err)
 }
 
 // devicePassphraseForDaemon is the device passphrase a command sends a

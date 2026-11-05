@@ -440,12 +440,17 @@ var ErrWrongDevicePassphrase = errors.New("the device passphrase does not open t
 // file in dataDir. It only reads: nothing is written, no daemon or lock is
 // involved, and a wrong passphrase wraps ErrWrongDevicePassphrase. The
 // caller zeroes pass. A file that is not sealed, or cannot be read, is an
-// error of another kind.
+// error of another kind (ErrDeviceKey), and the tombstone of a revoked
+// device is ErrDeviceRevoked.
 func CheckDevicePassphrase(dataDir string, pass []byte) error {
 	path := layout{data: dataDir}.deviceKeyFile()
 	b, err := readKeyFile(path)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrDeviceKey, err)
+	}
+	if t, ok := parseTombstone(b); ok {
+		// A revoked device's file holds no key to open; the store says so.
+		return t.err()
 	}
 	var f deviceKeyFile
 	if err := canonjson.Unmarshal(b, &f); err != nil || f.V != 1 {
@@ -621,7 +626,7 @@ func (d *deviceStore) load() (*deviceRecord, error) {
 	}
 	ids := d.cfg.self()
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("%w: %s names no device (hop unlock --password restores it)", ErrDeviceKey, d.l.deviceConfig())
+		return nil, fmt.Errorf("%w: %s names no device (hop unlock --password says how to restore it)", ErrDeviceKey, d.l.deviceConfig())
 	}
 	switch d.cfg.Store {
 	case DeviceStoreKeychain:
@@ -643,7 +648,7 @@ func (d *deviceStore) load() (*deviceRecord, error) {
 		}
 		if !slices.Contains(ids, rec.DeviceID) {
 			rec.zero()
-			return nil, fmt.Errorf("%w: %s holds the key of device %v, which %s names neither as this device nor as its pending replacement (hop unlock --password restores it)",
+			return nil, fmt.Errorf("%w: %s holds the key of device %v, which %s names neither as this device nor as its pending replacement (hop unlock --password says how to restore it)",
 				ErrDeviceKey, d.l.deviceKeyFile(), rec.DeviceID, d.l.deviceConfig())
 		}
 		return rec, nil
@@ -780,7 +785,7 @@ func (d *deviceStore) loadID(id model.ID) (*deviceRecord, error) {
 func (d *deviceStore) loadSlot(id model.ID) (*deviceRecord, error) {
 	raw, err := d.ring.Get(keychainService, d.slot(id))
 	if err != nil {
-		return nil, fmt.Errorf("%w: keychain: %v (hop unlock --password restores it)", ErrDeviceKey, err)
+		return nil, fmt.Errorf("%w: keychain: %v (hop unlock --password says how to restore it)", ErrDeviceKey, err)
 	}
 	if t, ok := parseTombstone([]byte(raw)); ok {
 		if t.AccountID != d.cfg.AccountID || t.DeviceID != id {
@@ -809,7 +814,7 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 	path := d.l.deviceKeyFile()
 	b, err := readKeyFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v (hop unlock --password restores it)", ErrDeviceKey, err)
+		return nil, fmt.Errorf("%w: %v (hop unlock --password says how to restore it)", ErrDeviceKey, err)
 	}
 	if t, ok := parseTombstone(b); ok {
 		if t.AccountID != d.cfg.AccountID {

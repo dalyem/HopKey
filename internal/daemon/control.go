@@ -293,6 +293,9 @@ func (d *Daemon) opStatus(ctx context.Context) (*StatusResult, error) {
 	if dd, ok := d.store.(interface{ DataDir() string }); ok {
 		out.DataDir = dd.DataDir()
 	}
+	if hp, ok := d.store.(interface{ HasDevicePassphrase() bool }); ok {
+		out.HasDevicePassphrase = hp.HasDevicePassphrase()
+	}
 	if why := d.pendingClear(); why != "" {
 		out.Warnings = append(out.Warnings, d.clearWarning(why))
 	}

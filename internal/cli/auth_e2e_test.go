@@ -136,6 +136,9 @@ type machine struct {
 	ring  *memRing
 	// noDaemon makes the CLI's daemon starts fail, so nothing syncs.
 	noDaemon atomic.Bool
+	// daemonPass, when set, is the HOP_DEVICE_PASSPHRASE the daemons the CLI
+	// starts here were started with.
+	daemonPass atomic.Pointer[string]
 
 	mu sync.Mutex
 	d  *daemon.Daemon
@@ -171,7 +174,13 @@ func (m *machine) startDaemon(t *testing.T) func() error {
 		if m.noDaemon.Load() {
 			return errors.New("this machine's daemon is off for the test")
 		}
-		s, err := store.Open(context.Background(), store.Config{DataDir: m.data, Keyring: m.ring, Getenv: func(string) string { return "" }})
+		getenv := func(k string) string {
+			if p := m.daemonPass.Load(); p != nil && k == store.PassphraseEnv {
+				return *p
+			}
+			return ""
+		}
+		s, err := store.Open(context.Background(), store.Config{DataDir: m.data, Keyring: m.ring, Getenv: getenv})
 		if err != nil {
 			return err
 		}

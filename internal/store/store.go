@@ -89,7 +89,7 @@ var (
 	// ErrObjectDigest means an object file does not match its digest.
 	ErrObjectDigest = errors.New("store: object does not match its digest")
 	// ErrDeviceKey means the device key could not be read. The vault stays
-	// locked; hop unlock --password restores the key.
+	// locked; hop unlock --password says how to restore the key.
 	ErrDeviceKey = errors.New("the device key is unavailable")
 	// ErrKeyStoreUnavailable means the device key store could not be read
 	// conclusively: a backend or access error, not a missing entry. The
@@ -592,6 +592,17 @@ func (s *Store) Generation() uint64 { return s.gen.Load() }
 
 // DataDir is the data directory this store owns.
 func (s *Store) DataDir() string { return s.cfg.DataDir }
+
+// HasDevicePassphrase reports whether this process has a device passphrase
+// of its own, in HOP_DEVICE_PASSPHRASE, to seal a device key file with. One
+// handed over for a single unlock is not counted: it is not kept.
+func (s *Store) HasDevicePassphrase() bool {
+	get := s.cfg.Getenv
+	if get == nil {
+		get = os.Getenv
+	}
+	return get(PassphraseEnv) != ""
+}
 
 // IsRevoked reports, without the store's mutex, whether this device is
 // known to be revoked (ErrDeviceRevoked).

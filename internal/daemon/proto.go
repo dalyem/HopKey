@@ -264,6 +264,10 @@ type StatusResult struct {
 	// Vault describes the encrypted store: locked or not, the device key
 	// store in use and the log head. Nil for other stores.
 	Vault *store.Info `json:"vault,omitempty"`
+	// HasDevicePassphrase says the daemon was started with
+	// HOP_DEVICE_PASSPHRASE set, so it can seal a device key file by itself.
+	// Only a store that can tell sets it.
+	HasDevicePassphrase bool `json:"has_device_passphrase,omitempty"`
 	// Sync is sync.status without its device scan, for a store that syncs.
 	Sync *SyncStatusResult `json:"sync,omitempty"`
 	// EndedSessions is the ssh sessions the daemon told to end
