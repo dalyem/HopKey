@@ -17,17 +17,18 @@ func (e *Env) storeConfig() store.Config {
 	if dir == "" {
 		dir = store.DefaultDataDir(e.Home, e.Getenv)
 	}
-	return store.Config{DataDir: dir, Keyring: e.Keyring, Getenv: e.Getenv}
+	return store.Config{DataDir: dir, Keyring: e.Keyring, Getenv: e.storeGetenv()}
 }
 
 // runInit is `hop init`: create the account and the vault on this device
-// (spec §4.3). It asks for the master password twice, prints the Emergency
-// Kit, has the user type back the last group of the Secret Key and of the
-// Recovery Key, and only then writes the vault.
+// (spec §4.3). On a machine with no usable keychain it first asks how to
+// keep the device key (settleDeviceKey). It asks for the master password
+// twice, prints the Emergency Kit, has the user type back the last group of
+// the Secret Key and of the Recovery Key, and only then writes the vault.
 func runInit(ctx context.Context, e *Env, args []string) error {
 	fs := newFlags(e, "init", commands["init"].usage)
 	kitFile := fs.String("kit-file", "", "also write the Emergency Kit to this new file (mode 0600)")
-	devStore := fs.String("device-key-store", "", "where the device key lives: keychain (the default) or file")
+	devStore := fs.String("device-key-store", "", "where the device key lives: keychain (the default) or file, which a terminal asks to seal with a device passphrase, or HOP_DEVICE_PASSPHRASE seals")
 	asJSON := fs.Bool("json", false, "print the result as JSON (the Emergency Kit and the prompts go to the terminal on stderr)")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
@@ -58,13 +59,20 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 
+	// Before any secret: a machine with no keychain is found out now.
+	defer e.clearDevicePass()
+	choice, err := settleDeviceKey(e, *devStore, e.canAsk(*asJSON), true)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(e.Stderr, "Your master password is the one thing you need to remember. Choose one you use nowhere else.")
 	pw, err := readNewPassword(e, "Master password: ")
 	if err != nil {
 		return err
 	}
 	defer clear(pw)
 	fmt.Fprintln(e.Stderr, "Generating keys...")
-	p, err := store.PrepareInit(cfg, store.InitOptions{Password: pw, DeviceStore: *devStore})
+	p, err := store.PrepareInit(cfg, store.InitOptions{Password: pw, DeviceStore: choice.store})
 	if errors.Is(err, store.ErrVaultExists) {
 		return failf("a vault already exists in %s; hop init will not replace it", cfg.DataDir)
 	}
@@ -105,10 +113,13 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 	if err := s.Close(); err != nil {
 		return failf("closing the vault: %v", err)
 	}
+	// A device passphrase typed here opens the vault in the daemon now, so
+	// the user is not asked for it again straight away.
+	handDevicePassphrase(ctx, e, *asJSON)
 	if *asJSON {
 		return printJSON(e, InitReport{DataDir: cfg.DataDir, DeviceKeyStore: p.DeviceStore(), KitFile: *kitFile})
 	}
-	e.printf("\nVault created in %s.\nDevice key: %s.\n", oneLine(cfg.DataDir), oneLine(p.DeviceStore()))
+	e.printf("\nVault created in %s.\nDevice key: %s.\n", oneLine(cfg.DataDir), oneLine(deviceKeyWords(p.DeviceStore())))
 	return nil
 }
 
@@ -126,25 +137,38 @@ type InitReport struct {
 func unsealedWarning(path string) string {
 	return safef("warning: %s is not set, so this device's private keys and the Secret Key will be stored "+
 		"unencrypted on disk in %s, protected only by its file permissions (0600). "+
-		"Anyone who can read that file as you can use them. Set %s before hop init to seal the file with a passphrase.\n",
+		"Anyone who can read that file as you can use them. To seal the file with a device passphrase, "+
+		"set %s to one and start again, or run this on a terminal and say yes when it asks.\n",
 		store.PassphraseEnv, path, store.PassphraseEnv)
+}
+
+// deviceKeyWords says where the device key is, in the words of this
+// program's text, from store.Info.DeviceStore (which --json keeps as it is).
+func deviceKeyWords(s string) string {
+	switch s {
+	case "file (sealed)":
+		return "file, sealed with the device passphrase"
+	case "file (unsealed: private keys on disk)":
+		return "file, not sealed (private keys unencrypted on disk)"
+	}
+	return s
 }
 
 // readNewPassword asks for a new master password twice.
 func readNewPassword(e *Env, prompt string) ([]byte, error) {
 	pw, err := e.ReadPassword(prompt)
 	if err != nil {
-		return nil, failf("reading the password: %v", err)
+		return nil, failf("reading the master password: %v", err)
 	}
 	again, err := e.ReadPassword("Repeat it: ")
 	if err != nil {
 		clear(pw)
-		return nil, failf("reading the password: %v", err)
+		return nil, failf("reading the master password: %v", err)
 	}
 	defer clear(again)
 	if !bytes.Equal(pw, again) {
 		clear(pw)
-		return nil, failf("the two passwords differ")
+		return nil, failf("the two master passwords differ; type the same one twice")
 	}
 	if len(pw) == 0 {
 		return nil, failf("the master password cannot be empty")

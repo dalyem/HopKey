@@ -96,6 +96,10 @@ type vaultHold struct {
 	once   sync.Once // the daemon's restart, by release or abandon
 	// loggedOut says open finished a logout that a crash had cut short.
 	loggedOut bool
+	// handPass says the command succeeded, so release opens the vault in
+	// the daemon it starts with the device passphrase typed for the
+	// command (handDevicePassphrase).
+	handPass bool
 }
 
 // holdMarkerName is the marker's name in the run directory.
@@ -319,6 +323,8 @@ func (h *vaultHold) release(ctx context.Context) {
 		}
 		if err := startDaemon(context.WithoutCancel(ctx), h.e); err != nil {
 			warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (hop sync starts it): "+err.Error())
+		} else if h.handPass {
+			handDevicePassphrase(ctx, h.e, h.asJSON)
 		}
 	})
 	h.e.setHold(nil)
@@ -430,7 +436,11 @@ func (h *vaultHold) vaultOf(s *store.Store) (*authflow.Vault, error) {
 		return nil, err
 	}
 	if s.Info().Locked {
-		return nil, failf("the vault is locked (%s); run hop unlock first", s.Info().LockReason)
+		hint := "run hop unlock first"
+		if sealed, err := store.SealedDeviceFile(h.cfg.DataDir); err == nil && sealed {
+			hint = "its device key file is sealed, so set " + store.PassphraseEnv + " to the device passphrase and run this again"
+		}
+		return nil, failf("the vault is locked (%s); %s", s.Info().LockReason, hint)
 	}
 	v, err := authflow.NewVault(h.cfg, s, c)
 	if err != nil {

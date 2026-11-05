@@ -62,6 +62,8 @@ never flags:
   HOP_RECOVERY_KEY    the Recovery Key from your Emergency Kit
   HOP_KIT_CONFIRM     the last group of a new kit's Secret Key and of its
                       Recovery Key, for hop auth resume
+  HOP_DEVICE_PASSPHRASE  the device passphrase that seals this machine's key
+                      file, with --device-key-store=file (a keychain needs none)
 --keep and --exclude choose devices, --yes confirms what deletes or revokes,
 --code gives the registration code, and hop auth approve --sas gives the
 check code the new device shows.
@@ -220,7 +222,7 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 	server := fs.String("server", "", "the hop-server URL (https://...)")
 	email := fs.String("email", "", "the account's sign-in email")
 	code := fs.String("code", "", "the registration code from hop-server invite")
-	devStore := fs.String("device-key-store", "", "for a new vault: where the device key lives, keychain (the default) or file")
+	devStore := fs.String("device-key-store", "", "for a new vault: where the device key lives, keychain (the default) or file, which a terminal asks to seal with a device passphrase, or HOP_DEVICE_PASSPHRASE seals")
 	fs.StringVar(&o.kitFile, "kit-file", "", "for a new vault: also write its Emergency Kit to this new file (mode 0600)")
 	pos, _, err := parseFlags(fs, args)
 	if err != nil {
@@ -238,6 +240,16 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 		if ok, err := store.Exists(e.storeConfig().DataDir); err == nil && !ok {
 			return failf("%s", errSignupNeedsTerminal)
 		}
+	}
+	// Before the daemon stops and before any secret: a new vault on a
+	// machine with no keychain is found out now.
+	defer e.clearDevicePass()
+	choice, err := settleDeviceKey(e, *devStore, u.interactive, false)
+	if err != nil {
+		return err
+	}
+	if choice.unsealed {
+		fmt.Fprint(e.Stderr, unsealedWarning(store.DeviceKeyFile(e.storeConfig().DataDir)))
 	}
 	h, err := holdVault(ctx, e, o.asJSON)
 	if err != nil {
@@ -293,7 +305,7 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 	}
 	defer c.CloseIdleConnections()
 	res, err := authflow.Signup(ctx, h.flowEnv(c, u), authflow.SignupOptions{
-		Email: addr, RegistrationCode: regCode, DeviceStore: *devStore, Local: s,
+		Email: addr, RegistrationCode: regCode, DeviceStore: choice.store, Local: s,
 	})
 	var rs *store.Store
 	if res != nil {
@@ -308,6 +320,7 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 		}
 		return authFailure(err)
 	}
+	h.handPass = true
 	return printSignup(e, o.asJSON, res)
 }
 
@@ -369,7 +382,7 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	method := fs.String("method", methodApprove, "approve (by another device), password (master password and Secret Key) or recovery (Recovery Key)")
 	name := fs.String("name", "", "this device's name in the account (default: the host name)")
 	mergeLocal := fs.Bool("merge", false, "merge this device's local-only vault into the account")
-	devStore := fs.String("device-key-store", "", "where the device key lives: keychain (the default) or file")
+	devStore := fs.String("device-key-store", "", "where the device key lives: keychain (the default) or file, which a terminal asks to seal with a device passphrase, or HOP_DEVICE_PASSPHRASE seals")
 	withToken := fs.Bool("with-token", false, "store a hop1_ token read from stdin (not available yet)")
 	discard := fs.Bool("discard", false, "discard an enrollment by approval that is in progress on this device (--yes skips the question)")
 	pos, _, err := parseFlags(fs, args)
@@ -421,6 +434,17 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 		return err
 	}
 	defer c.CloseIdleConnections()
+	// Before the daemon stops and before any secret: a machine with no
+	// keychain is found out now, not after the master password and the
+	// Secret Key were typed.
+	defer e.clearDevicePass()
+	choice, err := settleDeviceKey(e, *devStore, u.interactive, false)
+	if err != nil {
+		return err
+	}
+	if choice.unsealed {
+		fmt.Fprint(e.Stderr, unsealedWarning(store.DeviceKeyFile(e.storeConfig().DataDir)))
+	}
 	// Asked before the daemon stops: the operator's refusal lives in its
 	// memory only.
 	lock := daemonAdminLock(ctx, e)
@@ -434,12 +458,12 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	var res *authflow.LoginResult
 	var local *store.Store
 	if *method == methodApprove {
-		res, err = loginApprove(ctx, env, u, authflow.EnrollOptions{Email: addr, DeviceName: *name, DeviceStore: *devStore})
+		res, err = loginApprove(ctx, env, u, authflow.EnrollOptions{Email: addr, DeviceName: *name, DeviceStore: choice.store})
 	} else {
 		if local, err = h.open(ctx); err != nil {
 			return err
 		}
-		opts := authflow.LoginOptions{Email: addr, DeviceName: *name, DeviceStore: *devStore, Merge: *mergeLocal, Local: local}
+		opts := authflow.LoginOptions{Email: addr, DeviceName: *name, DeviceStore: choice.store, Merge: *mergeLocal, Local: local}
 		if *method == methodPassword {
 			res, err = authflow.LoginPassword(ctx, env, opts)
 		} else {
@@ -452,6 +476,7 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	}
 	defer closeStores(local, rs)
 	if errors.Is(err, authflow.ErrRecoveryIncomplete) && rs != nil {
+		h.handPass = true
 		return failf("signed in with the Recovery Key, but the recovery is not finished (%v); run hop auth resume to finish it", err)
 	}
 	if err != nil {
@@ -463,6 +488,7 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 		}
 		return authFailure(err)
 	}
+	h.handPass = true
 	return printLogin(e, o.asJSON, *method, res)
 }
 
@@ -910,7 +936,7 @@ func authStatus(ctx context.Context, e *Env, args []string, settle *func()) erro
 		e.printf("this device:  %s\n", fmtDevice(a.DeviceName, a.DeviceID))
 	}
 	if a.DeviceKeyStore != "" {
-		e.printf("device key:   %s\n", oneLine(a.DeviceKeyStore))
+		e.printf("device key:   %s\n", oneLine(deviceKeyWords(a.DeviceKeyStore)))
 	}
 	switch {
 	case !a.Locked:
@@ -1199,7 +1225,7 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	// tells the server needs to sign the retirement.
 	var pass []byte
 	if !*localOnly && e.Getenv(store.PassphraseEnv) == "" && canAskPassphrase(e) {
-		if pass, err = e.ReadPassword("Device passphrase: "); err != nil {
+		if pass, err = e.ReadPassword(devicePassphrasePrompt); err != nil {
 			return failf("reading the device passphrase: %v", err)
 		}
 		defer clear(pass)

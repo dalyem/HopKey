@@ -415,7 +415,7 @@ func TestSealedDeviceKeyLogoutOfABlockedDevice(t *testing.T) {
 	}
 
 	waitOperatorLock(t, m, "blocked this device", env)
-	s = &session{tty: true, secrets: map[string]string{"Device passphrase: ": unlockPassphrase}, answer: func(string) string { return "y" }}
+	s = &session{tty: true, secrets: map[string]string{"Device passphrase (": unlockPassphrase}, answer: func(string) string { return "y" }}
 	if code := m.hop(t, s, "logout"); code != 0 {
 		t.Fatalf("logout on a terminal: exit %d: %s", code, s.stderr.String())
 	}

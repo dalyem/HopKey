@@ -77,6 +77,9 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 	if *asJSON {
 		out = e.Stderr
 	}
+	// Registered before the hold's release, which runs after it: the
+	// release opens the vault in the daemon with the passphrase typed here.
+	defer e.clearDevicePass()
 	h, err := holdVault(ctx, e, *asJSON)
 	if err != nil {
 		return err
@@ -138,10 +141,12 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		if e.ReadPassword == nil {
 			return failf("the device key file is sealed and stdin is not a terminal to ask for its passphrase; set %s or run hop vault fork in an interactive terminal", store.PassphraseEnv)
 		}
-		if pass, err = e.ReadPassword("Device passphrase: "); err != nil {
+		if pass, err = e.ReadPassword(devicePassphrasePrompt); err != nil {
 			return failf("reading the device passphrase: %v", err)
 		}
 		defer clear(pass)
+		// Kept in this process, to open the vault in the daemon afterwards.
+		e.setDevicePass(pass)
 	}
 
 	var res *store.ForkResult
@@ -154,6 +159,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		return forkFailure(err)
 	}
 	if res != nil {
+		h.handPass = true
 		if *asJSON {
 			return printJSON(e, ForkReport{ForkResult: *res})
 		}
@@ -205,6 +211,15 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 
+	// Before the new master password: an explicit file store for a vault
+	// whose old key was not sealed is the same question hop init asks.
+	if *devStore == store.DeviceStoreFile && len(pass) == 0 && !e.hasDevicePassphrase() && e.canAsk(*asJSON) {
+		e.say("hop will keep the new device key in a file:\n  %s\n", store.DeviceKeyFile(cfg.DataDir))
+		if _, err := askSeal(e); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(e.Stderr, "The new vault is a new account, so it gets a new master password of its own.")
 	pw, err := readNewPassword(e, "Master password for the new vault: ")
 	if err != nil {
 		return err
@@ -249,6 +264,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		return failf("the fork's last step failed (%v), and the new vault may be in place in %s: keep the Emergency Kit shown above%s. "+
 			"hop auth status shows which vault is there", err, oneLine(cfg.DataDir), kitFileNote(*kitFile))
 	}
+	h.handPass = true
 	if *asJSON {
 		return printJSON(e, ForkReport{ForkResult: *res, DeviceKeyStore: p.DeviceStore(), KitFile: *kitFile})
 	}

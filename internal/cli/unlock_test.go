@@ -121,7 +121,7 @@ func TestUnlockSendsTheDevicePassphrase(t *testing.T) {
 		t.Fatal("unlocked with no passphrase")
 	}
 	// A wrong one is refused.
-	if code, _, errOut := x.hop(t, map[string]string{store.PassphraseEnv: "not the device passphrase"}, false, "unlock"); code == 0 || !strings.Contains(errOut, "wrong passphrase") {
+	if code, _, errOut := x.hop(t, map[string]string{store.PassphraseEnv: "not the device passphrase"}, false, "unlock"); code == 0 || !strings.Contains(errOut, "does not open with that device passphrase") {
 		t.Errorf("unlock with a wrong passphrase: exit %d, %q", code, errOut)
 	}
 	code, out, errOut := x.hop(t, map[string]string{store.PassphraseEnv: unlockPassphrase}, false, "unlock")
@@ -148,7 +148,7 @@ func TestUnlockAsksForTheDevicePassphrase(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "vault unlocked") {
 		t.Fatalf("unlock on a terminal: exit %d, %q %q", code, out, errOut)
 	}
-	if len(x.prompts) != 1 || x.prompts[0] != "Device passphrase: " {
+	if len(x.prompts) != 1 || x.prompts[0] != "Device passphrase (this machine's key file, not your master password): " {
 		t.Errorf("prompts %q", x.prompts)
 	}
 	if x.locked(t) {

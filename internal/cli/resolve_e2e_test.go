@@ -44,9 +44,18 @@ type memRing struct {
 	m  map[string]string
 	// failDelete makes Delete fail, as a keychain that refuses can.
 	failDelete atomic.Bool
+	// broken makes every call fail, as a machine with no Secret Service
+	// does (WSL, a headless server).
+	broken atomic.Bool
 }
 
+// errNoKeychain is what broken makes every call return.
+var errNoKeychain = errors.New("The name org.freedesktop.secrets was not provided by any .service files")
+
 func (r *memRing) Get(s, u string) (string, error) {
+	if r.broken.Load() {
+		return "", errNoKeychain
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	v, ok := r.m[s+"/"+u]
@@ -57,6 +66,9 @@ func (r *memRing) Get(s, u string) (string, error) {
 }
 
 func (r *memRing) Set(s, u, v string) error {
+	if r.broken.Load() {
+		return errNoKeychain
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.m[s+"/"+u] = v
@@ -64,6 +76,9 @@ func (r *memRing) Set(s, u, v string) error {
 }
 
 func (r *memRing) Delete(s, u string) error {
+	if r.broken.Load() {
+		return errNoKeychain
+	}
 	if r.failDelete.Load() {
 		return errors.New("memRing: the keychain refused to delete")
 	}

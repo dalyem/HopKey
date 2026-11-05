@@ -116,6 +116,11 @@ type Env struct {
 	holdMu sync.Mutex
 	hold   *vaultHold
 
+	// devPass is a device passphrase typed for this command, in this
+	// process only (devicekey.go). It is never put in the environment.
+	devPassMu sync.Mutex
+	devPass   []byte
+
 	// rotation is closed when the hop key rotate that is changing hosts
 	// ends, and nil when none is (beginRotation).
 	rotMu    sync.Mutex

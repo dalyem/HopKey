@@ -80,9 +80,9 @@ import (
 
 var (
 	// ErrNoVault means the data directory holds no vault.
-	ErrNoVault = errors.New("store: there is no vault on this device; run hop init")
+	ErrNoVault = errors.New("there is no vault on this device; run hop init")
 	// ErrVaultExists means init found a vault (or the start of one).
-	ErrVaultExists = errors.New("store: a vault already exists on this device")
+	ErrVaultExists = errors.New("a vault already exists on this device")
 	// ErrCorrupt means the files on disk fail verification. The store
 	// refuses to use them.
 	ErrCorrupt = errors.New("store: the vault failed verification")
@@ -90,19 +90,19 @@ var (
 	ErrObjectDigest = errors.New("store: object does not match its digest")
 	// ErrDeviceKey means the device key could not be read. The vault stays
 	// locked; hop unlock --password restores the key.
-	ErrDeviceKey = errors.New("store: the device key is unavailable")
+	ErrDeviceKey = errors.New("the device key is unavailable")
 	// ErrKeyStoreUnavailable means the device key store could not be read
 	// conclusively: a backend or access error, not a missing entry. The
 	// vault stays locked, nothing in the store or in device.json is changed,
 	// and no password unlock replaces the key until the store reads again
 	// (deviceStore.revokedSelf).
-	ErrKeyStoreUnavailable = errors.New("store: the device key store could not be read")
+	ErrKeyStoreUnavailable = errors.New("the device key store could not be read")
 	// ErrWrongPassword means the master password (with the Secret Key) did
 	// not open the account.
-	ErrWrongPassword = errors.New("store: wrong master password or Secret Key")
+	ErrWrongPassword = errors.New("wrong master password or Secret Key")
 	// ErrNeedSecretKey means a password unlock needs the Secret Key, which
 	// this device does not have stored.
-	ErrNeedSecretKey = errors.New("store: the Secret Key is not stored on this device; enter it from your Emergency Kit")
+	ErrNeedSecretKey = errors.New("the Secret Key is not stored on this device; enter it from your Emergency Kit")
 	// ErrSecretKeyStale means the Secret Key stored on this device belongs
 	// to credentials that a checkpoint has replaced since (another
 	// device's, normally), and it did not open the account: a password
@@ -111,17 +111,17 @@ var (
 	ErrSecretKeyStale error = staleSecretKeyError{}
 	// ErrKitPending means a password change committed but its Emergency Kit
 	// has not been confirmed yet.
-	ErrKitPending = errors.New("store: a new Emergency Kit is waiting to be confirmed; run hop passwd to see it")
+	ErrKitPending = errors.New("a new Emergency Kit is waiting to be confirmed; run hop passwd to see it")
 	// ErrVaultBusy means another Store (another process, normally the hop
 	// daemon) has the vault open.
-	ErrVaultBusy = errors.New("store: the vault is busy (another hop process owns it)")
+	ErrVaultBusy = errors.New("the vault is busy (another hop process owns it)")
 	// ErrDeviceRevoked means an authenticated checkpoint revoked this device
 	// (§5.5). Its vault can't be unlocked or used again, with the device key
 	// or the password: sign in again as a new device.
-	ErrDeviceRevoked = errors.New("store: this device was revoked from the account; its vault can't be used here again")
+	ErrDeviceRevoked = errors.New("this device was revoked from the account; its vault can't be used here again")
 	// ErrAlreadyUnlocked means UnlockWithPasswordRemote was called on an
 	// unlocked vault. It is for a lost device key, so it runs only locked.
-	ErrAlreadyUnlocked = errors.New("store: the vault is already unlocked; hop lock first to replace the device key with the password")
+	ErrAlreadyUnlocked = errors.New("the vault is already unlocked; hop lock first to replace the device key with the password")
 
 	// ErrChanged refuses a conditional write (SetHostKeyIfChain): an item it
 	// depends on changed, or is gone, since the caller looked. Nothing is

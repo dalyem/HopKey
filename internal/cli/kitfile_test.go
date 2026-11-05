@@ -272,12 +272,12 @@ func TestInitWarnsAboutAnUnsealedDeviceKeyFile(t *testing.T) {
 			keyFile := filepath.Join(dir, "data", "device.key")
 			want := "warning: HOP_DEVICE_PASSPHRASE is not set, so this device's private keys and the Secret Key will be stored " +
 				"unencrypted on disk in " + keyFile + ", protected only by its file permissions (0600)."
-			wantStore := "Device key: file (unsealed: private keys on disk)."
+			wantStore := "Device key: file, not sealed (private keys unencrypted on disk)."
 			if sealed {
 				if strings.Contains(stderr.String(), "unencrypted") || strings.Contains(stdout.String(), "unencrypted") {
 					t.Errorf("sealed, but warned: %q", stderr.String())
 				}
-				wantStore = "Device key: file (sealed)."
+				wantStore = "Device key: file, sealed with the device passphrase."
 			} else if !strings.Contains(stderr.String(), want) {
 				t.Errorf("stderr %q\nwant it to contain %q", stderr.String(), want)
 			}

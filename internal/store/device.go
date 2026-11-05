@@ -432,6 +432,71 @@ func SealedDeviceFile(dataDir string) (bool, error) {
 	return c.Store == DeviceStoreFile && c.Sealed, nil
 }
 
+// KeychainProblem says why the OS keychain can't hold a device key, or is
+// nil when it can. It is the probe hop init runs before it commits to the
+// keychain: one entry written, read back and deleted at once, so it makes
+// no vault, no file and no entry that outlives it. The keychain is cfg's
+// (nil means the OS's).
+func KeychainProblem(cfg Config) error {
+	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
+	return s.deviceStore(deviceConfig{V: 1, Store: DeviceStoreKeychain}).probe()
+}
+
+// KeychainUnusable is the error for a keychain KeychainProblem found, as
+// init, a sign-in and an enrollment return it. It matches
+// ErrKeychainUnusable and says what to do instead.
+func KeychainUnusable(cfg Config, cause error) error {
+	return keychainUnusable(cause, layout{data: cfg.DataDir}.deviceKeyFile())
+}
+
+func keychainUnusable(cause error, keyFile string) error {
+	return fmt.Errorf("%w (%v). To keep this device's key in a file instead (%s), run this again with --device-key-store=file; "+
+		"set %s to a device passphrase first to encrypt the file, which is recommended",
+		ErrKeychainUnusable, cause, keyFile, PassphraseEnv)
+}
+
+// DeviceKeyFile is the path of the device key file in dataDir.
+func DeviceKeyFile(dataDir string) string { return layout{data: dataDir}.deviceKeyFile() }
+
+// DeviceKeyPlan is where the device key of a sign-in or an enrollment that
+// has begun in a data directory goes. Store is empty when none has begun:
+// the choice is then still open. Once it has begun the choice is made and
+// recorded (device.json, enroll.json), and a command that resumes it must
+// follow the record, not ask again.
+type DeviceKeyPlan struct {
+	Store  string // DeviceStoreKeychain or DeviceStoreFile
+	Sealed bool   // the file store, sealed with a device passphrase
+}
+
+// PlannedDeviceKey reads the plan from device.json, else from enroll.json.
+// A data directory with neither has no plan.
+func PlannedDeviceKey(dataDir string) (DeviceKeyPlan, error) {
+	l := layout{data: dataDir}
+	b, err := os.ReadFile(l.deviceConfig())
+	if err == nil {
+		var c deviceConfig
+		if err := json.Unmarshal(b, &c); err != nil {
+			return DeviceKeyPlan{}, fmt.Errorf("%s does not parse: %w", l.deviceConfig(), err)
+		}
+		return DeviceKeyPlan{Store: c.Store, Sealed: c.Store == DeviceStoreFile && c.Sealed}, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return DeviceKeyPlan{}, err
+	}
+	b, err = os.ReadFile(l.enrollFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return DeviceKeyPlan{}, nil
+	}
+	if err != nil {
+		return DeviceKeyPlan{}, err
+	}
+	var ec enrollConfig
+	if err := canonjson.Unmarshal(b, &ec); err != nil {
+		return DeviceKeyPlan{}, fmt.Errorf("%s does not parse", l.enrollFile())
+	}
+	return DeviceKeyPlan{Store: ec.Store, Sealed: ec.Store == DeviceStoreFile && ec.Sealed}, nil
+}
+
 // Describe says which store is in use, for hop status (§11).
 func (d *deviceStore) Describe() string {
 	switch {
@@ -721,7 +786,7 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 	case d.cfg.Sealed && f.KDFVersion == crypto.KDFv1.Version && len(f.Salt) == crypto.SaltSize:
 		pass := d.getenv(PassphraseEnv)
 		if pass == "" {
-			return nil, fmt.Errorf("%w: %s is sealed; run hop unlock with %s set, or on a terminal to type the passphrase", ErrDeviceKey, path, PassphraseEnv)
+			return nil, fmt.Errorf("%w: %s is sealed with a device passphrase, and hop has none for it; run hop unlock on a terminal to type it, or set %s", ErrDeviceKey, path, PassphraseEnv)
 		}
 		env, err := crypto.ParseAEADEnvelope(f.Key)
 		if err != nil {
@@ -734,7 +799,7 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 		pt, err = crypto.OpenAEAD(key, env, crypto.DeviceKeyFileAAD(f.DeviceID))
 		key.Zero()
 		if err != nil {
-			return nil, fmt.Errorf("%w: %s does not open with %s (wrong passphrase, or the file was changed)", ErrDeviceKey, path, PassphraseEnv)
+			return nil, fmt.Errorf("%w: %s does not open with that device passphrase (it is wrong, or the file was changed)", ErrDeviceKey, path)
 		}
 		defer clear(pt)
 	case !d.cfg.Sealed && f.KDFVersion == 0 && len(f.Salt) == 0:
@@ -780,7 +845,7 @@ func (d *deviceStore) save(rec *deviceRecord) error {
 		if d.cfg.Sealed {
 			pass := d.getenv(PassphraseEnv)
 			if pass == "" {
-				return fmt.Errorf("the device key file is sealed; set %s", PassphraseEnv)
+				return fmt.Errorf("the device key file is sealed with a device passphrase, and hop has none for it; start the daemon with %s set", PassphraseEnv)
 			}
 			f.KDFVersion = crypto.KDFv1.Version
 			f.Salt = make([]byte, crypto.SaltSize)

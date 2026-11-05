@@ -83,6 +83,10 @@ func TestSubprocessAuthEndToEnd(t *testing.T) {
 
 	// A: a vault made on a terminal, with a host, then published.
 	p := a.startPTY(t, nil, "init", "--device-key-store", "file")
+	// On a terminal, a file store with no HOP_DEVICE_PASSPHRASE asks first
+	// whether to seal it; this machine keeps the unsealed file.
+	p.expect(t, "Protect it with a device passphrase? (recommended) [Y/n] ")
+	p.send("n")
 	p.expect(t, "Master password: ")
 	p.send(subPassword)
 	p.expect(t, "Repeat it: ")

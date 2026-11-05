@@ -205,6 +205,12 @@ type session struct {
 	answer func(prompt string) string
 	// wrongTypeBack types back something else than the kit.
 	wrongTypeBack bool
+	// onSecret, when set, answers a ReadPassword prompt first; ok false
+	// leaves it to secrets.
+	onSecret func(prompt string) (answer string, ok bool)
+	// failAt makes the ReadPassword prompt that starts with it fail, as a
+	// terminal does when the user presses Ctrl-C.
+	failAt string
 	// ctx, when set, is the context the command runs under.
 	ctx context.Context
 	// exit, when set, is Env.Exit: what hop calls to end the process after
@@ -212,9 +218,33 @@ type session struct {
 	exit func(code int)
 
 	stdout, stderr syncBuffer
+
+	// order is every prompt the command asked, secret or line, in order.
+	orderMu sync.Mutex
+	order   []string
 }
 
-var linePrompts = []string{"Type yes or no: ", "[y/N] ", "Enter keeps only this device): ", "Enter revokes all of them): ", ": "}
+// asked records a prompt.
+func (s *session) asked(prompt string) {
+	s.orderMu.Lock()
+	defer s.orderMu.Unlock()
+	s.order = append(s.order, prompt)
+}
+
+// askedIndex is the position of the first prompt that starts with prefix,
+// or -1.
+func (s *session) askedIndex(prefix string) int {
+	s.orderMu.Lock()
+	defer s.orderMu.Unlock()
+	for i, p := range s.order {
+		if strings.HasPrefix(p, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+var linePrompts = []string{"Type yes or no: ", "[y/N] ", "[Y/n] ", "Enter keeps only this device): ", "Enter revokes all of them): ", ": "}
 
 // stdin feeds answers to the prompts the command writes on stderr.
 type promptStdin struct {
@@ -231,6 +261,7 @@ func (p *promptStdin) Read(b []byte) (int, error) {
 			if len(out) > p.seen && hasPromptSuffix(out) {
 				prompt := out[strings.LastIndex(out[:len(out)-1], "\n")+1:]
 				p.seen = len(out)
+				p.s.asked(prompt)
 				if p.s.answer == nil {
 					return 0, io.EOF
 				}
@@ -288,6 +319,15 @@ func (m *machine) env(t *testing.T, s *session) *cli.Env {
 		StartDaemon: m.startDaemon(t), SyncClient: syncclient.Options{RootCAs: m.w.pool},
 		DialTimeout: 5 * time.Second, Exit: s.exit,
 		ReadPassword: func(prompt string) ([]byte, error) {
+			s.asked(prompt)
+			if s.failAt != "" && strings.HasPrefix(prompt, s.failAt) {
+				return nil, errors.New("interrupted")
+			}
+			if s.onSecret != nil {
+				if a, ok := s.onSecret(prompt); ok {
+					return []byte(a), nil
+				}
+			}
 			if strings.HasPrefix(prompt, "Type the last group of your ") {
 				if s.wrongTypeBack {
 					return []byte("WRONG"), nil

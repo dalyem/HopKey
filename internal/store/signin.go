@@ -255,8 +255,7 @@ func (s *Store) signInDevice(p SignInParams) (*deviceRecord, deviceConfig, bool,
 		}
 		if err := s.deviceStore(dcfg).probe(); err != nil {
 			if store == DeviceStoreKeychain {
-				return nil, deviceConfig{}, false, fmt.Errorf("%w (%v); pass --device-key-store=file to keep the device key in %s instead",
-					ErrKeychainUnusable, err, s.l.deviceKeyFile())
+				return nil, deviceConfig{}, false, keychainUnusable(err, s.l.deviceKeyFile())
 			}
 			return nil, deviceConfig{}, false, err
 		}

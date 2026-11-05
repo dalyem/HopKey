@@ -31,7 +31,7 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 		return failf("usage: %s", commands["passwd"].usage)
 	}
 	if e.ReadPassword == nil {
-		return failf("hop passwd needs a terminal to ask for passwords")
+		return failf("hop passwd needs a terminal to ask for your current and your new master password; run it in an interactive terminal")
 	}
 	if *kitFile != "" {
 		if _, err := os.Lstat(*kitFile); err == nil {
@@ -53,9 +53,10 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 		return confirmKit(ctx, e, c, *pending.Kit, *kitFile)
 	}
 
+	fmt.Fprintln(e.Stderr, "A new master password also makes a new Secret Key, a new Recovery Key and a new Emergency Kit.")
 	cur, err := e.ReadPassword("Current master password: ")
 	if err != nil {
-		return failf("reading the password: %v", err)
+		return failf("reading the master password: %v", err)
 	}
 	defer clear(cur)
 	next, err := readNewPassword(e, "New master password: ")
@@ -73,7 +74,7 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 		return failf("%v", err)
 	}
 	if res.Kit == nil {
-		return failf("the daemon returned no Emergency Kit")
+		return failf("the password may have changed, but hop got no Emergency Kit back; run hop passwd again to see it")
 	}
 	e.printf("Your master password has changed. Your Secret Key and Recovery Key have\n")
 	e.printf("changed with it; the old ones no longer work. Every token was revoked.\n")

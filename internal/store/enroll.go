@@ -318,8 +318,7 @@ func beginEnrollment(cfg Config, p EnrollParams, hook func(string) error) (_ *En
 	}
 	if err := s.deviceStore(deviceConfig{V: 1, Store: ec.Store, Sealed: ec.Sealed}).probe(); err != nil {
 		if ec.Store == DeviceStoreKeychain {
-			return nil, crypto.EnrollCommit{}, fmt.Errorf("%w (%v); pass --device-key-store=file to keep the device key in %s instead",
-				ErrKeychainUnusable, err, s.l.deviceKeyFile())
+			return nil, crypto.EnrollCommit{}, keychainUnusable(err, s.l.deviceKeyFile())
 		}
 		return nil, crypto.EnrollCommit{}, err
 	}
@@ -484,7 +483,7 @@ func (s *Store) saveEnroll(ec enrollConfig, b []byte) error {
 		if ec.Sealed {
 			pass := s.getenv()(PassphraseEnv)
 			if pass == "" {
-				return fmt.Errorf("the enrollment key file is sealed; set %s", PassphraseEnv)
+				return fmt.Errorf("the enrollment key file is sealed with a device passphrase, and hop has none for it; set %s", PassphraseEnv)
 			}
 			f.KDFVersion = crypto.KDFv1.Version
 			f.Salt = make([]byte, crypto.SaltSize)
@@ -560,7 +559,7 @@ func (s *Store) loadEnroll(ec enrollConfig) ([]byte, bool, error) {
 		case ec.Sealed && f.KDFVersion == crypto.KDFv1.Version && len(f.Salt) == crypto.SaltSize:
 			pass := s.getenv()(PassphraseEnv)
 			if pass == "" {
-				return nil, false, fmt.Errorf("%w: %s is sealed; set %s", ErrDeviceKey, s.l.enrollKeyFile(), PassphraseEnv)
+				return nil, false, fmt.Errorf("%w: %s is sealed with a device passphrase, and hop has none for it; run hop auth login on a terminal to type it, or set %s", ErrDeviceKey, s.l.enrollKeyFile(), PassphraseEnv)
 			}
 			env, err := crypto.ParseAEADEnvelope(f.Key)
 			if err != nil {
@@ -573,7 +572,7 @@ func (s *Store) loadEnroll(ec enrollConfig) ([]byte, bool, error) {
 			pt, err := crypto.OpenAEAD(key, env, enrollKeyAAD(ec.Ref))
 			key.Zero()
 			if err != nil {
-				return nil, false, fmt.Errorf("%w: %s does not open with %s", ErrDeviceKey, s.l.enrollKeyFile(), PassphraseEnv)
+				return nil, false, fmt.Errorf("%w: %s does not open with that device passphrase", ErrDeviceKey, s.l.enrollKeyFile())
 			}
 			return pt, true, nil
 		case !ec.Sealed && f.KDFVersion == 0 && len(f.Salt) == 0:

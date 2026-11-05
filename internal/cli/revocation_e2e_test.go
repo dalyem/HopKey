@@ -99,7 +99,7 @@ func TestUnlockAsksForThePassphraseAfterAFalseReport(t *testing.T) {
 	}
 
 	w.hook.Store(nil) // the server accepts the device again
-	s = &session{tty: true, secrets: map[string]string{"Device passphrase: ": unlockPassphrase}}
+	s = &session{tty: true, secrets: map[string]string{"Device passphrase (": unlockPassphrase}}
 	if code := m.hop(t, s, "unlock"); code != 0 {
 		t.Fatalf("hop unlock on a terminal: exit %d: %s", code, s.stderr.String())
 	}

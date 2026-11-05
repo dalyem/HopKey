@@ -39,7 +39,7 @@ type PendingInit struct {
 func Exists(dataDir string) (bool, error) { return layout{data: dataDir}.exists() }
 
 // ErrKeychainUnusable means hop init could not use the OS keychain.
-var ErrKeychainUnusable = errors.New("store: the OS keychain is not usable")
+var ErrKeychainUnusable = errors.New("the OS keychain is not usable")
 
 // PrepareInit generates a new account and vault (§4.3): account keys, the
 // Secret Key, the Recovery Key, VK[1], this device's keys, and the genesis
@@ -82,8 +82,7 @@ func PrepareInit(cfg Config, opts InitOptions) (*PendingInit, error) {
 	}
 	if err := s.deviceStore(devCfg).probe(); err != nil {
 		if store == DeviceStoreKeychain {
-			return nil, fmt.Errorf("%w (%v); pass --device-key-store=file to keep the device key in %s instead",
-				ErrKeychainUnusable, err, s.l.deviceKeyFile())
+			return nil, keychainUnusable(err, s.l.deviceKeyFile())
 		}
 		return nil, err
 	}

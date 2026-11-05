@@ -113,7 +113,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 		}
 		if err != nil && len(pass) == 0 && canAskPassphrase(e) {
 			// The daemon has no passphrase of its own, or the wrong one.
-			if pass, err = e.ReadPassword("Device passphrase: "); err != nil {
+			if pass, err = e.ReadPassword(devicePassphrasePrompt); err != nil {
 				return failf("reading the device passphrase: %v", err)
 			}
 			defer clear(pass)
@@ -128,11 +128,12 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 		return done(false)
 	}
 	if e.ReadPassword == nil {
-		return failf("hop unlock --password needs a terminal to ask for the master password")
+		return failf("hop unlock --password needs a terminal to ask for your master password and Secret Key; run it in an interactive terminal")
 	}
+	fmt.Fprintln(e.Stderr, "This opens the vault with your master password and Secret Key, and gives this machine a new device key.")
 	pw, err := e.ReadPassword("Master password: ")
 	if err != nil {
-		return failf("reading the password: %v", err)
+		return failf("reading the master password: %v", err)
 	}
 	defer clear(pw)
 	p := daemon.UnlockParams{Password: string(pw)}
@@ -219,7 +220,7 @@ func printVaultStatus(e *Env, v *store.Info) {
 	}
 	e.printf("vault:        %s\n", vaultState(v))
 	printAdminLockHelp(e, v)
-	e.printf("device key:   %s\n", oneLine(v.DeviceStore))
+	e.printf("device key:   %s\n", oneLine(deviceKeyWords(v.DeviceStore)))
 	if v.Head != nil {
 		e.printf("log head:     seq %s\n", v.Head.Short())
 	}

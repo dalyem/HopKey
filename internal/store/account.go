@@ -122,9 +122,10 @@ func (k Kit) Text() string {
 	fmt.Fprintf(&b, "Secret Key:    %s\n", k.SecretKey)
 	fmt.Fprintf(&b, "Recovery Key:  %s\n\n", k.RecoveryKey)
 	b.WriteString("Keep this offline: print it or write it down, and store it away from\n")
-	b.WriteString("this computer. A new device needs your master password and the Secret\n")
-	b.WriteString("Key. The Recovery Key replaces the password if you forget it. Nobody,\n")
-	b.WriteString("HopKey included, can recover either one for you.\n")
+	b.WriteString("this computer. Save it once; you do not need it day to day.\n")
+	b.WriteString("The Secret Key, with your master password, signs you in on a new device.\n")
+	b.WriteString("The Recovery Key signs you in if you forget your master password.\n")
+	b.WriteString("Nobody, HopKey included, can recover either one for you.\n")
 	return b.String()
 }
 
