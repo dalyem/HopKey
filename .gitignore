@@ -1,0 +1,22 @@
+# Build output
+/bin/
+/hop
+/hop-server
+*.test
+*.out
+
+# Local state and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Build cache of scripts/check.sh
+/.check-cache/
+
+# Binaries built by scripts/preview-server.sh
+/.bin/
+
+# End-to-end test runs (scripts/e2e/run.sh)
+/e2e-out/
+__pycache__/

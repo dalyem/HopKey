@@ -1,0 +1,19 @@
+{
+  "Version": "1.78.1",
+  "TUN": true,
+  "BackendState": "Stopped",
+  "HaveNodeKey": true,
+  "AuthURL": "",
+  "TailscaleIPs": null,
+  "Self": {
+    "ID": "nSELF01CNTRL",
+    "HostName": "laptop",
+    "DNSName": "laptop.tailnet-example.ts.net.",
+    "OS": "linux",
+    "TailscaleIPs": ["100.64.0.1"],
+    "Online": false
+  },
+  "Health": ["Tailscale is stopped."],
+  "MagicDNSSuffix": "",
+  "CurrentTailnet": null
+}

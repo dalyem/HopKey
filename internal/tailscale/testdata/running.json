@@ -1,0 +1,70 @@
+{
+  "Version": "1.78.1",
+  "TUN": true,
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "AuthURL": "",
+  "TailscaleIPs": ["100.64.0.1", "fd7a:115c:a1e0::1"],
+  "Self": {
+    "ID": "nSELF01CNTRL",
+    "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000001",
+    "HostName": "laptop",
+    "DNSName": "laptop.tailnet-example.ts.net.",
+    "OS": "linux",
+    "UserID": 1,
+    "TailscaleIPs": ["100.64.0.1", "fd7a:115c:a1e0::1"],
+    "Online": true
+  },
+  "Health": [],
+  "MagicDNSSuffix": "tailnet-example.ts.net",
+  "CurrentTailnet": {
+    "Name": "example@example.com",
+    "MagicDNSSuffix": "tailnet-example.ts.net",
+    "MagicDNSEnabled": true
+  },
+  "Peer": {
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000002": {
+      "ID": "nPRODDB1CNTRL",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000002",
+      "HostName": "prod-db",
+      "DNSName": "prod-db.tailnet-example.ts.net.",
+      "OS": "linux",
+      "UserID": 1,
+      "TailscaleIPs": ["100.64.0.2", "fd7a:115c:a1e0::2"],
+      "Online": true,
+      "sshHostKeys": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0ZmFrZWZha2VmYWtlZmFrZWZha2VmYWtlZmFrZWZha2U"
+      ]
+    },
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000003": {
+      "ID": "nBUILD01CNTRL",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000003",
+      "HostName": "build",
+      "DNSName": "build.tailnet-example.ts.net.",
+      "OS": "linux",
+      "UserID": 1,
+      "TailscaleIPs": ["100.64.0.3", "fd7a:115c:a1e0::3"],
+      "Online": true
+    },
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000004": {
+      "ID": "nBUILD02CNTRL",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000004",
+      "HostName": "build",
+      "DNSName": "build-1.tailnet-example.ts.net.",
+      "OS": "linux",
+      "UserID": 1,
+      "TailscaleIPs": ["100.64.0.4", "fd7a:115c:a1e0::4"],
+      "Online": false
+    },
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000005": {
+      "ID": "nPHONE01CNTRL",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000005",
+      "HostName": "Daly's iPhone",
+      "DNSName": "dalys-iphone.tailnet-example.ts.net.",
+      "OS": "iOS",
+      "UserID": 1,
+      "TailscaleIPs": ["100.64.0.5"],
+      "Online": false
+    }
+  }
+}

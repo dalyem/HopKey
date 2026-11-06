@@ -1,0 +1,192 @@
+{
+  "description": "Known-answer vectors for crypto spec rev 16 §5.4 and §4.4. message is the JCS bytes that D hashes; digest is SHA-256(lp(label) || lp(message)) in lowercase hex. Regenerate with gen_vectors.py.",
+  "resolve": [
+    {
+      "name": "put",
+      "label": "hopkey/v1/resolve",
+      "n": "7",
+      "action": "put",
+      "seen": {
+        "v": 1,
+        "item_id": "11111111111111111111111111111111",
+        "type": "host",
+        "item_version": "3",
+        "name": "web",
+        "aliases": [
+          "w"
+        ],
+        "addresses": [
+          "10.0.0.1"
+        ],
+        "port": 22,
+        "user": "root",
+        "key_id": "",
+        "credential_id": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+        "jump_host_id": "",
+        "tags": [
+          "prod"
+        ],
+        "description": "front door",
+        "tailscale": null,
+        "route": "auto",
+        "host_keys": [],
+        "agent_access": "allow"
+      },
+      "want": {
+        "v": 1,
+        "item_id": "11111111111111111111111111111111",
+        "type": "host",
+        "item_version": "3",
+        "name": "web",
+        "aliases": [
+          "w"
+        ],
+        "addresses": [
+          "10.0.0.2"
+        ],
+        "port": 22,
+        "user": "root",
+        "key_id": "",
+        "credential_id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "jump_host_id": "",
+        "tags": [
+          "prod"
+        ],
+        "description": "front door",
+        "tailscale": null,
+        "route": "auto",
+        "host_keys": [],
+        "agent_access": "allow"
+      },
+      "message": "{\"action\":\"put\",\"n\":\"7\",\"seen\":{\"addresses\":[\"10.0.0.1\"],\"agent_access\":\"allow\",\"aliases\":[\"w\"],\"credential_id\":\"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\",\"description\":\"front door\",\"host_keys\":[],\"item_id\":\"11111111111111111111111111111111\",\"item_version\":\"3\",\"jump_host_id\":\"\",\"key_id\":\"\",\"name\":\"web\",\"port\":22,\"route\":\"auto\",\"tags\":[\"prod\"],\"tailscale\":null,\"type\":\"host\",\"user\":\"root\",\"v\":1},\"want\":{\"addresses\":[\"10.0.0.2\"],\"agent_access\":\"allow\",\"aliases\":[\"w\"],\"credential_id\":\"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1\",\"description\":\"front door\",\"host_keys\":[],\"item_id\":\"11111111111111111111111111111111\",\"item_version\":\"3\",\"jump_host_id\":\"\",\"key_id\":\"\",\"name\":\"web\",\"port\":22,\"route\":\"auto\",\"tags\":[\"prod\"],\"tailscale\":null,\"type\":\"host\",\"user\":\"root\",\"v\":1}}",
+      "digest": "a6fdf057809ca0742eebd45310bff93bdc155a3b9e8bab893c078d5eb9154d9d"
+    },
+    {
+      "name": "create",
+      "label": "hopkey/v1/resolve",
+      "n": "0",
+      "action": "create",
+      "seen": null,
+      "want": {
+        "v": 1,
+        "item_id": "5050505050505050505050505050505a",
+        "type": "snippet",
+        "item_version": "1",
+        "name": "restart",
+        "command": "systemctl restart {{unit}}\nsystemctl status {{unit}}",
+        "params": [
+          "unit"
+        ],
+        "description": "redémarrer une unité"
+      },
+      "message": "{\"action\":\"create\",\"n\":\"0\",\"seen\":null,\"want\":{\"command\":\"systemctl restart {{unit}}\\nsystemctl status {{unit}}\",\"description\":\"redémarrer une unité\",\"item_id\":\"5050505050505050505050505050505a\",\"item_version\":\"1\",\"name\":\"restart\",\"params\":[\"unit\"],\"type\":\"snippet\",\"v\":1}}",
+      "digest": "2e7ed68974bb007c1835fc2285cffda30700ba7deb3584ea279540ace047408a"
+    },
+    {
+      "name": "delete, n is the largest u64",
+      "label": "hopkey/v1/resolve",
+      "n": "18446744073709551615",
+      "action": "delete",
+      "seen": {
+        "v": 1,
+        "item_id": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+        "type": "credential",
+        "item_version": "2",
+        "name": "root login",
+        "username": "root",
+        "password": "hunter2"
+      },
+      "want": null,
+      "message": "{\"action\":\"delete\",\"n\":\"18446744073709551615\",\"seen\":{\"item_id\":\"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\",\"item_version\":\"2\",\"name\":\"root login\",\"password\":\"hunter2\",\"type\":\"credential\",\"username\":\"root\",\"v\":1},\"want\":null}",
+      "digest": "33b389d7dd9d7fa1807cd3a90047288d56be845397d41ac14a6e98ff4198a836"
+    }
+  ],
+  "merge_discard": [
+    {
+      "name": "three rows, unsorted input",
+      "label": "hopkey/v1/merge-discard",
+      "vault_id": "0123456789abcdef0123456789abcdef",
+      "txn_id": "fedcba9876543210fedcba9876543210",
+      "rows": [
+        {
+          "item_id": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+          "type": "credential",
+          "digest": "764be8fc97ccbf1b3f7314ce637caeb088b89ee5433932c3a150f223d0e8301e"
+        },
+        {
+          "item_id": "5050505050505050505050505050505a",
+          "type": "snippet",
+          "digest": "5a00d5340f58d6c9f8354d34d3e1bc9eb0e6692d2aaee74fb9f6e291ce27a536"
+        },
+        {
+          "item_id": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+          "type": "key",
+          "digest": "a245371785f6c3f8ac1e8b73eba0b1b855a189751a793a7cf3d4cfc931fdf7c9"
+        }
+      ],
+      "message": "{\"items\":[{\"digest\":\"5a00d5340f58d6c9f8354d34d3e1bc9eb0e6692d2aaee74fb9f6e291ce27a536\",\"item_id\":\"5050505050505050505050505050505a\",\"type\":\"snippet\"},{\"digest\":\"a245371785f6c3f8ac1e8b73eba0b1b855a189751a793a7cf3d4cfc931fdf7c9\",\"item_id\":\"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0\",\"type\":\"key\"},{\"digest\":\"764be8fc97ccbf1b3f7314ce637caeb088b89ee5433932c3a150f223d0e8301e\",\"item_id\":\"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\",\"type\":\"credential\"}],\"txn_id\":\"fedcba9876543210fedcba9876543210\",\"vault_id\":\"0123456789abcdef0123456789abcdef\"}",
+      "digest": "96ac5464d781071e94bac5e059a8923bb6d0496637d117f2c1ec7ca80e7527ec"
+    },
+    {
+      "name": "no rows",
+      "label": "hopkey/v1/merge-discard",
+      "vault_id": "0123456789abcdef0123456789abcdef",
+      "txn_id": "fedcba9876543210fedcba9876543210",
+      "rows": [],
+      "message": "{\"items\":[],\"txn_id\":\"fedcba9876543210fedcba9876543210\",\"vault_id\":\"0123456789abcdef0123456789abcdef\"}",
+      "digest": "6af0d9d95487f2698941e6acbcc9bbe055053aba9fa987ee49a8c554008b6ef3"
+    }
+  ],
+  "merge_item": [
+    {
+      "name": "key at version 5",
+      "label": "hopkey/v1/merge-item",
+      "plaintext": {
+        "v": 1,
+        "item_id": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+        "type": "key",
+        "item_version": "5",
+        "name": "deploy",
+        "key_type": "ed25519",
+        "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBase deploy",
+        "dedicated_grant": ""
+      },
+      "message": "{\"dedicated_grant\":\"\",\"item_id\":\"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0\",\"item_version\":\"1\",\"key_type\":\"ed25519\",\"name\":\"deploy\",\"private_key\":\"-----BEGIN OPENSSH PRIVATE KEY-----\\nAAAA\\n-----END OPENSSH PRIVATE KEY-----\\n\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBase deploy\",\"type\":\"key\",\"v\":1}",
+      "digest": "a245371785f6c3f8ac1e8b73eba0b1b855a189751a793a7cf3d4cfc931fdf7c9"
+    },
+    {
+      "name": "snippet",
+      "label": "hopkey/v1/merge-item",
+      "plaintext": {
+        "v": 1,
+        "item_id": "5050505050505050505050505050505a",
+        "type": "snippet",
+        "item_version": "1",
+        "name": "restart",
+        "command": "systemctl restart {{unit}}\nsystemctl status {{unit}}",
+        "params": [
+          "unit"
+        ],
+        "description": "redémarrer une unité"
+      },
+      "message": "{\"command\":\"systemctl restart {{unit}}\\nsystemctl status {{unit}}\",\"description\":\"redémarrer une unité\",\"item_id\":\"5050505050505050505050505050505a\",\"item_version\":\"1\",\"name\":\"restart\",\"params\":[\"unit\"],\"type\":\"snippet\",\"v\":1}",
+      "digest": "5a00d5340f58d6c9f8354d34d3e1bc9eb0e6692d2aaee74fb9f6e291ce27a536"
+    },
+    {
+      "name": "credential at version 2",
+      "label": "hopkey/v1/merge-item",
+      "plaintext": {
+        "v": 1,
+        "item_id": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+        "type": "credential",
+        "item_version": "2",
+        "name": "root login",
+        "username": "root",
+        "password": "hunter2"
+      },
+      "message": "{\"item_id\":\"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0\",\"item_version\":\"1\",\"name\":\"root login\",\"password\":\"hunter2\",\"type\":\"credential\",\"username\":\"root\",\"v\":1}",
+      "digest": "764be8fc97ccbf1b3f7314ce637caeb088b89ee5433932c3a150f223d0e8301e"
+    }
+  ]
+}
