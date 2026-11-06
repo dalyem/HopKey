@@ -115,6 +115,20 @@ func SignedInDir(dataDir string) (bool, error) {
 	return true, nil
 }
 
+// RetiredDir reports whether the logout of the vault in dataDir is durably
+// RETIRED, so that only its cleanup is left, which needs no key: opening the
+// store finishes it. It reads vault/retire.json and nothing else, so it works
+// while a daemon owns the vault. A journal it can't read says no; opening the
+// store then reports what is wrong with it.
+func RetiredDir(dataDir string) bool {
+	b, err := os.ReadFile(layout{data: dataDir}.retireFile())
+	if err != nil {
+		return false
+	}
+	var j retireJournal
+	return canonjson.Unmarshal(b, &j) == nil && j.V == retireVersion && j.State == StateRetired
+}
+
 // Retirer is the server as a logout uses it (§9, §11.1; plan /v1/vaults,
 // /v1/retire-status). Slice E implements it over HTTP. Every call that
 // needs it authenticates with auth, which signs as the retiring device;

@@ -304,3 +304,40 @@ func TestUnlockWithPasswordRefusesAnUnusablePassphraseBeforeWriting(t *testing.T
 		})
 	}
 }
+
+// RetiredDir says yes only for a logout durably RETIRED, from a real logout
+// cut short at each side of that record.
+func TestRetiredDir(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook func(string) error
+		want bool
+	}{
+		{"RETIRING", crashAt("retire:post"), false},
+		{"RETIRED", crashAt("retire:outbox"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, srv := retireFixture(t)
+			if RetiredDir(f.cfg.DataDir) {
+				t.Fatal("RetiredDir before any logout")
+			}
+			f.s.testHook = tc.hook
+			if _, err := f.s.Logout(context.Background(), retirer{srv}, LogoutOptions{}); !errors.Is(err, errCrash) {
+				t.Fatalf("logout: %v", err)
+			}
+			if got := RetiredDir(f.cfg.DataDir); got != tc.want {
+				t.Errorf("RetiredDir = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	bad := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(bad, "vault"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bad, "vault", retireRel), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if RetiredDir(bad) {
+		t.Error("RetiredDir of an unreadable journal")
+	}
+}

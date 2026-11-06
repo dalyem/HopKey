@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/store"
 )
@@ -444,6 +445,56 @@ func TestDeclinedForkLeavesTheVaultOpen(t *testing.T) {
 			vaultOpen(t, k.m)
 			if rec, err := store.ForkRecord(k.m.data); err != nil || rec != nil {
 				t.Errorf("a fork record exists after a declined fork: %v %v", rec, err)
+			}
+		})
+	}
+}
+
+// A logout recorded as RETIRED and cut short before its cleanup is finished
+// by running it again, and that needs no key: the check of the key file
+// before a logout must not stand in its way, with no passphrase at hand and
+// no terminal to ask on. While the logout is only RETIRING it still needs
+// the key, and the check stays.
+func TestRetiredLogoutFinishesWithoutTheDevicePassphrase(t *testing.T) {
+	for _, tc := range []struct {
+		state    string
+		wantCode int
+		want     string
+	}{
+		{store.StateRetired, 0, "An interrupted logout is finished"},
+		{store.StateRetiring, 255, "hop auth logout --local-only"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			_, m := sealedAccount(t)
+			id := m.authStatus(t).DeviceID
+			m.must(t, nil, "daemon", "stop")
+			b, err := canonjson.Marshal(map[string]any{
+				"v": 1, "state": tc.state, "account_id": id, "vault_id": id, "device_id": id,
+				"outcome": store.OutcomeCommitted, "candidates": []any{}, "wires": []any{},
+				"key_store": store.DeviceStoreFile, "records": []any{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(m.data, "vault", "retire.json"), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got := store.RetiredDir(m.data); got != (tc.state == store.StateRetired) {
+				t.Fatalf("RetiredDir = %v", got)
+			}
+			s := &session{}
+			if code := m.hop(t, s, "auth", "logout", "--yes"); code != tc.wantCode {
+				t.Fatalf("logout: exit %d, want %d: %s %s", code, tc.wantCode, s.stdout.String(), s.stderr.String())
+			}
+			if out := s.stdout.String() + s.stderr.String(); !strings.Contains(out, tc.want) {
+				t.Errorf("logout said %q, want %q", out, tc.want)
+			}
+			if tc.state == store.StateRetired {
+				if ok, _ := store.Exists(m.data); ok {
+					t.Error("the vault is still there")
+				}
+			} else if _, err := os.Stat(keyFileOf(m)); err != nil {
+				t.Errorf("the refused logout changed the key file: %v", err)
 			}
 		})
 	}
