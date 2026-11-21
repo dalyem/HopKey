@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,20 +29,33 @@ func deadPID(t *testing.T) int {
 // returns its first status.
 func serveDaemon(t *testing.T, x *interruptEnv) daemon.StatusResult {
 	t.Helper()
+	st, _, stop := startServing(t, x)
+	t.Cleanup(stop)
+	return st
+}
+
+// startServing runs hop daemon on x's vault, and returns its first status,
+// what it writes on stderr, and what stops it.
+func startServing(t *testing.T, x *interruptEnv) (daemon.StatusResult, *syncBuffer, func()) {
+	t.Helper()
+	stderr := &syncBuffer{}
 	d := &Env{
-		Stdout: &strings.Builder{}, Stderr: &strings.Builder{}, Getenv: x.e.Getenv,
+		Stdout: &strings.Builder{}, Stderr: stderr, Getenv: x.e.Getenv,
 		DataDir: x.e.DataDir, Paths: x.e.Paths,
 	}
 	d.OpenStore = func() (model.Store, error) { return openReal(d) }
 	dctx, dcancel := context.WithCancel(context.Background())
 	ran := make(chan error, 1)
 	go func() { ran <- runDaemon(dctx, d, nil) }()
-	t.Cleanup(func() {
-		dcancel()
-		if err := <-ran; err != nil {
-			t.Errorf("runDaemon: %v; stderr %q", err, d.Stderr)
-		}
-	})
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			dcancel()
+			if err := <-ran; err != nil {
+				t.Errorf("runDaemon: %v; stderr %q", err, stderr)
+			}
+		})
+	}
 	var st daemon.StatusResult
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -50,11 +64,12 @@ func serveDaemon(t *testing.T, x *interruptEnv) daemon.StatusResult {
 			err = c.Call(context.Background(), daemon.OpStatus, nil, &st)
 			c.Close()
 			if err == nil {
-				return st
+				return st, stderr, stop
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the daemon does not answer: %v; stderr %q", err, d.Stderr)
+			stop()
+			t.Fatalf("the daemon does not answer: %v; stderr %q", err, stderr)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -92,7 +107,7 @@ func TestHandbackOfALockedVaultOutlivesTheHolder(t *testing.T) {
 	if st := serveDaemon(t, x); st.Vault == nil || !st.Vault.Locked {
 		t.Errorf("the daemon serves the vault open: %+v", st.Vault)
 	}
-	if _, err := os.Lstat(x.e.startLockedFile()); !os.IsNotExist(err) {
+	if err := goneSoon(x.e.startLockedFile()); !os.IsNotExist(err) {
 		t.Errorf("the instruction to start locked is left after the daemon took it: %v", err)
 	}
 }
@@ -121,6 +136,20 @@ func TestStartLockedIsForItsVaultAndForAWhile(t *testing.T) {
 			t.Errorf("an old instruction is left: %v", err)
 		}
 	})
+}
+
+// goneSoon waits a moment for path to go, and returns what Lstat last said
+// of it: the daemon removes the instruction to start locked just after it
+// begins to serve, so a status can come first.
+func goneSoon(path string) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Lstat(path)
+		if os.IsNotExist(err) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func writeStartLocked(t *testing.T, x *interruptEnv, dataDir string, at time.Time) {

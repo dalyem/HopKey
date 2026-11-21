@@ -53,7 +53,7 @@ func TestHandbackOfALockedVaultStartsTheDaemonLocked(t *testing.T) {
 	if _, err := os.Lstat(x.e.holdMarker()); !os.IsNotExist(err) {
 		t.Errorf("the handback marker is left: %v", err)
 	}
-	if _, err := os.Lstat(x.e.startLockedFile()); !os.IsNotExist(err) {
+	if err := goneSoon(x.e.startLockedFile()); !os.IsNotExist(err) {
 		t.Errorf("the instruction to start locked is left: %v", err)
 	}
 }

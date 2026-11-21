@@ -41,12 +41,16 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 		waitGone(ctx, hb.pid, handbackWait)
 		vault, err = e.OpenStore()
 	}
+	var followed os.FileInfo // the instruction to start locked, once followed
 	if err == nil {
-		if l, ok := vault.(interface{ Lock() }); ok && e.takeStartLocked() {
-			// A hop auth command found the vault locked, and leaves it so:
-			// it is locked before this daemon serves anything, although its
-			// device key may open by itself.
-			l.Lock()
+		if l, ok := vault.(interface{ Lock() }); ok {
+			if fi, ok := e.pendingStartLocked(); ok {
+				// A hop auth command found the vault locked, and leaves it
+				// so: it is locked before this daemon serves anything,
+				// although its device key may open by itself.
+				l.Lock()
+				followed = fi
+			}
 		}
 		e.clearHandback()
 	}
@@ -86,6 +90,11 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	}
 	if err != nil {
 		return failf("%v", err)
+	}
+	if followed != nil {
+		// Only now that this daemon serves the vault locked: one that did
+		// not get to serve leaves the instruction for the next.
+		e.dropStartLocked(followed)
 	}
 	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

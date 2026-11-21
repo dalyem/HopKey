@@ -333,7 +333,7 @@ func (e *Env) startLockedFile() string { return filepath.Join(e.Paths.RunDir, st
 
 // startLocked leaves the instruction to start locked for the vault in this
 // data directory: the next daemon to open it locks it before it serves
-// anything (takeStartLocked), although its device key may open by itself.
+// anything (pendingStartLocked), although its device key may open by itself.
 func (e *Env) startLocked() error {
 	dir, err := filepath.Abs(e.storeConfig().DataDir)
 	if err != nil {
@@ -345,30 +345,41 @@ func (e *Env) startLocked() error {
 	return writeMarker(e.startLockedFile(), dir+"\n")
 }
 
-// takeStartLocked reports whether the vault this daemon has opened is to
-// be served locked, and removes the instruction that says so: it is for
-// one daemon. One for another data directory is left for its own daemon;
-// one older than startLockedMaxAge is removed and not followed.
-func (e *Env) takeStartLocked() bool {
+// pendingStartLocked reports whether the vault this daemon has opened is
+// to be served locked, and returns the instruction's file, which
+// dropStartLocked removes once the daemon serves: it is for one daemon, and
+// one that does not get to serve leaves it for the next. One for another
+// data directory is left for its own daemon; one older than
+// startLockedMaxAge is removed and not followed.
+func (e *Env) pendingStartLocked() (os.FileInfo, bool) {
 	path := e.startLockedFile()
 	fi, err := os.Lstat(path)
 	if err != nil || !fi.Mode().IsRegular() {
-		return false
+		return nil, false
 	}
 	if time.Since(fi.ModTime()) > startLockedMaxAge {
 		os.Remove(path)
-		return false
+		return nil, false
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	here, err := filepath.Abs(e.storeConfig().DataDir)
 	if err != nil || !sameDir(strings.TrimSpace(string(b)), here) {
-		return false
+		return nil, false
 	}
-	os.Remove(path)
-	return true
+	return fi, true
+}
+
+// dropStartLocked removes the instruction to start locked that
+// pendingStartLocked returned, once the daemon serves the vault locked. One
+// that has replaced it since is left.
+func (e *Env) dropStartLocked(followed os.FileInfo) {
+	path := e.startLockedFile()
+	if fi, err := os.Lstat(path); err == nil && os.SameFile(fi, followed) {
+		os.Remove(path)
+	}
 }
 
 // holdVault stops the daemon so this process can own the vault. asJSON
@@ -551,9 +562,10 @@ func (h *vaultHold) restart(ctx context.Context, target restoreTo) {
 	}
 	h.unmark()
 	err := startDaemon(context.WithoutCancel(ctx), h.e)
-	if target == restoreLocked && err == nil {
+	if target == restoreLocked && err == nil && servedHere(ctx, h.e) {
 		// Taken by the daemon that started, or by none: lockAgain makes
-		// sure. One that does not come up in time keeps it.
+		// sure. One that does not come up in time keeps it, and so does a
+		// daemon of another vault, which never reads it.
 		os.Remove(h.e.startLockedFile())
 	}
 	if err != nil {
@@ -577,6 +589,19 @@ func (h *vaultHold) restoreLockState(ctx context.Context, target restoreTo) {
 	case restoreLocked:
 		lockAgain(ctx, h.e, h.asJSON)
 	}
+}
+
+// servedHere reports whether the running daemon says it serves this vault.
+func servedHere(ctx context.Context, e *Env) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreWait)
+	defer cancel()
+	c, err := dialExisting(ctx, e)
+	if err != nil || c == nil {
+		return false
+	}
+	defer c.Close()
+	_, err = servesThisVault(ctx, e, c)
+	return err == nil
 }
 
 // restoreWait bounds each request that puts the lock state back.
