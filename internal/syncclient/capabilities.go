@@ -66,7 +66,7 @@ func parseCapabilities(body []byte) ([]model.Type, error) {
 		return nil, fmt.Errorf("%w: no item_types list", ErrCapabilitiesUnknown)
 	}
 	known := map[model.Type]bool{}
-	for _, t := range append(slices.Clone(rev16Types), model.TypeAccess) {
+	for _, t := range append(slices.Clone(rev16Types), model.TypeAccess, model.TypeShortcut) {
 		known[t] = true
 	}
 	var out []model.Type

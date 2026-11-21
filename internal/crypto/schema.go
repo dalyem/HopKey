@@ -219,6 +219,31 @@ func ValidateSnippet(s *model.Snippet) error {
 	return CheckText("description", s.Description, 1024)
 }
 
+// ValidateShortcut checks a shortcut plaintext: keys are one or two
+// printable ASCII characters (model.CheckShortcutKeys), and command is one
+// line of at most model.MaxShortcutCommand bytes with no control character
+// but TAB, since the session panel types it into a remote shell. host_id
+// is "" for a global shortcut; the log rules check that any other names a
+// live host.
+func ValidateShortcut(s *model.Shortcut) error {
+	if err := checkHeader(s.Header, model.TypeShortcut); err != nil {
+		return err
+	}
+	if err := CheckStr("name", s.Name, 64); err != nil {
+		return err
+	}
+	if err := model.CheckShortcutKeys(s.Keys); err != nil {
+		return schemaErr("keys", "%v", err)
+	}
+	if s.Command == "" {
+		return schemaErr("command", "empty")
+	}
+	if err := CheckStr("command", strings.ReplaceAll(s.Command, "\t", " "), model.MaxShortcutCommand); err != nil {
+		return err
+	}
+	return CheckText("description", s.Description, 1024)
+}
+
 // MaxPolicyOffline is the longest max_offline a policy may set: ten years.
 const MaxPolicyOffline = 10 * 366 * 24 * 3600
 
@@ -269,8 +294,8 @@ func ValidateGrant(g *model.Grant) error {
 }
 
 // Item is one decoded §6.5 plaintext: *model.Host, *model.Key,
-// *model.Credential, *model.Snippet, *model.Grant, *model.Policy or
-// *model.Access.
+// *model.Credential, *model.Snippet, *model.Grant, *model.Policy,
+// *model.Access or *model.Shortcut.
 type Item any
 
 // ItemHeader returns the shared header of an Item.
@@ -289,6 +314,8 @@ func ItemHeader(it Item) (model.Header, error) {
 	case *model.Policy:
 		return v.Header, nil
 	case *model.Access:
+		return v.Header, nil
+	case *model.Shortcut:
 		return v.Header, nil
 	default:
 		return model.Header{}, fmt.Errorf("crypto: %T is not an item plaintext", it)
@@ -312,6 +339,8 @@ func ValidateItem(it Item) error {
 		return ValidatePolicy(v)
 	case *model.Access:
 		return ValidateAccess(v)
+	case *model.Shortcut:
+		return ValidateShortcut(v)
 	default:
 		return fmt.Errorf("crypto: %T is not an item plaintext", it)
 	}
@@ -336,6 +365,8 @@ func ParseItem(t model.Type, b []byte) (Item, error) {
 		it = new(model.Policy)
 	case model.TypeAccess:
 		it = new(model.Access)
+	case model.TypeShortcut:
+		it = new(model.Shortcut)
 	default:
 		return nil, schemaErr("type", "unknown item type %q", t)
 	}

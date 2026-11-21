@@ -35,11 +35,12 @@ func isHeader(member string) bool {
 }
 
 // IsFree reports whether member of an item of type t merges on its own
-// (§5.4): description for a host or snippet, nothing for a key or
-// credential. Every other member, including a header member, is not free.
+// (§5.4): description for a host, snippet or shortcut, nothing for a key
+// or credential. Every other member, including a header member, is not
+// free.
 func IsFree(t model.Type, member string) bool {
 	switch t {
-	case model.TypeHost, model.TypeSnippet:
+	case model.TypeHost, model.TypeSnippet, model.TypeShortcut:
 		return member == "description"
 	}
 	return false
@@ -53,7 +54,7 @@ func IsGuarded(t model.Type, member string) bool {
 
 func validType(t model.Type) error {
 	switch t {
-	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypePolicy, model.TypeAccess:
+	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypePolicy, model.TypeAccess, model.TypeShortcut:
 		return nil
 	case model.TypeGrant:
 		return ErrGrant
@@ -97,7 +98,7 @@ func ItemOf(v any) (*Item, error) {
 	switch x := v.(type) {
 	case model.Host, *model.Host, model.Key, *model.Key,
 		model.Credential, *model.Credential, model.Snippet, *model.Snippet, model.Policy, *model.Policy,
-		model.Access, *model.Access:
+		model.Access, *model.Access, model.Shortcut, *model.Shortcut:
 		j, err := canonjson.Marshal(x)
 		if err != nil {
 			return nil, fmt.Errorf("merge: %w", err)

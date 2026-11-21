@@ -429,6 +429,10 @@ func checkPlainSnapshot(s *State, sec *Secrets) error {
 			if err := ref(id, "jump_host_id", it.JumpHostID, model.TypeHost); err != nil {
 				return err
 			}
+		case *model.Shortcut:
+			if err := ref(id, "host_id", it.HostID, model.TypeHost); err != nil {
+				return err
+			}
 		case *model.Grant:
 			for _, x := range it.Items {
 				if x.IsZero() {

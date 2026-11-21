@@ -23,7 +23,7 @@ const (
 // sorted. The server reports them in GET /v1/capabilities.
 func ItemTypes() []model.Type {
 	out := []model.Type{model.TypeAccess, model.TypeCredential, model.TypeGrant, model.TypeHost,
-		model.TypeKey, model.TypePolicy, model.TypeSnippet}
+		model.TypeKey, model.TypePolicy, model.TypeShortcut, model.TypeSnippet}
 	slices.Sort(out)
 	return out
 }

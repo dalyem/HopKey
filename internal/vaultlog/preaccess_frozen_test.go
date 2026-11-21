@@ -56,15 +56,16 @@ func frozenPreAccessCheck(w *Wire) error {
 // accepts it, and the build before access stops on it with a schema
 // violation that says to upgrade. Entries without one pass both.
 func TestFrozenPreAccessBuildRefusesAccessEntries(t *testing.T) {
-	// The only type the two builds disagree on is access.
+	// The only types the two builds disagree on are access and the later
+	// shortcut (preshortcut_frozen_test.go).
 	var frozen []model.Type
 	for _, typ := range ItemTypes() {
 		if frozenPreAccessIsItemType(typ) {
 			frozen = append(frozen, typ)
 		}
 	}
-	if want := slices.DeleteFunc(slices.Clone(ItemTypes()), func(x model.Type) bool { return x == model.TypeAccess }); !slices.Equal(frozen, want) {
-		t.Fatalf("the frozen allowlist %v, today's without access %v", frozen, want)
+	if want := slices.DeleteFunc(slices.Clone(ItemTypes()), func(x model.Type) bool { return x == model.TypeAccess || x == model.TypeShortcut }); !slices.Equal(frozen, want) {
+		t.Fatalf("the frozen allowlist %v, today's without access and shortcut %v", frozen, want)
 	}
 
 	w := newWorld(t).withItems()
