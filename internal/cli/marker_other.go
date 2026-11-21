@@ -10,6 +10,8 @@ import (
 // openMarker opens the control marker at path for reading, refusing
 // anything but a regular file. There is no owner or mode to check here; the
 // directory's ACL decides who can write it.
+// Lstat, Open, then Stat is not safe against a symlink swapped in between;
+// that is accepted because Windows is not a supported platform.
 func openMarker(path string) (*os.File, os.FileInfo, error) {
 	if fi, err := os.Lstat(path); err != nil {
 		return nil, nil, err
