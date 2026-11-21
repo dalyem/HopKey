@@ -563,7 +563,8 @@ func (p *proxy) panelKey(t token) {
 				p.beep()
 				return
 			}
-			p.closePanel()
+			// suspend closes the panel in the write that gives the
+			// terminal back, which waits for it at most outGrace.
 			p.suspend()
 		case '\r':
 			if e := p.find(p.panel.prefix); e != nil && p.panel.prefix != "" {

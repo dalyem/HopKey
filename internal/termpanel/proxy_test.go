@@ -32,6 +32,9 @@ type vterm struct {
 	scr  *screen
 	raw  []byte
 	done chan struct{}
+	// hold stops the reading of the master between reads while paused.
+	hold   sync.Mutex
+	paused bool
 }
 
 func newVTerm(t *testing.T, cols, rows int) *vterm {
@@ -63,9 +66,14 @@ func newVTerm(t *testing.T, cols, rows int) *vterm {
 			if err != nil {
 				return
 			}
+			v.hold.Lock()
+			v.hold.Unlock()
 		}
 	}()
 	t.Cleanup(func() {
+		if v.paused {
+			v.drain()
+		}
 		v.tty.Close() // the master's read ends once no slave is open
 		<-v.done
 		v.ptm.Close()
@@ -78,6 +86,19 @@ func (v *vterm) key(s string) {
 	if _, err := v.ptm.Write([]byte(s)); err != nil {
 		v.t.Fatal(err)
 	}
+}
+
+// pause stops the terminal taking output, after the read in progress
+// (which takes what comes first): with stall, its buffer is then full.
+// drain has it take output again.
+func (v *vterm) pause() {
+	v.hold.Lock()
+	v.paused = true
+}
+
+func (v *vterm) drain() {
+	v.paused = false
+	v.hold.Unlock()
 }
 
 func (v *vterm) dump() string {
@@ -1031,7 +1052,9 @@ func newStalledVTerm(t *testing.T) *vterm {
 	return v
 }
 
-// stall fills the terminal's buffer, from a descriptor of its own.
+// stall fills the terminal's buffer, from a descriptor of its own: in
+// smaller writes as it fills, as the pty takes a small one when a large
+// one no longer fits.
 func (v *vterm) stall() {
 	v.t.Helper()
 	fd, err := unix.Open(v.tty.Name(), unix.O_WRONLY|unix.O_NOCTTY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
@@ -1039,17 +1062,19 @@ func (v *vterm) stall() {
 		v.t.Fatal(err)
 	}
 	defer unix.Close(fd)
-	buf := bytes.Repeat([]byte("x"), 4096)
-	for idle := 0; idle < 5; {
-		_, err := unix.Write(fd, buf)
-		switch {
-		case err == unix.EAGAIN:
-			idle++
-			time.Sleep(20 * time.Millisecond)
-		case err != nil:
-			v.t.Fatal(err)
-		default:
-			idle = 0
+	for _, size := range []int{4096, 256, 16, 1} {
+		buf := bytes.Repeat([]byte("x"), size)
+		for idle := 0; idle < 5; {
+			_, err := unix.Write(fd, buf)
+			switch {
+			case err == unix.EAGAIN:
+				idle++
+				time.Sleep(20 * time.Millisecond)
+			case err != nil:
+				v.t.Fatal(err)
+			default:
+				idle = 0
+			}
 		}
 	}
 }
@@ -1167,6 +1192,51 @@ func TestStalledTerminal(t *testing.T) {
 			t.Fatal("Run did not return with the terminal taking no output")
 		}
 	})
+}
+
+// Ctrl-Z in the panel stops hop when the terminal has stopped taking
+// output with the panel open: the panel closes as the terminal goes back
+// to the shell, within outGrace, and the terminal's mode is put back.
+func TestSuspendFromPanelWhileTerminalStalled(t *testing.T) {
+	v := newVTerm(t, 80, 24)
+	tio, fl := terminalState(t, v.fd)
+	stops := make(chan unix.Termios, 4)
+	real := stopSelf
+	stopSelf = func(<-chan os.Signal) {
+		now, err := unix.IoctlGetTermios(v.fd, ioctlGetTermios)
+		if err == nil {
+			stops <- *now
+		}
+	}
+	t.Cleanup(func() { stopSelf = real })
+	c := run(t, v, Options{Shortcuts: testShortcuts}, fill+`printf '\033[>8u\033[>4;1m\033[?1000h'; exec cat >/dev/null`, "")
+	v.waitFor("the remote side's modes", func(s *screen) bool {
+		return slices.Equal(s.kitty[0].pushed, []int{8}) && s.otherKeys == 1 && s.modes[1000]
+	})
+	v.key("\x1d")
+	v.panelAt(40)
+	v.waitFor("the panel's keyboard modes", func(s *screen) bool {
+		return s.altActive && slices.Equal(s.kitty[1].pushed, []int{29}) && s.otherKeys == 0
+	})
+	v.pause()
+	v.stall()
+	v.key("\x1a")
+	select {
+	case now := <-stops:
+		if now != tio {
+			t.Errorf("stopped with the terminal in mode %+v, want %+v", now, tio)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hop did not stop with the terminal taking no output")
+	}
+	c.p.Kill()
+	select {
+	case err := <-c.runErr:
+		c.runErr <- err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return with the terminal taking no output")
+	}
+	checkTerminalState(t, v.fd, tio, fl)
 }
 
 // With the kitty keyboard protocol on, the panel reads its keys in flags
