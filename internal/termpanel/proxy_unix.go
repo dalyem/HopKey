@@ -704,18 +704,39 @@ func (p *proxy) resize() {
 
 // stopSelf stops this process for job control, as SIGTSTP's default
 // action does, and returns once it is continued (cont), or after a
-// second if the stop did not happen: in an orphaned process group the
-// system drops SIGTSTP. Tests replace it.
+// second if the stop did not happen. It stops with SIGSTOP: once Go has
+// been notified of SIGTSTP its handler stays, even after signal.Reset,
+// and drops a SIGTSTP the process sends itself. SIGSTOP stops an
+// orphaned process group too, which nothing would continue, so it is
+// sent only when there is a shell to continue hop (hasShell), as the
+// system does for SIGTSTP. Tests replace it.
 var stopSelf = func(cont <-chan os.Signal) {
 	for len(cont) > 0 {
 		<-cont
 	}
-	signal.Reset(syscall.SIGTSTP)
-	syscall.Kill(os.Getpid(), syscall.SIGTSTP)
+	signal.Reset(syscall.SIGTSTP) // one sent meanwhile is dropped
+	if !hasShell() {
+		return
+	}
+	syscall.Kill(os.Getpid(), syscall.SIGSTOP)
 	select {
 	case <-cont:
 	case <-time.After(time.Second):
 	}
+}
+
+// hasShell says whether hop's process group is a job of a shell, which
+// can continue it: hop's parent is in another process group of the same
+// session. A group with no such process is orphaned.
+func hasShell() bool {
+	ppid := os.Getppid()
+	pg, err := unix.Getpgid(ppid)
+	if err != nil || pg == unix.Getpgrp() {
+		return false
+	}
+	sid, err := unix.Getsid(ppid)
+	own, err2 := unix.Getsid(0)
+	return err == nil && err2 == nil && sid == own
 }
 
 // suspend stops hop for job control: the panel's Ctrl-Z, or a SIGTSTP
