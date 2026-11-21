@@ -373,7 +373,11 @@ const (
 
 // shortcutHotkey is the byte that opens the session panel, and whether the
 // panel is on. Keys the panel or a terminal needs are refused: Ctrl-[ is
-// Esc, Ctrl-H Backspace, Ctrl-I Tab, Ctrl-J and Ctrl-M Enter, Ctrl-@ NUL.
+// Esc, Ctrl-H Backspace, Ctrl-I Tab, Ctrl-J and Ctrl-M Enter, Ctrl-@ NUL,
+// and in the panel Ctrl-C closes it and Ctrl-Z suspends hop. Every key it
+// gives is one termpanel takes as the hotkey; for a letter, \ and ], so
+// are Ctrl with that key in the kitty keyboard protocol and in xterm's
+// modifyOtherKeys.
 func (e *Env) shortcutHotkey() (key byte, on bool, err error) {
 	v := ""
 	if e.Getenv != nil {
@@ -397,6 +401,8 @@ func (e *Env) shortcutHotkey() (key byte, on bool, err error) {
 	switch {
 	case c == 'H' || c == 'I' || c == 'J' || c == 'M':
 		return 0, false, failf("%s=%s: Ctrl-%c is a key the terminal needs (Backspace, Tab or Enter); pick another", shortcutKeyEnv, oneLine(v), c)
+	case c == 'C' || c == 'Z':
+		return 0, false, failf("%s=%s: Ctrl-%c is a key of the panel itself (Ctrl-C closes it, Ctrl-Z suspends hop); pick another", shortcutKeyEnv, oneLine(v), c)
 	case c >= 'A' && c <= 'Z', c == '\\', c == ']', c == '^', c == '_':
 		return byte(c) & 0x1f, true, nil
 	}

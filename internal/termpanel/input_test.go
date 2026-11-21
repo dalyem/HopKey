@@ -72,3 +72,25 @@ func TestInputOtherHotkey(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// Every hotkey from Ctrl-A to Ctrl-Z, Ctrl-\ and Ctrl-] is the hotkey in
+// the kitty keyboard protocol and in modifyOtherKeys too, with Caps Lock
+// on or not; the same key with Shift is not.
+func TestInputHotkeyForms(t *testing.T) {
+	var hotkeys []byte
+	for k := byte(0x01); k <= 0x1a; k++ {
+		hotkeys = append(hotkeys, k)
+	}
+	hotkeys = append(hotkeys, 0x1c, 0x1d)
+	for _, k := range hotkeys {
+		code := int('a' + k - 1)
+		if k >= 0x1c {
+			code = int(k + 0x40)
+		}
+		in := fmt.Sprintf("%c\x1b[%d;5u\x1b[%d;69u\x1b[27;5;%d~\x1b[%d;6u", k, code, code, code, code)
+		want := fmt.Sprintf(`HOT:%q HOT:"\x1b[%d;5u" HOT:"\x1b[%d;69u" HOT:"\x1b[27;5;%d~" seq:"\x1b[%d;6u"`, string(rune(k)), code, code, code, code)
+		if got := kinds(newInputParser(k).feed([]byte(in))); got != want {
+			t.Errorf("hotkey %#x:\n got %s\nwant %s", k, got, want)
+		}
+	}
+}

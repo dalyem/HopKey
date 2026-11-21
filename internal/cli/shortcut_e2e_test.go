@@ -3,8 +3,11 @@ package cli_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/dalyem/hopkey/internal/cli"
@@ -248,6 +251,7 @@ func TestShortcutHotkey(t *testing.T) {
 		{"ctrl+\\", 0x1c, true, false}, {"off", 0, false, false}, {"None", 0, false, false},
 		{"ctrl-[", 0, false, true}, {"ctrl-m", 0, false, true}, {"ctrl-i", 0, false, true}, {"ctrl-h", 0, false, true},
 		{"ctrl-j", 0, false, true}, {"x", 0, false, true}, {"ctrl-1", 0, false, true}, {"ctrl-ab", 0, false, true}, {"ctrl-@", 0, false, true},
+		{"ctrl-c", 0, false, true}, {"^Z", 0, false, true}, {"ctrl+z", 0, false, true},
 	} {
 		v := c.v
 		env := &cli.Env{Getenv: func(k string) string {
@@ -260,5 +264,45 @@ func TestShortcutHotkey(t *testing.T) {
 		if (err != nil) != c.bad || key != c.key || on != c.on {
 			t.Errorf("HOP_SHORTCUT_KEY=%q: %#x %v %v", c.v, key, on, err)
 		}
+	}
+}
+
+// Every hotkey HOP_SHORTCUT_KEY gives is one the panel takes, and none is
+// a key the panel itself reads: Ctrl-C, Ctrl-Z, Esc, Backspace, Enter.
+func TestShortcutHotkeysThePanelTakes(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	accepted := 0
+	for c := byte(0x21); c < 0x7f; c++ {
+		v := "ctrl-" + string(c)
+		env := &cli.Env{Getenv: func(k string) string {
+			if k == "HOP_SHORTCUT_KEY" {
+				return v
+			}
+			return ""
+		}}
+		key, on, err := cli.ShortcutHotkey(env)
+		if err != nil {
+			continue
+		}
+		accepted++
+		if !on || slices.Contains([]byte{0x03, 0x1a, 0x1b, 0x08, 0x7f, 0x0d, 0x0a}, key) {
+			t.Errorf("HOP_SHORTCUT_KEY=%s gives %#x (on %v): a key of the panel itself", v, key, on)
+		}
+		// Run checks the hotkey before it looks at the terminal.
+		err = termpanel.Run(context.Background(), termpanel.Options{In: r, Out: w, Hotkey: key}, func(*os.File, *syscall.SysProcAttr) (func() error, error) {
+			t.Fatal("Run started a child on pipes")
+			return nil, nil
+		})
+		if !errors.Is(err, termpanel.ErrNotTerminal) && !errors.Is(err, termpanel.ErrUnsupported) {
+			t.Errorf("HOP_SHORTCUT_KEY=%s gives %#x, which the panel refuses: %v", v, key, err)
+		}
+	}
+	if accepted != 2*20+4 { // 20 letters, in either case, and \ ] ^ _
+		t.Errorf("%d values accepted", accepted)
 	}
 }
