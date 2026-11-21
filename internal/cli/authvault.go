@@ -415,6 +415,22 @@ func holdVaultWithKey(ctx context.Context, e *Env, asJSON bool) (*vaultHold, err
 	return h, nil
 }
 
+// openHere returns the status of the running daemon when it serves this
+// vault and has it open, so that stopping it loses something release must
+// put back; otherwise nil.
+func openHere(ctx context.Context, e *Env) *daemon.StatusResult {
+	c, err := dialExisting(ctx, e)
+	if err != nil || c == nil {
+		return nil
+	}
+	defer c.Close()
+	st, err := servesThisVault(ctx, e, c)
+	if err != nil || st.Vault == nil || st.Vault.Locked {
+		return nil
+	}
+	return &st
+}
+
 // daemonVaultLocked reports whether a running daemon has the vault locked.
 // A daemon that is not running, or does not answer, has nothing locked.
 func daemonVaultLocked(ctx context.Context, e *Env) bool {
@@ -726,10 +742,38 @@ func (h *vaultHold) signedIn(ctx context.Context) (*store.Store, *authflow.Vault
 	return s, v, nil
 }
 
+// errLocalOnlyVault is the refusal of a command that needs a signed-in
+// vault, on a local-only one.
+const errLocalOnlyVault = "this vault is local-only: hop auth signup publishes it to a server, or hop auth login --merge merges it into an account"
+
+// refuseLocalOnly refuses a command that needs a signed-in vault on a
+// local-only one, as signedIn does, but before anything is asked or the
+// daemon stopped. It reads vault/server.json only, so it works while the
+// daemon owns the vault. With no vault it lets the command go on: no
+// secret is asked for one, and signedIn says so.
+func refuseLocalOnly(e *Env) error {
+	if localOnlyVault(e) {
+		return failf("%s", errLocalOnlyVault)
+	}
+	return nil
+}
+
+// localOnlyVault reports whether this device has a vault that is not
+// signed in to a server. It reads the vault's files only, so it works while
+// the daemon owns the vault.
+func localOnlyVault(e *Env) bool {
+	dir := e.storeConfig().DataDir
+	if ok, err := store.Exists(dir); err != nil || !ok {
+		return false
+	}
+	server, err := store.ServerBackedDir(dir)
+	return err == nil && !server
+}
+
 func (h *vaultHold) vaultOf(s *store.Store) (*authflow.Vault, error) {
 	si, err := s.ServerInfo()
 	if errors.Is(err, store.ErrNotServerBacked) {
-		return nil, failf("this vault is local-only: hop auth signup publishes it to a server, or hop auth login --merge merges it into an account")
+		return nil, failf("%s", errLocalOnlyVault)
 	}
 	if err != nil {
 		return nil, failf("%v", err)

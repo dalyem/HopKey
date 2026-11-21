@@ -180,6 +180,11 @@ func enrollKeyAAD(ref model.ID) []byte {
 	return append(crypto.LP([]byte(labelEnrollKeyFile)), crypto.LP(ref[:])...)
 }
 
+// EnrollmentPending reports whether an enrollment by approval is in
+// progress in dataDir. It reads the name of enroll.json only, so it works
+// while a daemon owns the data directory.
+func EnrollmentPending(dataDir string) (bool, error) { return layout{data: dataDir}.enrollPending() }
+
 // enrollPending reports whether enroll.json exists.
 func (l layout) enrollPending() (bool, error) {
 	_, err := os.Lstat(l.enrollFile())

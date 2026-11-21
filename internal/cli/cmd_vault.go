@@ -80,63 +80,33 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 	// Registered before the hold's release, which runs after it: the
 	// release opens the vault in the daemon with the passphrase typed here.
 	defer e.clearDevicePass()
+	if *abandon {
+		return abandonFork(ctx, e, out, *yes, *asJSON)
+	}
 	cfg := e.storeConfig()
 	// A fork decrypts this device's copy with its key, so a key that can't
-	// be read (a keychain entry or a key file that is gone or damaged), or a
-	// sealed file's passphrase that does not open it, fails before the
-	// daemon is stopped, which an open vault would not survive: stopped, it
-	// would come back locked. An interrupted fork is about other files.
-	if !*abandon {
-		if pending, err := store.ForkInProgress(cfg.DataDir); err == nil && !pending {
-			if err := store.CheckDeviceKey(cfg); errors.Is(err, store.ErrDeviceKey) {
-				return forkFailure(err)
-			}
-			if sealedKeyFile(cfg.DataDir) {
-				if err := requireDevicePassphrase(e, *asJSON); err != nil {
-					return err
-				}
-			}
+	// be read (a keychain entry or a key file that is gone or damaged) fails
+	// before the daemon is stopped, which an open vault would not survive:
+	// stopped, it would come back locked. An interrupted fork is about other
+	// files. A sealed file's passphrase, which opens the vault in the daemon
+	// again, is settled before it too, and so is a wrong one.
+	if pending, err := store.ForkInProgress(cfg.DataDir); err == nil && !pending {
+		if err := store.CheckDeviceKey(cfg); errors.Is(err, store.ErrDeviceKey) {
+			return forkFailure(err)
+		}
+	}
+	if sealedKeyFile(cfg.DataDir) {
+		if err := requireDevicePassphrase(e, *asJSON); err != nil {
+			return err
 		}
 	}
 	// Until the fork begins, release opens the vault again if it was open,
 	// as a command that changes nothing does (keepOpen).
-	h, err := holdVaultKeeping(ctx, e, *asJSON, !*abandon)
+	h, err := holdVaultKeeping(ctx, e, *asJSON, true)
 	if err != nil {
 		return err
 	}
 	defer h.release(ctx)
-
-	if *abandon {
-		if !*yes {
-			ok, err := confirm(e, false, "Give up the interrupted fork? Its new vault is deleted; the old vault stays as it is.")
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return failf("not given up; nothing changed")
-			}
-		}
-		var gaveUp bool
-		err := retryBusy(ctx, func() (err error) {
-			gaveUp, err = store.AbandonFork(ctx, cfg)
-			return err
-		})
-		if err != nil {
-			return forkFailure(err)
-		}
-		if *asJSON {
-			return printJSON(e, struct {
-				Abandoned bool `json:"abandoned"`
-			}{gaveUp})
-		}
-		if !gaveUp {
-			fmt.Fprintln(out, "There is no interrupted fork to give up.")
-		} else {
-			fmt.Fprintln(out, "The interrupted fork was given up: its new vault and device key are deleted, and the Emergency Kit it showed belongs to no vault.")
-			fmt.Fprintf(out, "The vault in %s is as it was before the fork.\n", oneLine(cfg.DataDir))
-		}
-		return nil
-	}
 
 	// The device passphrase opens a sealed device key file: the old
 	// vault's, and an interrupted fork's new one, which finishing it opens.
@@ -156,20 +126,22 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 	var pass []byte
-	if sealed && !pending {
-		// Settled and checked above, before the daemon was stopped.
+	if sealed {
+		// Settled and checked above, before the daemon was stopped, where
+		// the key file in the data directory is sealed. An interrupted
+		// fork's new key file may be sealed where that one is not.
 		pass = e.typedPass()
-		defer clear(pass)
-	} else if sealed && e.Getenv(store.PassphraseEnv) == "" {
-		if e.ReadPassword == nil {
-			return failf("the device key file is sealed and stdin is not a terminal to ask for its passphrase; set %s or run hop vault fork in an interactive terminal", store.PassphraseEnv)
+		defer func() { clear(pass) }()
+		if len(pass) == 0 && e.Getenv(store.PassphraseEnv) == "" {
+			if e.ReadPassword == nil {
+				return failf("the device key file is sealed and stdin is not a terminal to ask for its passphrase; set %s or run hop vault fork in an interactive terminal", store.PassphraseEnv)
+			}
+			if pass, err = e.readPassword(devicePassphrasePrompt); err != nil {
+				return failf("reading the device passphrase: %v", err)
+			}
+			// Kept in this process, to open the vault in the daemon afterwards.
+			e.setDevicePass(pass)
 		}
-		if pass, err = e.readPassword(devicePassphrasePrompt); err != nil {
-			return failf("reading the device passphrase: %v", err)
-		}
-		defer clear(pass)
-		// Kept in this process, to open the vault in the daemon afterwards.
-		e.setDevicePass(pass)
 	}
 
 	var res *store.ForkResult
@@ -299,6 +271,62 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 	}
 	printForkDone(out, res)
 	return nil
+}
+
+// abandonFork is hop vault fork --local --abandon. It gives up an
+// interrupted fork and leaves the old vault as it was, in the daemon too:
+// with no fork to give up, or no to the question, the daemon is not
+// stopped at all, and an old vault the daemon has open with a sealed key
+// file has its passphrase settled first, to be opened again with it.
+func abandonFork(ctx context.Context, e *Env, out io.Writer, yes, asJSON bool) error {
+	cfg := e.storeConfig()
+	report := func(gaveUp bool) error {
+		if asJSON {
+			return printJSON(e, struct {
+				Abandoned bool `json:"abandoned"`
+			}{gaveUp})
+		}
+		if !gaveUp {
+			fmt.Fprintln(out, "There is no interrupted fork to give up.")
+		} else {
+			fmt.Fprintln(out, "The interrupted fork was given up: its new vault and device key are deleted, and the Emergency Kit it showed belongs to no vault.")
+			fmt.Fprintf(out, "The vault in %s is as it was before the fork.\n", oneLine(cfg.DataDir))
+		}
+		return nil
+	}
+	// It reads the fork's files only, so it works while the daemon owns the
+	// vault. AbandonFork, under the hold, has the last word.
+	if pending, err := store.ForkInProgress(cfg.DataDir); err == nil && !pending {
+		return report(false)
+	}
+	if !yes {
+		ok, err := confirm(e, false, "Give up the interrupted fork? Its new vault is deleted; the old vault stays as it is.")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return failf("not given up; nothing changed")
+		}
+	}
+	if sealedKeyFile(cfg.DataDir) && openHere(ctx, e) != nil {
+		if err := requireDevicePassphrase(e, asJSON); err != nil {
+			return err
+		}
+	}
+	h, err := holdVaultKeeping(ctx, e, asJSON, true)
+	if err != nil {
+		return err
+	}
+	defer h.release(ctx)
+	var gaveUp bool
+	err = retryBusy(ctx, func() (err error) {
+		gaveUp, err = store.AbandonFork(ctx, cfg)
+		return err
+	})
+	if err != nil {
+		return forkFailure(err)
+	}
+	return report(gaveUp)
 }
 
 // kitFileNote names the --kit-file copy of the kit, when there is one.

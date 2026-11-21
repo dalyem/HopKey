@@ -429,6 +429,11 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 			return authFailure(authflow.ErrSignedIn)
 		}
 	}
+	// A local-only vault signs in only by merging it into the account: said
+	// before anything is asked or the daemon stopped.
+	if !*mergeLocal && localOnlyVault(e) {
+		return authFailure(authflow.ErrLocalVault)
+	}
 	ctx, stopWatch := hangupContext(ctx, e)
 	defer stopWatch()
 	u := o.ui(e)
@@ -516,6 +521,10 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 // approval in progress on this device, the one that otherwise makes every
 // other login fail, and its keys.
 func runLoginDiscard(ctx context.Context, e *Env, o *authOpts) error {
+	// Before the question, and before the daemon is stopped for nothing.
+	if pending, err := store.EnrollmentPending(e.storeConfig().DataDir); err == nil && !pending {
+		return failf("%s", errNoEnrollment)
+	}
 	if !o.yes {
 		if !e.StdinTTY || o.asJSON {
 			return failf("hop auth login --discard deletes this device's unfinished enrollment and its keys, and there is no terminal to confirm on: pass --yes")
@@ -535,7 +544,7 @@ func runLoginDiscard(ctx context.Context, e *Env, o *authOpts) error {
 	defer h.release(ctx)
 	switch err := store.DiscardEnrollment(h.cfg); {
 	case errors.Is(err, store.ErrNoEnrollment):
-		return failf("no enrollment is in progress on this device, so there is nothing to discard")
+		return failf("%s", errNoEnrollment)
 	case errors.Is(err, store.ErrEnrollmentInstalling):
 		return failf("this device's enrollment was approved and is being installed, so it cannot be discarded: run hop auth login to finish it")
 	case err != nil:
@@ -547,6 +556,10 @@ func runLoginDiscard(ctx context.Context, e *Env, o *authOpts) error {
 	e.printf("The enrollment was discarded. hop auth login can start again.\n")
 	return nil
 }
+
+// errNoEnrollment is hop auth login --discard's answer where there is
+// nothing to discard.
+const errNoEnrollment = "no enrollment is in progress on this device, so there is nothing to discard"
 
 // maxEnrollResumes bounds how often one hop auth login resumes an
 // enrollment the network interrupted; the enrollment's own deadline
@@ -675,6 +688,9 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 	}
 	if *abort && len(pos) != 0 {
 		return failf("--abort takes no code")
+	}
+	if err := refuseLocalOnly(e); err != nil {
+		return err
 	}
 	ctx, stopWatch := hangupContext(ctx, e)
 	defer stopWatch()
@@ -1072,8 +1088,12 @@ func printCheckpoint(e *Env, asJSON bool, res *authflow.CheckpointResult) error 
 }
 
 // runCheckpoint is the shape of the checkpoint commands: the flags, the
-// signed-in vault, the flow, and its kit and survivors.
+// signed-in vault, the flow, and its kit and survivors. check refuses the
+// positional arguments the command does not take; it runs, with the other
+// checks that need no secret, before the device passphrase is asked and
+// the daemon stopped.
 func runCheckpoint(ctx context.Context, e *Env, name string, args []string, extra func(*flag.FlagSet, *authOpts),
+	check func(fs *flag.FlagSet, pos []string) error,
 	flow func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error)) error {
 	fs := newFlags(e, "auth "+name, authCommands[strings.Fields(name)[0]].usage)
 	var o authOpts
@@ -1086,7 +1106,13 @@ func runCheckpoint(ctx context.Context, e *Env, name string, args []string, extr
 	if err != nil {
 		return err
 	}
+	if err := check(fs, pos); err != nil {
+		return err
+	}
 	if err := o.checkKitFile(); err != nil {
+		return err
+	}
+	if err := refuseLocalOnly(e); err != nil {
 		return err
 	}
 	u := o.ui(e)
@@ -1120,10 +1146,13 @@ func runCheckpoint(ctx context.Context, e *Env, name string, args []string, extr
 
 func runAuthRevoke(ctx context.Context, e *Env, args []string) error {
 	revoked := false
-	err := runCheckpoint(ctx, e, "devices revoke", args, nil, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
+	needDevice := func(_ *flag.FlagSet, pos []string) error {
 		if len(pos) == 0 {
-			return nil, failf("name the device to revoke: hop auth devices revoke <name|id> (hop auth devices lists them)")
+			return failf("name the device to revoke: hop auth devices revoke <name|id> (hop auth devices lists them)")
 		}
+		return nil
+	}
+	err := runCheckpoint(ctx, e, "devices revoke", args, nil, needDevice, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
 		res, err := authflow.RevokeDevices(ctx, env, v, pos)
 		revoked = err == nil && res != nil
 		return res, err
@@ -1136,10 +1165,7 @@ func runAuthRevoke(ctx context.Context, e *Env, args []string) error {
 }
 
 func runAuthRotate(ctx context.Context, e *Env, args []string) error {
-	return runCheckpoint(ctx, e, "rotate", args, nil, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
-		if len(pos) != 0 {
-			return nil, failf("unexpected argument %q", pos[0])
-		}
+	return runCheckpoint(ctx, e, "rotate", args, nil, noArgs, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
 		return authflow.Rotate(ctx, env, v)
 	})
 }
@@ -1150,10 +1176,7 @@ func runAuthRotate(ctx context.Context, e *Env, args []string) error {
 func runAuthPasswd(ctx context.Context, e *Env, args []string) error {
 	return runCheckpoint(ctx, e, "passwd", args, func(fs *flag.FlagSet, o *authOpts) {
 		fs.Var(&o.exclude, "exclude", "a device that joined during the change to revoke, by ID or unique name (repeatable)")
-	}, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
-		if len(pos) != 0 {
-			return nil, failf("unexpected argument %q", pos[0])
-		}
+	}, noArgs, func(ctx context.Context, env *authflow.Env, v *authflow.Vault, pos []string) (*authflow.CheckpointResult, error) {
 		if si, err := v.Store.ServerInfo(); err == nil && si.CheckpointDue {
 			env.UI.(*termUI).notice("This device signed in with the Recovery Key: the new password finishes the recovery.")
 			res, err := authflow.Resume(ctx, env, v)
@@ -1183,6 +1206,12 @@ func runAuthResume(ctx context.Context, e *Env, args []string) error {
 	}
 	if err := o.checkKitFile(); err != nil {
 		return err
+	}
+	// A local-only vault has nothing to resume but its publication.
+	if pub, err := store.PublicationPendingDir(e.storeConfig().DataDir); err == nil && !pub {
+		if err := refuseLocalOnly(e); err != nil {
+			return err
+		}
 	}
 	u := o.ui(e)
 	defer e.clearDevicePass()
@@ -1259,9 +1288,60 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	if !o.yes && !u.interactive {
 		return failf("hop auth logout deletes this device's keys and its copy of the vault, and there is no terminal to confirm on: pass --yes")
 	}
+	// A local-only vault has no account to leave: said before any secret
+	// is asked or the daemon stopped.
+	if localOnlyVault(e) && !store.RetiredDir(e.storeConfig().DataDir) {
+		return failf("this vault is local-only, so it is not signed in to an account")
+	}
 	// Asked before the daemon stops: the operator's refusal lives in its
 	// memory only.
 	lock := daemonAdminLock(ctx, e)
+	// What the logout throws away is said before anything is asked or
+	// deleted, and a no leaves the vault as it is. Where this vault's daemon
+	// has it open, its counts are the ones to go by, and both come before
+	// the daemon is stopped: an open vault whose key file is sealed comes
+	// back open only with the device passphrase, which --local-only does
+	// not ask for. A logout already under way (RETIRING) has the vault
+	// locked, and counted when it began.
+	refuseQueued := func(pc store.PendingChanges) error {
+		if pc.Queued > 0 && !*discard {
+			return failf("this device has %s that the server has not received, and a logout throws them away: wait for the daemon to send them (hop sync shows them), "+
+				"or log out with --discard-pending to drop them%s", pendingChangesText(pc), lockedLogoutHint(lock))
+		}
+		return nil
+	}
+	asked := false
+	ask := func(pc store.PendingChanges) error {
+		if o.yes || asked {
+			return nil
+		}
+		asked = true
+		q := "Log out? This device leaves the account, and its keys and its copy of the vault are deleted."
+		if *localOnly {
+			q = "Wipe this device without telling the server? Its keys and its copy of the vault are deleted; the old device ID is still in the account until you revoke it from the new device."
+		}
+		if pc.Queued > 0 {
+			fmt.Fprintf(e.Stderr, "This device has %s that the server has not received. They are lost: they are not kept for the next sign-in.\n", pendingChangesText(pc))
+		}
+		if lock != nil {
+			fmt.Fprintf(e.Stderr, "The server's operator has locked this device out. After the logout, hop auth login signs this machine in again as a new device (master password and current Secret Key).\n")
+		}
+		ok, err := confirm(e, false, q)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return failf("not logged out")
+		}
+		return nil
+	}
+	var daemonPC *store.PendingChanges
+	if st := openHere(ctx, e); st != nil && st.Sync != nil {
+		daemonPC = &store.PendingChanges{Queued: st.Sync.Pending + st.Sync.Held, Held: st.Sync.Held}
+		if err := refuseQueued(*daemonPC); err != nil {
+			return err
+		}
+	}
 	// A sealed device key opens with its passphrase, which a logout that
 	// tells the server needs to sign the retirement.
 	defer e.clearDevicePass()
@@ -1277,6 +1357,11 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		}
 		if err := requireDevicePassphrase(e, o.asJSON); err != nil {
 			return failf("%v. A logout that tells the server signs with the device key; hop auth logout --local-only needs no key", err)
+		}
+	}
+	if daemonPC != nil {
+		if err := ask(*daemonPC); err != nil {
+			return err
 		}
 	}
 	// A logout that is refused or declined before it begins leaves the
@@ -1319,9 +1404,8 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return failf("%v", err)
 	}
 	id := s.Info().DeviceID
-	// What the logout throws away, said before anything is asked or
-	// deleted. A logout already under way (RETIRING) counted it when it
-	// began.
+	// The store's counts have the last word; the question is not asked
+	// twice.
 	var pc store.PendingChanges
 	if state, err := s.Retirement(); err != nil {
 		return failf("%v", err)
@@ -1329,29 +1413,12 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		if pc, err = s.PendingChanges(); err != nil {
 			return failf("%v", err)
 		}
-		if pc.Queued > 0 && !*discard {
-			return failf("this device has %s that the server has not received, and a logout throws them away: wait for the daemon to send them (hop sync shows them), "+
-				"or log out with --discard-pending to drop them%s", pendingChangesText(pc), lockedLogoutHint(lock))
-		}
 	}
-	if !o.yes {
-		q := "Log out? This device leaves the account, and its keys and its copy of the vault are deleted."
-		if *localOnly {
-			q = "Wipe this device without telling the server? Its keys and its copy of the vault are deleted; the old device ID is still in the account until you revoke it from the new device."
-		}
-		if pc.Queued > 0 {
-			fmt.Fprintf(e.Stderr, "This device has %s that the server has not received. They are lost: they are not kept for the next sign-in.\n", pendingChangesText(pc))
-		}
-		if lock != nil {
-			fmt.Fprintf(e.Stderr, "The server's operator has locked this device out. After the logout, hop auth login signs this machine in again as a new device (master password and current Secret Key).\n")
-		}
-		ok, err := confirm(e, false, q)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return failf("not logged out")
-		}
+	if err := refuseQueued(pc); err != nil {
+		return err
+	}
+	if err := ask(pc); err != nil {
+		return err
 	}
 	h.leaving() // begun: the vault is leaving
 	res, err := authflow.Logout(ctx, env, s, store.LogoutOptions{DiscardPending: *discard, LocalOnly: *localOnly, Why: adminLockWhy(lock)})
@@ -1526,6 +1593,15 @@ func runAuthMerge(ctx context.Context, e *Env, args []string) error {
 	if *token != "" && !*discard {
 		return failf("--confirm goes with --discard")
 	}
+	var confirmed crypto.Hash
+	if *token != "" {
+		if err := confirmed.UnmarshalText([]byte(strings.TrimSpace(*token))); err != nil || confirmed == (crypto.Hash{}) {
+			return failf("--confirm %q is not a token hop auth merge --discard showed", *token)
+		}
+	}
+	if err := refuseLocalOnly(e); err != nil {
+		return err
+	}
 	u := o.ui(e)
 	defer e.clearDevicePass()
 	h, err := holdVaultWithKey(ctx, e, o.asJSON)
@@ -1562,12 +1638,8 @@ func runAuthMerge(ctx context.Context, e *Env, args []string) error {
 		}
 		return report(&st, nil, "resumed")
 	case *discard:
-		var c crypto.Hash
-		if *token != "" {
-			if err := c.UnmarshalText([]byte(strings.TrimSpace(*token))); err != nil || c == (crypto.Hash{}) {
-				return failf("--confirm %q is not a token hop auth merge --discard showed", *token)
-			}
-		} else {
+		c := confirmed
+		if *token == "" {
 			prop, err := s.MergeDiscardProposal()
 			if err != nil {
 				return authFailure(err)

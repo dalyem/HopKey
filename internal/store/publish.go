@@ -93,6 +93,17 @@ const (
 
 func (l layout) publishFile() string { return filepath.Join(l.vault(), publishRel) }
 
+// PublicationPendingDir reports whether a publication of the vault in
+// dataDir is pending (vault/publish.json). It reads the file's name only,
+// so it works while a daemon owns the vault.
+func PublicationPendingDir(dataDir string) (bool, error) {
+	_, err := os.Lstat(layout{data: dataDir}.publishFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // Publisher is the server a publication goes to (§4.3, plan R3). Slice E
 // implements it over HTTP. Nothing it returns is trusted: the entry at
 // upload_seq is compared with the journal, and every later entry is

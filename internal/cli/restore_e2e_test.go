@@ -43,8 +43,11 @@ func TestInterruptedForkRestoresTheLockState(t *testing.T) {
 // vault goes back to is what was settled when the process took over. The
 // vault is still there, signed in and open (its key file is sealed, so it
 // is open again only with the device passphrase typed for the command).
+// Where the daemon has the vault open, the question comes before it is
+// stopped; with no daemon running, it comes while the vault is held.
 func TestAnswerDuringAbandonmentDoesNotGoOn(t *testing.T) {
 	_, m := sealedAccount(t)
+	m.must(t, nil, "daemon", "stop")
 	ictx, interrupt := context.WithCancelCause(context.Background())
 	exited := make(chan int, 1)
 	answer := make(chan string)
