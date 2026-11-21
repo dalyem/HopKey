@@ -147,7 +147,7 @@ func newInterruptEnv(t *testing.T) *interruptEnv {
 	dir := shortTempDir(t)
 	x := &interruptEnv{exits: make(chan int, 4)}
 	x.e = &Env{
-		Stdout: &strings.Builder{}, Stderr: &strings.Builder{}, Getenv: func(string) string { return "" },
+		Stdout: &strings.Builder{}, Stderr: &syncBuffer{}, Getenv: func(string) string { return "" },
 		DataDir: filepath.Join(dir, "data"),
 		Paths:   daemon.Paths{RunDir: filepath.Join(dir, "run"), StateDir: filepath.Join(dir, "state"), ConfigDir: filepath.Join(dir, "ssh")},
 		StartDaemon: func() error {
@@ -512,7 +512,7 @@ func TestAbandonWarnsInJSON(t *testing.T) {
 	}
 	// That the vault is being put back, the warning, then the interruption,
 	// each a line of JSON.
-	out := x.e.Stderr.(*strings.Builder).String()
+	out := x.e.Stderr.(*syncBuffer).String()
 	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	var w struct {
 		Warning string `json:"warning"`
@@ -605,7 +605,7 @@ func TestInterruptedShutdownWaitsForTheOldDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the new daemon does not answer: %v", err)
 	}
-	if s := x.e.Stderr.(*strings.Builder).String(); s != "" {
+	if s := x.e.Stderr.(*syncBuffer).String(); s != "" {
 		t.Errorf("hop auth warned: %q", s)
 	}
 	dcancel()

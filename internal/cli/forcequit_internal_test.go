@@ -24,16 +24,17 @@ func TestSecondInterruptSaysWhatToRun(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no exit after the interrupt")
 	}
-	if got := x.e.Stderr.(*strings.Builder).String(); !strings.Contains(got, "hop: "+restoringText+"\n") {
-		t.Errorf("stderr after the first Ctrl-C: %q", got)
+	stderr := x.e.Stderr.(*syncBuffer)
+	first := stderr.String()
+	if !strings.Contains(first, "hop: "+restoringText+"\n") {
+		t.Errorf("stderr after the first Ctrl-C: %q", first)
 	}
-	x.e.Stderr = &strings.Builder{}
 	x.e.setHold(h) // as if the second came while abandon still ran
 	x.e.ForceQuit()
 	if code := <-x.exits; code != ExitInterrupted {
 		t.Errorf("exit %d, want %d", code, ExitInterrupted)
 	}
-	if got := x.e.Stderr.(*strings.Builder).String(); got != quitText+"\n" {
+	if got := strings.TrimPrefix(stderr.String(), first); got != quitText+"\n" {
 		t.Errorf("stderr after the second Ctrl-C: %q", got)
 	}
 	x.e.setHold(nil)
@@ -53,7 +54,7 @@ func TestInterruptWithNothingToRestoreSaysNothingOfIt(t *testing.T) {
 	}
 	x.e.ForceQuit()
 	<-x.exits
-	if got := x.e.Stderr.(*strings.Builder).String(); strings.Contains(got, "lock state") {
+	if got := x.e.Stderr.(*syncBuffer).String(); strings.Contains(got, "lock state") {
 		t.Errorf("stderr: %q", got)
 	}
 }
