@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -259,4 +261,134 @@ func (w *writer) stop() {
 		}
 		w.wake.close()
 	})
+}
+
+// termOut writes to the user's terminal, which may stop taking output
+// (a stalled connection to a remote terminal, say) without going away: a
+// write waits for it while the session runs, as long as it takes, but
+// not once Run is stopping (abort) or the session is ending (end), so
+// that Run can still put the terminal's mode back and return. Its writes
+// are non-blocking and wait in select, on the terminal and on wake. The
+// descriptor is the shell's too, so it is non-blocking only during a
+// write.
+type termOut struct {
+	fd    int
+	fl    int // the descriptor's file status flags, as found
+	wake  wakePipe
+	state atomic.Int32
+}
+
+// A termOut's state: the session runs, or it is ending (a write waits at
+// most outGrace), or Run is stopping (a write waits no more).
+const (
+	outRunning int32 = iota
+	outEnding
+	outAborted
+)
+
+// outGrace bounds how long a write waits for the terminal once the
+// session is ending, and the writes that give the terminal back to the
+// shell before its mode is put back, on a suspend and at the end.
+const outGrace = 250 * time.Millisecond
+
+// errStalled is termOut.write's error when it stopped waiting for the
+// terminal.
+var errStalled = errors.New("termpanel: the terminal takes no output")
+
+func newTermOut(fd int) (*termOut, error) {
+	fl, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err != nil {
+		return nil, err
+	}
+	w, err := newWakePipe()
+	if err != nil {
+		return nil, err
+	}
+	return &termOut{fd: fd, fl: fl, wake: w}, nil
+}
+
+// end says that the session is ending; abort that Run is stopping.
+// Either wakes a write waiting for the terminal.
+func (o *termOut) end()   { o.set(outEnding) }
+func (o *termOut) abort() { o.set(outAborted) }
+
+func (o *termOut) set(st int32) {
+	for {
+		old := o.state.Load()
+		if old >= st {
+			return
+		}
+		if o.state.CompareAndSwap(old, st) {
+			o.wake.signal()
+			return
+		}
+	}
+}
+
+// write writes b, waiting for the terminal when it is full: at most limit
+// when that is not 0, at most outGrace once the session is ending, and
+// not at all without a limit once Run is stopping. It returns how much it
+// wrote, and errStalled when it stopped waiting.
+func (o *termOut) write(b []byte, limit time.Duration) (int, error) {
+	if o.fl&unix.O_NONBLOCK == 0 {
+		if _, err := unix.FcntlInt(uintptr(o.fd), unix.F_SETFL, o.fl|unix.O_NONBLOCK); err != nil {
+			return 0, err
+		}
+		defer unix.FcntlInt(uintptr(o.fd), unix.F_SETFL, o.fl)
+	}
+	var deadline time.Time
+	if limit > 0 {
+		deadline = time.Now().Add(limit)
+	}
+	off := 0
+	for off < len(b) {
+		n, err := unix.Write(o.fd, b[off:])
+		off += max(n, 0)
+		switch {
+		case err == nil, err == unix.EINTR:
+			continue
+		case err != unix.EAGAIN:
+			return off, err
+		}
+		st := o.state.Load()
+		switch {
+		case st == outAborted && limit == 0:
+			return off, errStalled
+		case st != outRunning && (deadline.IsZero() || time.Until(deadline) > outGrace):
+			deadline = time.Now().Add(outGrace)
+		}
+		if err := o.wait(deadline, st == outRunning); err != nil {
+			return off, err
+		}
+	}
+	return off, nil
+}
+
+// wait waits until the terminal can be written, or deadline (when it is
+// not zero), or, with wake, until end or abort.
+func (o *termOut) wait(deadline time.Time, wake bool) error {
+	if o.fd >= maxFd || o.wake.r >= maxFd {
+		return errFdRange
+	}
+	var tv *unix.Timeval
+	if !deadline.IsZero() {
+		d := time.Until(deadline)
+		if d <= 0 {
+			return errStalled
+		}
+		t := unix.NsecToTimeval(d.Nanoseconds())
+		tv = &t
+	}
+	var rs, ws unix.FdSet
+	ws.Set(o.fd)
+	nfd := o.fd
+	if wake {
+		rs.Set(o.wake.r)
+		nfd = max(nfd, o.wake.r)
+	}
+	_, err := unix.Select(nfd+1, &rs, &ws, nil, tv)
+	if err == unix.EINTR {
+		return nil
+	}
+	return err
 }

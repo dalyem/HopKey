@@ -63,6 +63,18 @@ func Run(ctx context.Context, opts Options, start func(tty *os.File, sys *syscal
 		return err
 	}
 	defer p.restore()
+	// Once ctx is done, the loop's writes stop waiting on a terminal that
+	// takes no output, as they do once the child has exited.
+	ended := make(chan struct{})
+	stopEnd := context.AfterFunc(ctx, func() {
+		defer close(ended)
+		p.o.end()
+	})
+	defer func() {
+		if !stopEnd() {
+			<-ended
+		}
+	}()
 	childDone := make(chan struct{})
 	abort := make(chan struct{})
 	loopDone := make(chan struct{})
@@ -72,11 +84,13 @@ func Run(ctx context.Context, opts Options, start func(tty *os.File, sys *syscal
 		p.loop(ctx, childDone, abort)
 	}()
 	// When start or wait panics, the loop stops before restore, which
-	// runs next, takes the terminal and the pty from under it. (A panic
-	// in the loop restores from there, in onPanic.)
+	// runs next, takes the terminal and the pty from under it, even while
+	// it waits for a terminal that takes no output. (A panic in the loop
+	// restores from there, in onPanic.)
 	joined := false
 	defer func() {
 		if !joined {
+			p.o.abort()
 			close(abort)
 			<-loopDone
 		}
@@ -85,6 +99,7 @@ func Run(ctx context.Context, opts Options, start func(tty *os.File, sys *syscal
 	if err == nil {
 		err = wait()
 	}
+	p.o.end()
 	close(childDone)
 	<-loopDone
 	joined = true
@@ -94,6 +109,7 @@ func Run(ctx context.Context, opts Options, start func(tty *os.File, sys *syscal
 type proxy struct {
 	in, out    *os.File
 	inFd       int
+	o          *termOut    // out's descriptor
 	orig       *term.State // the terminal's mode before Run
 	ptm        int         // -1 once closed
 	pts        *os.File
@@ -113,6 +129,8 @@ type proxy struct {
 	needResume bool    // continued in the background: resume once in front
 	gone       bool    // the terminal hung up, or ctx is done: the pty is closed
 	outGone    bool    // a write to the terminal failed
+	outStalled bool    // a write gave up on the terminal as the session ended
+	outCut     bool    // a write stopped partway, maybe in a sequence
 	outDone    bool    // the pty's output ended
 	restored   sync.Once
 	emergency  sync.Mutex // the panel state onPanic reads
@@ -178,9 +196,12 @@ func newProxy(opts Options) (_ *proxy, err error) {
 	if p.w, err = newWriter(p.ptm); err != nil {
 		return nil, err
 	}
+	if p.o, err = newTermOut(int(p.out.Fd())); err != nil {
+		return nil, err
+	}
 	// Every descriptor select is to wait on, before any goroutine waits:
 	// the caller then runs the child directly.
-	for _, fd := range []int{p.inFd, p.ptm, p.inR.wake.r, p.outR.wake.r, p.w.wake.r} {
+	for _, fd := range []int{p.inFd, p.o.fd, p.ptm, p.inR.wake.r, p.outR.wake.r, p.w.wake.r, p.o.wake.r} {
 		if fd >= maxFd {
 			return nil, ErrUnsupported
 		}
@@ -229,6 +250,9 @@ func (p *proxy) closeFds() {
 	if p.w != nil {
 		p.w.stop()
 	}
+	if p.o != nil {
+		p.o.wake.close()
+	}
 	if p.ptm >= 0 {
 		unix.Close(p.ptm)
 		p.ptm = -1
@@ -243,14 +267,18 @@ func (p *proxy) restore() {
 	p.restored.Do(func() {
 		signal.Stop(p.sig)
 		signal.Stop(p.cont)
+		var b []byte
 		p.emergency.Lock()
 		if p.panel.open {
-			p.out.Write(p.emergencyClose())
+			b = p.emergencyClose()
 		}
 		p.emergency.Unlock()
 		// The session is over, whatever the remote side left on. The
-		// loop is not running (or it is the loop, in onPanic).
-		p.out.Write(p.plainTerminal())
+		// loop is not running (or it is the loop, in onPanic). A terminal
+		// that takes no output gets outGrace, even when a write gave up
+		// on it before; its mode is put back however much it took.
+		p.outStalled = false
+		p.writeWithin(append(b, p.plainTerminal()...), outGrace)
 		term.Restore(p.inFd, p.orig)
 		p.closeFds()
 	})
@@ -390,11 +418,26 @@ func (p *proxy) hangup() {
 	p.ptm = -1
 }
 
-func (p *proxy) write(b []byte) {
-	if p.outGone || len(b) == 0 {
+func (p *proxy) write(b []byte) { p.writeWithin(b, 0) }
+
+// writeWithin writes b to the terminal, waiting for it at most limit when
+// that is not 0 (termOut.write). Once a write without a limit has given up
+// on the terminal, as the session ends, the rest of the session's output
+// is dropped.
+func (p *proxy) writeWithin(b []byte, limit time.Duration) {
+	if p.outGone || p.outStalled || len(b) == 0 {
 		return
 	}
-	if _, err := p.out.Write(b); err != nil {
+	if p.outCut {
+		// CAN ends the sequence the last write may have left unfinished.
+		b = append([]byte{0x18}, b...)
+	}
+	n, err := p.o.write(b, limit)
+	p.outCut = err != nil && (n > 0 || p.outCut)
+	switch {
+	case err == errStalled:
+		p.outStalled = limit == 0
+	case err != nil:
 		p.outGone = true
 		p.hangup()
 	}
@@ -694,9 +737,12 @@ func (p *proxy) paintUnder(w *painter, v view) {
 	w.finish()
 }
 
-func (p *proxy) closePanel() {
+func (p *proxy) closePanel() { p.write(p.closingPanel()) }
+
+// closingPanel closes the panel and returns what takes it off the screen.
+func (p *proxy) closingPanel() []byte {
 	if !p.panel.open {
-		return
+		return nil
 	}
 	pn := p.panel
 	p.emergency.Lock()
@@ -719,8 +765,7 @@ func (p *proxy) closePanel() {
 		p.putCursor(w, p.scr.cur)
 	}
 	p.putModes(w)
-	w.b = append(w.b, "\x1b[?2026l"...)
-	p.write(w.b)
+	return append(w.b, "\x1b[?2026l"...)
 }
 
 // putCursor puts the cursor, its attributes, the character sets and
@@ -859,16 +904,14 @@ func hasShell() bool {
 
 // suspend stops hop for job control: the panel's Ctrl-Z, or a SIGTSTP
 // sent to it. The terminal goes back to the mode the shell left it in,
-// as plainTerminal leaves it; resume undoes that. The child stops and
-// continues with hop when the caller says so (onSuspend, onResume);
+// as plainTerminal leaves it, however much of that a terminal that takes
+// no output takes within outGrace; resume undoes that. The child stops
+// and continues with hop when the caller says so (onSuspend, onResume);
 // otherwise it runs on meanwhile, but hop reads nothing from it, so it
 // waits once the pty is full.
 func (p *proxy) suspend() {
 	p.panel.pending, p.panel.queued = false, nil
-	if p.panel.open {
-		p.closePanel()
-	}
-	p.write(p.plainTerminal())
+	p.writeWithin(append(p.closingPanel(), p.plainTerminal()...), outGrace)
 	term.Restore(p.inFd, p.orig)
 	if p.onSuspend != nil {
 		p.onSuspend()

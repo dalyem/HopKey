@@ -1006,3 +1006,162 @@ func TestPanelKeepsInputQueueBounded(t *testing.T) {
 		})
 	}
 }
+
+// newStalledVTerm is a terminal that takes no output: nothing reads its
+// pty's master.
+func newStalledVTerm(t *testing.T) *vterm {
+	t.Helper()
+	m, s, err := openPTY()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := unix.Winsize{Col: 80, Row: 24}
+	if err := unix.IoctlSetWinsize(m, unix.TIOCSWINSZ, &ws); err != nil {
+		t.Fatal(err)
+	}
+	v := &vterm{t: t, ptm: os.NewFile(uintptr(m), "ptm"), tty: s, fd: int(s.Fd()), scr: newScreen(80, 24), done: make(chan struct{})}
+	close(v.done)
+	t.Cleanup(func() {
+		v.ptm.Close() // a write still waiting on the terminal fails
+		v.tty.Close()
+	})
+	return v
+}
+
+// stall fills the terminal's buffer, from a descriptor of its own.
+func (v *vterm) stall() {
+	v.t.Helper()
+	fd, err := unix.Open(v.tty.Name(), unix.O_WRONLY|unix.O_NOCTTY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		v.t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	buf := bytes.Repeat([]byte("x"), 4096)
+	for idle := 0; idle < 5; {
+		_, err := unix.Write(fd, buf)
+		switch {
+		case err == unix.EAGAIN:
+			idle++
+			time.Sleep(20 * time.Millisecond)
+		case err != nil:
+			v.t.Fatal(err)
+		default:
+			idle = 0
+		}
+	}
+}
+
+// terminalState is the terminal's mode and its descriptor's flags.
+func terminalState(t *testing.T, fd int) (unix.Termios, int) {
+	t.Helper()
+	tio, err := unix.IoctlGetTermios(fd, ioctlGetTermios)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fl, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *tio, fl
+}
+
+func checkTerminalState(t *testing.T, fd int, tio unix.Termios, fl int) {
+	t.Helper()
+	nowTio, nowFl := terminalState(t, fd)
+	if nowTio != tio {
+		t.Errorf("terminal mode %+v, want %+v", nowTio, tio)
+	}
+	if nowFl != fl {
+		t.Errorf("file status flags %#x, want %#x", nowFl, fl)
+	}
+}
+
+// A panic in the caller's wait while the loop waits to write to a
+// terminal that takes no output still stops the loop, puts the terminal
+// back and unwinds through Run.
+func TestPanicWhileTerminalStalled(t *testing.T) {
+	v := newStalledVTerm(t)
+	tio, fl := terminalState(t, v.fd)
+	children := make(chan *os.Process, 1)
+	res := make(chan any, 1)
+	go func() {
+		defer func() { res <- recover() }()
+		Run(context.Background(), Options{In: v.tty, Out: v.tty, Shortcuts: testShortcuts}, func(tty *os.File, sys *syscall.SysProcAttr) (func() error, error) {
+			p, err := os.StartProcess("/bin/sh", []string{"sh", "-c", "stty raw -echo; exec yes"}, &os.ProcAttr{Files: []*os.File{tty, tty, tty}, Sys: sys})
+			if err != nil {
+				return nil, err
+			}
+			children <- p
+			return func() error {
+				time.Sleep(500 * time.Millisecond) // the terminal is full, the loop waits
+				panic("boom")
+			}, nil
+		})
+	}()
+	select {
+	case r := <-res:
+		if r != "boom" {
+			t.Fatalf("Run's panic: %v", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not panic with the terminal taking no output")
+	}
+	if p := <-children; p != nil {
+		p.Kill()
+		p.Wait()
+	}
+	checkTerminalState(t, v.fd, tio, fl)
+}
+
+// A terminal that takes no output gets what gives it back to the shell
+// as far as it takes it, and its mode back in any case: when the session
+// ends, and when hop stops for job control.
+func TestStalledTerminal(t *testing.T) {
+	t.Run("session end", func(t *testing.T) {
+		v := newStalledVTerm(t)
+		tio, fl := terminalState(t, v.fd)
+		c := run(t, v, Options{Shortcuts: testShortcuts}, `stty raw -echo; printf '\033[?1000h'; exec cat >/dev/null`, "")
+		time.Sleep(100 * time.Millisecond)
+		v.stall()
+		c.p.Kill()
+		select {
+		case err := <-c.runErr:
+			c.runErr <- err
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return with the terminal taking no output")
+		}
+		checkTerminalState(t, v.fd, tio, fl)
+	})
+	t.Run("suspend", func(t *testing.T) {
+		v := newStalledVTerm(t)
+		tio, _ := terminalState(t, v.fd)
+		stops := make(chan unix.Termios, 4)
+		real := stopSelf
+		stopSelf = func(<-chan os.Signal) {
+			now, err := unix.IoctlGetTermios(v.fd, ioctlGetTermios)
+			if err == nil {
+				stops <- *now
+			}
+		}
+		t.Cleanup(func() { stopSelf = real })
+		c := run(t, v, Options{Shortcuts: testShortcuts}, `stty raw -echo; exec cat >/dev/null`, "")
+		time.Sleep(100 * time.Millisecond)
+		v.stall()
+		syscall.Kill(os.Getpid(), syscall.SIGTSTP)
+		select {
+		case now := <-stops:
+			if now != tio {
+				t.Errorf("stopped with the terminal in mode %+v, want %+v", now, tio)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("hop did not stop with the terminal taking no output")
+		}
+		c.p.Kill()
+		select {
+		case err := <-c.runErr:
+			c.runErr <- err
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return with the terminal taking no output")
+		}
+	})
+}
