@@ -123,10 +123,17 @@ func waitGone(ctx context.Context, pid int, d time.Duration) {
 }
 
 // clearHandback removes a handback marker once the daemon has the vault.
+// It reads the marker as readHold does (readMarker), so a FIFO or a
+// symlink there neither blocks the daemon, which owns the vault by now,
+// nor is followed; and it removes only the file it read.
 func (e *Env) clearHandback() {
 	path := e.holdMarker()
-	if b, err := os.ReadFile(path); err == nil {
-		if hi, ok := parseHold(string(b)); ok && hi.handback {
+	b, read, err := e.readMarker(path)
+	if err != nil {
+		return
+	}
+	if hi, ok := parseHold(string(b)); ok && hi.handback {
+		if fi, err := os.Lstat(path); err == nil && os.SameFile(fi, read) {
 			os.Remove(path)
 		}
 	}
