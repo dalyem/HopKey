@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -64,5 +65,65 @@ func TestRestartKeepsStartLockedWhenAnotherVaultAnswers(t *testing.T) {
 	h.restart(context.Background(), restoreLocked)
 	if b, err := os.ReadFile(x.e.startLockedFile()); err != nil || !sameDir(strings.TrimSpace(string(b)), x.e.DataDir) {
 		t.Errorf("the instruction to start locked: %q, %v; want it kept for %s", b, err, x.e.DataDir)
+	}
+}
+
+// An instruction to start locked is followed only from a file this user
+// alone can have written: not through a symlink, not one that others can
+// write, not one in a run directory that others can write, and not one
+// dated in the future. Each is ignored with a warning in the daemon's log.
+// (A file owned by another user can't be made without privileges, so that
+// case is left to trustedMarker's owner check.)
+func TestStartLockedFromAnUntrustedFileIsIgnored(t *testing.T) {
+	cases := []struct {
+		name  string
+		plant func(t *testing.T, x *interruptEnv)
+		gone  bool // the file is removed
+	}{
+		{"symlink", func(t *testing.T, x *interruptEnv) {
+			target := filepath.Join(t.TempDir(), "planted")
+			if err := os.WriteFile(target, []byte(x.e.storeConfig().DataDir+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(x.e.Paths.RunDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, x.e.startLockedFile()); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"writable by others", func(t *testing.T, x *interruptEnv) {
+			writeStartLocked(t, x, x.e.storeConfig().DataDir, time.Now())
+			if err := os.Chmod(x.e.startLockedFile(), 0o666); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"run directory writable by others", func(t *testing.T, x *interruptEnv) {
+			writeStartLocked(t, x, x.e.storeConfig().DataDir, time.Now())
+			if err := os.Chmod(x.e.Paths.RunDir, 0o777); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"dated in the future", func(t *testing.T, x *interruptEnv) {
+			writeStartLocked(t, x, x.e.storeConfig().DataDir, time.Now().Add(time.Hour))
+		}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			x := newInterruptEnv(t)
+			c.plant(t, x)
+			st, stderr, stop := startServing(t, x)
+			defer stop()
+			if st.Vault == nil || st.Vault.Locked {
+				t.Errorf("an untrusted instruction locked the vault: %+v", st.Vault)
+			}
+			if out := stderr.String(); !strings.Contains(out, "instruction to start the vault locked") {
+				t.Errorf("no warning that the instruction was ignored: %q", out)
+			}
+			_, err := os.Lstat(x.e.startLockedFile())
+			if c.gone != os.IsNotExist(err) {
+				t.Errorf("the file after the daemon started: %v; want it removed: %v", err, c.gone)
+			}
+		})
 	}
 }

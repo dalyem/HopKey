@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -203,13 +204,8 @@ type holdInfo struct {
 // readHold reads the marker. ok is false unless it names a live process
 // other than this one.
 func (e *Env) readHold() (holdInfo, bool) {
-	path := e.holdMarker()
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() || time.Since(fi.ModTime()) > holdMarkerMaxAge {
-		return holdInfo{}, false
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
+	b, fi, err := e.readMarker(e.holdMarker())
+	if err != nil || time.Since(fi.ModTime()) > holdMarkerMaxAge {
 		return holdInfo{}, false
 	}
 	hi, ok := parseHold(string(b))
@@ -217,6 +213,47 @@ func (e *Env) readHold() (holdInfo, bool) {
 		return holdInfo{}, false
 	}
 	return hi, true
+}
+
+// maxMarkerSize bounds what is read of a control marker: a pid and a word,
+// or a data directory's path.
+const maxMarkerSize = 4096
+
+// readMarker reads a control marker in the run directory (the hold marker,
+// the instruction to start locked), once the run directory is known to be
+// one that only this user can change (checkRunDir) and the file one that
+// only this user can have written (openMarker): elsewhere another local
+// user could have left it. A marker that is not there, or a run directory
+// that is not, is os.ErrNotExist.
+func (e *Env) readMarker(path string) ([]byte, os.FileInfo, error) {
+	if err := e.checkRunDir(); err != nil {
+		return nil, nil, err
+	}
+	f, fi, err := openMarker(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxMarkerSize))
+	return b, fi, err
+}
+
+// checkRunDir fails unless the run directory is one that only this user
+// can change: safepath's checks of its path, and not writable by group or
+// others itself, which safepath leaves to EnsurePrivateDir to tighten.
+func (e *Env) checkRunDir() error {
+	dir := e.Paths.RunDir
+	if err := safepath.Check(dir); err != nil {
+		return err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if err := privateDirMode(fi); err != nil {
+		return fmt.Errorf("the run directory %s: %w", oneLine(dir), err)
+	}
+	return nil
 }
 
 // parseHold reads a marker's text: "PID" or "PID handback".
@@ -350,19 +387,28 @@ func (e *Env) startLocked() error {
 // dropStartLocked removes once the daemon serves: it is for one daemon, and
 // one that does not get to serve leaves it for the next. One for another
 // data directory is left for its own daemon; one older than
-// startLockedMaxAge is removed and not followed.
+// startLockedMaxAge, or dated in the future, is removed and not followed.
+// One that another user could have left is not followed either, and the
+// daemon's log says so.
 func (e *Env) pendingStartLocked() (os.FileInfo, bool) {
 	path := e.startLockedFile()
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() {
-		return nil, false
+	ignored := func(why string) {
+		warn(e, false, "ignored "+oneLine(path)+", the instruction to start the vault locked: "+why)
 	}
-	if time.Since(fi.ModTime()) > startLockedMaxAge {
-		os.Remove(path)
-		return nil, false
-	}
-	b, err := os.ReadFile(path)
+	b, fi, err := e.readMarker(path)
 	if err != nil {
+		if _, lerr := os.Lstat(path); lerr == nil {
+			ignored(err.Error())
+		}
+		return nil, false
+	}
+	switch age := time.Since(fi.ModTime()); {
+	case age < 0:
+		os.Remove(path)
+		ignored("it is dated in the future")
+		return nil, false
+	case age > startLockedMaxAge:
+		os.Remove(path)
 		return nil, false
 	}
 	here, err := filepath.Abs(e.storeConfig().DataDir)
