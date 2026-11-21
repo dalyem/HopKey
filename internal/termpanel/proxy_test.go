@@ -1352,3 +1352,46 @@ func TestPanelSetsItsKeyboardModes(t *testing.T) {
 		})
 	}
 }
+
+// Suspended again with no resume between (here the child is gone, so
+// resume does not take the terminal), hop hands the terminal back once:
+// the bytes a terminal that takes no output is owed do not grow with each
+// suspend, and the shell's own kitty flags are not popped with the
+// session's, then or when the session ends.
+func TestSuspendHandsBackOnce(t *testing.T) {
+	v := newVTerm(t, 80, 24)
+	tio, fl := terminalState(t, v.fd)
+	if _, err := v.tty.Write([]byte("\x1b[>1u")); err != nil { // the shell's
+		t.Fatal(err)
+	}
+	p, err := newProxy(Options{In: v.tty, Out: v.tty, Shortcuts: testShortcuts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.restore()
+	real := stopSelf
+	stopSelf = func(<-chan os.Signal) {}
+	t.Cleanup(func() { stopSelf = real })
+	p.output([]byte("\x1b[>8uREADY"))
+	v.waitText("READY")
+	v.pause()
+	v.stall()
+	p.gone = true
+	p.suspend()
+	owed := len(p.owed)
+	if owed == 0 {
+		t.Fatal("the stalled terminal took the hand back: nothing is owed to test")
+	}
+	for range 3 {
+		p.suspend()
+	}
+	if len(p.owed) != owed {
+		t.Errorf("owed %d bytes after four suspends, %d after one", len(p.owed), owed)
+	}
+	v.drain()
+	p.restore()
+	checkTerminalState(t, v.fd, tio, fl)
+	v.waitFor("the shell's kitty flags", func(s *screen) bool {
+		return slices.Equal(s.kitty[0].pushed, []int{1})
+	})
+}

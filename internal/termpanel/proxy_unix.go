@@ -127,6 +127,7 @@ type proxy struct {
 	panel      panelState
 	held       []token // input for the child that the queue had no room for, and the keys after it
 	needResume bool    // continued in the background: resume once in front
+	handedBack bool    // the terminal is the shell's (suspend) until resume writes
 	gone       bool    // the terminal hung up, or ctx is done: the pty is closed
 	outGone    bool    // a write to the terminal failed
 	outStalled bool    // a write without a limit gave up on the terminal as the session ended
@@ -279,7 +280,13 @@ func (p *proxy) restore() {
 		// that takes no output gets outGrace, even when a write gave up
 		// on it before, for what is owed it and this; its mode is put back
 		// however much it took.
-		p.putBack(append(b, p.plainTerminal()...), outGrace)
+		// A terminal suspend handed back, and resume did not take again,
+		// has the shell's modes already: popping kitty flags again would
+		// pop the shell's.
+		if !p.handedBack {
+			b = append(b, p.plainTerminal()...)
+		}
+		p.putBack(b, outGrace)
 		term.Restore(p.inFd, p.orig)
 		p.closeFds()
 	})
@@ -999,7 +1006,14 @@ func hasShell() bool {
 // full.
 func (p *proxy) suspend() {
 	p.panel.pending, p.panel.queued = false, nil
-	p.putBack(append(p.closingPanel(), p.plainTerminal()...), outGrace)
+	// Suspended again with no resume between (continued in the
+	// background, or the child gone), the terminal is the shell's
+	// already: handing it back again would owe it the same bytes once
+	// more each time, and pop the shell's kitty flags.
+	if !p.handedBack {
+		p.putBack(append(p.closingPanel(), p.plainTerminal()...), outGrace)
+		p.handedBack = true
+	}
 	term.Restore(p.inFd, p.orig)
 	if p.onSuspend != nil {
 		p.onSuspend()
@@ -1025,6 +1039,7 @@ func (p *proxy) resume() {
 		return
 	}
 	p.needResume = false
+	p.handedBack = false
 	term.MakeRaw(p.inFd)
 	p.resize()
 	s := p.scr
