@@ -195,6 +195,9 @@ func checkShortcutInput(sc model.Shortcut, snap model.Snapshot) (model.Shortcut,
 	if strings.ContainsAny(sc.Command, "\r\n") {
 		return sc, invalidf("a shortcut's command is one line; for several commands, join them with ; or &&")
 	}
+	if strings.Contains(sc.Command, "\t") {
+		return sc, invalidf("a shortcut's command can't have a tab: typed into the shell, a tab is the completion key; use spaces")
+	}
 	if len(sc.Command) > model.MaxShortcutCommand {
 		return sc, invalidf("the command is longer than %d bytes", model.MaxShortcutCommand)
 	}

@@ -9,7 +9,7 @@ import (
 )
 
 func testShortcut() *model.Shortcut {
-	return &model.Shortcut{Header: hdr(model.TypeShortcut, 7), Name: "logs", Keys: "gl", Command: "journalctl -fu app\t# follow", Enter: true}
+	return &model.Shortcut{Header: hdr(model.TypeShortcut, 7), Name: "logs", Keys: "gl", Command: "journalctl -fu app # follow", Enter: true}
 }
 
 // A shortcut round-trips under its closed schema, global (host_id "") or
@@ -40,8 +40,9 @@ func TestShortcutSchemaValid(t *testing.T) {
 }
 
 // The panel types command into a remote shell as it is: one line, no
-// control character but TAB, no {{parameter}}, and keys of one or two
-// printable characters, none of them the panel's own.
+// control character (a TAB would be the completion key), no
+// {{parameter}}, and keys of one or two printable characters, none of
+// them the panel's own.
 func TestShortcutSchemaRejects(t *testing.T) {
 	for name, mutate := range map[string]func(*model.Shortcut){
 		"wrong type":     func(s *model.Shortcut) { s.Type = model.TypeSnippet },
@@ -60,6 +61,7 @@ func TestShortcutSchemaRejects(t *testing.T) {
 		"NUL in command": func(s *model.Shortcut) { s.Command = "a\x00b" },
 		"DEL in command": func(s *model.Shortcut) { s.Command = "ab\x7f" },
 		"C1 in command":  func(s *model.Shortcut) { s.Command = "a\u009bb" },
+		"TAB in command": func(s *model.Shortcut) { s.Command = "echo\thello" },
 		"parameter":      func(s *model.Shortcut) { s.Command = "ssh {{ host }}" },
 		"long command":   func(s *model.Shortcut) { s.Command = strings.Repeat("a", model.MaxShortcutCommand+1) },
 		"bad UTF-8":      func(s *model.Shortcut) { s.Command = "a\xffb" },
@@ -89,6 +91,7 @@ func TestShortcutFromAnotherDeviceChecked(t *testing.T) {
 	for name, mutate := range map[string]func(*model.Shortcut){
 		"reserved key": func(s *model.Shortcut) { s.Keys = "a?" },
 		"parameter":    func(s *model.Shortcut) { s.Command = "echo {{name}}" },
+		"TAB":          func(s *model.Shortcut) { s.Command = "echo\thello" },
 	} {
 		sc := testShortcut()
 		mutate(sc)

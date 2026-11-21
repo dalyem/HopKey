@@ -36,7 +36,7 @@ func TestShortcutsSyncBetweenDevices(t *testing.T) {
 	ctx := context.Background()
 	p := newPair(t)
 	g := putShortcut(t, p.a.s, model.Shortcut{Keys: "u", Name: "uptime", Command: "uptime", Enter: true})
-	h := putShortcut(t, p.a.s, model.Shortcut{Keys: "gl", Command: "git log --oneline\t-5", HostID: p.host.ItemID, Description: "recent\ncommits"})
+	h := putShortcut(t, p.a.s, model.Shortcut{Keys: "gl", Command: "git log --oneline -5", HostID: p.host.ItemID, Description: "recent\ncommits"})
 	if res := pushAll(t, p.a.s, p.r); res.Outcome != PushEmpty {
 		t.Fatalf("a's push: %+v", res)
 	}

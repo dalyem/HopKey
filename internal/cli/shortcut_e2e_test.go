@@ -142,6 +142,7 @@ func TestShortcutAddRefusals(t *testing.T) {
 		{[]string{"a", "--", "printf '\x1b[2J'"}, "control character"},
 		{[]string{"a", "--", "ls\x00"}, "control character"},
 		{[]string{"a", "--", "cat {{file}}"}, "{{parameters}}"},
+		{[]string{"a", "--", "echo\thello"}, "can't have a tab"},
 		{[]string{"g", "--", "git log"}, "already has a shortcut on \"g\""},
 		{[]string{"gu", "--", "git pull"}, "can't both be shortcuts"},
 		{[]string{"xa", "--host", "web-1", "--", "ls"}, "can't both be shortcuts"},
@@ -156,8 +157,8 @@ func TestShortcutAddRefusals(t *testing.T) {
 	if got := e.store.Writes(); got != writes {
 		t.Errorf("refusals wrote %d changes", got-writes)
 	}
-	// A docker-style template is not a parameter, and a tab is allowed.
-	e.mustHop(t, "shortcut", "add", "d", "--", "docker ps --format '{{.Names}}'\t# names")
+	// A docker-style template is not a parameter.
+	e.mustHop(t, "shortcut", "add", "d", "--", "docker ps --format '{{.Names}}'")
 	// The same keys in the other scope are allowed: the host's wins there.
 	out := e.mustHop(t, "shortcut", "add", "gu", "--host", "web-1", "--", "git pull")
 	if !strings.Contains(out, "hides the global shortcut g") {

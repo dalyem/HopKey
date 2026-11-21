@@ -67,9 +67,10 @@ func displaySafe(s string) string {
 }
 
 // typeable returns s without the characters that must never be typed for
-// the user: C0 and C1 controls, DEL and invalid UTF-8. A control character
-// typed into a shell or an editor is a keystroke (Enter, Ctrl-C, Esc), not
-// text.
+// the user: C0 and C1 controls, TAB among them, DEL and invalid UTF-8. A
+// control character typed into a shell or an editor is a keystroke (Enter,
+// Ctrl-C, Esc, Tab's completion), not text. The shortcut schema already
+// refuses them; this is in case a caller passes one on.
 func typeable(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); {

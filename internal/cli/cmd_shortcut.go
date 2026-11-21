@@ -95,8 +95,8 @@ func runShortcutAdd(ctx context.Context, e *Env, args []string) error {
 	helpNote(e, fs, "\nKeys are one or two printable characters, pressed one after the other in the panel that Ctrl-] opens\n"+
 		"during hop connect (HOP_SHORTCUT_KEY changes that key). '?' is the panel's own. A one-key shortcut can't share\n"+
 		"a panel with a two-key one it starts: a host shortcut then hides the global one in that host's panel.\n"+
-		"One word after -- is the command line as typed; several words are quoted one by one. The command is one line,\n"+
-		"typed into the remote shell as it is, so it has no {{parameters}}: use hop snippet for those.\n")
+		"One word after -- is the command line as typed; several words are quoted one by one. The command is one line\n"+
+		"without tabs, typed into the remote shell as it is, so it has no {{parameters}}: use hop snippet for those.\n")
 	pos, rest, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -356,12 +356,12 @@ func (e *Env) sessionShortcuts(ctx context.Context, rr *daemon.ResolveResult) ([
 }
 
 // typeable reports whether command is safe to type into a remote shell: a
-// non-empty line of valid text with no control character but TAB.
+// non-empty line of valid text with no control character, not even TAB.
 func typeable(command string) bool {
 	if command == "" || !utf8.ValidString(command) {
 		return false
 	}
-	return !strings.ContainsFunc(command, func(r rune) bool { return r != '\t' && unicode.IsControl(r) })
+	return !strings.ContainsFunc(command, unicode.IsControl)
 }
 
 // The session panel's hotkey: Ctrl-] unless HOP_SHORTCUT_KEY says
