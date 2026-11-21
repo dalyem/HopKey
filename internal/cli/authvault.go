@@ -551,6 +551,11 @@ func (h *vaultHold) restart(ctx context.Context, target restoreTo) {
 	}
 	h.unmark()
 	err := startDaemon(context.WithoutCancel(ctx), h.e)
+	if target == restoreLocked && err == nil {
+		// Taken by the daemon that started, or by none: lockAgain makes
+		// sure. One that does not come up in time keeps it.
+		os.Remove(h.e.startLockedFile())
+	}
 	if err != nil {
 		warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (hop sync starts it): "+err.Error())
 		return
