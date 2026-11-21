@@ -1160,6 +1160,25 @@ func TestStalledTerminal(t *testing.T) {
 		}
 		checkTerminalState(t, v.fd, tio, fl)
 	})
+	t.Run("session end, panel open", func(t *testing.T) {
+		v := newVTerm(t, 80, 24)
+		tio, fl := terminalState(t, v.fd)
+		c := run(t, v, Options{Shortcuts: testShortcuts}, `stty raw -echo; printf '\033[>8u\033[>4;1mREADY'; exec cat >/dev/null`, "")
+		v.waitText("READY")
+		v.key("\x1d")
+		v.panelAt(40)
+		v.waitFor("the panel's keyboard modes", panelModes)
+		v.pause()
+		v.stall()
+		c.p.Kill()
+		select {
+		case err := <-c.runErr:
+			c.runErr <- err
+		case <-time.After(5 * time.Second):
+			t.Fatal("Run did not return with the terminal taking no output")
+		}
+		checkTerminalState(t, v.fd, tio, fl)
+	})
 	t.Run("suspend", func(t *testing.T) {
 		v := newStalledVTerm(t)
 		tio, _ := terminalState(t, v.fd)
@@ -1197,6 +1216,9 @@ func TestStalledTerminal(t *testing.T) {
 // Ctrl-Z in the panel stops hop when the terminal has stopped taking
 // output with the panel open: the panel closes as the terminal goes back
 // to the shell, within outGrace, and the terminal's mode is put back.
+// What the terminal did not take is owed it: once it takes output again,
+// it gets that and then the session back, so that each keyboard flag the
+// panel and the remote side pushed comes off once and goes back once.
 func TestSuspendFromPanelWhileTerminalStalled(t *testing.T) {
 	v := newVTerm(t, 80, 24)
 	tio, fl := terminalState(t, v.fd)
@@ -1210,14 +1232,14 @@ func TestSuspendFromPanelWhileTerminalStalled(t *testing.T) {
 	}
 	t.Cleanup(func() { stopSelf = real })
 	c := run(t, v, Options{Shortcuts: testShortcuts}, fill+`printf '\033[>8u\033[>4;1m\033[?1000h'; exec cat >/dev/null`, "")
-	v.waitFor("the remote side's modes", func(s *screen) bool {
-		return slices.Equal(s.kitty[0].pushed, []int{8}) && s.otherKeys == 1 && s.modes[1000]
-	})
+	sessionModes := func(s *screen) bool {
+		return !s.altActive && slices.Equal(s.kitty[0].pushed, []int{8}) && !s.kitty[1].active() && s.otherKeys == 1 && s.modes[1000]
+	}
+	v.waitFor("the remote side's modes", sessionModes)
+	before := v.snapshot()
 	v.key("\x1d")
 	v.panelAt(40)
-	v.waitFor("the panel's keyboard modes", func(s *screen) bool {
-		return s.altActive && slices.Equal(s.kitty[1].pushed, []int{29}) && s.otherKeys == 0
-	})
+	v.waitFor("the panel's keyboard modes", panelModes)
 	v.pause()
 	v.stall()
 	v.key("\x1a")
@@ -1229,6 +1251,9 @@ func TestSuspendFromPanelWhileTerminalStalled(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("hop did not stop with the terminal taking no output")
 	}
+	v.drain()
+	v.waitSame(before)
+	v.waitFor("the session's modes back", sessionModes)
 	c.p.Kill()
 	select {
 	case err := <-c.runErr:
@@ -1237,6 +1262,46 @@ func TestSuspendFromPanelWhileTerminalStalled(t *testing.T) {
 		t.Fatal("Run did not return with the terminal taking no output")
 	}
 	checkTerminalState(t, v.fd, tio, fl)
+}
+
+// panelModes is that the panel is open on the alternate screen over the
+// normal one, with its kitty flags pushed there, over a session that
+// pushed 8 on the normal screen and set modifyOtherKeys.
+func panelModes(s *screen) bool {
+	return s.altActive && slices.Equal(s.kitty[1].pushed, []int{29}) && slices.Equal(s.kitty[0].pushed, []int{8}) && s.otherKeys == 0
+}
+
+// When the child exits with the panel open and the terminal taking no
+// output, closing the panel gives up on the terminal. What closes it is
+// still owed the terminal, and the child's last output, which the
+// terminal did not get, is not taken for what it has: when the terminal
+// takes output again as it is put back, it leaves the panel's alternate
+// screen and flags, then the remote side's flags on the normal screen.
+// Run's steps, in its order, with the terminal drained before restore.
+func TestSessionEndOwesThePanelsClose(t *testing.T) {
+	v := newVTerm(t, 80, 24)
+	tio, fl := terminalState(t, v.fd)
+	p, err := newProxy(Options{In: v.tty, Out: v.tty, Shortcuts: testShortcuts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.restore()
+	p.output([]byte("\x1b[>8u\x1b[>4;1m\x1b[?1000hREADY"))
+	p.openPanel()
+	v.panelAt(40)
+	v.waitFor("the panel's keyboard modes", panelModes)
+	v.pause()
+	v.stall()
+	// The child pops its flags as it exits.
+	if _, err := p.pts.Write([]byte("\x1b[<u")); err != nil {
+		t.Fatal(err)
+	}
+	p.o.end()
+	p.finish()
+	v.drain()
+	p.restore()
+	checkTerminalState(t, v.fd, tio, fl)
+	waitReset(t, v)
 }
 
 // With the kitty keyboard protocol on, the panel reads its keys in flags
