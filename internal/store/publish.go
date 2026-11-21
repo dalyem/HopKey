@@ -314,11 +314,11 @@ func (s *Store) Publish(ctx context.Context, p Publisher, opts PublishOptions) (
 		return Publication{}, err
 	}
 	defer s.syncMu.Unlock()
-	accessOK, err := s.publishAccessCheck(ctx, p)
+	accepted, err := s.publishAccessCheck(ctx, p)
 	if err != nil {
 		return Publication{}, err
 	}
-	j, wires, err := s.beginPublication(opts, accessOK)
+	j, wires, err := s.beginPublication(opts, accepted)
 	if err != nil {
 		return Publication{}, err
 	}
@@ -347,9 +347,10 @@ func (s *Store) ResumePublish(ctx context.Context, p Publisher) (Publication, er
 }
 
 // beginPublication runs the preflight and journals the publication.
-// accessOK says the target server lists access: without it, a log that
-// ever held an access item is refused before anything is journaled.
-func (s *Store) beginPublication(opts PublishOptions, accessOK bool) (*publicationJSON, []*vaultlog.Wire, error) {
+// accepted is the target server's item types, or nil when it was not
+// asked: a log that ever held an access item or a shortcut is refused
+// before anything is journaled unless accepted lists that type.
+func (s *Store) beginPublication(opts PublishOptions, accepted []model.Type) (*publicationJSON, []*vaultlog.Wire, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state == nil {
@@ -406,8 +407,11 @@ func (s *Store) beginPublication(opts PublishOptions, accessOK bool) (*publicati
 	if err := checkUpload(j, wires); err != nil {
 		return nil, nil, err
 	}
-	if !accessOK && uploadHasAccess(wires) {
+	if !slices.Contains(accepted, model.TypeAccess) && uploadHas(wires, model.TypeAccess) {
 		return nil, nil, fmt.Errorf("%w: this vault has access records; the server at %s doesn't accept them", ErrAccessUnsupported, opts.Server)
+	}
+	if !slices.Contains(accepted, model.TypeShortcut) && uploadHas(wires, model.TypeShortcut) {
+		return nil, nil, fmt.Errorf("%w: this vault has shortcuts; the server at %s doesn't accept them; upgrade hop-server, or remove them with hop shortcut rm", ErrShortcutsUnsupported, opts.Server)
 	}
 	b, err := sealPublication(s.rec, j)
 	if err != nil {
@@ -426,6 +430,10 @@ func (s *Store) beginPublication(opts PublishOptions, accessOK bool) (*publicati
 // types (crypto spec rev 17, §5.3).
 var ErrAccessUnsupported = errors.New("store: the server doesn't accept access records")
 
+// ErrShortcutsUnsupported: the server doesn't list shortcut among its
+// item types.
+var ErrShortcutsUnsupported = errors.New("store: the server doesn't accept shortcuts")
+
 // CapabilityReader is a Publisher that can read the server's item types
 // (GET /v1/capabilities). A Publisher without it can't publish a vault
 // whose log holds an access item.
@@ -434,11 +442,12 @@ type CapabilityReader interface {
 }
 
 // publishAccessCheck is the publication preflight of §5.3: if any entry
-// from genesis to the head holds an item_put of type access (a deleted
-// record's puts are uploaded too), the server must list access. It reports
-// whether it does; beginPublication scans again under the lock, so a
-// record made after this check is still refused.
-func (s *Store) publishAccessCheck(ctx context.Context, p Publisher) (bool, error) {
+// from genesis to the head holds an item_put of type access or shortcut (a
+// deleted item's puts are uploaded too), the server must list that type.
+// It returns the server's item types, or nil when there is no such put and
+// so nothing to ask; beginPublication scans again under the lock, so an
+// item made after this check is still refused.
+func (s *Store) publishAccessCheck(ctx context.Context, p Publisher) ([]model.Type, error) {
 	s.mu.Lock()
 	var wires []*vaultlog.Wire
 	var err error
@@ -453,25 +462,32 @@ func (s *Store) publishAccessCheck(ctx context.Context, p Publisher) (bool, erro
 		}
 	}
 	s.mu.Unlock()
-	if err != nil || !uploadHasAccess(wires) {
-		return false, err
+	if err != nil {
+		return nil, err
+	}
+	hasAccess, hasShortcut := uploadHas(wires, model.TypeAccess), uploadHas(wires, model.TypeShortcut)
+	if !hasAccess && !hasShortcut {
+		return nil, nil
 	}
 	cr, ok := p.(CapabilityReader)
+	if !ok && hasAccess {
+		return nil, fmt.Errorf("%w: hop could not check whether the server accepts access records", ErrAccessUnsupported)
+	}
 	if !ok {
-		return false, fmt.Errorf("%w: hop could not check whether the server accepts access records", ErrAccessUnsupported)
+		return nil, fmt.Errorf("%w: hop could not check whether the server accepts shortcuts", ErrShortcutsUnsupported)
 	}
 	types, err := cr.ItemTypes(ctx)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return slices.Contains(types, model.TypeAccess), nil
+	return types, nil
 }
 
-// uploadHasAccess reports whether any entry puts an access item.
-func uploadHasAccess(wires []*vaultlog.Wire) bool {
+// uploadHas reports whether any entry puts an item of type t.
+func uploadHas(wires []*vaultlog.Wire, t model.Type) bool {
 	for _, w := range wires {
 		for _, op := range w.Entry.Ops {
-			if p, ok := op.(*vaultlog.ItemPutOp); ok && p.Type == model.TypeAccess {
+			if p, ok := op.(*vaultlog.ItemPutOp); ok && p.Type == t {
 				return true
 			}
 		}

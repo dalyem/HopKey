@@ -23,6 +23,7 @@ hop check|which|trust <target>    diagnose, explain resolution, pin the server's
 hop ls [tag] | info <target> | add | edit | rm
 hop key add <path> | ls | pub <key> [--fingerprint] | rm | rotate <key>|--all [--hosts h1,h2] [--type ed25519|ecdsa|rsa] [--new-key K] [--dry-run] [--yes] [--keep-old]
 hop snippet add <name> [--description D] -- <cmd...> | ls | rm <name>
+hop shortcut add <keys> [--host H] [--name N] [--description D] [--no-enter] -- <cmd...> | ls [--host H] | rm <keys|id> [--host H]
 hop import ssh-config [path] [--with-keys] [--dry-run] [--yes]
 hop ts import [--dry-run] | ts link <host> <node-id-or-dns-name>   (never links an ambiguous match; pick the node with ts link)
 hop setup                         put `Include ~/.ssh/hop/config` above every other directive in ~/.ssh/config
@@ -36,6 +37,17 @@ hop mcp [--read-only] [--tag T]... | mcp install [--client claude|codex|print] [
 ```
 
 `hop import ssh-config` reads your config with `ssh -G`, the way `ssh <host>` does, so it runs any `Match exec` commands in it and may do DNS lookups. It lists what its own scan found (best effort, not a guarantee) and asks before it runs ssh; without a terminal, or with `--json`, it refuses unless you pass `--yes`. Importing your config carries the same trust as using it.
+
+### Shortcuts
+
+A shortcut is a command on one or two keys of the panel that Ctrl-] opens during `hop <target>` (`hop connect`). Choosing it types the command into the ssh session and presses Enter; one added with `--no-enter` is typed without Enter, so you can read it first. `hop shortcut add gl -- git log --oneline -20` is a global shortcut, in every host's panel; `hop shortcut add r --host web -- sudo systemctl restart app` is in web's panel only. As with snippets, one word after `--` is the command line as typed, and several words are quoted one by one.
+
+- Keys are one or two printable ASCII characters, pressed one after the other: `u`, or `g` then `u`. Space and `?` (the panel's help) can't be used. `HOP_SHORTCUT_KEY` changes the key that opens the panel: `ctrl-X` or `^X`, where X is a letter or one of `\ ] ^ _`, or `off`. Ctrl-[ (Esc), Ctrl-@, Ctrl-H, Ctrl-I, Ctrl-J and Ctrl-M are refused.
+- The command is one line with no control character but tab, at most 4096 bytes, and has no `{{parameters}}`: the panel types it as it is. Use a snippet for a command with parameters. Templates such as `docker ps --format '{{.Names}}'` are fine.
+- Two shortcuts of one panel can't share keys, and a one-key shortcut can't start a two-key one (`g` and `gu`), since the panel would run `g` before the second key. hop refuses both within the global shortcuts or within one host's. A host's shortcut may clash with a global one: in that host's panel the host's shortcut wins and the global one is hidden. `hop shortcut add` says when that happens, and `hop shortcut ls --host H` shows that host's panel, its own shortcuts first, with each hidden one marked. If two devices add clashing shortcuts at once, both are kept and every device shows the same one in the panel (the one with the lower item ID); remove the other by its ID.
+- A host shortcut belongs to its host. `hop rm <host>` names the host's shortcuts and removes them with it; nothing else deletes a host that has shortcuts. If one device deletes a host while another adds a shortcut to it, whichever reaches the server second is held in `hop sync resolve`. `hop vault fork --local` keeps the shortcuts and leaves out, with a note, one whose host is gone.
+- Shortcuts are in the vault and sync like hosts. The key, the command, Enter, and the host are one unit, so two different changes to them are held; the description merges on its own. `hop snippet ls` does not list them, and no access token or agent sees them.
+- Shortcuts need hop-server and every device's hop at this version or later. hop refuses to add the first shortcut while the server doesn't list them in `GET /v1/capabilities` ("upgrade hop-server"), and refuses to publish a local vault that has had one to such a server. A device on hop 0.1.0-rc.4 or earlier stops syncing at the first shortcut with "this vault uses an item type from a newer hop (shortcut); upgrade hop on this device", and loses nothing; upgrade it and sync goes on.
 
 `hop key pub <key>` prints a vault key's public half as an `authorized_keys` line (`ssh-ed25519 AAAA... <key name>`), and `--fingerprint` prints its `SHA256:` fingerprint, as `ssh-keygen -l` shows it; `--json` gives the id, name, type, line and fingerprint. It reads only what the daemon already lists for `hop key ls`: no private byte is read or printed.
 

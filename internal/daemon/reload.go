@@ -76,6 +76,9 @@ func fingerprint(s model.Snapshot) string {
 	for _, sn := range s.Snippets {
 		lines = append(lines, fmt.Sprintf("snippet %s %d", sn.ItemID, sn.ItemVersion))
 	}
+	for _, sc := range s.Shortcuts {
+		lines = append(lines, fmt.Sprintf("shortcut %s %d", sc.ItemID, sc.ItemVersion))
+	}
 	for id, m := range s.Marks {
 		lines = append(lines, fmt.Sprintf("mark %s %s", id, m))
 	}

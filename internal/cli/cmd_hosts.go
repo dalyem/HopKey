@@ -575,14 +575,30 @@ func runRm(ctx context.Context, e *Env, args []string) error {
 		return failMsg(describeUnresolved(rr.Result))
 	}
 	h := rr.Host
-	ok, err := confirm(e, *yes, safef("Remove host %s (%s)?", h.Name, joinOne(h.Addresses, ", ")))
+	// A host's shortcuts go with it (hop shortcut): they mean nothing
+	// without it, and the vault keeps no reference to a host that is gone.
+	l, err := listAll(ctx, e)
+	if err != nil {
+		return err
+	}
+	var keys []string
+	for _, sc := range l.Shortcuts {
+		if sc.HostID == h.ItemID {
+			keys = append(keys, sc.Keys)
+		}
+	}
+	question := safef("Remove host %s (%s)?", h.Name, joinOne(h.Addresses, ", "))
+	if len(keys) > 0 {
+		question = safef("Remove host %s (%s) and its shortcuts %s?", h.Name, joinOne(h.Addresses, ", "), strings.Join(keys, ", "))
+	}
+	ok, err := confirm(e, *yes, question)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return failf("not removed")
 	}
-	if err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: h.ItemID.String()}, nil); err != nil {
+	if err := callChange(ctx, e, *asJSON, daemon.OpDelete, daemon.DeleteParams{ID: h.ItemID.String(), WithShortcuts: len(keys) > 0}, nil); err != nil {
 		return err
 	}
 	if *asJSON {

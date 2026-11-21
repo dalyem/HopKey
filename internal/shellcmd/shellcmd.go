@@ -250,3 +250,7 @@ func Join(words []string) string {
 	}
 	return strings.Join(q, " ")
 }
+
+// HasPlaceholder reports whether command holds a {{name}} placeholder,
+// quoted or not.
+func HasPlaceholder(command string) bool { return placeholderRe.MatchString(command) }

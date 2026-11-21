@@ -384,8 +384,12 @@ func printForkPlan(out io.Writer, p store.ForkPlan, discardOld bool) {
 	if p.Server != "" {
 		fmt.Fprintf(out, "  from: account %s on %s (vault %s, this device %s)\n", p.Old.AccountID, oneLine(p.Server), p.Old.VaultID, p.Old.DeviceID)
 	}
-	fmt.Fprintf(out, "  items: %d hosts, %d keys, %d credentials, %d snippets, %d policies, each with a new item ID\n",
-		p.Hosts, p.Keys, p.Credentials, p.Snippets, p.Policies)
+	shortcuts := ""
+	if p.Shortcuts > 0 {
+		shortcuts = fmt.Sprintf(", %d shortcuts", p.Shortcuts)
+	}
+	fmt.Fprintf(out, "  items: %d hosts, %d keys, %d credentials, %d snippets, %d policies%s, each with a new item ID\n",
+		p.Hosts, p.Keys, p.Credentials, p.Snippets, p.Policies, shortcuts)
 	if p.Pending > 0 || p.Held > 0 {
 		fmt.Fprintf(out, "  changes that never reached the server: %d pending, %d held; the new vault keeps them as this device shows them\n", p.Pending, p.Held)
 	}

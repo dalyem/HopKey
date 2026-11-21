@@ -96,10 +96,11 @@ func preAccessUnlock(s *Store) error {
 // can't unlock it, and says to upgrade; the same cache without the access
 // entry unlocks.
 func TestFrozenPreAccessBuildCantUnlockACacheWithAccess(t *testing.T) {
-	// The only type the two builds disagree on is access.
+	// The only types the two builds disagree on are access and the later
+	// shortcut.
 	frozen := slices.DeleteFunc(vaultlog.ItemTypes(), func(x model.Type) bool { return !preAccessIsItemType(x) })
-	if want := slices.DeleteFunc(vaultlog.ItemTypes(), func(x model.Type) bool { return x == model.TypeAccess }); !slices.Equal(frozen, want) {
-		t.Fatalf("the frozen allowlist %v, today's without access %v", frozen, want)
+	if want := slices.DeleteFunc(vaultlog.ItemTypes(), func(x model.Type) bool { return x == model.TypeAccess || x == model.TypeShortcut }); !slices.Equal(frozen, want) {
+		t.Fatalf("the frozen allowlist %v, today's without access and shortcut %v", frozen, want)
 	}
 	t.Run("control: no access entry", func(t *testing.T) {
 		f := newVault(t, testConfig(t))

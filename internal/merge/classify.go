@@ -40,6 +40,7 @@ const (
 	UnitCredential = "credential"
 	UnitPolicy     = "policy"
 	UnitAccess     = "access"
+	UnitShortcut   = "shortcut"
 )
 
 // Coupling names, as a conflict reports them.
@@ -89,6 +90,13 @@ var classifications = map[model.Type]*classification{
 	},
 	model.TypeSnippet: {
 		units: []unit{{UnitExecutable, []string{"name", "command", "params"}}},
+		free:  []string{"description"},
+	},
+	// One unit, like a snippet's: which keys type what, where, and whether
+	// Enter follows, are one decision, so two devices' edits never combine
+	// into a command neither chose for those keys.
+	model.TypeShortcut: {
+		units: []unit{{UnitShortcut, []string{"name", "keys", "command", "enter", "host_id"}}},
 		free:  []string{"description"},
 	},
 	model.TypeKey: {

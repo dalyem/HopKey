@@ -26,6 +26,8 @@ func newPlain(t model.Type) (crypto.Item, error) {
 		return new(model.Policy), nil
 	case model.TypeAccess:
 		return new(model.Access), nil
+	case model.TypeShortcut:
+		return new(model.Shortcut), nil
 	}
 	return nil, fmt.Errorf("store: %q items do not queue", t)
 }
@@ -364,6 +366,9 @@ func (s *Store) queueDelete(id model.ID) error {
 		if h, ok := p.(*model.Host); ok && oid != id && (h.KeyID == id || h.CredentialID == id || h.JumpHostID == id) {
 			return fmt.Errorf("store: host %q still refers to item %s", h.Name, id)
 		}
+		if sc, ok := p.(*model.Shortcut); ok && sc.HostID == id {
+			return fmt.Errorf("store: shortcut %q still belongs to host %s", sc.Keys, id)
+		}
 	}
 	_, err = s.appendRecord(merge.Intent{Action: merge.ActionDelete, ItemID: id, Type: cur.Type(), Seen: cur})
 	return err
@@ -372,9 +377,16 @@ func (s *Store) queueDelete(id model.ID) error {
 // errDangling is a reference to an item that is not in the overlay.
 var errDangling = errors.New("store: a reference names no live item of the right type")
 
-// checkRefs requires every reference a host makes to name a live overlay
-// item of the matching type (§5.3, against what the user sees).
+// checkRefs requires every reference a host or shortcut makes to name a
+// live overlay item of the matching type (§5.3, against what the user
+// sees).
 func checkRefs(it crypto.Item, items map[model.ID]*merge.Item) error {
+	if sc, ok := it.(*model.Shortcut); ok {
+		if o, ok := items[sc.HostID]; !sc.HostID.IsZero() && (!ok || o.Type() != model.TypeHost) {
+			return fmt.Errorf("%w: shortcut %q host_id %s", errDangling, sc.Keys, sc.HostID)
+		}
+		return nil
+	}
 	h, ok := it.(*model.Host)
 	if !ok {
 		return nil

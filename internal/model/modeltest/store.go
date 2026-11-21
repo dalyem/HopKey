@@ -94,6 +94,19 @@ func (s *Store) PutSnippet(_ context.Context, sn model.Snippet) (model.Snippet, 
 	return put(s, sn, model.TypeSnippet, func(x *model.Snapshot) *[]model.Snippet { return &x.Snippets }, func(sn *model.Snippet) *model.Header { return &sn.Header })
 }
 
+// PutShortcut creates or replaces a shortcut after its schema.
+func (s *Store) PutShortcut(_ context.Context, sc model.Shortcut) (model.Shortcut, error) {
+	check := sc
+	if check.ItemID.IsZero() {
+		check.ItemID = model.ID{1}
+	}
+	check.V, check.Type = 1, model.TypeShortcut
+	if err := crypto.ValidateShortcut(&check); err != nil {
+		return model.Shortcut{}, err
+	}
+	return put(s, sc, model.TypeShortcut, func(sn *model.Snapshot) *[]model.Shortcut { return &sn.Shortcuts }, func(sc *model.Shortcut) *model.Header { return &sc.Header })
+}
+
 func (s *Store) Delete(_ context.Context, id model.ID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -104,6 +117,7 @@ func (s *Store) Delete(_ context.Context, id model.ID) error {
 	next.Credentials = without(next.Credentials, id, &found, func(c *model.Credential) *model.Header { return &c.Header })
 	next.Snippets = without(next.Snippets, id, &found, func(sn *model.Snippet) *model.Header { return &sn.Header })
 	next.Access = without(next.Access, id, &found, func(a *model.Access) *model.Header { return &a.Header })
+	next.Shortcuts = without(next.Shortcuts, id, &found, func(sc *model.Shortcut) *model.Header { return &sc.Header })
 	if !found {
 		return model.ErrNotFound
 	}
@@ -193,7 +207,8 @@ func holdsID(snap model.Snapshot, id model.ID) bool {
 		slices.ContainsFunc(snap.Keys, func(x model.Key) bool { return x.ItemID == id }) ||
 		slices.ContainsFunc(snap.Credentials, func(x model.Credential) bool { return x.ItemID == id }) ||
 		slices.ContainsFunc(snap.Snippets, func(x model.Snippet) bool { return x.ItemID == id }) ||
-		slices.ContainsFunc(snap.Access, func(x model.Access) bool { return x.ItemID == id })
+		slices.ContainsFunc(snap.Access, func(x model.Access) bool { return x.ItemID == id }) ||
+		slices.ContainsFunc(snap.Shortcuts, func(x model.Shortcut) bool { return x.ItemID == id })
 }
 
 func normalizeHost(h model.Host) model.Host {
@@ -232,13 +247,18 @@ func validateHost(h model.Host) error {
 	return nil
 }
 
-// checkRefs enforces reference integrity: every key_id, credential_id and
-// jump_host_id names a live item of the right type, and jump hosts form no
-// loop.
+// checkRefs enforces reference integrity: every key_id, credential_id,
+// jump_host_id and shortcut host_id names a live item of the right type,
+// and jump hosts form no loop.
 func checkRefs(snap model.Snapshot) error {
 	hosts := map[model.ID]model.Host{}
 	for _, h := range snap.Hosts {
 		hosts[h.ItemID] = h
+	}
+	for _, sc := range snap.Shortcuts {
+		if _, ok := hosts[sc.HostID]; !sc.HostID.IsZero() && !ok {
+			return fmt.Errorf("modeltest: shortcut %q refers to missing host %s", sc.Keys, sc.HostID)
+		}
 	}
 	for _, h := range snap.Hosts {
 		if !h.KeyID.IsZero() && !slices.ContainsFunc(snap.Keys, func(k model.Key) bool { return k.ItemID == h.KeyID }) {
@@ -277,6 +297,7 @@ func cloneSnapshot(s model.Snapshot) model.Snapshot {
 	for _, a := range s.Access {
 		out.Access = append(out.Access, *access.Clone(&a))
 	}
+	out.Shortcuts = slices.Clone(s.Shortcuts)
 	return out
 }
 

@@ -75,6 +75,7 @@ const (
 	TypeGrant      Type = "grant"
 	TypePolicy     Type = "policy"
 	TypeAccess     Type = "access"
+	TypeShortcut   Type = "shortcut"
 )
 
 // Header is the part every item plaintext shares. ItemVersion is a u64
@@ -166,6 +167,26 @@ type Snippet struct {
 	Description string   `json:"description"`
 }
 
+// Shortcut is a command bound to one or two keys of the session panel (hop
+// connect, Ctrl-]). Choosing it types Command into the live ssh session,
+// then Enter unless Enter is false. HostID names the host whose panel it
+// belongs to; zero is a global shortcut, in every host's panel. A host
+// shortcut takes the place of any global one whose keys equal its own or
+// are a prefix of them, or the other way round (EffectiveShortcuts).
+//
+// It is its own item type, not a snippet with more members: a build that
+// predates it stops on it with "upgrade hop" (§5.2), where an unknown
+// snippet member would fail as an unreadable item.
+type Shortcut struct {
+	Header
+	Name        string `json:"name"`
+	Keys        string `json:"keys"`
+	Command     string `json:"command"`
+	Enter       bool   `json:"enter"`
+	HostID      ID     `json:"host_id"`
+	Description string `json:"description"`
+}
+
 // Policy is an account setting every device follows (type "policy"). A
 // device that has not reached the server for longer than MaxOffline
 // seconds locks and refuses to unlock until it does; 0 turns that off. A
@@ -252,6 +273,7 @@ type Snapshot struct {
 	Snippets    []Snippet
 	Policies    []Policy
 	Access      []Access
+	Shortcuts   []Shortcut
 	Marks       map[ID]Mark
 }
 

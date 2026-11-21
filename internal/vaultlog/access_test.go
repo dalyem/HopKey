@@ -167,7 +167,8 @@ func withHeaderOf(t testing.TB, it crypto.Item, v uint64) crypto.Item {
 	return out
 }
 
-// access is one of the item types this build and its server accept.
+// access and shortcut are among the item types this build and its server
+// accept.
 func TestItemTypesListAccess(t *testing.T) {
 	types := ItemTypes()
 	for i, typ := range types {
@@ -178,7 +179,7 @@ func TestItemTypesListAccess(t *testing.T) {
 			t.Errorf("not sorted: %v", types)
 		}
 	}
-	if len(types) != 7 || !isItemType(model.TypeAccess) {
+	if len(types) != 8 || !isItemType(model.TypeAccess) || !isItemType(model.TypeShortcut) {
 		t.Errorf("types %v", types)
 	}
 }

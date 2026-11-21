@@ -302,7 +302,7 @@ func TestClassificationIsComplete(t *testing.T) {
 	for typ, v := range map[model.Type]any{
 		model.TypeHost: model.Host{}, model.TypeSnippet: model.Snippet{}, model.TypeKey: model.Key{},
 		model.TypeCredential: model.Credential{}, model.TypePolicy: model.Policy{},
-		model.TypeAccess: model.Access{},
+		model.TypeAccess: model.Access{}, model.TypeShortcut: model.Shortcut{},
 	} {
 		cl := classifications[typ]
 		if cl == nil {

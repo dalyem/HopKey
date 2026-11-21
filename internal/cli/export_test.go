@@ -1,6 +1,19 @@
 package cli
 
-import "context"
+import (
+	"context"
+
+	"github.com/dalyem/hopkey/internal/daemon"
+	"github.com/dalyem/hopkey/internal/termpanel"
+)
+
+// SessionShortcuts is the session panel's lookup, sessionShortcuts.
+func SessionShortcuts(ctx context.Context, e *Env, rr *daemon.ResolveResult) ([]termpanel.Shortcut, error) {
+	return e.sessionShortcuts(ctx, rr)
+}
+
+// ShortcutHotkey is shortcutHotkey.
+func ShortcutHotkey(e *Env) (key byte, on bool, err error) { return e.shortcutHotkey() }
 
 // SetLogoutCleanupHook sets testHookLogoutCleanup until the returned
 // function runs.

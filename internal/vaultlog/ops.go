@@ -339,7 +339,8 @@ func (o *DeviceRetireOp) validate() error {
 // isItemType reports whether t is one of the §5.2 item types.
 func isItemType(t model.Type) bool {
 	switch t {
-	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypeGrant, model.TypePolicy, model.TypeAccess:
+	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypeGrant, model.TypePolicy, model.TypeAccess,
+		model.TypeShortcut:
 		return true
 	}
 	return false
