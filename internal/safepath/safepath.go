@@ -77,8 +77,8 @@ func EnsurePrivateDir(dir string) (string, error) {
 // or changing anything: the path to dir, as far as it exists, must be
 // owned by root or the current user and not writable by group or others
 // (with EnsurePrivateDir's sticky exception), and so must dir itself when
-// it is there. It is for a command that would otherwise ask for secrets
-// first and fail when it creates dir.
+// it is there, which must not be a symlink. It is for a command that would
+// otherwise ask for secrets first and fail when it creates dir.
 func Check(dir string) error {
 	if !filepath.IsAbs(dir) {
 		return fmt.Errorf("safepath: %q is not absolute", dir)
@@ -91,6 +91,19 @@ func Check(dir string) error {
 	}
 	if len(missing) > 0 {
 		existing = filepath.Dir(missing[len(missing)-1])
+	} else {
+		// As EnsurePrivateDir: symlinks in the ancestors are followed, and
+		// one in the last component is refused.
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("safepath: %s is a symlink", dir)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("safepath: %s is not a directory", dir)
+		}
 	}
 	resolved, err := filepath.EvalSymlinks(existing)
 	if err != nil {

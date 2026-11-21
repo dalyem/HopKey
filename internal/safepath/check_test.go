@@ -50,3 +50,43 @@ func TestCheckAcceptsAndRefusesLikeEnsurePrivateDirWithoutCreating(t *testing.T)
 		t.Errorf("Check changed the mode to %o", fi.Mode().Perm())
 	}
 }
+
+// Check and EnsurePrivateDir agree on symlinks: a final component that is
+// one is refused, dangling or not, and a symlinked ancestor is followed.
+func TestCheckTreatsSymlinksAsEnsurePrivateDirDoes(t *testing.T) {
+	base, err := os.MkdirTemp("", "sp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(base) })
+	if err := os.Chmod(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	dangling := filepath.Join(base, "dangling")
+	if err := os.Symlink(filepath.Join(base, "gone"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		what, dir string
+		ok        bool
+	}{
+		{"a final symlink to a private directory", link, false},
+		{"a dangling final symlink", dangling, false},
+		{"a directory below a symlinked ancestor", filepath.Join(link, "below"), true},
+		{"a directory below a dangling symlink", filepath.Join(dangling, "below"), false},
+	} {
+		checkErr := Check(c.dir)
+		_, ensureErr := EnsurePrivateDir(c.dir)
+		if (checkErr == nil) != c.ok || (ensureErr == nil) != c.ok {
+			t.Errorf("%s: Check %v, EnsurePrivateDir %v; want accepted %v", c.what, checkErr, ensureErr, c.ok)
+		}
+	}
+}
