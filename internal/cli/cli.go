@@ -275,15 +275,29 @@ func (e *Env) notice(asJSON bool, msg string) {
 
 // ForceQuit is for a second SIGINT or SIGTERM, which ends hop at once,
 // however far it got after the first. Where the vault's lock state was
-// still to be put back, it says what to run; then it exits.
+// still to be put back, it says what to run; then it exits. Saying so is
+// best-effort: a stderr nobody reads (a full pipe) can keep a write, and
+// warnMu with it, forever, so it waits for the notice at most
+// forceQuitWait.
 func (e *Env) ForceQuit() {
 	if e.restorePending() {
-		e.notice(e.currentHoldJSON(), quitText)
+		said := make(chan struct{})
+		go func() {
+			defer close(said)
+			e.notice(e.currentHoldJSON(), quitText)
+		}()
+		select {
+		case <-said:
+		case <-time.After(forceQuitWait):
+		}
 	}
 	if e.Exit != nil {
 		e.Exit(ExitInterrupted)
 	}
 }
+
+// forceQuitWait bounds how long ForceQuit waits to say what to run.
+const forceQuitWait = 200 * time.Millisecond
 
 // errHalted is what a prompt returns once a signal ended the command
 // while it waited (prompt): its answer is not used.
