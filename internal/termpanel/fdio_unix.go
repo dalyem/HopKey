@@ -144,9 +144,11 @@ func (r *reader) stop() {
 	})
 }
 
-// writeLimit is how much input the writer holds before the proxy stops
-// reading the terminal, so that a child that does not read its input
-// slows the user down rather than hop's memory growing.
+// writeLimit is how much input the writer holds for the child, at most:
+// the proxy queues no more than room allows, and stops reading the
+// terminal while it has input that does not fit, so that a child that
+// does not read its input slows the user down rather than hop's memory
+// growing.
 const writeLimit = 64 << 10
 
 // writer writes to a non-blocking descriptor in a goroutine, once
@@ -158,7 +160,7 @@ type writer struct {
 	q       [][]byte
 	n       int
 	kick    chan struct{}
-	space   chan struct{} // the queue fell below writeLimit
+	space   chan struct{} // the queue got shorter, and is below writeLimit
 	quit    chan struct{}
 	done    chan struct{}
 	once    sync.Once
@@ -193,10 +195,13 @@ func (w *writer) send(b []byte) {
 	}
 }
 
-func (w *writer) full() bool {
+func (w *writer) full() bool { return w.room() == 0 }
+
+// room is how much more the queue takes.
+func (w *writer) room() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.n >= writeLimit
+	return max(writeLimit-w.n, 0)
 }
 
 func (w *writer) run() {

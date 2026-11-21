@@ -116,6 +116,7 @@ type panelLook struct {
 	hotkey     byte
 	unicode    bool // box drawing and ellipsis characters; else ASCII
 	canSuspend bool
+	note       string // shown above the hints, when set
 }
 
 const (
@@ -193,10 +194,13 @@ func layout(cols, rows int, es []entry, prefix string, look panelLook) view {
 		}
 	}
 	footer := wrapHints(hints, dot, text)
+	if look.note != "" {
+		footer = append([][]seg{{{look.note, styleBold}}}, footer...)
+	}
 
 	room := rows - 1 - 2 - len(footer) // a line of the screen stays clear
 	if cols < minWidth-10 || room < 1 {
-		return bar(cols, es, prefix, hk)
+		return bar(cols, es, prefix, hk, look.note)
 	}
 	if len(body) > room {
 		cut := 0
@@ -256,10 +260,13 @@ func wrapHints(hints []string, sep string, w int) [][]seg {
 }
 
 // bar is the panel for a screen too small for the box: one reverse-video
-// line in the top right corner with the keys, or a notice when there is
-// no shortcut.
-func bar(cols int, es []entry, prefix, hk string) view {
+// line in the top right corner with the note, if any, and the keys, or a
+// notice when there is no shortcut.
+func bar(cols int, es []entry, prefix, hk, note string) view {
 	t := " " + hk + " "
+	if note != "" {
+		t += note + ": "
+	}
 	if len(es) == 0 {
 		t += "no shortcuts "
 	}

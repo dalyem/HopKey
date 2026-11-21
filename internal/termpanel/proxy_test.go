@@ -924,3 +924,85 @@ func TestPanelTakesProtocolKeys(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	waitFile(t, typed, "echo hi\rgit status")
 }
+
+func (w *writer) queued() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.n
+}
+
+// A child that does not read its input fills the queue of input hop holds
+// for it. Then the panel adds nothing to the queue, nor does the input
+// after it closes, however the keys come: here one read at a time, each
+// submitting and opening the panel again. The panel says why it does
+// nothing, and still closes.
+func TestPanelKeepsInputQueueBounded(t *testing.T) {
+	for _, c := range []struct{ name, keys string }{
+		{"shortcut", "u\x1d"},
+		{"hotkey twice", "\x1d\x1d"},
+		{"typing after Ctrl-C", "\x03" + strings.Repeat("a", 1000) + "\x1d"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			v := newVTerm(t, 80, 24)
+			sc := []Shortcut{{Keys: "u", Name: "Long", Command: strings.Repeat("x", maxCommand), Enter: true}}
+			p, err := newProxy(Options{In: v.tty, Out: v.tty, Shortcuts: sc, DoubleTap: time.Hour})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.restore()
+			// Nothing reads the other side of the child's pty: once that
+			// is full, the queue fills. (In canonical mode the pty would
+			// drop what does not fit in a line.)
+			tio, err := unix.IoctlGetTermios(int(p.pts.Fd()), ioctlGetTermios)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tio.Lflag &^= unix.ICANON | unix.ECHO
+			if err := unix.IoctlSetTermios(int(p.pts.Fd()), ioctlSetTermios, tio); err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+				if p.w.full() {
+					time.Sleep(100 * time.Millisecond)
+					if p.w.full() {
+						break
+					}
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("the queue holds %d bytes", p.w.queued())
+				}
+				p.w.send(bytes.Repeat([]byte("q"), 4096))
+			}
+			limit := max(writeLimit, p.w.queued())
+			p.openPanel()
+			for i := 0; i < 50 && p.readsInput(); i++ {
+				p.handle(p.ip.feed([]byte(c.keys)))
+				if n := p.w.queued(); n > limit {
+					t.Fatalf("after %d reads of %q the queue holds %d bytes, over %d", i+1, c.keys, n, limit)
+				}
+			}
+			if !p.panel.open {
+				// The rest waits for room, and the terminal is not read
+				// meanwhile.
+				if p.readsInput() {
+					t.Fatal("the panel is closed, and the terminal is read with the queue full")
+				}
+				return
+			}
+			v.waitText(noteNotReading)
+			for _, k := range []string{"\x1b", "\x03", "\x1d"} {
+				if !p.panel.open {
+					p.openPanel()
+				}
+				p.tap = 0 // the hotkey closes
+				p.handle(append(p.ip.feed([]byte(k)), p.ip.flush()...))
+				if p.panel.open {
+					t.Fatalf("%q does not close the panel", k)
+				}
+			}
+			if n := p.w.queued(); n > limit {
+				t.Fatalf("the queue holds %d bytes, over %d", n, limit)
+			}
+		})
+	}
+}

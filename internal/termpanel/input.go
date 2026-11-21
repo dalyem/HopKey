@@ -19,6 +19,7 @@ const (
 	tokHotkey                  // the hotkey, pressed
 	tokHotkeyUp                // the hotkey's repeat or release, in the kitty keyboard protocol
 	tokPaste                   // part of a bracketed paste, markers included
+	tokLiteral                 // for the child as it is: the hotkey pressed twice
 )
 
 type token struct {

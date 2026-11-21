@@ -4,6 +4,7 @@ package termpanel
 
 import (
 	"context"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -108,10 +109,11 @@ type proxy struct {
 	onResume   func()
 	size       unix.Winsize
 	panel      panelState
-	needResume bool // continued in the background: resume once in front
-	gone       bool // the terminal hung up, or ctx is done: the pty is closed
-	outGone    bool // a write to the terminal failed
-	outDone    bool // the pty's output ended
+	held       []token // input for the child that the queue had no room for, and the keys after it
+	needResume bool    // continued in the background: resume once in front
+	gone       bool    // the terminal hung up, or ctx is done: the pty is closed
+	outGone    bool    // a write to the terminal failed
+	outDone    bool    // the pty's output ended
 	restored   sync.Once
 	emergency  sync.Mutex // the panel state onPanic reads
 }
@@ -128,6 +130,7 @@ type panelState struct {
 	slot      bool // the terminal's saved cursor (DECSC) holds the cursor to put back
 	view      view
 	prefix    string
+	note      string // why the last key did nothing
 	openedAt  time.Time
 }
 
@@ -281,14 +284,8 @@ func (p *proxy) loop(ctx context.Context, childDone, abort <-chan struct{}) {
 	esc.Stop()
 	escArmed := false
 	for {
-		// A full queue of input for the child stops the reading of the
-		// terminal, but not while the panel is open: its keys are the
-		// panel's, and the child's output waits for the panel, so a child
-		// held up writing it would never take the input that frees the
-		// queue, and Esc would never be read. The panel adds at most one
-		// command (maxCommand) or the hotkey to the queue, as it closes.
 		inC, spaceC := p.inR.out, (<-chan struct{})(nil)
-		if p.gone || (p.w.full() && !p.panel.open) {
+		if !p.readsInput() {
 			inC = nil
 			spaceC = p.w.space
 		}
@@ -313,6 +310,7 @@ func (p *proxy) loop(ctx context.Context, childDone, abort <-chan struct{}) {
 			p.handle(p.ip.feed(b))
 			p.inR.release(b)
 		case <-spaceC:
+			p.handle(nil) // what is held, as far as there is room
 		case b, ok := <-outC:
 			if !ok {
 				p.outDone = true
@@ -419,26 +417,53 @@ func (p *proxy) output(b []byte) {
 	}
 }
 
-// handle acts on the user's keys: passes them to the child, or to the
-// panel when it is open.
+// readsInput says whether the loop reads the terminal. Input for the
+// child that the queue has no room for stops it, and so does a full
+// queue, but not while the panel is open: its keys are the panel's, and
+// the child's output waits for the panel, so a child held up writing it
+// would never take the input that frees the queue, and Esc would never be
+// read. The panel adds to the queue only what it has room for.
+func (p *proxy) readsInput() bool {
+	return !p.gone && len(p.held) == 0 && (p.panel.open || !p.w.full())
+}
+
+// room is how much more input the queue for the child takes. Once the pty
+// is closed, what is sent is dropped, so there is room for anything.
+func (p *proxy) room() int {
+	if p.ptm < 0 {
+		return math.MaxInt
+	}
+	return p.w.room()
+}
+
+// handle acts on the user's keys, after any held: passes them to the
+// child, or to the panel when it is open. Input for the child that the
+// queue has no room for is held, with the keys after it, until there is
+// room (readsInput).
 func (p *proxy) handle(ts []token) {
+	if len(p.held) > 0 {
+		ts = append(p.held, ts...)
+		p.held = nil
+	}
 	var pass []byte
 	flush := func() {
 		p.send(pass)
 		pass = nil
 	}
-	for _, t := range ts {
+	for i, t := range ts {
 		switch {
+		case p.panel.pending && t.kind != tokHotkey:
+			p.panel.queued = append(p.panel.queued, copyTokens(ts[i:i+1])...)
+			continue
 		case p.panel.pending:
-			if t.kind == tokHotkey {
-				p.panel.pending, p.panel.queued = false, nil
-				p.send(append([]byte(nil), t.raw...))
-				continue
-			}
-			p.panel.queued = append(p.panel.queued, token{t.kind, append([]byte(nil), t.raw...)})
+			// The hotkey twice: the hotkey itself, for the child, held as
+			// that if need be.
+			p.panel.pending, p.panel.queued = false, nil
+			ts[i].kind = tokLiteral
 		case p.panel.open:
 			flush()
 			p.panelKey(t)
+			continue
 		case t.kind == tokHotkey:
 			flush()
 			if p.scr.ground() {
@@ -446,18 +471,38 @@ func (p *proxy) handle(ts []token) {
 			} else {
 				p.panel.pending, p.panel.pendingAt = true, time.Now()
 			}
+			continue
 		case t.kind == tokHotkeyUp:
-		default:
-			pass = append(pass, t.raw...)
+			continue
 		}
+		if len(pass)+len(t.raw) > p.room() {
+			flush()
+			if len(t.raw) > p.room() {
+				p.held = copyTokens(ts[i:])
+				return
+			}
+		}
+		pass = append(pass, t.raw...)
 	}
 	flush()
+}
+
+// copyTokens copies ts, whose bytes may be a read buffer's.
+func copyTokens(ts []token) []token {
+	out := make([]token, len(ts))
+	for i, t := range ts {
+		out[i] = token{t.kind, append([]byte(nil), t.raw...)}
+	}
+	return out
 }
 
 func (p *proxy) panelKey(t token) {
 	switch t.kind {
 	case tokHotkey:
 		quick := time.Since(p.panel.openedAt) < p.tap
+		if quick && !p.fits(t.raw) {
+			return
+		}
 		p.closePanel()
 		if quick {
 			p.send(append([]byte(nil), t.raw...))
@@ -537,12 +582,30 @@ func (p *proxy) key(c byte) {
 	}
 }
 
+// fits says whether the queue for the child has room for what the panel
+// would type, b. When it has not, the panel stays open and says why,
+// with a beep; what is queued already stays.
+func (p *proxy) fits(b []byte) bool {
+	if len(b) <= p.room() {
+		return true
+	}
+	p.beep()
+	if p.panel.note == "" {
+		p.panel.note = noteNotReading
+		p.drawPanel()
+	}
+	return false
+}
+
+// noteNotReading is the panel's note when the queue for the child has no
+// room for a shortcut's command or the hotkey.
+const noteNotReading = "Session isn't reading input"
+
 // fire closes the panel and types e's command, as if the user had: in a
 // bracketed paste when the remote side asked for those, so that a shell
 // or an editor takes it as text whatever its key bindings, then Enter
 // as a key of its own.
 func (p *proxy) fire(e entry) {
-	p.closePanel()
 	var b []byte
 	if e.typed != "" {
 		if p.scr.bracketed {
@@ -556,11 +619,17 @@ func (p *proxy) fire(e entry) {
 	if e.enter {
 		b = append(b, '\r')
 	}
+	if !p.fits(b) {
+		return
+	}
+	p.closePanel()
 	p.send(b)
 }
 
 func (p *proxy) layout() view {
-	return layout(p.scr.cols, p.scr.rows, p.es, p.panel.prefix, p.look)
+	look := p.look
+	look.note = p.panel.note
+	return layout(p.scr.cols, p.scr.rows, p.es, p.panel.prefix, look)
 }
 
 // openPanel draws the panel. On the normal screen it switches the
