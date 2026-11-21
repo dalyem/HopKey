@@ -184,11 +184,10 @@ func (e *Env) holdMarker() string { return filepath.Join(e.Paths.RunDir, holdMar
 
 // holdInfo is what the marker says: the pid of the hop auth command, and
 // handback once that command launched the daemon that is to take the vault
-// after it, which then keeps the vault locked if locked is set.
+// after it.
 type holdInfo struct {
 	pid      int
 	handback bool
-	locked   bool
 }
 
 // readHold reads the marker. ok is false unless it names a live process
@@ -210,18 +209,17 @@ func (e *Env) readHold() (holdInfo, bool) {
 	return hi, true
 }
 
-// parseHold reads a marker's text: "PID", "PID handback" or
-// "PID handback locked".
+// parseHold reads a marker's text: "PID" or "PID handback".
 func parseHold(text string) (holdInfo, bool) {
 	f := strings.Fields(text)
-	if len(f) == 0 || len(f) > 3 || (len(f) >= 2 && f[1] != "handback") || (len(f) == 3 && f[2] != "locked") {
+	if len(f) == 0 || len(f) > 2 || (len(f) == 2 && f[1] != "handback") {
 		return holdInfo{}, false
 	}
 	pid, err := strconv.Atoi(f[0])
 	if err != nil || pid <= 0 {
 		return holdInfo{}, false
 	}
-	return holdInfo{pid: pid, handback: len(f) >= 2, locked: len(f) == 3}, true
+	return holdInfo{pid: pid, handback: len(f) == 2}, true
 }
 
 // authHolder returns the pid of a live process that holds the vault for a
@@ -232,7 +230,7 @@ func (e *Env) authHolder() (int, bool) {
 }
 
 // handbackFrom says which hop auth command launched this daemon to take
-// the vault after it, and whether the daemon is to keep the vault locked.
+// the vault after it.
 func (e *Env) handbackFrom() (holdInfo, bool) {
 	hi, ok := e.readHold()
 	return hi, ok && hi.handback
@@ -303,14 +301,64 @@ func (h *vaultHold) unmark() {
 }
 
 // handOver turns the marker into a handback for the daemon about to be
-// started, which keeps the vault locked if locked is set. It reports
-// whether the marker says so.
-func (h *vaultHold) handOver(locked bool) bool {
-	text := fmt.Sprintf("%d handback\n", os.Getpid())
-	if locked {
-		text = fmt.Sprintf("%d handback locked\n", os.Getpid())
+// started. It reports whether the marker says so.
+func (h *vaultHold) handOver() bool {
+	return h.marker != "" && writeMarker(h.marker, fmt.Sprintf("%d handback\n", os.Getpid())) == nil
+}
+
+// startLockedName is, in the run directory, the instruction a hop auth
+// command leaves for the daemon that takes the vault after it: keep it
+// locked (startLocked). It is apart from the marker, which counts only
+// while its holder lives: away from a prompt the holder launches the daemon
+// and exits, and the daemon may read the run directory after that.
+const startLockedName = "start-locked"
+
+// startLockedMaxAge bounds how long an instruction to start locked is
+// followed: past the time the daemon it was left for takes to open the
+// vault (handbackWait), and short, so that one left by a daemon that never
+// started does not lock a vault made later in the same place.
+const startLockedMaxAge = 2 * time.Minute
+
+func (e *Env) startLockedFile() string { return filepath.Join(e.Paths.RunDir, startLockedName) }
+
+// startLocked leaves the instruction to start locked for the vault in this
+// data directory: the next daemon to open it locks it before it serves
+// anything (takeStartLocked), although its device key may open by itself.
+func (e *Env) startLocked() error {
+	dir, err := filepath.Abs(e.storeConfig().DataDir)
+	if err != nil {
+		return err
 	}
-	return h.marker != "" && writeMarker(h.marker, text) == nil
+	if _, err := safepath.EnsurePrivateDir(e.Paths.RunDir); err != nil {
+		return err
+	}
+	return writeMarker(e.startLockedFile(), dir+"\n")
+}
+
+// takeStartLocked reports whether the vault this daemon has opened is to
+// be served locked, and removes the instruction that says so: it is for
+// one daemon. One for another data directory is left for its own daemon;
+// one older than startLockedMaxAge is removed and not followed.
+func (e *Env) takeStartLocked() bool {
+	path := e.startLockedFile()
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	if time.Since(fi.ModTime()) > startLockedMaxAge {
+		os.Remove(path)
+		return false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	here, err := filepath.Abs(e.storeConfig().DataDir)
+	if err != nil || !sameDir(strings.TrimSpace(string(b)), here) {
+		return false
+	}
+	os.Remove(path)
+	return true
 }
 
 // holdVault stops the daemon so this process can own the vault. asJSON
@@ -468,14 +516,15 @@ func (h *vaultHold) release(ctx context.Context) {
 
 // restart starts the daemon again on the vault, which is free, and leaves
 // the vault in it as target says (restoreLockState). A vault that is to be
-// locked is handed over locked: the marker tells the daemon to lock it
-// before it serves anything (runDaemon), so it is never open in between.
+// locked is handed over locked: the instruction to start locked has the
+// daemon lock it before it serves anything (runDaemon), so it is never
+// open in between.
 func (h *vaultHold) restart(ctx context.Context, target restoreTo) {
-	if target != restoreLocked || !h.handOver(true) {
-		h.unmark()
+	if target == restoreLocked {
+		h.e.startLocked() // lockAgain, below, is the check
 	}
+	h.unmark()
 	err := startDaemon(context.WithoutCancel(ctx), h.e)
-	h.unmark() // a handback the daemon did not take
 	if err != nil {
 		warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (hop sync starts it): "+err.Error())
 		return
@@ -572,7 +621,8 @@ const closeWait = 5 * time.Second
 // after Ctrl-C at a prompt an open vault is open. Elsewhere the flow may be
 // using what it holds, so it is left to the exit, and the marker turns into
 // a handback: hop daemon, finding the vault busy, waits for this process to
-// exit (runDaemon), and keeps the vault locked if it was. So does a vault
+// exit (runDaemon), and keeps the vault locked if it was (startLocked),
+// whether or not this process is still there when it looks. So does a vault
 // that is still busy when that is closed. A release already under way
 // finishes first.
 //
@@ -597,8 +647,14 @@ func (h *vaultHold) abandon() {
 			h.restart(context.Background(), target)
 			return
 		}
-		// The marker now tells the daemon to wait for this process.
-		if !h.handOver(target == restoreLocked) {
+		// The marker now tells the daemon to wait for this process, and
+		// the instruction to start locked outlives it.
+		if target == restoreLocked {
+			if err := h.e.startLocked(); err != nil {
+				warn(h.e, h.asJSON, "the vault was locked before this command and may be open in the hop daemon that takes it: run hop lock ("+err.Error()+")")
+			}
+		}
+		if !h.handOver() {
 			h.unmark()
 		}
 		launch := h.e.StartDaemon

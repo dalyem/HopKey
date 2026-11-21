@@ -42,10 +42,10 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 		vault, err = e.OpenStore()
 	}
 	if err == nil {
-		if l, ok := vault.(interface{ Lock() }); ok && handback && hb.locked {
-			// The command found the vault locked, and leaves it so: it is
-			// locked before this daemon serves anything, although its device
-			// key may open by itself.
+		if l, ok := vault.(interface{ Lock() }); ok && e.takeStartLocked() {
+			// A hop auth command found the vault locked, and leaves it so:
+			// it is locked before this daemon serves anything, although its
+			// device key may open by itself.
 			l.Lock()
 		}
 		e.clearHandback()
