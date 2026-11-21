@@ -1528,6 +1528,8 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 			snap.Policies = append(snap.Policies, *v)
 		case *model.Access:
 			snap.Access = append(snap.Access, *access.Clone(v))
+		case *model.Shortcut:
+			snap.Shortcuts = append(snap.Shortcuts, *v)
 		}
 	}
 	byName := func(a, b model.Header, an, bn string) int {
@@ -1542,6 +1544,7 @@ func snapshotOf(sec *vaultlog.Secrets) model.Snapshot {
 	slices.SortFunc(snap.Snippets, func(a, b model.Snippet) int { return byName(a.Header, b.Header, a.Name, b.Name) })
 	slices.SortFunc(snap.Policies, func(a, b model.Policy) int { return byName(a.Header, b.Header, "", "") })
 	slices.SortFunc(snap.Access, func(a, b model.Access) int { return byName(a.Header, b.Header, a.Label, b.Label) })
+	slices.SortFunc(snap.Shortcuts, func(a, b model.Shortcut) int { return byName(a.Header, b.Header, a.Keys, b.Keys) })
 	return snap
 }
 
@@ -1712,6 +1715,16 @@ func (s *Store) PutPolicy(_ context.Context, p model.Policy) (model.Policy, erro
 	return *out, nil
 }
 
+// PutShortcut creates or replaces a shortcut (model.Shortcut). A host
+// shortcut's host must be live, as any reference must.
+func (s *Store) PutShortcut(_ context.Context, sc model.Shortcut) (model.Shortcut, error) {
+	out, err := put(s, &sc, model.TypeShortcut, nil)
+	if err != nil {
+		return model.Shortcut{}, err
+	}
+	return *out, nil
+}
+
 // header returns the shared header of an item pointer.
 func header(it crypto.Item) *model.Header {
 	switch v := it.(type) {
@@ -1726,6 +1739,8 @@ func header(it crypto.Item) *model.Header {
 	case *model.Policy:
 		return &v.Header
 	case *model.Access:
+		return &v.Header
+	case *model.Shortcut:
 		return &v.Header
 	}
 	return nil

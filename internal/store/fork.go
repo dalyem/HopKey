@@ -176,6 +176,7 @@ type ForkPlan struct {
 	Credentials int    `json:"credentials"`
 	Snippets    int    `json:"snippets"`
 	Policies    int    `json:"policies"`
+	Shortcuts   int    `json:"shortcuts,omitempty"`
 	// Pending and Held count the queued changes (outbox records) that
 	// never reached the server; the fork keeps what they show.
 	Pending int `json:"pending"`
@@ -256,6 +257,7 @@ type forkPlanRecord struct {
 	Credentials  int          `json:"credentials"`
 	Snippets     int          `json:"snippets"`
 	Policies     int          `json:"policies"`
+	Shortcuts    int          `json:"shortcuts,omitempty"`
 	Pending      int          `json:"pending"`
 	Held         int          `json:"held"`
 	HeldDeletes  int          `json:"held_deletes"`
@@ -269,7 +271,7 @@ func (j *forkJournal) result() *ForkResult {
 		ForkPlan: ForkPlan{
 			DataDir: j.DataDir, Backup: j.Backup, Server: p.Server, Old: p.Old, Logout: p.Logout,
 			Hosts: p.Hosts, Keys: p.Keys, Credentials: p.Credentials, Snippets: p.Snippets, Policies: p.Policies,
-			Pending: p.Pending, Held: p.Held, HeldDeletes: p.HeldDeletes, OtherDevices: p.OtherDevices, Departed: p.Departed,
+			Shortcuts: p.Shortcuts, Pending: p.Pending, Held: p.Held, HeldDeletes: p.HeldDeletes, OtherDevices: p.OtherDevices, Departed: p.Departed,
 		},
 		New: j.New, Discarded: j.Discarded, BackupMissing: j.BackupMissing,
 	}
@@ -1064,7 +1066,7 @@ func (p *PendingFork) read() error {
 // refused rather than dropped or carried without its rules.
 func forkCarries(t model.Type) bool {
 	switch t {
-	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypePolicy:
+	case model.TypeHost, model.TypeKey, model.TypeCredential, model.TypeSnippet, model.TypePolicy, model.TypeShortcut:
 		return true
 	}
 	return false
@@ -1238,6 +1240,8 @@ func (p *PendingFork) readLoaded(v *loaded, sf *serverFile, logout string) error
 			plan.Snippets++
 		case *model.Policy:
 			plan.Policies++
+		case *model.Shortcut:
+			plan.Shortcuts++
 		}
 	}
 	for id, d := range st.Devices {
@@ -1289,6 +1293,8 @@ func itemLabel(it crypto.Item) string {
 		return fmt.Sprintf("snippet %q", v.Name)
 	case *model.Policy:
 		return "the account policy"
+	case *model.Shortcut:
+		return fmt.Sprintf("shortcut %q", v.Keys)
 	}
 	return "an item"
 }
@@ -1297,7 +1303,8 @@ func itemLabel(it crypto.Item) string {
 // rules, which verified state already does but the queued changes applied
 // to a newer verified state need not: a host reference to an item that is
 // gone or of another type, and a jump host loop, are cleared, each with a
-// warning.
+// warning. A shortcut of a host that is gone is dropped, with a warning:
+// cleared, it would be a global one, in every host's panel.
 func sanitizeRefs(items map[model.ID]crypto.Item) []string {
 	var warns []string
 	ids := make([]model.ID, 0, len(items))
@@ -1310,6 +1317,10 @@ func sanitizeRefs(items map[model.ID]crypto.Item) []string {
 		return ok && header(it).Type == t
 	}
 	for _, id := range ids {
+		if sc, ok := items[id].(*model.Shortcut); ok && !sc.HostID.IsZero() && !is(sc.HostID, model.TypeHost) {
+			delete(items, id)
+			warns = append(warns, fmt.Sprintf("shortcut %q belonged to a host the vault no longer has; it is left out", sc.Keys))
+		}
 		h, ok := items[id].(*model.Host)
 		if !ok {
 			continue
@@ -1448,7 +1459,7 @@ func (p *PendingFork) planRecord() forkPlanRecord {
 	pl := p.plan
 	return forkPlanRecord{
 		Server: pl.Server, Old: pl.Old, Logout: pl.Logout, Hosts: pl.Hosts, Keys: pl.Keys, Credentials: pl.Credentials,
-		Snippets: pl.Snippets, Policies: pl.Policies, Pending: pl.Pending, Held: pl.Held, HeldDeletes: pl.HeldDeletes,
+		Snippets: pl.Snippets, Policies: pl.Policies, Shortcuts: pl.Shortcuts, Pending: pl.Pending, Held: pl.Held, HeldDeletes: pl.HeldDeletes,
 		OtherDevices: pl.OtherDevices, Departed: pl.Departed,
 	}
 }
@@ -1513,19 +1524,29 @@ func (p *PendingFork) remap(old model.ID, it crypto.Item) (crypto.Item, error) {
 			}
 		}
 	}
+	if sc, ok := c.(*model.Shortcut); ok && !sc.HostID.IsZero() {
+		nid, ok := p.ids[sc.HostID]
+		if !ok {
+			return nil, fmt.Errorf("store: shortcut %q refers to a host the fork did not read", sc.Keys)
+		}
+		sc.HostID = nid
+	}
 	return c, nil
 }
 
 // depOrder lists the IDs of items so that every item comes after what it
 // refers to: keys, credentials, policies and snippets first, then hosts,
-// each after its jump host.
+// each after its jump host, then shortcuts.
 func depOrder(items map[model.ID]crypto.Item) []model.ID {
 	rank := map[model.Type]int{model.TypeKey: 0, model.TypeCredential: 1, model.TypePolicy: 2, model.TypeSnippet: 3}
-	var flat, hosts []model.ID
+	var flat, hosts, shortcuts []model.ID
 	for id, it := range items {
-		if _, ok := it.(*model.Host); ok {
+		switch it.(type) {
+		case *model.Host:
 			hosts = append(hosts, id)
-		} else {
+		case *model.Shortcut:
+			shortcuts = append(shortcuts, id)
+		default:
 			flat = append(flat, id)
 		}
 	}
@@ -1554,7 +1575,8 @@ func depOrder(items map[model.ID]crypto.Item) []model.ID {
 	for _, id := range hosts {
 		visit(id)
 	}
-	return flat
+	slices.SortFunc(shortcuts, byID)
+	return append(flat, shortcuts...)
 }
 
 // importInto writes the items into ns, the new vault: verified state in
@@ -1729,6 +1751,9 @@ func readNewVault(ctx context.Context, cfg Config) (*forkedVault, error) {
 	}
 	for i := range snap.Policies {
 		nv.items[snap.Policies[i].ItemID] = &snap.Policies[i]
+	}
+	for i := range snap.Shortcuts {
+		nv.items[snap.Shortcuts[i].ItemID] = &snap.Shortcuts[i]
 	}
 	return nv, nil
 }
