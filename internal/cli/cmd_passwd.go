@@ -78,11 +78,12 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 			return failf("the vault is locked, so its password can't be changed: %s", lockedFix(st.Vault))
 		}
 		// What hop unlock would do, with the passphrase just typed. The vault
-		// goes back as it was when the command ends.
+		// goes back as it was when the command ends, and when Ctrl-C ends it
+		// at a prompt, which does not return: registered before the unlock.
+		defer e.atInterrupt(func() { lockAgain(ctx, e, false) })()
 		if err := sendDevicePassphrase(ctx, e, c, false, pass); err != nil {
 			return failf("%v", err)
 		}
-		defer lockAgain(ctx, e, false)
 	}
 
 	var pending daemon.KitResult
@@ -95,7 +96,7 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 	}
 
 	fmt.Fprintln(e.Stderr, "A new master password also makes a new Secret Key, a new Recovery Key and a new Emergency Kit.")
-	cur, err := e.ReadPassword("Current master password: ")
+	cur, err := e.readPassword("Current master password: ")
 	if err != nil {
 		return failf("reading the master password: %v", err)
 	}

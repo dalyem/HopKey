@@ -314,6 +314,8 @@ func changeWarning(e *Env, asJSON bool, w *daemon.Error, err error) error {
 // line, or a {"warning": ...} line when the caller asked for JSON, so
 // stdout keeps its shape.
 func warn(e *Env, asJSON bool, msg string) {
+	e.warnMu.Lock()
+	defer e.warnMu.Unlock()
 	if e.warned[msg] {
 		return
 	}
@@ -377,7 +379,7 @@ func pick(e *Env, res *resolve.Result) (string, error) {
 		return "", failf("no vault host to pick; link the tailnet node with hop ts link <host> <node-id>")
 	}
 	fmt.Fprintf(e.Stderr, "pick 1-%d: ", len(named))
-	line, err := readLine(e.Stdin)
+	line, err := e.readLine()
 	if err != nil && line == "" {
 		return "", failf("no choice made")
 	}

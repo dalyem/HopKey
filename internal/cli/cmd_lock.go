@@ -186,7 +186,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 		return failf("%v. Nothing was asked or changed", store.ErrAlreadyUnlocked)
 	}
 	fmt.Fprintln(e.Stderr, "This opens the vault with your master password and Secret Key, and gives this machine a new device key.")
-	pw, err := e.ReadPassword("Master password: ")
+	pw, err := e.readPassword("Master password: ")
 	if err != nil {
 		return failf("reading the master password: %v", err)
 	}
@@ -194,7 +194,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	p := daemon.UnlockParams{Password: string(pw)}
 	w, err := c.CallWarn(ctx, daemon.OpUnlock, p, nil)
 	if daemon.IsCode(err, daemon.CodeNeedSecretKey) {
-		sk, rerr := e.ReadPassword("Secret Key (from your Emergency Kit): ")
+		sk, rerr := e.readPassword("Secret Key (from your Emergency Kit): ")
 		if rerr != nil {
 			return failf("reading the Secret Key: %v", rerr)
 		}

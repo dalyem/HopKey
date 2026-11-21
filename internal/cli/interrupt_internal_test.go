@@ -409,15 +409,25 @@ func fakeShutdown(t *testing.T, e *Env, answer func(c net.Conn, ln net.Listener)
 	}
 	t.Cleanup(func() { ln.Close() })
 	go func() {
-		c, err := ln.Accept()
-		if err != nil {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			line, err := bufio.NewReader(c).ReadString('\n')
+			var req daemon.Request
+			if err == nil && json.Unmarshal([]byte(line), &req) == nil && req.Op == daemon.OpStatus {
+				// What the hold asks first: whether the vault is locked.
+				json.NewEncoder(c).Encode(daemon.Response{OK: true, Result: json.RawMessage(`{}`)})
+				c.Close()
+				continue
+			}
+			if err == nil {
+				answer(c, ln)
+			}
+			c.Close()
 			return
 		}
-		defer c.Close()
-		if _, err := bufio.NewReader(c).ReadString('\n'); err != nil {
-			return
-		}
-		answer(c, ln)
 	}()
 }
 

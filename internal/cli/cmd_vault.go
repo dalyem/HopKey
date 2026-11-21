@@ -164,7 +164,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		if e.ReadPassword == nil {
 			return failf("the device key file is sealed and stdin is not a terminal to ask for its passphrase; set %s or run hop vault fork in an interactive terminal", store.PassphraseEnv)
 		}
-		if pass, err = e.ReadPassword(devicePassphrasePrompt); err != nil {
+		if pass, err = e.readPassword(devicePassphrasePrompt); err != nil {
 			return failf("reading the device passphrase: %v", err)
 		}
 		defer clear(pass)
@@ -175,7 +175,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 	var res *store.ForkResult
 	var abandoned bool
 	if pending {
-		h.keepOpen = false // an interrupted fork is being finished
+		h.leaving() // an interrupted fork is being finished
 	}
 	err = retryBusy(ctx, func() (err error) {
 		res, abandoned, err = store.ResumeFork(ctx, cfg, store.ForkOptions{Passphrase: pass, KeepOld: *keepOld})
@@ -185,7 +185,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		return forkFailure(err)
 	}
 	if res != nil {
-		h.handPass = true
+		h.succeeded()
 		if *asJSON {
 			return printJSON(e, ForkReport{ForkResult: *res})
 		}
@@ -213,7 +213,9 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 	if err != nil {
 		return forkFailure(err)
 	}
-	defer p.Close()
+	// The prepared fork owns the vault: abandon closes it, as it closes a
+	// store, if Ctrl-C finds the fork at a prompt.
+	defer h.track(p.Close)()
 	if *kitFile != "" {
 		if in, err := p.Touches(*kitFile); err != nil {
 			return failf("%v", err)
@@ -272,7 +274,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		}
 		return failf("%v; nothing was changed", err)
 	}
-	h.keepOpen = false // begun: the vault is leaving
+	h.leaving() // begun: the vault is leaving
 	res, err = p.Commit(ctx, *discardOld)
 	if err != nil {
 		// The kit file is deleted only when the new account is known to
@@ -291,7 +293,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		return failf("the fork's last step failed (%v), and the new vault may be in place in %s: keep the Emergency Kit shown above%s. "+
 			"hop auth status shows which vault is there", err, oneLine(cfg.DataDir), kitFileNote(*kitFile))
 	}
-	h.handPass = true
+	h.succeeded()
 	if *asJSON {
 		return printJSON(e, ForkReport{ForkResult: *res, DeviceKeyStore: p.DeviceStore(), KitFile: *kitFile})
 	}

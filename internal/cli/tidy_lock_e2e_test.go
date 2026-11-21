@@ -370,30 +370,7 @@ func TestInitOnAnUnsafePathRefusesBeforeAnySecret(t *testing.T) {
 // itself. The command cannot return from the prompt, so the process is
 // abandoned and the vault freed for the daemon.
 func TestInterruptAtAPromptRestoresTheLockState(t *testing.T) {
-	interrupted := func(t *testing.T, m *machine, s *session, args ...string) {
-		t.Helper()
-		ictx, interrupt := context.WithCancelCause(context.Background())
-		exited := make(chan int, 1)
-		release := make(chan struct{})
-		s.tty, s.ctx, s.grace = true, ictx, 50*time.Millisecond
-		s.exit = func(code int) { exited <- code }
-		s.answer = func(string) string {
-			interrupt(cli.ErrInterrupted) // Ctrl-C, while the prompt waits
-			<-release
-			return ""
-		}
-		done := make(chan int, 1)
-		go func() { done <- m.hop(t, s, args...) }()
-		select {
-		case code := <-exited:
-			if code != cli.ExitInterrupted {
-				t.Errorf("exit %d, want %d", code, cli.ExitInterrupted)
-			}
-		case <-time.After(60 * time.Second):
-			t.Fatal("the interrupted command did not give the vault up")
-		}
-		t.Cleanup(func() { close(release); <-done })
-	}
+	interrupted := interruptAtPrompt
 	t.Run("open, sealed device key", func(t *testing.T) {
 		_, m := sealedAccount(t)
 		interrupted(t, m, &session{env: map[string]string{"HOP_PASSWORD": resolvePassword}, secrets: map[string]string{askOldPass: devPass}}, "auth", "rotate")
@@ -408,4 +385,32 @@ func TestInterruptAtAPromptRestoresTheLockState(t *testing.T) {
 			t.Error("the vault was locked before the interrupted command and is open after it")
 		}
 	})
+}
+
+// interruptAtPrompt runs hop args on m in session s, on a terminal, and
+// sends it Ctrl-C at its first line prompt, which then never returns while
+// the test runs: the process is abandoned, and the test waits for its exit.
+func interruptAtPrompt(t *testing.T, m *machine, s *session, args ...string) {
+	t.Helper()
+	ictx, interrupt := context.WithCancelCause(context.Background())
+	exited := make(chan int, 1)
+	release := make(chan struct{})
+	s.tty, s.ctx, s.grace = true, ictx, 50*time.Millisecond
+	s.exit = func(code int) { exited <- code }
+	s.answer = func(string) string {
+		interrupt(cli.ErrInterrupted) // Ctrl-C, while the prompt waits
+		<-release
+		return ""
+	}
+	done := make(chan int, 1)
+	go func() { done <- m.hop(t, s, args...) }()
+	select {
+	case code := <-exited:
+		if code != cli.ExitInterrupted {
+			t.Errorf("exit %d, want %d", code, cli.ExitInterrupted)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the interrupted command did not give the vault up")
+	}
+	t.Cleanup(func() { close(release); <-done })
 }

@@ -63,7 +63,7 @@ func readPrivateKey(e *Env, path string) (pem string, key *sshkeys.Private, err 
 		if e.ReadPassword == nil || !e.StdinTTY {
 			return "", nil, failf("%s is passphrase-protected; run this on a terminal so hop can ask for the passphrase", path)
 		}
-		pass, perr := e.ReadPassword(safef("Passphrase for %s: ", path))
+		pass, perr := e.readPassword(safef("Passphrase for %s: ", path))
 		if perr != nil {
 			return "", nil, failf("reading the passphrase: %v", perr)
 		}

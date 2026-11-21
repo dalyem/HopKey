@@ -66,6 +66,14 @@ func (e *Env) typedPass() []byte {
 	return bytes.Clone(e.devPass)
 }
 
+// hasTypedPass reports whether a device passphrase was typed for this
+// command.
+func (e *Env) hasTypedPass() bool {
+	e.devPassMu.Lock()
+	defer e.devPassMu.Unlock()
+	return len(e.devPass) > 0
+}
+
 // clearDevicePass drops the typed device passphrase.
 func (e *Env) clearDevicePass() {
 	e.devPassMu.Lock()
@@ -202,11 +210,11 @@ func askSeal(e *Env) (bool, error) {
 		return false, err
 	}
 	for range maxAsks {
-		pass, err := e.ReadPassword("New device passphrase: ")
+		pass, err := e.readPassword("New device passphrase: ")
 		if err != nil {
 			return false, failf("reading the device passphrase: %v", err)
 		}
-		again, err := e.ReadPassword("Repeat the device passphrase: ")
+		again, err := e.readPassword("Repeat the device passphrase: ")
 		if err != nil {
 			clear(pass)
 			return false, failf("reading the device passphrase: %v", err)
@@ -241,7 +249,7 @@ func validPassphrase(pass []byte) bool {
 func askYesNo(e *Env, question string) (bool, error) {
 	for range maxAsks {
 		fmt.Fprintf(e.Stderr, "%s [Y/n] ", question)
-		line, err := readLine(e.Stdin)
+		line, err := e.readLine()
 		if err != nil && line == "" {
 			if errors.Is(err, io.EOF) {
 				return false, failf("no answer: stdin ended; nothing was created")
@@ -274,7 +282,7 @@ func sealedKeyFile(dataDir string) bool {
 func (e *Env) askDevicePassphrase(check bool) error {
 	dir := e.storeConfig().DataDir
 	for try := range maxAsks {
-		pass, err := e.ReadPassword(devicePassphrasePrompt)
+		pass, err := e.readPassword(devicePassphrasePrompt)
 		if err != nil {
 			return failf("reading the device passphrase: %v", err)
 		}

@@ -328,7 +328,7 @@ func runAuthSignup(ctx context.Context, e *Env, args []string) error {
 		}
 		return authFailure(err)
 	}
-	h.handPass = true
+	h.succeeded()
 	return printSignup(e, o.asJSON, res)
 }
 
@@ -496,7 +496,7 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 	}
 	defer closeStores(local, rs)
 	if errors.Is(err, authflow.ErrRecoveryIncomplete) && rs != nil {
-		h.handPass = true
+		h.succeeded()
 		return failf("signed in with the Recovery Key, but the recovery is not finished (%v); run hop auth resume to finish it", err)
 	}
 	if err != nil {
@@ -508,7 +508,7 @@ func runAuthLogin(ctx context.Context, e *Env, args []string) error {
 		}
 		return authFailure(err)
 	}
-	h.handPass = true
+	h.succeeded()
 	return printLogin(e, o.asJSON, *method, res)
 }
 
@@ -1353,7 +1353,7 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 			return failf("not logged out")
 		}
 	}
-	h.keepOpen = false // begun: the vault is leaving
+	h.leaving() // begun: the vault is leaving
 	res, err := authflow.Logout(ctx, env, s, store.LogoutOptions{DiscardPending: *discard, LocalOnly: *localOnly, Why: adminLockWhy(lock)})
 	if errors.Is(err, store.ErrLogoutPending) && errors.Is(err, syncclient.ErrUnauthorized) {
 		// The server doesn't know this device (401): a deleted account's

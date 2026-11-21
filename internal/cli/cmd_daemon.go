@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -32,16 +31,23 @@ func runDaemon(ctx context.Context, e *Env, args []string) error {
 	if pid, ok := e.authHolder(); ok {
 		return errHeld(pid)
 	}
+	// Read before the vault is opened: the hop auth command that launched
+	// this daemon may exit, and its marker count for nothing, meanwhile.
+	hb, handback := e.handbackFrom()
 	vault, err := e.OpenStore()
-	if errors.Is(err, store.ErrVaultBusy) {
-		if pid, ok := e.handbackFrom(); ok {
-			// An interrupted hop auth command launched this daemon as it
-			// exits: the vault is free once it is gone.
-			waitGone(ctx, pid, handbackWait)
-			vault, err = e.OpenStore()
-		}
+	if errors.Is(err, store.ErrVaultBusy) && handback {
+		// An interrupted hop auth command launched this daemon as it
+		// exits: the vault is free once it is gone.
+		waitGone(ctx, hb.pid, handbackWait)
+		vault, err = e.OpenStore()
 	}
 	if err == nil {
+		if l, ok := vault.(interface{ Lock() }); ok && handback && hb.locked {
+			// The command found the vault locked, and leaves it so: it is
+			// locked before this daemon serves anything, although its device
+			// key may open by itself.
+			l.Lock()
+		}
 		e.clearHandback()
 	}
 	if errors.Is(err, store.ErrVaultBusy) {
@@ -110,8 +116,10 @@ func waitGone(ctx context.Context, pid int, d time.Duration) {
 // clearHandback removes a handback marker once the daemon has the vault.
 func (e *Env) clearHandback() {
 	path := e.holdMarker()
-	if b, err := os.ReadFile(path); err == nil && strings.HasSuffix(strings.TrimSpace(string(b)), " handback") {
-		os.Remove(path)
+	if b, err := os.ReadFile(path); err == nil {
+		if hi, ok := parseHold(string(b)); ok && hi.handback {
+			os.Remove(path)
+		}
 	}
 }
 

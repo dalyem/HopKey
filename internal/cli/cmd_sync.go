@@ -1014,7 +1014,7 @@ func (r *resolver) ask(h *daemon.HeldChange) error {
 		return failf("nothing can resolve change %d here", h.N)
 	}
 	fmt.Fprintf(r.e.Stderr, "%s, or q) leave it held: ", strings.Join(offered, ", "))
-	line, err := readLine(r.e.Stdin)
+	line, err := r.e.readLine()
 	if err != nil && line == "" {
 		return failf("no choice made; change %d stays held", h.N)
 	}
@@ -1156,7 +1156,7 @@ func (r *resolver) readSets(h *daemon.HeldChange) ([]string, error) {
 	var out []string
 	for {
 		fmt.Fprint(r.e.Stderr, "> ")
-		line, err := readLine(r.e.Stdin)
+		line, err := r.e.readLine()
 		line = strings.TrimSpace(line)
 		if line == "" {
 			return out, nil

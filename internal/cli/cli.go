@@ -109,8 +109,23 @@ type Env struct {
 	InterruptGrace time.Duration
 
 	// warned holds the warnings already printed in this run, so a command
-	// that makes many changes says each one once.
+	// that makes many changes says each one once. Run's signal watcher
+	// warns too, hence warnMu.
+	warnMu sync.Mutex
 	warned map[string]bool
+
+	// prompts counts the reads of the terminal under way (prompt), and
+	// halted, once Run's signal watcher has made it, keeps any of them that
+	// returns from going back to the command, until it is closed.
+	promptMu sync.Mutex
+	prompts  int
+	halted   chan struct{}
+	resumed  bool
+
+	// onInterrupt is what a command that holds no vault has to undo if a
+	// signal ends it where it can't return (atInterrupt).
+	interruptMu sync.Mutex
+	onInterrupt func()
 
 	// hold is the hop auth command's hold of the vault while it lasts.
 	holdMu sync.Mutex
@@ -145,8 +160,9 @@ const ExitInterrupted = 130
 // holds nothing exits at once, as it did when the signal killed it,
 // unless it handles the context itself (ctxAware, decided before the
 // command starts: see handlesInterrupt). A hop key rotate that another
-// command runs is waited for (beginRotation). asJSON is the command's
-// output mode.
+// command runs is waited for (beginRotation). After that no prompt returns
+// to the command (prompt), and what it registered with atInterrupt runs
+// before the process exits. asJSON is the command's output mode.
 func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware, asJSON bool) {
 	if e.Exit == nil {
 		return
@@ -187,6 +203,10 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 		case <-time.After(grace):
 		}
 	}
+	// From here on no prompt returns to the command: what is typed after
+	// Ctrl-C is not acted on.
+	e.haltPrompts()
+	defer e.resumePrompts()
 	if h := e.currentHold(); h != nil {
 		asJSON = asJSON || h.asJSON
 		select {
@@ -198,6 +218,7 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 			h.abandon()
 		}
 	}
+	e.interrupted()
 	select {
 	case <-done:
 		return
@@ -207,6 +228,110 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 	// it returns (interruptedText), in JSON for a --json command.
 	printError(e, asJSON, &exitError{code: ExitInterrupted, msg: interruptedText})
 	e.Exit(ExitInterrupted)
+}
+
+// errHalted is what a prompt returns once a signal ended the command
+// while it waited (prompt): its answer is not used.
+var errHalted = errors.New(interruptedText)
+
+// prompt runs read, which reads an answer from the terminal. Once Run's
+// signal watcher has halted prompts (haltPrompts), the answer does not go
+// back to the command: prompt waits until the watcher is done giving the
+// vault up, and returns errHalted. So a command cannot act on an answer
+// typed after Ctrl-C, while the vault it holds is being freed.
+func (e *Env) prompt(read func() error) error {
+	e.promptMu.Lock()
+	e.prompts++
+	e.promptMu.Unlock()
+	err := read()
+	e.promptMu.Lock()
+	halted := e.halted
+	e.promptMu.Unlock()
+	if halted != nil {
+		<-halted
+		err = errHalted
+	}
+	e.promptMu.Lock()
+	e.prompts--
+	e.promptMu.Unlock()
+	return err
+}
+
+// readPassword is ReadPassword, through prompt.
+func (e *Env) readPassword(p string) ([]byte, error) {
+	var b []byte
+	err := e.prompt(func() (err error) {
+		b, err = e.ReadPassword(p)
+		return err
+	})
+	if errors.Is(err, errHalted) {
+		clear(b)
+		return nil, err
+	}
+	return b, err
+}
+
+// readLine reads a line from stdin (readLine), through prompt.
+func (e *Env) readLine() (string, error) {
+	var line string
+	err := e.prompt(func() (err error) {
+		line, err = readLine(e.Stdin)
+		return err
+	})
+	if errors.Is(err, errHalted) {
+		return "", err
+	}
+	return line, err
+}
+
+// haltPrompts keeps any prompt that returns from now on from going back to
+// the command, until resumePrompts. It reports whether one is under way:
+// then the command waits there, and does nothing more.
+func (e *Env) haltPrompts() (atPrompt bool) {
+	e.promptMu.Lock()
+	defer e.promptMu.Unlock()
+	if e.halted == nil {
+		e.halted = make(chan struct{})
+	}
+	return e.prompts > 0
+}
+
+// resumePrompts lets the prompts haltPrompts held return errHalted.
+func (e *Env) resumePrompts() {
+	e.promptMu.Lock()
+	defer e.promptMu.Unlock()
+	if e.halted != nil && !e.resumed {
+		close(e.halted)
+		e.resumed = true
+	}
+}
+
+// atInterrupt registers undo, for a command that holds no vault, to run
+// if a signal ends the command where it can't return: Run's watcher runs it
+// before the process exits. The function returned runs it otherwise; it
+// runs once, whichever comes first, and is for the command to defer.
+func (e *Env) atInterrupt(undo func()) func() {
+	var once sync.Once
+	f := func() { once.Do(undo) }
+	e.interruptMu.Lock()
+	e.onInterrupt = f
+	e.interruptMu.Unlock()
+	return func() {
+		f()
+		e.interruptMu.Lock()
+		e.onInterrupt = nil
+		e.interruptMu.Unlock()
+	}
+}
+
+// interrupted runs what atInterrupt registered, if anything.
+func (e *Env) interrupted() {
+	e.interruptMu.Lock()
+	f := e.onInterrupt
+	e.interruptMu.Unlock()
+	if f != nil {
+		f()
+	}
 }
 
 // beginRotation marks hop key rotate as changing hosts until end is
@@ -369,6 +494,9 @@ func Run(ctx context.Context, args []string, e *Env) int {
 		e.Getenv = os.Getenv
 	}
 	ctxAware := handlesInterrupt(args)
+	e.promptMu.Lock()
+	e.halted, e.resumed = nil, false
+	e.promptMu.Unlock()
 	done := make(chan struct{})
 	go e.watchInterrupt(ctx, done, ctxAware, wantsJSON(args))
 	err := dispatch(ctx, e, args)
@@ -655,7 +783,7 @@ func confirm(e *Env, yes bool, question string) (bool, error) {
 		return false, failf("%s: confirmation needed but stdin is not a terminal; pass --yes", question)
 	}
 	fmt.Fprintf(e.Stderr, "%s [y/N] ", question)
-	line, err := readLine(e.Stdin)
+	line, err := e.readLine()
 	if err != nil && line == "" {
 		return false, nil
 	}

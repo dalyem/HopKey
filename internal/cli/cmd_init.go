@@ -206,11 +206,11 @@ func deviceKeyWords(s string) string {
 
 // readNewPassword asks for a new master password twice.
 func readNewPassword(e *Env, prompt string) ([]byte, error) {
-	pw, err := e.ReadPassword(prompt)
+	pw, err := e.readPassword(prompt)
 	if err != nil {
 		return nil, failf("reading the master password: %v", err)
 	}
-	again, err := e.ReadPassword("Repeat it: ")
+	again, err := e.readPassword("Repeat it: ")
 	if err != nil {
 		clear(pw)
 		return nil, failf("reading the master password: %v", err)
@@ -324,7 +324,7 @@ func typeBack(e *Env, kit store.Kit) error {
 	} {
 		ok := false
 		for try := 0; try < 3 && !ok; try++ {
-			got, err := e.ReadPassword(fmt.Sprintf("Type the last group of your %s: ", k.name))
+			got, err := e.readPassword(fmt.Sprintf("Type the last group of your %s: ", k.name))
 			if err != nil {
 				return fmt.Errorf("reading the answer: %v", err)
 			}

@@ -188,7 +188,7 @@ func (u *termUI) refused(what, source string) error {
 }
 
 func (u *termUI) readSecret(prompt string) ([]byte, error) {
-	b, err := u.e.ReadPassword(prompt)
+	b, err := u.e.readPassword(prompt)
 	if err != nil {
 		return nil, uiErrorf("reading the answer: %v", err)
 	}
@@ -198,7 +198,7 @@ func (u *termUI) readSecret(prompt string) ([]byte, error) {
 // readAnswer asks a question on stderr and reads one line from stdin.
 func (u *termUI) readAnswer(prompt string) (string, error) {
 	u.say("%s", prompt)
-	line, err := readLine(u.e.Stdin)
+	line, err := u.e.readLine()
 	if err != nil && line == "" {
 		if errors.Is(err, io.EOF) {
 			return "", uiErrorf("no answer: stdin ended")
@@ -219,7 +219,7 @@ func (u *termUI) Password(ctx context.Context, r authflow.Reason) ([]byte, error
 			return nil, u.refused("master password", "--password-stdin")
 		}
 		u.used["stdin"] = true
-		line, err := readLine(u.e.Stdin)
+		line, err := u.e.readLine()
 		line = strings.TrimSuffix(line, "\r")
 		if err != nil && line == "" {
 			return nil, uiErrorf("--password-stdin: no password on stdin")
