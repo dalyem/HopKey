@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -217,13 +218,19 @@ type proc struct {
 // run runs sh -c script (with $0 set to arg0) under Run on v.
 func run(t *testing.T, v *vterm, opts Options, script, arg0 string) *proc {
 	t.Helper()
+	return runCtx(t, context.Background(), v, opts, script, arg0)
+}
+
+// runCtx is run with ctx for Run's.
+func runCtx(t *testing.T, ctx context.Context, v *vterm, opts Options, script, arg0 string) *proc {
+	t.Helper()
 	opts.In, opts.Out = v.tty, v.tty
 	if opts.DoubleTap == 0 {
 		opts.DoubleTap = 50 * time.Millisecond
 	}
 	c := &proc{started: make(chan struct{}), runErr: make(chan error, 1)}
 	go func() {
-		c.runErr <- Run(context.Background(), opts, func(tty *os.File, sys *syscall.SysProcAttr) (func() error, error) {
+		c.runErr <- Run(ctx, opts, func(tty *os.File, sys *syscall.SysProcAttr) (func() error, error) {
 			p, err := os.StartProcess("/bin/sh", []string{"sh", "-c", script, arg0}, &os.ProcAttr{Files: []*os.File{tty, tty, tty}, Sys: sys})
 			if err != nil {
 				return nil, err
@@ -447,6 +454,7 @@ func TestChildExitsWhilePanelOpen(t *testing.T) {
 	if *now != *orig {
 		t.Errorf("terminal mode %+v, want %+v", *now, *orig)
 	}
+	before.cur.pen = pen{} // the session is over: plain attributes
 	v.waitSame(before)
 }
 
@@ -555,7 +563,8 @@ func TestSuspendAndResume(t *testing.T) {
 		// no mouse reports, the mode it had.
 		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
 			v.mu.Lock()
-			left := !v.scr.altActive && !v.scr.modes[1000] && !v.scr.keypad
+			left := !v.scr.altActive && !v.scr.modes[1000] && !v.scr.keypad &&
+				!v.scr.kitty[0].active() && !v.scr.kitty[1].active() && v.scr.otherKeys == 0
 			v.mu.Unlock()
 			if left {
 				tio, _ := unix.IoctlGetTermios(v.fd, ioctlGetTermios)
@@ -566,7 +575,7 @@ func TestSuspendAndResume(t *testing.T) {
 		stops <- nil
 	}
 	t.Cleanup(func() { stopSelf = real })
-	run(t, v, Options{Shortcuts: testShortcuts}, alt+`printf '\033[?1000h\033=\033[12;5H'; printf READY; exec cat >/dev/null`, "")
+	run(t, v, Options{Shortcuts: testShortcuts}, alt+`printf '\033[?1000h\033=\033[>5u\033[>4;1m\033[12;5H'; printf READY; exec cat >/dev/null`, "")
 	v.waitText("READY")
 	before := v.snapshot()
 	check := func(how string) {
@@ -583,7 +592,9 @@ func TestSuspendAndResume(t *testing.T) {
 			t.Fatalf("%s: hop did not stop", how)
 		}
 		v.waitSame(before)
-		v.waitFor("the modes back", func(s *screen) bool { return s.modes[1000] && s.keypad })
+		v.waitFor("the modes back", func(s *screen) bool {
+			return s.modes[1000] && s.keypad && slices.Equal(s.kitty[1].pushed, []int{5}) && !s.kitty[0].active() && s.otherKeys == 1
+		})
 	}
 	v.key("\x1d")
 	v.panelAt(40)
@@ -762,4 +773,53 @@ func TestPanicInWaitStopsTheLoop(t *testing.T) {
 			t.Fatalf("the proxy's loop runs on after Run's panic:\n%s", buf[max(i-1000, 0):min(i+500, n)])
 		}
 	}
+}
+
+// resetSetup turns on, on the alternate screen, what the terminal must
+// not keep once the session is over: mouse reports, focus events,
+// bracketed paste, application cursor keys and keypad, the kitty
+// keyboard protocol and modifyOtherKeys, bold red and a hidden cursor.
+const resetSetup = `stty raw -echo
+printf '\033[?1049h\033[?1000h\033[?1006h\033[?1004h\033[?2004h\033[?1h\033=\033[>1u\033[>4;2m\033[1;31m\033[?25lREADY'
+exec cat >/dev/null
+`
+
+func waitReset(t *testing.T, v *vterm) {
+	t.Helper()
+	v.waitFor("the terminal as the shell had it", func(s *screen) bool {
+		for _, m := range trackedModes {
+			if s.modes[m] {
+				return false
+			}
+		}
+		return !s.altActive && !s.keypad && !s.kitty[0].active() && !s.kitty[1].active() && s.otherKeys == 0 &&
+			s.visible && s.cur.pen == pen{}
+	})
+}
+
+// When the session ends, the terminal is left as the shell had it, as on
+// a suspend: whether ssh exits on its own or on a signal hop passes on,
+// or Run's context ends with the panel open.
+func TestSessionEndResetsTerminal(t *testing.T) {
+	t.Run("child signalled", func(t *testing.T) {
+		v := newVTerm(t, 80, 24)
+		c := run(t, v, Options{Shortcuts: testShortcuts}, resetSetup, "")
+		v.waitText("READY")
+		v.waitFor("the remote side's modes", func(s *screen) bool { return s.altActive && s.modes[1000] && s.keypad })
+		c.p.Signal(syscall.SIGTERM)
+		c.wait(t)
+		waitReset(t, v)
+	})
+	t.Run("context done, panel open", func(t *testing.T) {
+		v := newVTerm(t, 80, 24)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c := runCtx(t, ctx, v, Options{Shortcuts: testShortcuts}, resetSetup, "")
+		v.waitText("READY")
+		v.key("\x1d")
+		v.panelAt(40)
+		cancel()
+		c.wait(t)
+		waitReset(t, v)
+	})
 }

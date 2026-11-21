@@ -2,6 +2,7 @@ package termpanel
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -267,4 +268,30 @@ func TestScreenResize(t *testing.T) {
 	if s.top != 0 || s.bot != 2 {
 		t.Fatal("the region is the whole screen")
 	}
+}
+
+// The kitty keyboard protocol's flags are a stack for each screen, and
+// modifyOtherKeys a level: the model follows both, so they can be taken
+// back when the terminal goes to the shell.
+func TestScreenKeyboardModes(t *testing.T) {
+	s := newScreen(80, 24)
+	step := func(in string, main, alt []int, base, other int) {
+		t.Helper()
+		s.Write([]byte(in))
+		if !slices.Equal(s.kitty[0].pushed, main) || !slices.Equal(s.kitty[1].pushed, alt) || s.kitty[0].base != base || s.otherKeys != other {
+			t.Fatalf("after %q: normal %v (base %d), alternate %v, modifyOtherKeys %d; want %v (base %d), %v, %d",
+				in, s.kitty[0].pushed, s.kitty[0].base, s.kitty[1].pushed, s.otherKeys, main, base, alt, other)
+		}
+	}
+	step("\x1b[>1u\x1b[>3u\x1b[=8;2u", []int{1, 11}, nil, 0, 0)
+	step("\x1b[?1049h\x1b[>4u", []int{1, 11}, []int{4}, 0, 0)
+	step("\x1b[<u", []int{1, 11}, []int{}, 0, 0)
+	step("\x1b[?1049l\x1b[=2;3u", []int{1, 9}, []int{}, 0, 0)
+	step("\x1b[<5u", []int{}, []int{}, 0, 0)
+	step("\x1b[=5u", []int{}, []int{}, 5, 0)
+	step("\x1b[<u", []int{}, []int{}, 0, 0)
+	step("\x1b[>4;2m", []int{}, []int{}, 0, 2)
+	step("\x1b[>1;2m", []int{}, []int{}, 0, 2) // modifyCursorKeys
+	step("\x1b[>4m", []int{}, []int{}, 0, 0)
+	step("\x1b[>4;1m\x1b[>4n", []int{}, []int{}, 0, 0)
 }

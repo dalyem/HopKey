@@ -42,11 +42,14 @@ const (
 // on this goroutine. tty stays open until Run returns.
 //
 // Run puts the terminal in raw mode and restores it before it returns,
-// also when start or wait panics or the child exits while the panel is open. It
-// handles SIGWINCH (the child's pty takes the terminal's size), SIGTSTP
-// (hop stops, with the terminal restored for the shell) and SIGCONT,
-// and nothing else: the caller still holds or passes on SIGINT, SIGTERM
-// and the rest. The child is never signalled from here: on a suspend,
+// also when start or wait panics or the child exits while the panel is
+// open, and leaves it as the shell had it however the session ends: on
+// the normal screen, with the modes the remote side turned on that change
+// what keys and the mouse send turned off (plainTerminal). It handles
+// SIGWINCH (the child's pty takes the terminal's size), SIGTSTP (hop
+// stops, with the terminal restored for the shell) and SIGCONT, and
+// nothing else: the caller still holds or passes on SIGINT, SIGTERM and
+// the rest. The child is never signalled from here: on a suspend,
 // opts.OnSuspend and opts.OnResume are the caller's. When ctx is
 // done, or the terminal hangs up, the pty is closed, which hangs up the
 // child's session; wait still decides when Run returns.
@@ -106,7 +109,8 @@ type proxy struct {
 	size       unix.Winsize
 	panel      panelState
 	needResume bool // continued in the background: resume once in front
-	gone       bool // the terminal hung up
+	gone       bool // the terminal hung up, or ctx is done: the pty is closed
+	outGone    bool // a write to the terminal failed
 	outDone    bool // the pty's output ended
 	restored   sync.Once
 	emergency  sync.Mutex // the panel state onPanic reads
@@ -241,6 +245,9 @@ func (p *proxy) restore() {
 			p.out.Write(p.emergencyClose())
 		}
 		p.emergency.Unlock()
+		// The session is over, whatever the remote side left on. The
+		// loop is not running (or it is the loop, in onPanic).
+		p.out.Write(p.plainTerminal())
 		term.Restore(p.inFd, p.orig)
 		p.closeFds()
 	})
@@ -380,10 +387,11 @@ func (p *proxy) hangup() {
 }
 
 func (p *proxy) write(b []byte) {
-	if p.gone || len(b) == 0 {
+	if p.outGone || len(b) == 0 {
 		return
 	}
 	if _, err := p.out.Write(b); err != nil {
+		p.outGone = true
 		p.hangup()
 	}
 }
@@ -768,8 +776,7 @@ func hasShell() bool {
 
 // suspend stops hop for job control: the panel's Ctrl-Z, or a SIGTSTP
 // sent to it. The terminal goes back to the mode the shell left it in,
-// off the alternate screen and with the modes that change what keys and
-// the mouse send turned off; resume undoes that. The child stops and
+// as plainTerminal leaves it; resume undoes that. The child stops and
 // continues with hop when the caller says so (onSuspend, onResume);
 // otherwise it runs on meanwhile, but hop reads nothing from it, so it
 // waits once the pty is full.
@@ -778,21 +785,7 @@ func (p *proxy) suspend() {
 	if p.panel.open {
 		p.closePanel()
 	}
-	s := p.scr
-	var b []byte
-	for _, m := range trackedModes {
-		if s.modes[m] {
-			b = append(b, "\x1b[?"+strconv.Itoa(m)+"l"...)
-		}
-	}
-	if s.keypad {
-		b = append(b, "\x1b>"...)
-	}
-	if s.altActive {
-		b = append(b, "\x1b[?1049l"...)
-	}
-	b = append(b, "\x1b[0m\x1b[?25h"...)
-	p.write(b)
+	p.write(p.plainTerminal())
 	term.Restore(p.inFd, p.orig)
 	if p.onSuspend != nil {
 		p.onSuspend()
@@ -824,12 +817,14 @@ func (p *proxy) resume() {
 	w := &painter{}
 	w.b = append(w.b, drawModes...)
 	w.screen(s.main.cells)
+	w.b = s.kitty[0].redo(w.b)
 	if s.altActive {
 		// 1049 saves the cursor the normal screen is to get back.
 		p.putCursor(w, s.main.saved)
 		w.b = append(w.b, "\x1b[?1049h"...)
 		w.b = append(w.b, drawModes...)
 		w.screen(s.alt.cells)
+		w.b = s.kitty[1].redo(w.b)
 	}
 	if b := s.buf(); b.live {
 		p.putCursor(w, b.saved)
@@ -843,9 +838,41 @@ func (p *proxy) resume() {
 	if s.keypad {
 		w.b = append(w.b, "\x1b="...)
 	}
+	if s.otherKeys != 0 {
+		w.b = append(w.b, "\x1b[>4;"+strconv.Itoa(s.otherKeys)+"m"...)
+	}
 	p.putCursor(w, s.cur)
 	p.putModes(w)
 	p.write(w.b)
+}
+
+// plainTerminal is what gives the terminal back to the shell from the
+// session: the modes the remote side turned on that change what keys and
+// the mouse send off (mouse reports, focus events, bracketed paste,
+// application cursor keys and keypad, modifyOtherKeys, and the kitty
+// keyboard protocol's flags, popped on each screen), the normal screen,
+// plain attributes and the cursor shown. suspend sends it, and restore
+// once the session is over.
+func (p *proxy) plainTerminal() []byte {
+	s := p.scr
+	var b []byte
+	for _, m := range trackedModes {
+		if s.modes[m] {
+			b = append(b, "\x1b[?"+strconv.Itoa(m)+"l"...)
+		}
+	}
+	if s.keypad {
+		b = append(b, "\x1b>"...)
+	}
+	if s.otherKeys != 0 {
+		b = append(b, "\x1b[>4m"...)
+	}
+	if s.altActive {
+		b = s.kitty[1].undo(b)
+		b = append(b, "\x1b[?1049l"...)
+	}
+	b = s.kitty[0].undo(b)
+	return append(b, "\x1b[0m\x1b[?25h"...)
 }
 
 // foreground says whether hop's process group has the terminal, or the

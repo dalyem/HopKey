@@ -1,6 +1,7 @@
 package termpanel
 
 import (
+	"strconv"
 	"unicode/utf8"
 )
 
@@ -22,10 +23,12 @@ type screen struct {
 	cur        cursor
 	top, bot   int // scroll region, inclusive rows
 	autowrap   bool
-	insert     bool // IRM
-	visible    bool // DECTCEM
-	keypad     bool // DECKPAM
-	bracketed  bool // 2004, bracketed paste
+	insert     bool         // IRM
+	visible    bool         // DECTCEM
+	keypad     bool         // DECKPAM
+	bracketed  bool         // 2004, bracketed paste
+	kitty      [2]kittyKeys // the kitty keyboard protocol's flags: normal, alternate screen
+	otherKeys  int          // xterm's modifyOtherKeys level
 	modes      map[int]bool
 	tabs       []bool
 	last       rune // last printed character, for REP
@@ -66,6 +69,77 @@ type buffer struct {
 // so the local shell gets a plain terminal, and on again after.
 var trackedModes = []int{1, 9, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 2004}
 
+// kittyKeys is one screen's stack of kitty keyboard protocol flags, which
+// also change what the terminal sends: CSI > flags u pushes, CSI < n u
+// pops, CSI = flags ; mode u changes the top. base is the flags set while
+// nothing the remote side pushed is on the stack.
+type kittyKeys struct {
+	pushed []int
+	base   int
+}
+
+// maxKittyPushed bounds the stack; a push beyond it drops the oldest, as
+// kitty does.
+const maxKittyPushed = 64
+
+func (k *kittyKeys) apply(prefix byte, params [][]int) {
+	arg := func(i, def int) int {
+		if i < len(params) && params[i][0] >= 0 {
+			return params[i][0]
+		}
+		return def
+	}
+	switch prefix {
+	case '>':
+		if len(k.pushed) == maxKittyPushed {
+			k.pushed = k.pushed[1:]
+		}
+		k.pushed = append(k.pushed, arg(0, 0))
+	case '<':
+		k.pushed = k.pushed[:len(k.pushed)-min(max(arg(0, 1), 1), len(k.pushed))]
+		if len(k.pushed) == 0 {
+			k.base = 0 // emptying the stack resets every flag
+		}
+	case '=':
+		f, cur := arg(0, 0), &k.base
+		if len(k.pushed) > 0 {
+			cur = &k.pushed[len(k.pushed)-1]
+		}
+		switch arg(1, 1) {
+		case 1:
+			*cur = f
+		case 2:
+			*cur |= f
+		case 3:
+			*cur &^= f
+		}
+	}
+}
+
+func (k *kittyKeys) active() bool { return len(k.pushed) > 0 || k.base != 0 }
+
+// undo appends what takes back the remote side's flags.
+func (k *kittyKeys) undo(b []byte) []byte {
+	switch {
+	case len(k.pushed) > 0:
+		return append(b, "\x1b[<"+strconv.Itoa(len(k.pushed))+"u"...)
+	case k.base != 0:
+		return append(b, "\x1b[=0;1u"...)
+	}
+	return b
+}
+
+// redo appends what sets them again after undo.
+func (k *kittyKeys) redo(b []byte) []byte {
+	if k.base != 0 {
+		b = append(b, "\x1b[="+strconv.Itoa(k.base)+";1u"...)
+	}
+	for _, f := range k.pushed {
+		b = append(b, "\x1b[>"+strconv.Itoa(f)+"u"...)
+	}
+	return b
+}
+
 func newScreen(cols, rows int) *screen {
 	s := &screen{modes: map[int]bool{}}
 	s.cols, s.rows = max(cols, 1), max(rows, 1)
@@ -82,6 +156,7 @@ func (s *screen) reset() {
 	s.main.saved, s.alt.saved = s.cur, s.cur
 	s.top, s.bot = 0, s.rows-1
 	s.autowrap, s.insert, s.visible, s.keypad, s.bracketed = true, false, true, false, false
+	s.kitty, s.otherKeys = [2]kittyKeys{}, 0
 	clear(s.modes)
 	s.tabs = make([]bool, s.cols)
 	for i := 8; i < s.cols; i += 8 {
@@ -510,6 +585,23 @@ func (s *screen) csiDispatch(prefix byte, inter []byte, final byte, params [][]i
 			for _, p := range params {
 				s.decMode(p[0], final == 'h')
 			}
+		}
+		return
+	}
+	switch {
+	case final == 'u' && (prefix == '>' || prefix == '<' || prefix == '='):
+		k := &s.kitty[0]
+		if s.altActive {
+			k = &s.kitty[1]
+		}
+		k.apply(prefix, params)
+		return
+	case prefix == '>' && (final == 'm' || final == 'n') && len(params) > 0 && params[0][0] == 4:
+		// CSI > 4 ; n m sets modifyOtherKeys, CSI > 4 m and CSI > 4 n
+		// turn it off.
+		s.otherKeys = 0
+		if final == 'm' && len(params) > 1 {
+			s.otherKeys = max(params[1][0], 0)
 		}
 		return
 	}
