@@ -543,6 +543,8 @@ func init() {
 			" | hop access add LABEL [HOST...] [--alongside] | hop access rm LABEL [HOST...] [--same-machine] [--yes] [--json] | hop access rm LABEL --abandon HOST [--yes]" +
 			" | hop access migrate LABEL HOST [--yes] | hop access forget LABEL [--yes] | hop access ls [LABEL] [--json]" +
 			" | hop access check [LABEL] [--host HOST]... [--all-hosts] [--json]"},
+		"shortcut": {runShortcut, "hop shortcut add <keys> [--host H] [--name N] [--description D] [--no-enter] [--json] -- <command...>" +
+			" | hop shortcut ls [--host H] [--json] | hop shortcut rm <keys|id> [--host H] [--yes] [--json]"},
 		"vault": {runVault, vaultForkUsage},
 	}
 }
@@ -553,6 +555,7 @@ const usageText = `usage: hop <target>           open a shell on a vault host (a
        hop ls [tag] | info <target> | add | edit | rm
        hop key add|ls|rm|rotate | import ssh-config | ts import|link
        hop snippet add|ls|rm
+       hop shortcut add|ls|rm   commands on a key of the Ctrl-] panel in hop connect
        hop access add|rm|ls|check|migrate|forget   a colleague's key on your hosts
        hop mcp [--read-only] | mcp install   tools for local AI agents (MCP)
        hop setup [--service] | status | daemon
