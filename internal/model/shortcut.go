@@ -15,9 +15,8 @@ const MaxShortcutCommand = 4096
 const ShortcutReservedKeys = "?"
 
 // CheckShortcutKeys enforces the form of a shortcut's keys (§6.5): one or
-// two printable ASCII characters other than space. Keys the panel reserves
-// are refused when a shortcut is written (the daemon's put_shortcut), not
-// here, so that a later panel can reserve fewer.
+// two printable ASCII characters other than space. The item schema
+// (crypto.ValidateShortcut) also refuses the keys the panel reserves.
 func CheckShortcutKeys(keys string) error {
 	if len(keys) < 1 || len(keys) > 2 {
 		return fmt.Errorf("shortcut keys are one or two characters, not %d", len(keys))

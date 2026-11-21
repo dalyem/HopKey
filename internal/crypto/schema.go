@@ -10,6 +10,7 @@ import (
 
 	"github.com/dalyem/hopkey/internal/canonjson"
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/shellcmd"
 )
 
 // SchemaError reports a value that the closed schemas of §3 and §6.5 do not
@@ -220,11 +221,14 @@ func ValidateSnippet(s *model.Snippet) error {
 }
 
 // ValidateShortcut checks a shortcut plaintext: keys are one or two
-// printable ASCII characters (model.CheckShortcutKeys), and command is one
-// line of at most model.MaxShortcutCommand bytes with no control character
-// but TAB, since the session panel types it into a remote shell. host_id
-// is "" for a global shortcut; the log rules check that any other names a
-// live host.
+// printable ASCII characters (model.CheckShortcutKeys) and none the panel
+// keeps for itself (model.ShortcutReservedKeys), and command is one line
+// of at most model.MaxShortcutCommand bytes with no control character but
+// TAB and no {{parameter}}, since the session panel types it into a
+// remote shell as it is. host_id is "" for a global shortcut; the log
+// rules check that any other names a live host. A shortcut from another
+// device is opened under these rules too, so one the panel could not use
+// never reaches the vault.
 func ValidateShortcut(s *model.Shortcut) error {
 	if err := checkHeader(s.Header, model.TypeShortcut); err != nil {
 		return err
@@ -235,11 +239,17 @@ func ValidateShortcut(s *model.Shortcut) error {
 	if err := model.CheckShortcutKeys(s.Keys); err != nil {
 		return schemaErr("keys", "%v", err)
 	}
+	if strings.ContainsAny(s.Keys, model.ShortcutReservedKeys) {
+		return schemaErr("keys", "%q is a key of the panel itself", model.ShortcutReservedKeys)
+	}
 	if s.Command == "" {
 		return schemaErr("command", "empty")
 	}
 	if err := CheckStr("command", strings.ReplaceAll(s.Command, "\t", " "), model.MaxShortcutCommand); err != nil {
 		return err
+	}
+	if shellcmd.HasPlaceholder(s.Command) {
+		return schemaErr("command", "has a {{parameter}}")
 	}
 	return CheckText("description", s.Description, 1024)
 }
