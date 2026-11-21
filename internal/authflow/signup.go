@@ -3,7 +3,6 @@ package authflow
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/dalyem/hopkey/internal/model"
 	"github.com/dalyem/hopkey/internal/store"
@@ -81,7 +80,7 @@ func Signup(ctx context.Context, env *Env, opts SignupOptions) (_ *SignupResult,
 	switch {
 	case pending != nil:
 		if pending.Server != c.Origin() {
-			return nil, fmt.Errorf("%w: a publication to %s is pending", ErrServerMismatch, pending.Server)
+			return nil, &ServerMismatchError{Recorded: pending.Server, Given: c.Origin(), Publication: true}
 		}
 		err = env.retry(ctx, func() (err error) {
 			pub, err = s.ResumePublish(ctx, publisherOf(c, pending.VaultID))

@@ -477,6 +477,54 @@ func CheckDevicePassphrase(dataDir string, pass []byte) error {
 	return nil
 }
 
+// CheckDeviceKey reports whether the device key of the vault in cfg.DataDir
+// can be read now, with no passphrase: nil, or an error that matches
+// ErrDeviceKey (the keychain entry or the key file is gone, or does not
+// parse). It only reads, so a command can run it before it stops the daemon
+// that holds the vault open. A sealed key file is checked for presence and
+// shape, not opened: CheckDevicePassphrase does that with a passphrase. The
+// tombstone of a revoked device is ErrDeviceRevoked.
+func CheckDeviceKey(cfg Config) error {
+	s := &Store{cfg: cfg, l: layout{data: cfg.DataDir}}
+	c, err := s.readDeviceConfig()
+	if err != nil {
+		return err
+	}
+	if c.Store == DeviceStoreFile && c.Sealed {
+		if err := CheckDevicePassphrase(cfg.DataDir, nil); !errors.Is(err, ErrWrongDevicePassphrase) {
+			return err
+		}
+		return nil
+	}
+	ds := s.deviceStore(c)
+	if err := ds.revokedSelf(); err != nil {
+		return err
+	}
+	if c.Store == DeviceStoreFile {
+		rec, err := ds.loadFile()
+		if err != nil {
+			return err
+		}
+		rec.zero()
+		return nil
+	}
+	var first error
+	for _, id := range c.self() {
+		rec, err := ds.loadSlot(id)
+		if err == nil {
+			rec.zero()
+			return nil
+		}
+		if first == nil {
+			first = err
+		}
+	}
+	if first == nil {
+		first = fmt.Errorf("%w: %s names no device", ErrDeviceKey, s.l.deviceConfig())
+	}
+	return first
+}
+
 // What DeviceKeyFileProblem finds wrong with the device key file.
 const (
 	KeyFileMissing = "missing"

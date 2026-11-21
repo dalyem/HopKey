@@ -440,8 +440,9 @@ func TestNoSecretReachesADaemonOfAnotherVault(t *testing.T) {
 			// hop passwd, which sends it with its request.
 			p := &session{tty: true, secrets: map[string]string{
 				askOldPass: devPass, "Current master password: ": resolvePassword, "New master password: ": newPassword, "Repeat it: ": newPassword}}
-			if code := m.hop(t, p, "passwd"); code != 255 || !strings.Contains(p.stderr.String(), "no device passphrase was sent") {
-				t.Errorf("passwd: exit %d: %s", code, p.stderr.String())
+			// Refused before anything is asked: it sends the passwords with its request.
+			if code := m.hop(t, p, "passwd"); code != 255 || !strings.Contains(p.stderr.String(), "nothing was sent or changed") || len(p.order) != 0 {
+				t.Errorf("passwd: exit %d, asked %v: %s", code, p.order, p.stderr.String())
 			}
 			for _, op := range []string{daemon.OpUnlock, daemon.OpPasswd, daemon.OpKitDone} {
 				for _, params := range f.called(op) {

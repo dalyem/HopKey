@@ -258,6 +258,11 @@ func TestVaultEndToEnd(t *testing.T) {
 
 	// After a restart, the old password fails and the new one works.
 	v.restartDaemon(t)
+	// The restarted daemon opens the vault by itself; a password unlock runs
+	// only on a locked one.
+	if code, _, stderr := v.hop(t, "lock"); code != 0 {
+		t.Fatalf("hop lock: %d %s", code, stderr)
+	}
 	v.answers = []string{password}
 	if code, _, stderr := v.hop(t, "unlock", "--password"); code != 255 || !strings.Contains(stderr, "wrong master password") {
 		t.Errorf("unlock with the old password: exit %d %q", code, stderr)

@@ -51,7 +51,7 @@ func Logout(ctx context.Context, env *Env, s *store.Store, opts store.LogoutOpti
 		}
 		if err == nil {
 			if si.Server != "" && si.Server != env.Client.Origin() {
-				return store.LogoutResult{}, ErrServerMismatch
+				return store.LogoutResult{}, &ServerMismatchError{Recorded: si.Server, Given: env.Client.Origin()}
 			}
 			r = env.Client.Retirer(si.VaultID)
 		}

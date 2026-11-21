@@ -299,6 +299,11 @@ func (d *Daemon) unlockVault(ctx context.Context, v Vault, p UnlockParams) error
 		pass = []byte(p.DevicePassphrase)
 		defer clear(pass)
 	}
+	// An unlocked vault has a device key that works: a password unlock would
+	// replace it, and add the old one to the stale devices, every time.
+	if p.Password != "" && !v.Info().Locked {
+		return invalidf("%v", store.ErrAlreadyUnlocked)
+	}
 	chk := &unlockCheck{parent: ctx, admin: d.adminLock()}
 	defer chk.done()
 	if v.Info().ServerReport != nil {

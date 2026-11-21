@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,8 +108,14 @@ type vaultHold struct {
 	// had the vault locked (wasLocked), so an open vault stays open.
 	keepOpen bool
 	// wasLocked says the daemon holdVault stopped had the vault locked,
-	// which a command does not undo.
+	// which a command does not undo: release locks it again when the daemon
+	// it starts opens it by itself (a keychain, an unsealed key file).
 	wasLocked bool
+
+	// stores are the stores open in this command's flow (open), which
+	// abandon closes to free the vault when the command is interrupted.
+	storesMu sync.Mutex
+	stores   []*store.Store
 }
 
 // holdMarkerName is the marker's name in the run directory.
@@ -338,6 +345,9 @@ func (h *vaultHold) open(ctx context.Context) (*store.Store, error) {
 			if err != nil {
 				return nil, failf("opening the vault: %v", err)
 			}
+			h.storesMu.Lock()
+			h.stores = append(h.stores, s)
+			h.storesMu.Unlock()
 			return s, nil
 		}
 		select {
@@ -374,12 +384,48 @@ func (h *vaultHold) release(ctx context.Context) {
 		}
 		if err := startDaemon(context.WithoutCancel(ctx), h.e); err != nil {
 			warn(h.e, h.asJSON, "the hop daemon did not start again, so nothing syncs until it does (hop sync starts it): "+err.Error())
-		} else if h.handPass || (h.keepOpen && !h.wasLocked) {
-			handDevicePassphrase(ctx, h.e, h.asJSON)
+		} else {
+			h.restoreLockState(ctx)
 		}
 	})
 	h.e.clearDevicePass()
 	h.e.setHold(nil)
+}
+
+// restoreLockState leaves the vault in the daemon as the command found it,
+// once release or abandon has started the daemon again: one that was
+// locked stays locked, even for a device key the daemon opens by itself,
+// and one that was open is open, with the device passphrase typed for the
+// command when the key file is sealed. A command that made the vault or
+// signed in to it (handPass) hands the passphrase over whatever the state
+// was.
+func (h *vaultHold) restoreLockState(ctx context.Context) {
+	switch {
+	case h.handPass:
+		handDevicePassphrase(ctx, h.e, h.asJSON)
+	case h.keepOpen && h.wasLocked:
+		lockAgain(ctx, h.e, h.asJSON)
+	case h.keepOpen:
+		handDevicePassphrase(ctx, h.e, h.asJSON)
+	}
+}
+
+// lockAgain locks the vault in the running daemon if it is open.
+func lockAgain(ctx context.Context, e *Env, asJSON bool) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	c, err := dialExisting(ctx, e)
+	if err != nil || c == nil {
+		return
+	}
+	defer c.Close()
+	var st daemon.StatusResult
+	if err := c.Call(ctx, daemon.OpStatus, nil, &st); err != nil || st.Vault == nil || st.Vault.Locked {
+		return
+	}
+	if err := c.Call(ctx, daemon.OpLock, nil, nil); err != nil {
+		warn(e, asJSON, "the vault was locked before this command and is open now: run hop lock ("+err.Error()+")")
+	}
 }
 
 // releaseBusyWait bounds how long release waits for a daemon on its way
@@ -409,14 +455,34 @@ func waitVaultFree(dataDir string) bool {
 }
 
 // abandon is release for a process about to exit on a signal while its
-// flow still runs. The flow's store is still open, so the daemon is
-// launched without waiting for it, and the marker turns into a handback:
-// hop daemon, finding the vault busy, waits for this process to exit
-// (runDaemon). A release already under way finishes first.
+// flow still runs, stuck where the context does not reach (a prompt). The
+// stores the flow opened are closed first, which frees the vault, and the
+// daemon then starts as release starts it and gets the vault as the command
+// found it (restoreLockState): after Ctrl-C at a prompt an open vault is
+// open. A store the flow opened some other way keeps the vault busy; then
+// the daemon is launched without waiting for it, and the marker turns into a
+// handback: hop daemon, finding the vault busy, waits for this process to
+// exit (runDaemon). A release already under way finishes first.
 func (h *vaultHold) abandon() {
 	h.once.Do(func() {
 		if exists, err := store.Exists(h.cfg.DataDir); err != nil || !exists {
 			h.unmark()
+			return
+		}
+		h.storesMu.Lock()
+		stores := slices.Clone(h.stores)
+		h.stores = nil
+		h.storesMu.Unlock()
+		closeStores(stores...)
+		if len(stores) > 0 && waitVaultFree(h.cfg.DataDir) {
+			h.unmark()
+			// Not warn: this runs on Run's signal watcher, beside the
+			// command, so it leaves the command's warned map alone.
+			if err := startDaemon(context.Background(), h.e); err != nil {
+				printWarning(h.e, h.asJSON, "the hop daemon did not start again (hop sync starts it): "+err.Error())
+			} else {
+				h.restoreLockState(context.Background())
+			}
 			return
 		}
 		// The marker now tells the daemon to wait for this process.
@@ -428,8 +494,6 @@ func (h *vaultHold) abandon() {
 			launch = func() error { return launchDaemon(h.e) }
 		}
 		if err := launch(); err != nil {
-			// Not warn: this runs on Run's signal watcher, beside the
-			// command, so it leaves the command's warned map alone.
 			printWarning(h.e, h.asJSON, "the hop daemon did not start again (hop sync starts it): "+err.Error())
 		}
 	})
@@ -519,6 +583,10 @@ func closeStores(ss ...*store.Store) {
 	}
 }
 
+// interruptedText is all hop says of a command that Ctrl-C (or a cancelled
+// context) ended, whatever it was doing: the same words wherever it was.
+const interruptedText = "interrupted"
+
 // authFailure is a flow's error as the user reads it.
 func authFailure(err error) error {
 	if err == nil {
@@ -528,12 +596,14 @@ func authFailure(err error) error {
 	if errors.As(err, &ee) {
 		return err
 	}
-	var interrupted *authflow.EnrollInterruptedError
 	var limit *authflow.MailboxLimitError
+	var mismatch *authflow.ServerMismatchError
 	switch {
-	case errors.As(err, &interrupted) && errors.Is(err, context.Canceled):
-		// The error quotes the enrollment's URL, which the user need not see.
-		return failf("the sign-in was cancelled")
+	case errors.Is(err, context.Canceled):
+		// What a cancelled flow wraps quotes URLs and paths, which the user
+		// need not see; and it is one text for every command that Ctrl-C
+		// ends (interruptedText).
+		return failf("%s", interruptedText)
 	case errors.Is(err, authflow.ErrLocalVault):
 		return failf("this device has a local-only vault: hop auth login --merge (with --method password or recovery) merges it into the account, or hop auth signup publishes it")
 	case errors.Is(err, authflow.ErrSignedIn):
@@ -554,10 +624,26 @@ func authFailure(err error) error {
 		return failf("this device's check code was rejected, so nothing was installed. Run hop auth login again to start over")
 	case errors.As(err, &limit):
 		return failf("%s", mailboxLimitText(limit))
+	case errors.As(err, &mismatch):
+		return failf("%s", originMismatchText(mismatch))
 	case errors.Is(err, store.ErrOutboxNotEmpty):
 		return failf("queued changes have not reached the server yet: wait for the daemon to send them (hop sync shows them), or log out with --discard-pending to drop them")
 	}
 	return failf("%v", err)
+}
+
+// originMismatchText is the refusal of a server URL that is not the origin
+// the vault has: signatures to the server cover its origin, so a vault only
+// works with the one it recorded. It says both, and that the account is not
+// the problem, which a refused login would suggest.
+func originMismatchText(m *authflow.ServerMismatchError) string {
+	what := "this vault is signed in to"
+	if m.Publication {
+		what = "the publication of this vault that was started went to"
+	}
+	return fmt.Sprintf("origin mismatch: %s %s, but the server URL given is %s. "+
+		"Use the same origin, character for character (hop auth status shows the recorded one). "+
+		"This is about the server's address, not about the account or the password", what, oneLine(m.Recorded), oneLine(m.Given))
 }
 
 // mailboxLimitText is the refusal of a new approval request while the

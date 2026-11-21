@@ -170,6 +170,25 @@ var (
 	ErrEnrollmentInterrupted = errors.New("authflow: an enrollment by approval was interrupted and can't be continued; start it again")
 )
 
+// ServerMismatchError is ErrServerMismatch with the two origins: the one
+// the vault recorded (or the publication that is pending went to) and the
+// one the client was given. It matches ErrServerMismatch.
+type ServerMismatchError struct {
+	Recorded, Given string
+	// Publication says Recorded is where a publication that is not finished
+	// was started, not where the vault is signed in.
+	Publication bool
+}
+
+func (e *ServerMismatchError) Error() string {
+	if e.Publication {
+		return fmt.Sprintf("%s: a publication to %s is pending, not to %s", ErrServerMismatch, e.Recorded, e.Given)
+	}
+	return fmt.Sprintf("%s: %s, not %s", ErrServerMismatch, e.Recorded, e.Given)
+}
+
+func (e *ServerMismatchError) Is(target error) bool { return target == ErrServerMismatch }
+
 // MailboxLimitError means the server would not start another enrollment
 // by approval from this address: it holds at most 3 live mailboxes per IP,
 // and one that was never finished, as when its device was interrupted,
@@ -227,7 +246,7 @@ func NewVault(cfg store.Config, s *store.Store, c *syncclient.Client) (*Vault, e
 		return nil, err
 	}
 	if si.Server != "" && si.Server != c.Origin() {
-		return nil, fmt.Errorf("%w: %s, not %s", ErrServerMismatch, si.Server, c.Origin())
+		return nil, &ServerMismatchError{Recorded: si.Server, Given: c.Origin()}
 	}
 	// The unlocked store's verified state names the vault.
 	if s.Info().Locked {

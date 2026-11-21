@@ -24,6 +24,9 @@ type sealedDaemon struct {
 	dataDir string
 	paths   daemon.Paths
 	prompts []string
+	// typed are the answers to the next prompts, in order; with none left,
+	// a prompt is answered with the right passphrase.
+	typed []string
 }
 
 func newSealedDaemon(t *testing.T) *sealedDaemon {
@@ -78,6 +81,11 @@ func (x *sealedDaemon) hop(t *testing.T, env map[string]string, tty bool, args .
 	if tty {
 		e.ReadPassword = func(p string) ([]byte, error) {
 			x.prompts = append(x.prompts, p)
+			if len(x.typed) > 0 {
+				ans := x.typed[0]
+				x.typed = x.typed[1:]
+				return []byte(ans), nil
+			}
 			return []byte(unlockPassphrase), nil
 		}
 	}

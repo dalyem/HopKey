@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/store"
@@ -102,6 +103,9 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 			}
 		case password:
 			e.printf("vault unlocked with the master password; this device has a new device key\n")
+			if hint := strings.TrimSpace(serviceHint(e)); hint != "" {
+				fmt.Fprintf(e.Stderr, "hop: note: %s\n", hint)
+			}
 		default:
 			e.printf("vault unlocked\n")
 		}
@@ -142,20 +146,25 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 			return err
 		}
 		w, err := unlock(pass)
-		if err := refusedUnlock(err); err != nil {
+		if err := refusedUnlock(ctx, e, c, err); err != nil {
 			return err
 		}
 		if err != nil && len(pass) == 0 && canAskPassphrase(e) {
-			// The daemon has no passphrase of its own, or the wrong one.
-			if pass, err = e.ReadPassword(devicePassphrasePrompt); err != nil {
-				return failf("reading the device passphrase: %v", err)
+			// The daemon has no passphrase of its own, or the wrong one. As
+			// for the commands that open the vault themselves, a passphrase
+			// that does not open the key file is asked for again, up to
+			// maxAsks times.
+			defer e.clearDevicePass()
+			if err := e.askDevicePassphrase(true); err != nil {
+				return err
 			}
+			pass = e.typedPass()
 			defer clear(pass)
 			if err := guard(pass); err != nil {
 				return err
 			}
 			w, err = unlock(pass)
-			if err := refusedUnlock(err); err != nil {
+			if err := refusedUnlock(ctx, e, c, err); err != nil {
 				return err
 			}
 		}
@@ -169,6 +178,12 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	}
 	if err := passwordUnlockPreflight(ctx, e, c); err != nil {
 		return err
+	}
+	// An unlocked vault has a device key that works: this would replace it
+	// and add the old one to the stale devices, each time it was run.
+	var cur daemon.StatusResult
+	if c.Call(ctx, daemon.OpStatus, nil, &cur) == nil && cur.Vault != nil && !cur.Vault.Locked {
+		return failf("%v. Nothing was asked or changed", store.ErrAlreadyUnlocked)
 	}
 	fmt.Fprintln(e.Stderr, "This opens the vault with your master password and Secret Key, and gives this machine a new device key.")
 	pw, err := e.ReadPassword("Master password: ")
@@ -190,7 +205,7 @@ func runUnlock(ctx context.Context, e *Env, args []string) error {
 	if daemon.IsCode(err, daemon.CodeWrongPassword) {
 		return failf("wrong master password or Secret Key; the vault was not unlocked")
 	}
-	if err := refusedUnlock(err); err != nil {
+	if err := refusedUnlock(ctx, e, c, err); err != nil {
 		return err
 	}
 	if err := changeWarning(e, *asJSON, w, err); err != nil {
@@ -227,16 +242,45 @@ func passwordUnlockPreflight(ctx context.Context, e *Env, c *daemon.Client) erro
 	}
 	return failf("this device's key file is sealed with a device passphrase, and the running hop daemon, which saves the new key, has no usable one: "+
 		"it was started without %s, or with a value that is under 8 characters or not valid text (setting it for this command does not reach the daemon). "+
-		"Nothing was changed. To go on, %s. %s", store.PassphraseEnv, steps, daemonKeepsPassphrase)
+		"Nothing was changed. To go on, %s. %s%s", store.PassphraseEnv, steps, daemonKeepsPassphrase, serviceHint(e))
+}
+
+// serviceHint is the sentence about the login service (hop setup --service)
+// when hop installed one: the daemon a command starts for these steps is not
+// the service's, so the service stays inactive, with nothing to say so.
+// Empty where there is no service.
+func serviceHint(e *Env) string {
+	spec, err := serviceFor(e)
+	if err != nil {
+		return ""
+	}
+	if body, existed, err := readServiceFile(spec.path()); err != nil || !existed || !spec.owns(body) {
+		return ""
+	}
+	return " The login service (hop setup --service) is installed and stays inactive while a daemon started this way has the vault: " +
+		"when you are done, run hop daemon stop and then hop setup --service, so the service runs the daemon again."
 }
 
 // refusedUnlock is the message for an unlock that no passphrase or
 // password changes: this device was revoked (the server says so, or the
 // log proved it), or the account's max-offline policy locked it. Any other
-// error is nil.
-func refusedUnlock(err error) error {
+// error is nil. A device whose revocation was proven has been wiped by
+// now, or is being: there is nothing for hop auth logout to wipe, and the
+// text says what is true of this device.
+func refusedUnlock(ctx context.Context, e *Env, c *daemon.Client, err error) error {
 	switch {
 	case daemon.IsCode(err, daemon.CodeRevoked):
+		var st daemon.StatusResult
+		if c.Call(ctx, daemon.OpStatus, nil, &st) == nil && st.Sync != nil {
+			if r := st.Sync.ServerRetirement; r != nil && !r.Unverified {
+				if r.Wiped {
+					return failf("the vault was not unlocked: this device was %s from the account, and its copy of the vault, its device key and the ssh files hop wrote are already wiped. "+
+						"hop auth login signs in again as a new device", oneLine(r.How))
+				}
+				return failf("the vault was not unlocked: this device was %s from the account, and wiping its copy of the vault has not finished (%s). "+
+					"The daemon tries again; hop auth status says where it stands, and hop auth login signs in again afterwards", oneLine(r.How), oneLine(r.WipeError))
+			}
+		}
 		return failf("the vault was not unlocked: this device was revoked from the account. " +
 			"hop auth status says what the server reported; hop auth logout wipes this device, and hop auth login signs in again")
 	case daemon.IsCode(err, daemon.CodeOffline):
@@ -333,6 +377,16 @@ func printDeviceKeyFileProblem(e *Env, dir string) {
 		next = "hop auth logout --local-only, then hop auth login (and hop auth devices revoke OLD-ID from another device), replaces it"
 	}
 	e.printf("device key:   the file %s %s, so this vault cannot be unlocked again once it locks or the daemon stops; %s\n", path, what, next)
+}
+
+// lockedFix says what opens the locked vault described by v, for a command
+// that needs it open: the lock state's own sentence where it has one, and
+// hop unlock otherwise.
+func lockedFix(v *store.Info) string {
+	if text := vaultState(v); strings.HasPrefix(text, "locked: ") {
+		return strings.TrimPrefix(text, "locked: ")
+	}
+	return "run hop unlock first, then hop passwd"
 }
 
 // vaultState says whether the vault is unlocked and, when it is locked,

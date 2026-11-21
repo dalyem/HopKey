@@ -532,7 +532,7 @@ func TestLoginByApprovalWithNoKeychainFollowsItsRecord(t *testing.T) {
 		t.Fatal("the cancelled login succeeded")
 	}
 	// The user is told it was cancelled, not shown the enrollment's URL.
-	if out := first.stderr.String(); !strings.Contains(out, "the sign-in was cancelled") || strings.Contains(out, "/v1/enroll") || strings.Contains(out, "context canceled") {
+	if out := first.stderr.String(); !strings.Contains(out, "interrupted") || strings.Contains(out, "/v1/enroll") || strings.Contains(out, "context canceled") {
 		t.Errorf("the cancelled login says:\n%s", out)
 	}
 	if q, rc := strings.Index(first.stderr.String(), "Protect it"), strings.Index(first.stderr.String(), "hop auth approve "); q < 0 || q > rc {

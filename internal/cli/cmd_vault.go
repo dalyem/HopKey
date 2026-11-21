@@ -81,13 +81,20 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 	// release opens the vault in the daemon with the passphrase typed here.
 	defer e.clearDevicePass()
 	cfg := e.storeConfig()
-	// A fork decrypts this device's copy with its key, so a sealed key file
-	// that can't be read fails before the daemon is stopped, which an open
-	// vault would not survive. An interrupted fork is about other files.
-	if !*abandon && sealedKeyFile(cfg.DataDir) {
+	// A fork decrypts this device's copy with its key, so a key that can't
+	// be read (a keychain entry or a key file that is gone or damaged), or a
+	// sealed file's passphrase that does not open it, fails before the
+	// daemon is stopped, which an open vault would not survive: stopped, it
+	// would come back locked. An interrupted fork is about other files.
+	if !*abandon {
 		if pending, err := store.ForkInProgress(cfg.DataDir); err == nil && !pending {
-			if err := store.CheckDevicePassphrase(cfg.DataDir, nil); errors.Is(err, store.ErrDeviceKey) {
+			if err := store.CheckDeviceKey(cfg); errors.Is(err, store.ErrDeviceKey) {
 				return forkFailure(err)
+			}
+			if sealedKeyFile(cfg.DataDir) {
+				if err := requireDevicePassphrase(e, *asJSON); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -149,7 +156,11 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 	var pass []byte
-	if sealed && e.Getenv(store.PassphraseEnv) == "" {
+	if sealed && !pending {
+		// Settled and checked above, before the daemon was stopped.
+		pass = e.typedPass()
+		defer clear(pass)
+	} else if sealed && e.Getenv(store.PassphraseEnv) == "" {
 		if e.ReadPassword == nil {
 			return failf("the device key file is sealed and stdin is not a terminal to ask for its passphrase; set %s or run hop vault fork in an interactive terminal", store.PassphraseEnv)
 		}

@@ -139,6 +139,9 @@ type machine struct {
 	// daemonPass, when set, is the HOP_DEVICE_PASSPHRASE the daemons the CLI
 	// starts here were started with.
 	daemonPass atomic.Pointer[string]
+	// exe and goos are Env.Executable and Env.GOOS, for the commands that
+	// look for the login service.
+	exe, goos string
 
 	mu sync.Mutex
 	d  *daemon.Daemon
@@ -223,8 +226,9 @@ type session struct {
 	// ctx, when set, is the context the command runs under.
 	ctx context.Context
 	// exit, when set, is Env.Exit: what hop calls to end the process after
-	// a signal.
-	exit func(code int)
+	// a signal, and grace is Env.InterruptGrace.
+	exit  func(code int)
+	grace time.Duration
 
 	stdout, stderr syncBuffer
 
@@ -325,8 +329,9 @@ func (m *machine) env(t *testing.T, s *session) *cli.Env {
 		Getenv: func(k string) string { return s.env[k] },
 		Home:   m.home, Paths: m.paths, DataDir: m.data, Keyring: m.ring,
 		StdinTTY: s.tty, StdoutTTY: s.tty,
+		Executable: m.exe, GOOS: m.goos,
 		StartDaemon: m.startDaemon(t), SyncClient: syncclient.Options{RootCAs: m.w.pool},
-		DialTimeout: 5 * time.Second, Exit: s.exit,
+		DialTimeout: 5 * time.Second, Exit: s.exit, InterruptGrace: s.grace,
 		ReadPassword: func(prompt string) ([]byte, error) {
 			s.asked(prompt)
 			if s.failAt != "" && strings.HasPrefix(prompt, s.failAt) {

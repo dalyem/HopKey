@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -43,6 +44,16 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 	// before the passwords are asked, and sent with each request that saves
 	// the key, never kept by the daemon.
 	defer e.clearDevicePass()
+	// A daemon of another vault is refused first, before a device passphrase
+	// or a password is asked for: nothing would be sent to it.
+	if c, err := dialExisting(ctx, e); err == nil && c != nil {
+		_, err := servesThisVault(ctx, e, c)
+		c.Close()
+		var other *daemonElsewhere
+		if errors.As(err, &other) {
+			return failf("%v; %s", err, wrongDaemonSent(false))
+		}
+	}
 	if err := requireDevicePassphrase(e, false); err != nil {
 		return err
 	}
@@ -59,11 +70,19 @@ func runPasswd(ctx context.Context, e *Env, args []string) error {
 	if err != nil {
 		return failf("%v; %s", err, wrongDaemonSent(len(pass) > 0))
 	}
-	if len(pass) > 0 && st.Vault != nil && st.Vault.Locked {
-		// What hop unlock would do, with the passphrase just typed.
+	if st.Vault != nil && st.Vault.Locked {
+		// Before any password is asked: a locked vault with no device
+		// passphrase to open it would fail only after the passwords were
+		// typed, with nothing to show for them.
+		if len(pass) == 0 {
+			return failf("the vault is locked, so its password can't be changed: %s", lockedFix(st.Vault))
+		}
+		// What hop unlock would do, with the passphrase just typed. The vault
+		// goes back as it was when the command ends.
 		if err := sendDevicePassphrase(ctx, e, c, false, pass); err != nil {
 			return failf("%v", err)
 		}
+		defer lockAgain(ctx, e, false)
 	}
 
 	var pending daemon.KitResult

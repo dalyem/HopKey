@@ -186,7 +186,9 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 		case <-time.After(grace):
 		}
 	}
+	asJSON := false
 	if h := e.currentHold(); h != nil {
+		asJSON = h.asJSON
 		select {
 		case <-done:
 			return
@@ -200,6 +202,11 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 	case <-done:
 		return
 	default:
+	}
+	// The command is stuck, so Run never reports it: the same words as when
+	// it returns (interruptedText).
+	if !asJSON { // a --json command's stderr stays JSON
+		fmt.Fprintf(e.Stderr, "hop: %s\n", interruptedText)
 	}
 	e.Exit(ExitInterrupted)
 }
@@ -374,8 +381,10 @@ func Run(ctx context.Context, args []string, e *Env) int {
 	// stops on a signal by design, and a service manager reads 0 as a
 	// clean stop. So does hop <target> once ssh ran: it exits as ssh did.
 	if !ctxAware && !e.sshRan.Load() && errors.Is(context.Cause(ctx), ErrInterrupted) {
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, flag.ErrHelp) {
-			report(e, err, args)
+		// One text, whatever the command was doing when the signal came and
+		// whatever its cancelled context made it return (interruptedText).
+		if err != nil && !errors.Is(err, flag.ErrHelp) {
+			report(e, &exitError{code: ExitInterrupted, msg: interruptedText}, args)
 		}
 		return ExitInterrupted
 	}

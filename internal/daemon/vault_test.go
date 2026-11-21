@@ -112,6 +112,11 @@ func TestEncryptedVaultOps(t *testing.T) {
 	if err := c.Call(ctx, OpUnlock, UnlockParams{Password: password, SecretKey: p.Kit().SecretKey}, nil); err != nil {
 		t.Fatal(err)
 	}
+	// An unlocked vault has a device key that works: a password unlock would
+	// replace it, and leave the old one as a stale device, every time.
+	if err := c.Call(ctx, OpUnlock, UnlockParams{Password: password, SecretKey: p.Kit().SecretKey}, nil); !IsCode(err, CodeInvalid) {
+		t.Errorf("password unlock of an unlocked vault: %v", err)
+	}
 
 	// While the head does not move, requests do not re-read the store.
 	if err := c.Call(ctx, OpList, nil, nil); err != nil {
