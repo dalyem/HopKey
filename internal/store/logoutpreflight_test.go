@@ -65,3 +65,29 @@ func TestLogoutPreflightMatchesTheGuards(t *testing.T) {
 		t.Errorf("a logout under way: %v", err)
 	}
 }
+
+// An acknowledgment cut short once its journal is installed leaves the
+// checkpoint's name beside wal.json; opening the store replays the removal,
+// and the logout goes ahead. The preflight leaves that to the store.
+func TestLogoutPreflightLeavesAnInterruptedCommitToTheStore(t *testing.T) {
+	ctx := context.Background()
+	a, _, r := newCkptPair(t)
+	if _, err := a.s.Rotate(ctx, r, []byte(testPassword), CheckpointOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	a.s.testHook = crashAtN("wal:op:0", 1)
+	if err := a.s.AckKit(); !errors.Is(err, errCrash) {
+		t.Fatalf("ack: %v", err)
+	}
+	a.s.Close()
+	if !journalExists(t, a.cfg) {
+		t.Fatal("the crash left no checkpoint journal")
+	}
+	if err := LogoutPreflight(a.cfg.DataDir); err != nil {
+		t.Errorf("preflight with a commit to replay: %v", err)
+	}
+	s := open(t, a.cfg)
+	if _, err := s.Logout(ctx, nil, LogoutOptions{LocalOnly: true, DiscardPending: true}); err != nil {
+		t.Errorf("the store's logout after the replay: %v", err)
+	}
+}

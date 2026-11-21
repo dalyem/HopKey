@@ -398,6 +398,15 @@ func LogoutPreflight(dataDir string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	// A commit cut short leaves its journal: opening the store replays it,
+	// which may delete the very files the guards look for (a kit's
+	// acknowledgment removes its checkpoint). The names say nothing until
+	// then, so the store's own guards decide.
+	if _, err := os.Lstat(l.walFile()); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if exists, err := l.mergeExists(); err != nil {
 		return err
 	} else if exists {
