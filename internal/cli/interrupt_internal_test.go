@@ -198,7 +198,7 @@ func TestInterruptAbandonsAStuckFlow(t *testing.T) {
 		t.Fatalf("marker %q, %v", b, err)
 	}
 	done := make(chan struct{})
-	go x.e.watchInterrupt(ctx, done, false)
+	go x.e.watchInterrupt(ctx, done, false, false)
 	cancel(ErrInterrupted)
 	select {
 	case code := <-x.exits:
@@ -231,7 +231,7 @@ func TestInterruptLetsAReturningFlowRelease(t *testing.T) {
 	}
 	done := make(chan struct{})
 	watched := make(chan struct{})
-	go func() { x.e.watchInterrupt(ctx, done, false); close(watched) }()
+	go func() { x.e.watchInterrupt(ctx, done, false, false); close(watched) }()
 	cancel(ErrInterrupted)
 	<-ctx.Done()
 	h.release(ctx)
@@ -253,7 +253,7 @@ func TestInterruptLetsAReturningFlowRelease(t *testing.T) {
 func TestInterruptWithoutAHold(t *testing.T) {
 	x := newInterruptEnv(t)
 	ctx, cancel := interrupted()
-	go x.e.watchInterrupt(ctx, make(chan struct{}), false)
+	go x.e.watchInterrupt(ctx, make(chan struct{}), false, false)
 	cancel(ErrInterrupted)
 	select {
 	case code := <-x.exits:
@@ -266,14 +266,14 @@ func TestInterruptWithoutAHold(t *testing.T) {
 
 	ctx, cancel = interrupted()
 	watched := make(chan struct{})
-	go func() { x.e.watchInterrupt(ctx, make(chan struct{}), true); close(watched) }()
+	go func() { x.e.watchInterrupt(ctx, make(chan struct{}), true, false); close(watched) }()
 	cancel(ErrInterrupted)
 	<-watched
 
 	dctx, dcancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer dcancel()
 	watched = make(chan struct{})
-	go func() { x.e.watchInterrupt(dctx, make(chan struct{}), false); close(watched) }()
+	go func() { x.e.watchInterrupt(dctx, make(chan struct{}), false, false); close(watched) }()
 	<-watched
 	select {
 	case code := <-x.exits:
@@ -493,19 +493,28 @@ func TestAbandonWarnsInJSON(t *testing.T) {
 	if _, err := holdVault(ctx, x.e, true); err != nil {
 		t.Fatal(err)
 	}
-	go x.e.watchInterrupt(ctx, make(chan struct{}), false)
+	go x.e.watchInterrupt(ctx, make(chan struct{}), false, false)
 	cancel(ErrInterrupted)
 	select {
 	case <-x.exits:
 	case <-time.After(5 * time.Second):
 		t.Fatal("no exit after the interrupt")
 	}
+	// The warning, then the interruption, each a line of JSON.
 	out := x.e.Stderr.(*strings.Builder).String()
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	var w struct {
 		Warning string `json:"warning"`
+		Error   string `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(out), &w); err != nil || !strings.Contains(w.Warning, "no daemon here") {
-		t.Errorf("stderr %q is not one JSON warning: %v", out, err)
+	if len(lines) != 2 {
+		t.Fatalf("stderr %q is not two lines", out)
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &w); err != nil || !strings.Contains(w.Warning, "no daemon here") {
+		t.Errorf("stderr %q does not start with a JSON warning: %v", out, err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &w); err != nil || w.Error != interruptedText {
+		t.Errorf("stderr %q does not end with a JSON error: %v", out, err)
 	}
 }
 

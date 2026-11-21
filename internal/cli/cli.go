@@ -145,8 +145,9 @@ const ExitInterrupted = 130
 // holds nothing exits at once, as it did when the signal killed it,
 // unless it handles the context itself (ctxAware, decided before the
 // command starts: see handlesInterrupt). A hop key rotate that another
-// command runs is waited for (beginRotation).
-func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware bool) {
+// command runs is waited for (beginRotation). asJSON is the command's
+// output mode.
+func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware, asJSON bool) {
 	if e.Exit == nil {
 		return
 	}
@@ -186,9 +187,8 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 		case <-time.After(grace):
 		}
 	}
-	asJSON := false
 	if h := e.currentHold(); h != nil {
-		asJSON = h.asJSON
+		asJSON = asJSON || h.asJSON
 		select {
 		case <-done:
 			return
@@ -204,10 +204,8 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 	default:
 	}
 	// The command is stuck, so Run never reports it: the same words as when
-	// it returns (interruptedText).
-	if !asJSON { // a --json command's stderr stays JSON
-		fmt.Fprintf(e.Stderr, "hop: %s\n", interruptedText)
-	}
+	// it returns (interruptedText), in JSON for a --json command.
+	printError(e, asJSON, &exitError{code: ExitInterrupted, msg: interruptedText})
 	e.Exit(ExitInterrupted)
 }
 
@@ -372,7 +370,7 @@ func Run(ctx context.Context, args []string, e *Env) int {
 	}
 	ctxAware := handlesInterrupt(args)
 	done := make(chan struct{})
-	go e.watchInterrupt(ctx, done, ctxAware)
+	go e.watchInterrupt(ctx, done, ctxAware, wantsJSON(args))
 	err := dispatch(ctx, e, args)
 	close(done)
 	// After a signal hop exits 130, however the command ended: with the
@@ -427,8 +425,13 @@ func report(e *Env, err error, args []string) int {
 // applied. JSON carries the full text either way, encoded by encoding/json and
 // escapeJSONControls, for machines.
 func reportError(e *Env, err error, args []string) {
+	printError(e, wantsJSON(args), err)
+}
+
+// printError is reportError for a command whose output mode is known.
+func printError(e *Env, asJSON bool, err error) {
 	msg := err.Error()
-	if wantsJSON(args) {
+	if asJSON {
 		b, _ := json.Marshal(map[string]string{"error": msg})
 		fmt.Fprintln(e.Stderr, string(escapeJSONControls(b)))
 		return
