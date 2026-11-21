@@ -38,6 +38,12 @@ type Options struct {
 	Hotkey byte
 	// DoubleTap is DefaultDoubleTap when 0.
 	DoubleTap time.Duration
+	// OnSuspend, when set, is called as hop stops itself for job control
+	// (the panel's Ctrl-Z, or SIGTSTP), once the terminal is the shell's
+	// again; OnResume once hop is continued, or the stop did not happen.
+	// The child is in a session of its own and does not stop with hop:
+	// these are where the caller stops and continues it.
+	OnSuspend, OnResume func()
 }
 
 // ErrNotTerminal is Run's error when In or Out is not a terminal. The

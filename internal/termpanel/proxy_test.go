@@ -591,6 +591,46 @@ func TestSuspendAndResume(t *testing.T) {
 	check("SIGTSTP")
 }
 
+// The caller stops the child as hop stops, and continues it as hop is
+// continued: OnSuspend before the stop, OnResume after it.
+func TestSuspendHooks(t *testing.T) {
+	v := newVTerm(t, 80, 24)
+	var mu sync.Mutex
+	var got []string
+	note := func(s string) func() {
+		return func() {
+			mu.Lock()
+			got = append(got, s)
+			mu.Unlock()
+		}
+	}
+	real := stopSelf
+	stopSelf = func(<-chan os.Signal) { note("stop")() }
+	t.Cleanup(func() { stopSelf = real })
+	run(t, v, Options{Shortcuts: testShortcuts, OnSuspend: note("suspend"), OnResume: note("resume")}, `printf READY; exec cat >/dev/null`, "")
+	v.waitText("READY")
+	wait := func(how, want string) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			mu.Lock()
+			s := strings.Join(got, " ")
+			mu.Unlock()
+			if s == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: hooks and stops %q, want %q", how, s, want)
+			}
+		}
+	}
+	v.key("\x1d")
+	v.panelAt(40)
+	v.key("\x1a")
+	wait("Ctrl-Z in the panel", "suspend stop resume")
+	syscall.Kill(os.Getpid(), syscall.SIGTSTP)
+	wait("SIGTSTP", "suspend stop resume suspend stop resume")
+}
+
 func TestNotATerminal(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {

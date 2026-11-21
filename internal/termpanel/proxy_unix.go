@@ -46,7 +46,8 @@ const (
 // handles SIGWINCH (the child's pty takes the terminal's size), SIGTSTP
 // (hop stops, with the terminal restored for the shell) and SIGCONT,
 // and nothing else: the caller still holds or passes on SIGINT, SIGTERM
-// and the rest. The child is never signalled from here. When ctx is
+// and the rest. The child is never signalled from here: on a suspend,
+// opts.OnSuspend and opts.OnResume are the caller's. When ctx is
 // done, or the terminal hangs up, the pty is closed, which hangs up the
 // child's session; wait still decides when Run returns.
 //
@@ -88,6 +89,8 @@ type proxy struct {
 	inR, outR  *reader
 	w          *writer
 	sig, cont  chan os.Signal
+	onSuspend  func()
+	onResume   func()
 	size       unix.Winsize
 	panel      panelState
 	needResume bool // continued in the background: resume once in front
@@ -120,7 +123,8 @@ func newProxy(opts Options) (_ *proxy, err error) {
 	if opts.In == nil || opts.Out == nil || !term.IsTerminal(int(opts.In.Fd())) || !term.IsTerminal(int(opts.Out.Fd())) {
 		return nil, ErrNotTerminal
 	}
-	p := &proxy{in: opts.In, out: opts.Out, inFd: int(opts.In.Fd()), ptm: -1, es: entries(opts.Shortcuts), tap: opts.DoubleTap}
+	p := &proxy{in: opts.In, out: opts.Out, inFd: int(opts.In.Fd()), ptm: -1, es: entries(opts.Shortcuts), tap: opts.DoubleTap,
+		onSuspend: opts.OnSuspend, onResume: opts.OnResume}
 	if p.tap <= 0 {
 		p.tap = DefaultDoubleTap
 	}
@@ -742,9 +746,10 @@ func hasShell() bool {
 // suspend stops hop for job control: the panel's Ctrl-Z, or a SIGTSTP
 // sent to it. The terminal goes back to the mode the shell left it in,
 // off the alternate screen and with the modes that change what keys and
-// the mouse send turned off; resume undoes that. The child runs on
-// meanwhile, but hop reads nothing from it, so it waits once the pty is
-// full.
+// the mouse send turned off; resume undoes that. The child stops and
+// continues with hop when the caller says so (onSuspend, onResume);
+// otherwise it runs on meanwhile, but hop reads nothing from it, so it
+// waits once the pty is full.
 func (p *proxy) suspend() {
 	p.panel.pending, p.panel.queued = false, nil
 	if p.panel.open {
@@ -766,7 +771,13 @@ func (p *proxy) suspend() {
 	b = append(b, "\x1b[0m\x1b[?25h"...)
 	p.write(b)
 	term.Restore(p.inFd, p.orig)
+	if p.onSuspend != nil {
+		p.onSuspend()
+	}
 	stopSelf(p.cont)
+	if p.onResume != nil {
+		p.onResume()
+	}
 	signal.Notify(p.sig, syscall.SIGTSTP)
 	p.needResume = true
 	p.resume()
