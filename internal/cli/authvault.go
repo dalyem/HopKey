@@ -563,7 +563,9 @@ func lockAgain(ctx context.Context, e *Env, asJSON bool) {
 }
 
 // lockThisVault locks the vault in the running daemon, if it serves this
-// vault and has it open.
+// vault and has it open. A daemon too old to say which vault it serves is
+// left alone too, but whether this vault is locked is then not known: that
+// is an error.
 func lockThisVault(ctx context.Context, e *Env) error {
 	c, err := dialExisting(ctx, e)
 	if err != nil || c == nil {
@@ -572,7 +574,7 @@ func lockThisVault(ctx context.Context, e *Env) error {
 	defer c.Close()
 	st, err := servesThisVault(ctx, e, c)
 	var other *daemonElsewhere
-	if errors.As(err, &other) {
+	if errors.As(err, &other) && other.dir != "" {
 		return nil
 	}
 	if err != nil {
