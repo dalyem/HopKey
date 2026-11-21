@@ -454,7 +454,7 @@ func CheckDevicePassphrase(dataDir string, pass []byte) error {
 	}
 	var f deviceKeyFile
 	if err := canonjson.Unmarshal(b, &f); err != nil || f.V != 1 {
-		return fmt.Errorf("%w: %s does not parse", ErrDeviceKey, path)
+		return fmt.Errorf("%w: %s does not parse, so it is damaged or cut short (hop unlock --password says how to restore it)", ErrDeviceKey, path)
 	}
 	if f.KDFVersion != crypto.KDFv1.Version || len(f.Salt) != crypto.SaltSize {
 		return fmt.Errorf("%w: %s is not sealed with a device passphrase", ErrDeviceKey, path)
@@ -475,6 +475,44 @@ func CheckDevicePassphrase(dataDir string, pass []byte) error {
 	}
 	clear(pt)
 	return nil
+}
+
+// What DeviceKeyFileProblem finds wrong with the device key file.
+const (
+	KeyFileMissing = "missing"
+	KeyFileDamaged = "damaged"
+)
+
+// DeviceKeyFileProblem says what is wrong with the device key file of the
+// vault in dataDir, for hop status: KeyFileMissing, KeyFileDamaged (it does
+// not parse, as a truncated one does), or "" when the device key is not a
+// file, the file is fine, or what is wrong with it is not known (it cannot
+// be read). It only reads, and needs no passphrase.
+func DeviceKeyFileProblem(dataDir string) string {
+	l := layout{data: dataDir}
+	b, err := os.ReadFile(l.deviceConfig())
+	if err != nil {
+		return ""
+	}
+	var c deviceConfig
+	if json.Unmarshal(b, &c) != nil || c.Store != DeviceStoreFile {
+		return ""
+	}
+	b, err = readKeyFile(l.deviceKeyFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return KeyFileMissing
+	}
+	if err != nil {
+		return ""
+	}
+	if _, ok := parseTombstone(b); ok {
+		return ""
+	}
+	var f deviceKeyFile
+	if canonjson.Unmarshal(b, &f) != nil || f.V != 1 {
+		return KeyFileDamaged
+	}
+	return ""
 }
 
 // KeychainProblem says why the OS keychain can't hold a device key, or is
@@ -824,7 +862,7 @@ func (d *deviceStore) loadFile() (*deviceRecord, error) {
 	}
 	var f deviceKeyFile
 	if err := canonjson.Unmarshal(b, &f); err != nil || f.V != 1 {
-		return nil, fmt.Errorf("%w: %s does not parse", ErrDeviceKey, path)
+		return nil, fmt.Errorf("%w: %s does not parse, so it is damaged or cut short (hop unlock --password says how to restore it)", ErrDeviceKey, path)
 	}
 	pt := []byte(f.Key)
 	switch {

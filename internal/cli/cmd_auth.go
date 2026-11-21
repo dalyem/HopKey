@@ -789,6 +789,9 @@ type AuthStatus struct {
 	Wiped             bool                    `json:"wiped,omitempty"`
 	WipePending       bool                    `json:"wipe_pending,omitempty"`
 	Revocation        *store.RevocationRecord `json:"revocation,omitempty"`
+	// Publishing means a publication of this vault to a server is journaled
+	// and not finished: the vault is not signed in yet (SignedIn is false).
+	Publishing bool `json:"publishing,omitempty"`
 	// Vault is false when this device has no vault at all.
 	Vault          bool                     `json:"vault"`
 	Server         string                   `json:"server,omitempty"`
@@ -870,6 +873,9 @@ func authStatus(ctx context.Context, e *Env, args []string, settle *func()) erro
 	}
 	a := AuthStatus{Vault: true, Sync: st.Sync, EndedSessions: st.EndedSessions}
 	sshPending := false
+	if st.Sync != nil {
+		a.Publishing = st.Sync.Publishing
+	}
 	if v := st.Vault; v != nil {
 		a.DeviceID, a.DeviceKeyStore, a.Locked, a.KitPending, a.AccountID = v.DeviceID, v.DeviceStore, v.Locked, v.KitPending, v.AccountID
 		a.SecretKeyStale = v.SecretKeyStale
@@ -887,7 +893,14 @@ func authStatus(ctx context.Context, e *Env, args []string, settle *func()) erro
 			a.Vault = false
 			a.Revocation, _ = store.ReadRevocation(e.storeConfig().DataDir)
 		}
-		a.SignedIn = !a.Revoked
+		// A locked vault says "locked", not "off", whatever it is, so the
+		// files say whether it syncs with a server.
+		dir := st.DataDir
+		if dir == "" {
+			dir = e.storeConfig().DataDir
+		}
+		backed, _ := store.ServerBackedDir(dir)
+		a.SignedIn = !a.Revoked && (s.Server != "" || backed)
 		a.Server, a.Email, a.VaultID = s.Server, s.Email, s.VaultID
 		if s.AccountID != "" {
 			a.AccountID = s.AccountID
@@ -951,6 +964,9 @@ func authStatus(ctx context.Context, e *Env, args []string, settle *func()) erro
 			"and nothing syncs (hop auth logout wipes this device, then hop auth login signs in again)\n", oneLine(r.How), r.Seq)
 	case a.Revoked:
 		e.printf("signed in:    no; this device was revoked from the account, so nothing syncs here any more (hop auth logout --local-only wipes this device's copy, then hop auth login signs in again)\n")
+	case a.Publishing:
+		e.printf("signed in:    no; this vault is being published to a server and the publication is not finished " +
+			"(the daemon finishes it once the vault is unlocked, and hop auth signup finishes it from here)\n")
 	default:
 		e.printf("signed in:    no; this vault is local-only (hop auth signup publishes it, hop auth login --merge merges it into an account)\n")
 	}
@@ -959,6 +975,7 @@ func authStatus(ctx context.Context, e *Env, args []string, settle *func()) erro
 	}
 	if a.DeviceKeyStore != "" {
 		e.printf("device key:   %s\n", oneLine(deviceKeyWords(a.DeviceKeyStore)))
+		printDeviceKeyFileProblem(e, st.DataDir)
 	}
 	switch {
 	case !a.Locked:

@@ -239,7 +239,7 @@ func TestVaultStatusAndUnlockWarningsAreOneLine(t *testing.T) {
 		Warnings: []string{"stale " + bad, "second " + bad},
 	}
 	var out bytes.Buffer
-	printVaultStatus(&Env{Stdout: &out}, info)
+	printVaultStatus(&Env{Stdout: &out}, info, "")
 	got := out.String()
 	if c, bad := unsafeIn(got); bad {
 		t.Errorf("unsafe %U in %q", c, got)

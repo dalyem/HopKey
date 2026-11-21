@@ -282,16 +282,18 @@ func kitReminder(ctx context.Context, e *Env, c *daemon.Client) error {
 	return nil
 }
 
-// printVaultStatus is the vault part of hop status: locked or not, where
-// the device key is, and the log head (seq and the first 8 bytes of H, for
+// printVaultStatus is the vault part of hop status of the vault the daemon
+// serves in dataDir ("" for a daemon that does not say): locked or not,
+// where the device key is, and the log head (seq and the first 8 bytes of H, for
 // comparing devices by eye, spec §5.6).
-func printVaultStatus(e *Env, v *store.Info) {
+func printVaultStatus(e *Env, v *store.Info, dataDir string) {
 	if v == nil {
 		return
 	}
 	e.printf("vault:        %s\n", vaultState(v))
 	printAdminLockHelp(e, v)
 	e.printf("device key:   %s\n", oneLine(deviceKeyWords(v.DeviceStore)))
+	printDeviceKeyFileProblem(e, dataDir)
 	if v.Head != nil {
 		e.printf("log head:     seq %s\n", v.Head.Short())
 	}
@@ -304,6 +306,33 @@ func printVaultStatus(e *Env, v *store.Info) {
 	for _, w := range v.Warnings {
 		e.printf("warning:      %s\n", oneLine(w))
 	}
+}
+
+// printDeviceKeyFileProblem says that the device key file is missing or
+// damaged, and what replaces it: the device key line names the file as the
+// store, so without this a missing one reads like a healthy sealed one.
+func printDeviceKeyFileProblem(e *Env, dir string) {
+	if dir == "" {
+		if e.DataDir == "" && e.Getenv == nil {
+			return // an Env that says no data directory has no key file to look at
+		}
+		dir = e.storeConfig().DataDir
+	}
+	path := oneLine(store.DeviceKeyFile(dir))
+	var what string
+	switch store.DeviceKeyFileProblem(dir) {
+	case store.KeyFileMissing:
+		what = "is missing"
+	case store.KeyFileDamaged:
+		what = "is damaged: it does not parse, as a cut-short file does not"
+	default:
+		return
+	}
+	next := "hop lock, then hop unlock --password, replaces the key"
+	if server, err := store.ServerBackedDir(dir); err == nil && server {
+		next = "hop auth logout --local-only, then hop auth login (and hop auth devices revoke OLD-ID from another device), replaces it"
+	}
+	e.printf("device key:   the file %s %s, so this vault cannot be unlocked again once it locks or the daemon stops; %s\n", path, what, next)
 }
 
 // vaultState says whether the vault is unlocked and, when it is locked,

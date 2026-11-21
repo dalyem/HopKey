@@ -50,7 +50,7 @@ func TestAdminLockHelpSteps(t *testing.T) {
 	}
 	// The steps are part of hop status, under the vault line.
 	var out strings.Builder
-	printVaultStatus(&Env{Stdout: &out}, blocked)
+	printVaultStatus(&Env{Stdout: &out}, blocked, "")
 	if s := out.String(); !strings.Contains(s, "vault:        locked") || strings.Index(s, "hop auth logout") < strings.Index(s, "vault:") ||
 		strings.Index(s, "hop auth logout") > strings.Index(s, "device key:") {
 		t.Errorf("hop status:\n%s", s)

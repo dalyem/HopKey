@@ -236,7 +236,7 @@ func runStatus(ctx context.Context, e *Env, args []string) error {
 	if l := e.endedLine(st.EndedSessions); l != "" {
 		e.printf("sessions:     %s\n", l)
 	}
-	printVaultStatus(e, st.Vault)
+	printVaultStatus(e, st.Vault, st.DataDir)
 	if st.Sync != nil {
 		o := syncBlockOpts{shown: map[string]bool{}}
 		if st.Vault != nil {
