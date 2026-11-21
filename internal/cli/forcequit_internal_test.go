@@ -34,7 +34,7 @@ func TestSecondInterruptSaysWhatToRun(t *testing.T) {
 	if code := <-x.exits; code != ExitInterrupted {
 		t.Errorf("exit %d, want %d", code, ExitInterrupted)
 	}
-	if got := strings.TrimPrefix(stderr.String(), first); got != quitText+"\n" {
+	if got := strings.TrimPrefix(stderr.String(), first); got != "hop: "+quitText+"\n" {
 		t.Errorf("stderr after the second Ctrl-C: %q", got)
 	}
 	x.e.setHold(nil)

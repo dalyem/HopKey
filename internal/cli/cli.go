@@ -189,11 +189,7 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 	}
 	if e.restorePending() {
 		// What is left to do takes a moment, and a second Ctrl-C skips it.
-		if asJSON || e.currentHoldJSON() {
-			printWarning(e, true, restoringText)
-		} else {
-			fmt.Fprintln(e.Stderr, "hop: "+restoringText)
-		}
+		e.notice(asJSON || e.currentHoldJSON(), restoringText)
 	}
 	grace := e.InterruptGrace
 	if grace <= 0 {
@@ -246,7 +242,7 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 const restoringText = "restoring the vault's lock state; press Ctrl-C again to quit now (the vault may be left open: run hop lock)"
 
 // quitText is said when a second signal ends hop before that is done.
-const quitText = "hop: quit before the vault's lock state was restored: the vault may be open, so run hop lock if it was locked; hop status shows its state"
+const quitText = "quit before the vault's lock state was restored: the vault may be open, so run hop lock if it was locked; hop status shows its state"
 
 // restorePending reports whether the command has the vault's lock state
 // to put back: it holds the vault (a hop auth command, whose release or
@@ -265,12 +261,24 @@ func (e *Env) currentHoldJSON() bool {
 	return h != nil && h.asJSON
 }
 
+// notice says msg on stderr, as a JSON warning for a --json command. The
+// flow may be warning at the same time, hence warnMu.
+func (e *Env) notice(asJSON bool, msg string) {
+	e.warnMu.Lock()
+	defer e.warnMu.Unlock()
+	if asJSON {
+		printWarning(e, true, msg)
+		return
+	}
+	fmt.Fprintln(e.Stderr, "hop: "+msg)
+}
+
 // ForceQuit is for a second SIGINT or SIGTERM, which ends hop at once,
 // however far it got after the first. Where the vault's lock state was
 // still to be put back, it says what to run; then it exits.
 func (e *Env) ForceQuit() {
 	if e.restorePending() {
-		fmt.Fprintln(e.Stderr, quitText)
+		e.notice(e.currentHoldJSON(), quitText)
 	}
 	if e.Exit != nil {
 		e.Exit(ExitInterrupted)
