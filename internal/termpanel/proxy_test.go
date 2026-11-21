@@ -1395,3 +1395,45 @@ func TestSuspendHandsBackOnce(t *testing.T) {
 		return slices.Equal(s.kitty[0].pushed, []int{1})
 	})
 }
+
+// While the terminal is the shell's (suspended, and resume has not taken
+// it since), what the session draws and a panel opened from keys read
+// before the suspend do not reach it: restore, knowing the terminal handed
+// back, would not turn off what they turned on.
+func TestNothingDrawnWhileHandedBack(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		then func(p *proxy)
+	}{
+		{"session output", func(p *proxy) { p.output([]byte("\x1b[?1000h\x1b[>4;2mLATE")) }},
+		{"panel opened", func(p *proxy) { p.openPanel() }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			v := newVTerm(t, 80, 24)
+			tio, fl := terminalState(t, v.fd)
+			p, err := newProxy(Options{In: v.tty, Out: v.tty, Shortcuts: testShortcuts})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.restore()
+			real := stopSelf
+			stopSelf = func(<-chan os.Signal) {}
+			t.Cleanup(func() { stopSelf = real })
+			p.output([]byte("\x1b[>4;1m\x1b[?1000hREADY"))
+			v.waitText("READY")
+			p.gone = true // resume does not take the terminal back
+			p.suspend()
+			c.then(p)
+			if p.panel.open {
+				t.Error("a panel opened on a terminal handed back")
+			}
+			p.restore()
+			checkTerminalState(t, v.fd, tio, fl)
+			if _, err := v.tty.Write([]byte("DONE")); err != nil {
+				t.Fatal(err)
+			}
+			v.waitText("DONE")
+			waitReset(t, v)
+		})
+	}
+}

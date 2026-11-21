@@ -449,6 +449,13 @@ func (p *proxy) writeWithin(b []byte, limit time.Duration, back bool) bool {
 	switch {
 	case p.outGone:
 		return false
+	case p.handedBack && !back:
+		// The terminal is the shell's until resume takes it: what the
+		// session or the panel would draw meanwhile (output drained as
+		// the session ends, a panel opened from keys read before the
+		// suspend) is dropped, so it turns nothing back on that restore,
+		// knowing the terminal handed back, would leave on.
+		return false
 	case p.outStalled && limit == 0:
 		if back {
 			p.owed = append(p.owed, b...)
