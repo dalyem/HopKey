@@ -497,9 +497,17 @@ func (p *proxy) panelKey(t token) {
 			return
 		}
 		p.key(t.raw[0])
+	case tokSeq:
+		// The kitty keyboard protocol and modifyOtherKeys send the
+		// panel's keys as sequences when the remote side turned them on.
+		if k, release, ok := decodeKey(t.raw); ok {
+			if !release {
+				p.panelKey(k)
+			}
+		}
 	}
-	// Escape sequences (other keys, mouse and focus reports) and pastes
-	// are dropped.
+	// Other escape sequences (other keys, mouse and focus reports) and
+	// pastes are dropped.
 }
 
 func (p *proxy) find(keys string) *entry {

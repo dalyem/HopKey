@@ -130,3 +130,68 @@ func TestInputHotkeyShiftedForms(t *testing.T) {
 		}
 	}
 }
+
+// The panel's keys as the kitty keyboard protocol and modifyOtherKeys send
+// them decode to the tokens the plain keys give.
+func TestDecodeKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"\x1b[117u":        `text:"u"`,
+		"\x1b[117;1:1u":    `text:"u"`,
+		"\x1b[117;1:2u":    `text:"u"`, // a repeat
+		"\x1b[117;1:3u":    `release`,
+		"\x1b[117;2u":      `text:"U"`,
+		"\x1b[49;2u":       `none`, // Shift-1: which character is not said
+		"\x1b[49:33;2u":    `text:"!"`,
+		"\x1b[49;2;33u":    `text:"!"`,
+		"\x1b[117;;117u":   `text:"u"`,
+		"\x1b[117;65u":     `text:"U"`, // Caps Lock
+		"\x1b[117;129u":    `text:"u"`, // Num Lock
+		"\x1b[27u":         `esc:"\x1b"`,
+		"\x1b[27;1:3u":     `release`,
+		"\x1b[13u":         `ctl:"\r"`,
+		"\x1b[57414u":      `ctl:"\r"`,
+		"\x1b[127u":        `ctl:"\x7f"`,
+		"\x1b[99;5u":       `ctl:"\x03"`,
+		"\x1b[99;69u":      `ctl:"\x03"`,
+		"\x1b[122;5u":      `ctl:"\x1a"`,
+		"\x1b[27;5;99~":    `ctl:"\x03"`,
+		"\x1b[27;5;122~":   `ctl:"\x1a"`,
+		"\x1b[27;2;85~":    `text:"U"`,
+		"\x1b[27;1;103~":   `text:"g"`,
+		"\x1b[27;5;13~":    `none`, // Ctrl-Enter
+		"\x1b[117;3u":      `none`, // Alt-u
+		"\x1b[99;6u":       `none`, // Ctrl-Shift-c
+		"\x1b[57399u":      `none`, // the keypad's 0
+		"\x1b[A":           `none`,
+		"\x1b[1;5A":        `none`,
+		"\x1b[2~":          `none`,
+		"\x1b[27;5~":       `none`,
+		"\x1b[x;5u":        `none`,
+		"\x1b[117;1;2;3u":  `none`,
+		"\x1b[200~":        `none`,
+		"\x1bx":            `none`,
+		"\x1b[117;0u":      `none`,
+		"\x1b[-117u":       `none`,
+		"\x1b[117:85:117u": `text:"u"`,
+		"\x1b[117:85;2:3u": `release`,
+		"\x1b[32u":         `text:" "`,
+		"\x1b[9u":          `none`, // Tab
+		"\x1b[105;5u":      `ctl:"\t"`,
+		"\x1b[27;6;94~":    `none`, // Ctrl-Shift-^: not a panel key
+		"\x1b[126u":        `text:"~"`,
+		"\x1b[127;1:2u":    `ctl:"\x7f"`,
+		"\x1b[13;2u":       `ctl:"\r"`,
+	} {
+		tk, release, ok := decodeKey([]byte(in))
+		got := "none"
+		switch {
+		case release && ok:
+			got = "release"
+		case ok:
+			got = kinds([]token{tk})
+		}
+		if got != want {
+			t.Errorf("%q: %s, want %s", in, got, want)
+		}
+	}
+}

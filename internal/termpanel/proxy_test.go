@@ -861,3 +861,66 @@ func TestPanelUnderInputBackpressure(t *testing.T) {
 		v.waitFor(fmt.Sprintf("Esc to close the panel after %d bytes of input", sent), func(s *screen) bool { return !s.altActive })
 	}
 }
+
+// With the kitty keyboard protocol reporting every key, or xterm's
+// modifyOtherKeys, the terminal sends the panel's keys as escape
+// sequences: they do what the plain keys do, and a release does nothing.
+func TestPanelTakesProtocolKeys(t *testing.T) {
+	v := newVTerm(t, 80, 24)
+	typed := filepath.Join(t.TempDir(), "typed")
+	var mu sync.Mutex
+	stops := 0
+	real := stopSelf
+	stopSelf = func(<-chan os.Signal) {
+		mu.Lock()
+		stops++
+		mu.Unlock()
+	}
+	t.Cleanup(func() { stopSelf = real })
+	run(t, v, Options{Shortcuts: testShortcuts}, fill+`exec cat >"$0"`, typed)
+	v.waitText("READY")
+	before := v.snapshot()
+
+	v.key("\x1b[93;5u") // Ctrl-]
+	v.panelAt(40)
+	v.key("\x1b[117;1:3u") // u released
+	v.key("\x1b[117u")
+	waitFile(t, typed, "echo hi\r")
+	v.waitSame(before)
+
+	v.key("\x1b[93;5u")
+	v.panelAt(40)
+	v.key("\x1b[103;1:1u") // g, pressed
+	v.waitText("Shortcuts: g")
+	v.key("\x1b[127u") // Backspace
+	v.waitFor("the full list again", func(s *screen) bool { return strings.Contains(s.text(0), "Shortcuts ") })
+	v.key("\x1b[27;1;103~") // g in modifyOtherKeys
+	v.waitText("Shortcuts: g")
+	v.key("\x1b[115u")
+	waitFile(t, typed, "echo hi\rgit status")
+	v.waitSame(before)
+
+	for _, k := range []string{"\x1b[27u", "\x1b[99;5u", "\x1b[27;5;99~", "\x1b[99;69u"} { // Esc, Ctrl-C, Ctrl-C, Ctrl-C with Caps Lock
+		v.key("\x1b[27;5;93~") // Ctrl-] in modifyOtherKeys
+		v.panelAt(40)
+		v.key(k)
+		v.waitSame(before)
+	}
+	v.key("\x1b[93;5u")
+	v.panelAt(40)
+	v.key("\x1b[122;5u") // Ctrl-Z
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		mu.Lock()
+		n := stops
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Ctrl-Z in the kitty keyboard protocol did not suspend hop")
+		}
+	}
+	v.waitSame(before)
+	time.Sleep(50 * time.Millisecond)
+	waitFile(t, typed, "echo hi\rgit status")
+}

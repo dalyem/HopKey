@@ -278,6 +278,97 @@ func (p *inputParser) csi() token {
 	}
 	return token{tokSeq, seq}
 }
+
+// decodeKey decodes, for the panel, a key the kitty keyboard protocol
+// (CSI key[:shifted] ; mods[:event] ; text u) or xterm's modifyOtherKeys
+// (CSI 27 ; mods ; key ~) sends as a sequence: into the token the key
+// gives without them, a printable character, Esc, Enter, Backspace or Ctrl
+// with a letter. ok is false for any other sequence. release is that it
+// is a key's release, which kitty reports when the remote side asked for
+// event types, and which the panel ignores; a repeat counts as a press.
+func decodeKey(seq []byte) (t token, release, ok bool) {
+	if len(seq) < 4 || seq[0] != 0x1b || seq[1] != '[' {
+		return t, false, false
+	}
+	bad := false
+	num := func(s string) int {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			bad = true
+		}
+		return n
+	}
+	fields := strings.Split(string(seq[2:len(seq)-1]), ";")
+	key, shifted, text, mods := 0, 0, 0, 1
+	switch seq[len(seq)-1] {
+	case 'u':
+		if len(fields) > 3 {
+			return t, false, false
+		}
+		k := strings.Split(fields[0], ":")
+		key = num(k[0])
+		if len(k) > 1 && k[1] != "" {
+			shifted = num(k[1])
+		}
+		if len(fields) > 1 && fields[1] != "" {
+			m := strings.Split(fields[1], ":")
+			mods = num(m[0])
+			release = len(m) > 1 && num(m[1]) == 3
+		}
+		if len(fields) > 2 {
+			if tx := strings.Split(fields[2], ":"); len(tx) == 1 {
+				text = num(tx[0])
+			}
+		}
+	case '~':
+		if len(fields) != 3 || fields[0] != "27" {
+			return t, false, false
+		}
+		// The key is the character typed, Shift applied, as kitty's text.
+		mods, key = num(fields[1]), num(fields[2])
+		text = key
+	default:
+		return t, false, false
+	}
+	if bad || mods < 1 {
+		return t, false, false
+	}
+	if release {
+		return t, true, true
+	}
+	m := (mods - 1) &^ (64 | 128) // Caps Lock and Num Lock aside
+	lower := key | 0x20
+	switch {
+	case m == 4 && lower >= 'a' && lower <= 'z':
+		return token{tokControl, []byte{byte(lower) & 0x1f}}, false, true
+	case m != 0 && m != 1: // anything but no modifier or Shift
+		return t, false, false
+	case key == 27 && m == 0:
+		return token{tokEsc, []byte{0x1b}}, false, true
+	case key == 13 || key == 57414: // Enter, the keypad's Enter
+		return token{tokControl, []byte{'\r'}}, false, true
+	case key == 127 || key == 8:
+		return token{tokControl, []byte{0x7f}}, false, true
+	}
+	c := key
+	switch {
+	case text > 0:
+		c = text
+	case m == 1 && shifted > 0:
+		c = shifted
+	case m == 1 && c >= 'a' && c <= 'z':
+		c -= 0x20
+	case m == 1:
+		return t, false, false // what Shift makes of the key is not known
+	case (mods-1)&64 != 0 && c >= 'a' && c <= 'z': // Caps Lock
+		c -= 0x20
+	}
+	if c < 0x20 || c > 0x7e {
+		return t, false, false
+	}
+	return token{tokText, []byte{byte(c)}}, false, true
+}
+
 func splitOnce(s string, sep byte) []string {
 	if i := strings.IndexByte(s, sep); i >= 0 {
 		return []string{s[:i], s[i+1:]}
