@@ -109,8 +109,9 @@ type vaultHold struct {
 	// opens the vault in the daemon it starts with the typed device
 	// passphrase however the command ended, unless the daemon it stopped
 	// had the vault locked (wasLocked), so an open vault stays open. It
-	// ends once the vault is leaving (leaving).
-	keepOpen bool
+	// ends once the vault is leaving (leaving), and comes back as keep
+	// says if the vault turns out to stay (staying).
+	keepOpen, keep bool
 	// wasLocked says the daemon holdVault stopped had the vault locked,
 	// which a command that fails does not undo: release locks it again,
 	// even where the daemon it starts opens it by itself (a keychain, an
@@ -134,6 +135,15 @@ func (h *vaultHold) leaving() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.keepOpen = false
+}
+
+// staying records that the replacement or deletion leaving began did not
+// happen after all, so the vault the command found is there, and goes back
+// as it was found.
+func (h *vaultHold) staying() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.keepOpen = h.keep
 }
 
 // restoreTo is the state the daemon gets the vault in when the command
@@ -376,7 +386,7 @@ func holdVault(ctx context.Context, e *Env, asJSON bool) (*vaultHold, error) {
 func holdVaultKeeping(ctx context.Context, e *Env, asJSON, keep bool) (*vaultHold, error) {
 	// The policy is settled before the hold is published: Run's signal
 	// watcher may read it from then on.
-	h := &vaultHold{e: e, cfg: e.storeConfig(), asJSON: asJSON, keepOpen: keep}
+	h := &vaultHold{e: e, cfg: e.storeConfig(), asJSON: asJSON, keepOpen: keep, keep: keep}
 	if err := h.mark(); err != nil {
 		return nil, err
 	}

@@ -166,6 +166,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		return nil
 	}
 	if abandoned {
+		h.staying() // the old vault stays, until the fork below begins
 		warn(e, *asJSON, "an earlier fork stopped before its new vault was verified: it was deleted, and the Emergency Kit it showed belongs to no vault; the fork starts again")
 	}
 
@@ -253,6 +254,7 @@ func runVaultFork(ctx context.Context, e *Env, args []string) error {
 		// be gone: a failure after the new vault was staged may have left
 		// it in place (the last journal write can fail after its rename).
 		if p.Abandoned() {
+			h.staying() // the new vault is gone, and the old one is in place
 			if *kitFile != "" {
 				os.Remove(*kitFile) // it belongs to a vault that does not exist
 			}

@@ -1422,6 +1422,11 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 	}
 	h.leaving() // begun: the vault is leaving
 	res, err := authflow.Logout(ctx, env, s, store.LogoutOptions{DiscardPending: *discard, LocalOnly: *localOnly, Why: adminLockWhy(lock)})
+	if state, rerr := s.Retirement(); err != nil && rerr == nil && state == "" {
+		// Refused before it was recorded (a pending kit, a merge): the
+		// vault stays as it was.
+		h.staying()
+	}
 	if errors.Is(err, store.ErrLogoutPending) && errors.Is(err, syncclient.ErrUnauthorized) {
 		// The server doesn't know this device (401): a deleted account's
 		// included, but the server doesn't say so, and neither does this.
