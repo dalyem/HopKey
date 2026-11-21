@@ -42,7 +42,7 @@ const (
 // on this goroutine. tty stays open until Run returns.
 //
 // Run puts the terminal in raw mode and restores it before it returns,
-// also when wait panics or the child exits while the panel is open. It
+// also when start or wait panics or the child exits while the panel is open. It
 // handles SIGWINCH (the child's pty takes the terminal's size), SIGTSTP
 // (hop stops, with the terminal restored for the shell) and SIGCONT,
 // and nothing else: the caller still holds or passes on SIGINT, SIGTERM
@@ -60,11 +60,22 @@ func Run(ctx context.Context, opts Options, start func(tty *os.File, sys *syscal
 	}
 	defer p.restore()
 	childDone := make(chan struct{})
+	abort := make(chan struct{})
 	loopDone := make(chan struct{})
 	go func() {
 		defer close(loopDone)
 		defer p.onPanic()
-		p.loop(ctx, childDone)
+		p.loop(ctx, childDone, abort)
+	}()
+	// When start or wait panics, the loop stops before restore, which
+	// runs next, takes the terminal and the pty from under it. (A panic
+	// in the loop restores from there, in onPanic.)
+	joined := false
+	defer func() {
+		if !joined {
+			close(abort)
+			<-loopDone
+		}
 	}()
 	wait, err := start(p.pts, &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0})
 	if err == nil {
@@ -72,6 +83,7 @@ func Run(ctx context.Context, opts Options, start func(tty *os.File, sys *syscal
 	}
 	close(childDone)
 	<-loopDone
+	joined = true
 	return err
 }
 
@@ -255,7 +267,9 @@ func (p *proxy) emergencyClose() []byte {
 	return []byte("\x1b[?25h")
 }
 
-func (p *proxy) loop(ctx context.Context, childDone <-chan struct{}) {
+// loop copies between the terminal and the child until childDone, then
+// shows the child's last output (finish), or until abort, at once.
+func (p *proxy) loop(ctx context.Context, childDone, abort <-chan struct{}) {
 	esc := time.NewTimer(time.Hour)
 	esc.Stop()
 	escArmed := false
@@ -314,6 +328,8 @@ func (p *proxy) loop(ctx context.Context, childDone <-chan struct{}) {
 			p.hangup()
 		case <-childDone:
 			p.finish()
+			return
+		case <-abort:
 			return
 		}
 		if escArmed && !p.ip.held() {

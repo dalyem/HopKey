@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -708,5 +709,57 @@ func TestRunRefusesHighDescriptors(t *testing.T) {
 	}
 	if *now != *orig {
 		t.Errorf("terminal mode %+v, want %+v", *now, *orig)
+	}
+}
+
+// A panic in the caller's wait unwinds through Run once the proxy's loop
+// is stopped and joined: the terminal is put back and the pty closed with
+// nothing of the loop left running.
+func TestPanicInWaitStopsTheLoop(t *testing.T) {
+	v := newVTerm(t, 80, 24)
+	orig, err := unix.IoctlGetTermios(v.fd, ioctlGetTermios)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var child *os.Process
+	func() {
+		defer func() {
+			if r := recover(); r != "boom" {
+				t.Fatalf("Run's panic: %v", r)
+			}
+		}()
+		Run(context.Background(), Options{In: v.tty, Out: v.tty, Shortcuts: testShortcuts}, func(tty *os.File, sys *syscall.SysProcAttr) (func() error, error) {
+			p, err := os.StartProcess("/bin/sh", []string{"sh", "-c", "stty raw -echo; exec yes"}, &os.ProcAttr{Files: []*os.File{tty, tty, tty}, Sys: sys})
+			if err != nil {
+				return nil, err
+			}
+			child = p
+			return func() error {
+				v.waitText("y") // the loop is busy with the output
+				panic("boom")
+			}, nil
+		})
+	}()
+	if child != nil {
+		child.Kill()
+		child.Wait()
+	}
+	now, err := unix.IoctlGetTermios(v.fd, ioctlGetTermios)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *now != *orig {
+		t.Errorf("terminal mode %+v, want %+v", *now, *orig)
+	}
+	buf := make([]byte, 1<<20)
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
+		n := runtime.Stack(buf, true)
+		i := bytes.Index(buf[:n], []byte("(*proxy).loop("))
+		if i < 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the proxy's loop runs on after Run's panic:\n%s", buf[max(i-1000, 0):min(i+500, n)])
+		}
 	}
 }
