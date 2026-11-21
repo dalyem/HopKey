@@ -2,6 +2,7 @@ package termpanel
 
 import (
 	"bytes"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -41,21 +42,53 @@ const maxSeq = 4096
 // side has turned those on.
 type inputParser struct {
 	hotkey  byte
-	key     int    // the hotkey's key code, for the CSI forms; 0: none
-	pending []byte // an unfinished escape sequence or character
+	keys    hotkeyCodes // the hotkey's key codes, for the CSI forms
+	pending []byte      // an unfinished escape sequence or character
 	paste   bool
 	match   int // how much of pasteEnd the paste has ended with
 }
 
-func newInputParser(hotkey byte) *inputParser {
-	p := &inputParser{hotkey: hotkey}
+// hotkeyCodes are the key codes with which Ctrl is a hotkey in the kitty
+// keyboard protocol and modifyOtherKeys, and whether Ctrl with Shift is
+// too.
+type hotkeyCodes struct {
+	codes []int
+	shift bool
+}
+
+// codesOf is the CSI forms of hotkey: none for a byte that is not a
+// hotkey Options allows. For a letter, \ and ] it is the key itself.
+// Ctrl-^ and Ctrl-_ are Shift with 6 and minus on many layouts (US ones
+// among them), and the terminals differ: kitty reports the key without
+// Shift, with Shift among the modifiers (CSI 54;6u, with the shifted key
+// after a colon when asked: CSI 54:94;6u), xterm's modifyOtherKeys the
+// character Shift gives (CSI 27;6;94~), and a layout with a key of its own
+// for ^ or _ sends that key with Ctrl alone. So for those two, Ctrl with
+// either key, with or without Shift, is the hotkey, as Ctrl-6 and Ctrl-^
+// both send 0x1e without these protocols.
+func codesOf(hotkey byte) hotkeyCodes {
 	switch {
 	case hotkey >= 0x01 && hotkey <= 0x1a:
-		p.key = int('a' + hotkey - 1)
-	case hotkey >= 0x1c && hotkey <= 0x1d:
-		p.key = int(hotkey + 0x40)
+		return hotkeyCodes{codes: []int{int('a' + hotkey - 1)}}
+	case hotkey == 0x1c || hotkey == 0x1d:
+		return hotkeyCodes{codes: []int{int(hotkey + 0x40)}}
+	case hotkey == 0x1e:
+		return hotkeyCodes{codes: []int{'^', '6'}, shift: true}
+	case hotkey == 0x1f:
+		return hotkeyCodes{codes: []int{'_', '-'}, shift: true}
 	}
-	return p
+	return hotkeyCodes{}
+}
+
+// match says whether key with mods (kitty's encoding: 1 plus the
+// modifier bits) is the hotkey. Caps Lock and Num Lock don't count.
+func (h hotkeyCodes) match(key, mods int) bool {
+	m := (mods - 1) &^ (64 | 128)
+	return slices.Contains(h.codes, key) && (m == 4 || (h.shift && m == 5))
+}
+
+func newInputParser(hotkey byte) *inputParser {
+	return &inputParser{hotkey: hotkey, keys: codesOf(hotkey)}
 }
 
 // feed returns the tokens in b. A sequence or character b leaves
@@ -199,7 +232,7 @@ func (p *inputParser) csi() token {
 	case bytes.Equal(seq, pasteStart):
 		p.paste = true
 		return token{tokPaste, seq}
-	case p.key == 0:
+	case len(p.keys.codes) == 0:
 		return token{tokSeq, seq}
 	}
 	body, final := string(seq[2:len(seq)-1]), seq[len(seq)-1]
@@ -222,17 +255,16 @@ func (p *inputParser) csi() token {
 		}
 		return out
 	}
-	ctrl := func(mods int) bool { return (mods-1)&^(64|128) == 4 } // Ctrl, perhaps with Caps or Num Lock
 	switch final {
 	case 'u':
 		// key[:alternates];mods[:event]
 		parts := splitOnce(body, ';')
 		key := nums(splitOnce(parts[0], ':')[0], ':')
-		if len(parts) < 2 || len(key) != 1 || key[0] != p.key {
+		if len(parts) < 2 || len(key) != 1 {
 			break
 		}
 		modEv := nums(splitOnce(parts[1], ';')[0], ':')
-		if len(modEv) == 0 || !ctrl(modEv[0]) {
+		if len(modEv) == 0 || !p.keys.match(key[0], modEv[0]) {
 			break
 		}
 		if len(modEv) > 1 && modEv[1] != 1 {
@@ -240,13 +272,12 @@ func (p *inputParser) csi() token {
 		}
 		return token{tokHotkey, seq}
 	case '~':
-		if n := nums(body, ';'); len(n) == 3 && n[0] == 27 && ctrl(n[1]) && n[2] == p.key {
+		if n := nums(body, ';'); len(n) == 3 && n[0] == 27 && p.keys.match(n[2], n[1]) {
 			return token{tokHotkey, seq}
 		}
 	}
 	return token{tokSeq, seq}
 }
-
 func splitOnce(s string, sep byte) []string {
 	if i := strings.IndexByte(s, sep); i >= 0 {
 		return []string{s[:i], s[i+1:]}

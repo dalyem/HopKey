@@ -94,3 +94,39 @@ func TestInputHotkeyForms(t *testing.T) {
 		}
 	}
 }
+
+// Ctrl-^ and Ctrl-_ are Shift with 6 and minus on many layouts. The kitty
+// protocol reports the key without Shift, with Shift among the
+// modifiers (and, when asked, the shifted key after a colon), and
+// modifyOtherKeys the character Shift gives: Ctrl with ^ or 6, and with
+// _ or -, with or without Shift, is the hotkey. Ctrl with Alt is not,
+// nor is the other one's key.
+func TestInputHotkeyShiftedForms(t *testing.T) {
+	for _, c := range []struct {
+		hotkey      byte
+		base, shift int
+		other       int
+	}{{0x1e, '6', '^', '_'}, {0x1f, '-', '_', '^'}} {
+		var in, want []string
+		hot := func(s string) {
+			in = append(in, s)
+			want = append(want, fmt.Sprintf("HOT:%q", s))
+		}
+		hot(string(rune(c.hotkey)))
+		for _, code := range []int{c.base, c.shift} {
+			hot(fmt.Sprintf("\x1b[%d;5u", code))
+			hot(fmt.Sprintf("\x1b[%d;6u", code))
+			hot(fmt.Sprintf("\x1b[%d;70u", code))
+			hot(fmt.Sprintf("\x1b[27;5;%d~", code))
+			hot(fmt.Sprintf("\x1b[27;6;%d~", code))
+		}
+		hot(fmt.Sprintf("\x1b[%d:%d;6u", c.base, c.shift))
+		for _, s := range []string{fmt.Sprintf("\x1b[%d;7u", c.shift), fmt.Sprintf("\x1b[%d;5u", c.other), fmt.Sprintf("\x1b[27;5;%d~", c.other)} {
+			in = append(in, s)
+			want = append(want, fmt.Sprintf("seq:%q", s))
+		}
+		if got := kinds(newInputParser(c.hotkey).feed([]byte(strings.Join(in, "")))); got != strings.Join(want, " ") {
+			t.Errorf("hotkey %#x:\n got %s\nwant %s", c.hotkey, got, strings.Join(want, " "))
+		}
+	}
+}

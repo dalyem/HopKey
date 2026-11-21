@@ -56,11 +56,13 @@ var ErrNotTerminal = errors.New("termpanel: not a terminal")
 // start, and the caller runs the child on its streams directly instead.
 var ErrUnsupported = errors.New("termpanel: not supported on this system")
 
+// hotkey is the hotkey to use. Every one it gives is also known in the
+// kitty keyboard protocol's and modifyOtherKeys' forms (codesOf).
 func (o Options) hotkey() (byte, error) {
 	switch {
 	case o.Hotkey == 0:
 		return DefaultHotkey, nil
-	case o.Hotkey >= 0x20 || o.Hotkey == 0x1b:
+	case o.Hotkey >= 0x20 || o.Hotkey == 0x1b || len(codesOf(o.Hotkey).codes) == 0:
 		return 0, errors.New("termpanel: the hotkey must be a control character other than ESC")
 	}
 	return o.Hotkey, nil

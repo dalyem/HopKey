@@ -268,8 +268,10 @@ func TestShortcutHotkey(t *testing.T) {
 	}
 }
 
-// Every hotkey HOP_SHORTCUT_KEY gives is one the panel takes, and none is
-// a key the panel itself reads: Ctrl-C, Ctrl-Z, Esc, Backspace, Enter.
+// Every hotkey HOP_SHORTCUT_KEY gives is one the panel takes, in its
+// kitty keyboard protocol and modifyOtherKeys forms too (Run refuses a
+// hotkey it has none for), and none is a key the panel itself reads:
+// Ctrl-C, Ctrl-Z, Esc, Backspace, Enter.
 func TestShortcutHotkeysThePanelTakes(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {

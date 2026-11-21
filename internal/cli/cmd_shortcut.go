@@ -375,9 +375,9 @@ const (
 // panel is on. Keys the panel or a terminal needs are refused: Ctrl-[ is
 // Esc, Ctrl-H Backspace, Ctrl-I Tab, Ctrl-J and Ctrl-M Enter, Ctrl-@ NUL,
 // and in the panel Ctrl-C closes it and Ctrl-Z suspends hop. Every key it
-// gives is one termpanel takes as the hotkey; for a letter, \ and ], so
-// are Ctrl with that key in the kitty keyboard protocol and in xterm's
-// modifyOtherKeys.
+// gives is one termpanel takes as the hotkey, as are Ctrl with that key
+// in the kitty keyboard protocol and in xterm's modifyOtherKeys (for ^
+// and _, also Ctrl with 6 and minus, with or without Shift).
 func (e *Env) shortcutHotkey() (key byte, on bool, err error) {
 	v := ""
 	if e.Getenv != nil {
