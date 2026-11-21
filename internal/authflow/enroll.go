@@ -76,6 +76,9 @@ func LoginApprove(ctx context.Context, env *Env, opts EnrollOptions) (*LoginResu
 		return nil, err
 	}
 	mb := opts.Mailbox
+	// When an earlier attempt of this device lapses, the place it holds on
+	// the server frees.
+	var earlier time.Time
 	if e != nil {
 		switch st := e.State(); {
 		case st == crypto.DeviceDone:
@@ -97,6 +100,7 @@ func LoginApprove(ctx context.Context, env *Env, opts EnrollOptions) (*LoginResu
 				}
 				return nil, ErrEnrollmentInterrupted
 			}
+			earlier = e.Deadline()
 			if err := discard(cfg, e); err != nil {
 				return nil, err
 			}
@@ -125,7 +129,15 @@ func LoginApprove(ctx context.Context, env *Env, opts EnrollOptions) (*LoginResu
 		if err != nil {
 			// Nothing was revealed: no other device can have seen more
 			// than the commit.
-			return nil, errors.Join(err, discard(cfg, e))
+			err = errors.Join(err, discard(cfg, e))
+			if errors.Is(err, syncclient.ErrRateLimited) {
+				limit := &MailboxLimitError{Err: err}
+				if earlier.After(time.Now()) {
+					limit.Until = earlier
+				}
+				return nil, limit
+			}
+			return nil, err
 		}
 	}
 	d := &deviceSide{env: env, e: e, mb: mb, relay: c.DeviceRelay(mb), reader: reader}

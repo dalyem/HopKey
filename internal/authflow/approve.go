@@ -36,6 +36,9 @@ func Approve(ctx context.Context, env *Env, v *Vault, routingCode string) (*Appr
 	code := normalizeRoutingCode(routingCode)
 	var cl syncclient.Claim
 	if err := env.retry(ctx, func() (err error) { cl, err = c.Claim(ctx, v.dev, code); return err }); err != nil {
+		if errors.Is(err, syncclient.ErrNotFound) || errors.Is(err, syncclient.ErrBadRequest) {
+			return nil, fmt.Errorf("%w: %w", ErrUnknownCode, err)
+		}
 		return nil, err
 	}
 	info, err := s.Approval()

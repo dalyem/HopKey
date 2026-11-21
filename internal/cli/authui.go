@@ -68,15 +68,25 @@ type termUI struct {
 const defaultWaitHint = 60 * time.Second
 
 // waitHintText is the line printed when the approval takes long. The new
-// device cannot see why: an approving device that used its 3 attempts of the
-// hour refuses with an error that only it shows. This login is unfinished,
-// which blocks every other method, so the way out starts by ending it.
-const waitHintText = "Still waiting. If the approving device refused because it used its 3 approval attempts of the hour, " +
-	"it can try again later; or cancel this login (Ctrl-C), run hop auth login --discard, " +
+// device cannot see why: an approving device that refuses (it used its 3
+// attempts of the hour, say) shows its error there only. This login is
+// unfinished, which blocks every other method, so the way out starts by
+// ending it.
+const waitHintText = "Still waiting for the approving device, which has to run the hop auth approve command above. " +
+	"If it refused, only it shows why; one reason is that it used its 3 approval attempts of the hour, and it can try again later. " +
+	"To give up, cancel this login (Ctrl-C), run hop auth login --discard, " +
 	"then sign in with hop auth login --method password"
 
-// startWaitHint prints waitHintText once, after the wait has lasted a while.
-func (u *termUI) startWaitHint() {
+// confirmedHintText is the line printed when this device confirmed the
+// check code and the approving device has still not finished. The relay
+// has no message for a refusal, so a device whose user answered no, or
+// cancelled, never tells this one: it waits until the request expires.
+const confirmedHintText = "Still waiting for the approving device to answer yes to the check code too. " +
+	"If its user answered no, or cancelled, this device is not told, and waits until the request expires (10 minutes after the code was shown). " +
+	"To stop waiting, cancel this login (Ctrl-C), then run hop auth login again"
+
+// startWaitHint prints text once, after the wait has lasted a while.
+func (u *termUI) startWaitHint(text string) {
 	d := u.waitHintAfter
 	if d <= 0 {
 		d = defaultWaitHint
@@ -90,7 +100,7 @@ func (u *termUI) startWaitHint() {
 		u.hintMu.Lock()
 		defer u.hintMu.Unlock()
 		if u.hint != nil {
-			u.say("%s\n", waitHintText)
+			u.say("%s\n", text)
 		}
 	})
 }
@@ -338,7 +348,7 @@ func (u *termUI) ShowRoutingCode(ctx context.Context, code string) error {
 	u.say("\nTo approve this device, run this on a device that is already signed in:\n\n")
 	u.say("    hop auth approve %s\n\n", groupCode(code))
 	u.say("Waiting for the approval...\n")
-	u.startWaitHint()
+	u.startWaitHint(waitHintText)
 	return nil
 }
 
@@ -417,6 +427,10 @@ func (u *termUI) ConfirmSAS(ctx context.Context, sas, deviceName string) (bool, 
 		}
 		switch strings.ToLower(a) {
 		case "yes":
+			if u.role == roleLogin {
+				u.say("Confirmed. Waiting for the approving device to confirm the same code...\n")
+				u.startWaitHint(confirmedHintText)
+			}
 			return true, nil
 		case "no":
 			return false, nil

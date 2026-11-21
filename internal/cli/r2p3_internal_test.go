@@ -80,3 +80,26 @@ func TestClosestCommand(t *testing.T) {
 		}
 	}
 }
+
+// A new device that confirmed the check code says what it waits for, and
+// that an approver's no never reaches it, instead of blaming the approval
+// budget the approver may not have used.
+func TestConfirmedCheckCodeHintSaysWhatIsAwaited(t *testing.T) {
+	f := newUIFixture(t, true, "yes\n", nil)
+	f.u.role = roleLogin
+	f.u.waitHintAfter = 20 * time.Millisecond
+	if _, err := f.u.ConfirmSAS(t.Context(), testSAS, "laptop"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	f.u.stopWaitHint()
+	out := f.stderr.String()
+	for _, want := range []string{"Confirmed. Waiting for the approving device", "answer yes to the check code too", "not told", "Ctrl-C"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "approval attempts") || strings.Contains(out, "--method password") {
+		t.Errorf("the hint blames the approval budget after the codes were compared:\n%s", out)
+	}
+}

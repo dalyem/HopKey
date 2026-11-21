@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dalyem/hopkey/internal/authflow"
+	"github.com/dalyem/hopkey/internal/crypto"
 	"github.com/dalyem/hopkey/internal/daemon"
 	"github.com/dalyem/hopkey/internal/safepath"
 	"github.com/dalyem/hopkey/internal/store"
@@ -528,6 +529,7 @@ func authFailure(err error) error {
 		return err
 	}
 	var interrupted *authflow.EnrollInterruptedError
+	var limit *authflow.MailboxLimitError
 	switch {
 	case errors.As(err, &interrupted) && errors.Is(err, context.Canceled):
 		// The error quotes the enrollment's URL, which the user need not see.
@@ -542,10 +544,34 @@ func authFailure(err error) error {
 		return failf("the server refused the recovery: a wrong Recovery Key, or no account has that email")
 	case errors.Is(err, authflow.ErrSASMismatch):
 		return failf("the codes did not match, so nothing was sent to the new device. Start again on the new device")
+	case errors.Is(err, authflow.ErrUnknownCode):
+		return failf("no new device is waiting with that code: it was mistyped, or its request expired or finished (a request lasts 10 minutes). " +
+			"Check the code the new device shows; if it is gone, run hop auth login again on the new device")
+	case errors.Is(err, crypto.ErrEnrollExpired):
+		return failf("the approval request expired, so nothing was installed: a request lasts 10 minutes, and the other device did not finish it in time " +
+			"(it may have answered no, or cancelled, or never run hop auth approve). Run hop auth login again on the new device")
+	case errors.Is(err, crypto.ErrSASRejected):
+		return failf("this device's check code was rejected, so nothing was installed. Run hop auth login again to start over")
+	case errors.As(err, &limit):
+		return failf("%s", mailboxLimitText(limit))
 	case errors.Is(err, store.ErrOutboxNotEmpty):
 		return failf("queued changes have not reached the server yet: wait for the daemon to send them (hop sync shows them), or log out with --discard-pending to drop them")
 	}
 	return failf("%v", err)
+}
+
+// mailboxLimitText is the refusal of a new approval request while the
+// server holds the most it allows from this address: 3 unfinished ones,
+// each kept for 10 minutes, even after the device that made it was
+// cancelled. The server does not say when one frees; the latest this
+// device's own place frees is known when an earlier attempt left a record.
+func mailboxLimitText(l *authflow.MailboxLimitError) string {
+	msg := "too many pending device approvals from this address: the server keeps at most 3 at a time, and one that was cancelled before it finished " +
+		"holds its place for 10 minutes. Wait up to 10 minutes and run hop auth login again"
+	if !l.Until.IsZero() {
+		msg += " (this device's own earlier attempt frees its place by " + l.Until.Local().Format("15:04") + " at the latest)"
+	}
+	return msg
 }
 
 // fmtDevice names a device for a message: its name and ID.

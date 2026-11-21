@@ -747,7 +747,7 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 		}
 		switch {
 		case isUIError(err), errors.Is(err, authflow.ErrSASMismatch), errors.Is(err, authflow.ErrApprovalFailed),
-			errors.Is(err, crypto.ErrEnrollExpired):
+			errors.Is(err, authflow.ErrUnknownCode), errors.Is(err, crypto.ErrEnrollExpired):
 			return authFailure(err)
 		}
 		return failf("%v. Run hop auth approve with the same code to resume the approval, or hop auth approve --abort to end it", err)
@@ -759,7 +759,8 @@ func runAuthApprove(ctx context.Context, e *Env, args []string) error {
 	if name == "" {
 		name = "the new device"
 	}
-	e.printf("Approved %s. It receives the vault now.\n", name)
+	e.printf("Approved %s. It receives the vault once it has confirmed the check code on its side too. "+
+		"If it cancelled instead, hop auth devices shows it as undelivered, and hop auth devices revoke removes it.\n", name)
 	return nil
 }
 

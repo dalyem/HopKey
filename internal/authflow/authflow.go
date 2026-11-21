@@ -160,12 +160,32 @@ var (
 	// already failed (a mismatch, an abort, the deadline): the new device
 	// must start a new enrollment.
 	ErrApprovalFailed = errors.New("authflow: the approval for that code already failed; start again on the new device")
+	// ErrUnknownCode means the routing code names no waiting device: the
+	// server has no live mailbox for it (mistyped, expired or finished).
+	ErrUnknownCode = errors.New("authflow: no new device is waiting with that routing code")
 	// ErrEnrollmentInterrupted means an enrollment in progress can't be
 	// continued: its mailbox credential exists only in memory (store gap
 	// G2), and this process does not have it. Start again with
 	// EnrollOptions.Restart.
 	ErrEnrollmentInterrupted = errors.New("authflow: an enrollment by approval was interrupted and can't be continued; start it again")
 )
+
+// MailboxLimitError means the server would not start another enrollment
+// by approval from this address: it holds at most 3 live mailboxes per IP,
+// and one that was never finished, as when its device was interrupted,
+// holds its place until it expires. Until is when an earlier attempt of
+// this device expires, the latest that this device's own place frees, or
+// zero when none is known.
+type MailboxLimitError struct {
+	Until time.Time
+	Err   error
+}
+
+func (e *MailboxLimitError) Error() string {
+	return "authflow: too many pending device approvals from this address: " + e.Err.Error()
+}
+
+func (e *MailboxLimitError) Unwrap() error { return e.Err }
 
 // EnrollInterruptedError means an enrollment stopped before it finished,
 // in a state the same process can resume: pass Mailbox in
