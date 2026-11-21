@@ -73,6 +73,32 @@ func EnsurePrivateDir(dir string) (string, error) {
 	return resolved, nil
 }
 
+// Check reports whether EnsurePrivateDir would accept dir, without creating
+// or changing anything: the path to dir, as far as it exists, must be
+// owned by root or the current user and not writable by group or others
+// (with EnsurePrivateDir's sticky exception), and so must dir itself when
+// it is there. It is for a command that would otherwise ask for secrets
+// first and fail when it creates dir.
+func Check(dir string) error {
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("safepath: %q is not absolute", dir)
+	}
+	dir = filepath.Clean(dir)
+	existing := dir
+	missing, err := missingDirs(dir)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		existing = filepath.Dir(missing[len(missing)-1])
+	}
+	resolved, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return err
+	}
+	return checkPath(resolved, len(missing) > 0)
+}
+
 // missingDirs lists dir and those of its ancestors that do not exist yet,
 // from dir upwards.
 func missingDirs(dir string) ([]string, error) {

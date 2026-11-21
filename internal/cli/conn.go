@@ -38,9 +38,20 @@ func connect(ctx context.Context, e *Env) (*daemon.Client, error) {
 		return nil, errHeld(pid)
 	}
 	if err := startDaemon(ctx, e); err != nil {
-		return nil, err
+		return nil, noVaultFailure(e, err)
 	}
 	return daemon.Dial(ctx, path)
+}
+
+// noVaultFailure is the plain message for a daemon that could not start
+// because this device has no vault: a local-only logout deleted it, or hop
+// init never ran. The daemon's own failure, with its log, says it in the
+// words of a log; that is not what someone who ran hop ls needs to read.
+func noVaultFailure(e *Env, err error) error {
+	if !strings.Contains(err.Error(), store.ErrNoVault.Error()) {
+		return err
+	}
+	return failf("there is no vault on this device (hop auth logout --local-only deletes it): hop init creates a local one, and hop auth login signs in to an account")
 }
 
 func socketAbsent(err error) bool {

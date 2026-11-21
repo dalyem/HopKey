@@ -13,6 +13,21 @@ import (
 // itself, and tightens its mode. resolved must already have its symlinks
 // resolved.
 func checkPrivateDir(resolved string) error {
+	return checkChain(resolved, false, false)
+}
+
+// checkPath is checkPrivateDir for Check: it changes nothing. resolved is
+// the deepest directory of the path that exists, with its symlinks resolved;
+// creating says that the directory the caller wants is below it, so
+// resolved is an ancestor of it and not the directory itself.
+func checkPath(resolved string, creating bool) error {
+	return checkChain(resolved, creating, true)
+}
+
+// checkChain does the work of both. With creating, every component of
+// resolved is an ancestor of a directory that will be made below it, owned by
+// the current user and 0700. With dry, the directory is not tightened.
+func checkChain(resolved string, creating, dry bool) error {
 	self := uint32(os.Geteuid())
 
 	// Components from / down to resolved itself.
@@ -37,7 +52,11 @@ func checkPrivateDir(resolved string) error {
 	}
 
 	last := len(chain) - 1
-	for i := 0; i < last; i++ {
+	ancestors := last
+	if creating {
+		ancestors = len(chain)
+	}
+	for i := 0; i < ancestors; i++ {
 		p, fi := chain[i], infos[i]
 		uid, ok := ownerOf(fi)
 		if !ok || (uid != 0 && uid != self) {
@@ -51,9 +70,12 @@ func checkPrivateDir(resolved string) error {
 		if fi.Mode()&os.ModeSticky == 0 {
 			return fmt.Errorf("safepath: %s is writable by group or others (mode %o)", p, fi.Mode().Perm())
 		}
+		if i+1 > last {
+			continue // the next one is made by us, private
+		}
 		next, nextInfo := chain[i+1], infos[i+1]
 		nextUID, ok := ownerOf(nextInfo)
-		if i+1 == last {
+		if i+1 == last && !creating {
 			// The final directory is tightened below; judge the mode it
 			// will have once we own it.
 			if !ok || nextUID != self {
@@ -65,10 +87,16 @@ func checkPrivateDir(resolved string) error {
 			return fmt.Errorf("safepath: %s is writable by group or others and %s is not a 0700 directory owned by uid %d", p, next, self)
 		}
 	}
+	if creating {
+		return nil
+	}
 
 	fi := infos[last]
 	if uid, ok := ownerOf(fi); !ok || uid != self {
 		return fmt.Errorf("safepath: %s is not owned by uid %d", resolved, self)
+	}
+	if dry {
+		return nil
 	}
 	if fi.Mode().Perm() != 0o700 {
 		if err := os.Chmod(resolved, 0o700); err != nil {

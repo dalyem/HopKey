@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/dalyem/hopkey/internal/safepath"
 	"github.com/dalyem/hopkey/internal/store"
 )
 
@@ -59,6 +61,12 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 		}
 	}
 
+	// Before any secret: a data directory that safepath will refuse (a
+	// Windows drive under WSL, say) is found out now, not after the
+	// Emergency Kit was shown and typed back.
+	if err := checkDataDirs(e, cfg.DataDir); err != nil {
+		return err
+	}
 	// Before any secret: a machine with no keychain is found out now.
 	defer e.clearDevicePass()
 	choice, err := settleDeviceKey(e, *devStore, e.canAsk(*asJSON), true)
@@ -121,6 +129,42 @@ func runInit(ctx context.Context, e *Env, args []string) error {
 	}
 	e.printf("\nVault created in %s.\nDevice key: %s.\n", oneLine(cfg.DataDir), oneLine(deviceKeyWords(p.DeviceStore())))
 	return nil
+}
+
+// checkDataDirs fails, creating nothing, when a directory hop init or the
+// daemon it starts would make for the vault fails safepath's check: its
+// data directory and the ssh config and state directories.
+func checkDataDirs(e *Env, dataDir string) error {
+	for _, dir := range []string{dataDir, e.Paths.ConfigDir, e.Paths.StateDir} {
+		if dir == "" {
+			continue
+		}
+		if err := safepath.Check(dir); err != nil {
+			return unsafeDirFailure(e, dir, err)
+		}
+	}
+	return nil
+}
+
+// unsafeDirFailure is safepath's refusal of dir as the user reads it. Under
+// WSL the usual cause is a home directory on a Windows drive (/mnt/c, mode
+// 777), which no setting makes private: the Linux home directory is.
+func unsafeDirFailure(e *Env, dir string, err error) error {
+	if wsl(e, dir) {
+		return failf("%v. %s is on a Windows drive, which every Windows user can write to, so hop will not keep a vault, keys or its ssh config there. "+
+			"Use your Linux home directory instead: run hop from a shell whose HOME is under /home (cd ~ and echo $HOME show it), not from /mnt/c", err, oneLine(dir))
+	}
+	return failf("%v. hop keeps the vault only where no other user can replace its parent directories: run hop with a HOME (or XDG_DATA_HOME) that is yours and private", err)
+}
+
+// wsl reports whether hop runs under WSL, or dir is on a Windows drive
+// mounted into it.
+func wsl(e *Env, dir string) bool {
+	if e.Getenv != nil && (e.Getenv("WSL_DISTRO_NAME") != "" || e.Getenv("WSL_INTEROP") != "") {
+		return true
+	}
+	rest, ok := strings.CutPrefix(filepath.ToSlash(dir), "/mnt/")
+	return ok && len(rest) >= 1 && (len(rest) == 1 || rest[1] == '/') && rest[0] >= 'a' && rest[0] <= 'z'
 }
 
 // InitReport is the --json shape of hop init. It holds no secret: the

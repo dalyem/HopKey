@@ -7,5 +7,8 @@ package safepath
 // for Windows will replace this.
 func checkPrivateDir(string) error { return nil }
 
+// checkPath is Check's counterpart of checkPrivateDir.
+func checkPath(string, bool) error { return nil }
+
 // syncDirOS does nothing: directories cannot be fsynced here.
 func syncDirOS(string) error { return nil }
