@@ -144,10 +144,17 @@ type interruptEnv struct {
 
 func newInterruptEnv(t *testing.T) *interruptEnv {
 	t.Helper()
+	return newInterruptEnvWith(t, func(string) string { return "" })
+}
+
+// newInterruptEnvWith is newInterruptEnv with getenv as the environment,
+// for hop init too: a device passphrase in it seals the key file.
+func newInterruptEnvWith(t *testing.T, getenv func(string) string) *interruptEnv {
+	t.Helper()
 	dir := shortTempDir(t)
 	x := &interruptEnv{exits: make(chan int, 4)}
 	x.e = &Env{
-		Stdout: &strings.Builder{}, Stderr: &syncBuffer{}, Getenv: func(string) string { return "" },
+		Stdout: &strings.Builder{}, Stderr: &syncBuffer{}, Getenv: getenv,
 		DataDir: filepath.Join(dir, "data"),
 		Paths:   daemon.Paths{RunDir: filepath.Join(dir, "run"), StateDir: filepath.Join(dir, "state"), ConfigDir: filepath.Join(dir, "ssh")},
 		StartDaemon: func() error {

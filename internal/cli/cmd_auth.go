@@ -1336,10 +1336,17 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		return nil
 	}
 	var daemonPC *store.PendingChanges
-	if st := openHere(ctx, e); st != nil && st.Sync != nil {
-		daemonPC = &store.PendingChanges{Queued: st.Sync.Pending + st.Sync.Held, Held: st.Sync.Held}
-		if err := refuseQueued(*daemonPC); err != nil {
+	if st := openHere(ctx, e); st != nil {
+		// The refusals that beginLogout is sure to make come first too; the
+		// daemon knows of them only while it has the vault open.
+		if err := logoutBlocked(st); err != nil {
 			return err
+		}
+		if st.Sync != nil {
+			daemonPC = &store.PendingChanges{Queued: st.Sync.Pending + st.Sync.Held, Held: st.Sync.Held}
+			if err := refuseQueued(*daemonPC); err != nil {
+				return err
+			}
 		}
 	}
 	// A sealed device key opens with its passphrase, which a logout that
@@ -1465,6 +1472,21 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 		e.printf("%d queued change(s) were discarded.\n", res.Discarded)
 	}
 	printLogoutNext(e, res, id, lock != nil || res.Why != "")
+	return nil
+}
+
+// logoutBlocked is the refusal the store's logout guards make (a login
+// merge in progress, a password change whose Emergency Kit is not
+// confirmed), from what this vault's daemon says of the open vault, so that
+// it comes before anything is asked or the daemon stopped. The store's
+// guards still have the last word.
+func logoutBlocked(st *daemon.StatusResult) error {
+	switch {
+	case st.Vault != nil && st.Vault.Merge != "":
+		return authFailure(store.ErrMergeInProgress)
+	case st.Vault != nil && st.Vault.KitPending, st.Sync != nil && st.Sync.Checkpoint != nil:
+		return authFailure(store.ErrCheckpointPending)
+	}
 	return nil
 }
 

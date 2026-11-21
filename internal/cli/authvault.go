@@ -118,6 +118,9 @@ type vaultHold struct {
 	// even where the daemon it starts opens it by itself (a keychain, an
 	// unsealed key file).
 	wasLocked bool
+	// wasOpen says that daemon served this vault and had it open, so a
+	// vault that comes back locked lost something (warnLockedNow).
+	wasOpen bool
 	// closers free the vault where the flow holds it (track): its stores,
 	// a prepared fork. abandon runs them when the command is interrupted.
 	closers []func()
@@ -448,6 +451,7 @@ func holdVaultKeeping(ctx context.Context, e *Env, asJSON, keep bool) (*vaultHol
 		return nil, err
 	}
 	h.wasLocked = daemonVaultLocked(ctx, e)
+	h.wasOpen = openHere(ctx, e) != nil
 	e.setHold(h)
 	if _, err := shutdownDaemon(ctx, e); err != nil {
 		if e.daemonGone() {
@@ -631,9 +635,30 @@ func (h *vaultHold) restart(ctx context.Context, target restoreTo) {
 func (h *vaultHold) restoreLockState(ctx context.Context, target restoreTo) {
 	switch target {
 	case restoreOpen:
-		handDevicePassphrase(ctx, h.e, h.asJSON)
+		if h.e.hasTypedPass() {
+			handDevicePassphrase(ctx, h.e, h.asJSON)
+		} else if h.wasOpen {
+			warnLockedNow(ctx, h.e, h.asJSON)
+		}
 	case restoreLocked:
 		lockAgain(ctx, h.e, h.asJSON)
+	}
+}
+
+// warnLockedNow warns when this vault's daemon has the vault locked after
+// the command, although it was open before, and nothing was typed that
+// opens it: a sealed key file whose passphrase the command did not ask for
+// (hop auth logout --local-only), so the daemon started again can't open it.
+func warnLockedNow(ctx context.Context, e *Env, asJSON bool) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreWait)
+	defer cancel()
+	c, err := dialExisting(ctx, e)
+	if err != nil || c == nil {
+		return // the restart said so
+	}
+	defer c.Close()
+	if st, err := servesThisVault(ctx, e, c); err == nil && st.Vault != nil && st.Vault.Locked {
+		warn(e, asJSON, "the vault was open before this command and is locked now: the hop daemon was started again without the device passphrase; run hop unlock")
 	}
 }
 

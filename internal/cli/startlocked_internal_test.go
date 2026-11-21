@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/dalyem/hopkey/internal/model"
+	"github.com/dalyem/hopkey/internal/store"
 )
 
 // otherVault is a second vault whose daemon uses x's run directory, as a
@@ -125,5 +126,41 @@ func TestStartLockedFromAnUntrustedFileIsIgnored(t *testing.T) {
 				t.Errorf("the file after the daemon started: %v; want it removed: %v", err, c.gone)
 			}
 		})
+	}
+}
+
+// A vault that was open in the daemon, with a sealed key file whose
+// passphrase the command did not ask for, comes back locked: the daemon
+// started again has no passphrase. release says so, and what to run.
+func TestReleaseSaysWhenAnOpenVaultComesBackLocked(t *testing.T) {
+	const pass = "release test device passphrase"
+	x := newInterruptEnvWith(t, func(k string) string {
+		if k == store.PassphraseEnv {
+			return pass
+		}
+		return ""
+	})
+	if st, _, stop := startServing(t, x); st.Vault == nil || st.Vault.Locked {
+		stop()
+		t.Fatalf("the daemon with the passphrase serves the vault locked: %+v", st.Vault)
+	} else {
+		t.Cleanup(stop)
+	}
+	// The command has no passphrase, and the daemon it starts again none.
+	x.e.Getenv = func(string) string { return "" }
+	x.e.DaemonWait = 10 * time.Second
+	x.e.StartDaemon = func() error {
+		_, _, stop := startServing(t, x)
+		t.Cleanup(stop)
+		return nil
+	}
+	ctx := context.Background()
+	h, err := holdVaultKeeping(ctx, x.e, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.release(ctx)
+	if out := x.e.Stderr.(*syncBuffer).String(); !strings.Contains(out, "was open before this command") || !strings.Contains(out, "hop unlock") {
+		t.Errorf("no warning that the vault came back locked: %q", out)
 	}
 }
