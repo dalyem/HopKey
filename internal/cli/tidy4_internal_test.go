@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dalyem/hopkey/internal/store"
 )
 
 // stuckWriter is a stderr nobody drains: a full pipe. Write returns only
@@ -36,5 +39,44 @@ func TestForceQuitExitsWhileStderrIsStuck(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no exit while stderr is stuck")
+	}
+}
+
+// Ctrl-C while a command on an open vault with a sealed key file is stuck
+// away from a prompt, after the hold and before the vault begins to leave
+// (hop auth logout --local-only --yes, no passphrase in the environment):
+// the daemon that takes the vault after this process can't open it, and
+// abandon says so, although no passphrase was typed.
+func TestHandbackOfAnOpenSealedVaultWarnsWithNothingTyped(t *testing.T) {
+	const pass = "handback test device passphrase"
+	x := newInterruptEnvWith(t, func(k string) string {
+		if k == store.PassphraseEnv {
+			return pass
+		}
+		return ""
+	})
+	if st, _, stop := startServing(t, x); st.Vault == nil || st.Vault.Locked {
+		stop()
+		t.Fatalf("the daemon with the passphrase serves the vault locked: %+v", st.Vault)
+	} else {
+		t.Cleanup(stop)
+	}
+	x.e.Getenv = func(string) string { return "" }
+	ctx := context.Background()
+	h, err := holdVaultKeeping(ctx, x.e, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := h.open(ctx) // what the stuck flow holds the vault with
+	if err != nil || s == nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	h.abandon()
+	if starts := x.started(); len(starts) != 1 || !strings.HasSuffix(starts[0], "handback") {
+		t.Fatalf("daemon starts %q, want one handback", starts)
+	}
+	if out := x.e.Stderr.(*syncBuffer).String(); !strings.Contains(out, "locked") || !strings.Contains(out, "hop unlock") {
+		t.Errorf("no warning that the vault comes back locked: %q", out)
 	}
 }

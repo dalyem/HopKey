@@ -794,6 +794,12 @@ func (h *vaultHold) abandon() {
 			warn(h.e, h.asJSON, "the hop daemon did not start again (hop sync starts it): "+err.Error())
 		} else if target == restoreOpen && h.e.hasTypedPass() {
 			warn(h.e, h.asJSON, "the vault is locked: the hop daemon takes it after this process, without the device passphrase typed for it; run hop unlock")
+		} else if target == restoreOpen && h.wasOpen && !h.e.hasDevicePassphrase() && sealedKeyFile(h.cfg.DataDir) {
+			// Nothing was typed (hop auth logout --local-only), and the
+			// daemon, which gets this process's environment, finds no
+			// passphrase there either: it can't open the vault that was
+			// open.
+			warn(h.e, h.asJSON, "the vault was open before this command and is locked now: the hop daemon takes it after this process, and its key file is sealed with a passphrase this command did not ask for; run hop unlock")
 		}
 	})
 }
