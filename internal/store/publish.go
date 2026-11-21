@@ -485,15 +485,23 @@ func (s *Store) refuseCheckpoint() error {
 	if s.kit != nil || s.kitOrphaned {
 		return ErrCheckpointPending
 	}
-	seqs, err := s.journalSeqs()
+	return s.l.refuseCheckpointFiles()
+}
+
+// refuseCheckpointFiles is refuseCheckpoint from the vault's files: a
+// local password change's journal, or a server-backed checkpoint's
+// (checkpoint.go). Either is there for as long as its kit is pending
+// (AckKit), and it reads their names only, so it works while the vault is
+// locked.
+func (l layout) refuseCheckpointFiles() error {
+	seqs, err := l.journalSeqs()
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if len(seqs) > 0 {
 		return ErrCheckpointPending
 	}
-	// A server-backed checkpoint's journal (checkpoint.go).
-	if ok, err := s.l.checkpointExists(); err != nil {
+	if ok, err := l.checkpointExists(); err != nil {
 		return err
 	} else if ok {
 		return ErrCheckpointPending

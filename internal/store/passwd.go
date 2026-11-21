@@ -948,8 +948,12 @@ func (s *Store) readJournal(seq uint64) (*journalFile, error) {
 	return &j, nil
 }
 
-func (s *Store) journalSeqs() ([]uint64, error) {
-	ents, err := os.ReadDir(s.l.journal())
+func (s *Store) journalSeqs() ([]uint64, error) { return s.l.journalSeqs() }
+
+// journalSeqs lists the seqs of the journal files, ascending, from their
+// names. A missing journal directory is os.ErrNotExist.
+func (l layout) journalSeqs() ([]uint64, error) {
+	ents, err := os.ReadDir(l.journal())
 	if err != nil {
 		return nil, err
 	}

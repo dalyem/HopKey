@@ -42,3 +42,33 @@ func TestLogoutRefusedByAPendingKitAsksNothingAndKeepsTheVaultOpen(t *testing.T)
 		})
 	}
 }
+
+// Where no daemon has the vault open (it is locked, or no daemon runs),
+// the refusal of a pending Emergency Kit comes from the vault's files, and
+// still before the device passphrase is asked: plain hop auth logout.
+func TestLogoutRefusedByAPendingKitAsksNothingWithTheVaultLockedOrNoDaemon(t *testing.T) {
+	for _, how := range [][]string{{"lock"}, {"daemon", "stop"}} {
+		t.Run(strings.Join(how, " "), func(t *testing.T) {
+			_, m := sealedAccount(t)
+			keepOnlyThis := func(p string) string {
+				if strings.HasSuffix(p, "[y/N] ") {
+					return "y"
+				}
+				return "" // only this device
+			}
+			s := &session{tty: true, env: map[string]string{"HOP_PASSWORD": resolvePassword},
+				secrets: map[string]string{askOldPass: devPass}, answer: keepOnlyThis, wrongTypeBack: true}
+			if code := m.hop(t, s, "auth", "rotate"); code == 0 || !strings.Contains(s.stderr.String(), "stays pending") {
+				t.Fatalf("rotate with a wrong type-back: exit %d: %s", code, s.stderr.String())
+			}
+			m.must(t, nil, how...)
+			s = &session{tty: true, secrets: map[string]string{askOldPass: devPass}}
+			if code := m.hop(t, s, "auth", "logout", "--yes"); code == 0 || !strings.Contains(s.stderr.String(), "Emergency Kit is not confirmed") {
+				t.Fatalf("logout with a pending kit: exit %d: %s", code, s.stderr.String())
+			}
+			if len(s.order) != 0 {
+				t.Errorf("asked before the refusal: %q", s.order)
+			}
+		})
+	}
+}

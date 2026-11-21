@@ -382,6 +382,30 @@ func (s *Store) logoutGuards(discardPending bool) error {
 	return nil
 }
 
+// LogoutPreflight is the refusal a logout of the vault in dataDir is sure
+// to meet from the guards that refuse whatever the options (logoutGuards):
+// a login merge in progress, or a password change whose Emergency Kit is
+// not confirmed. It reads file names only, so it needs no key, works while
+// the vault is locked or a daemon owns it, and changes nothing; a caller
+// can refuse before it asks for a secret. A logout already under way meets
+// no guard: Logout resumes it. A queued outbox is left to the caller, which
+// knows whether pending changes are to be discarded. Logout's guards still
+// have the last word.
+func LogoutPreflight(dataDir string) error {
+	l := layout{data: dataDir}
+	if _, err := os.Lstat(l.retireFile()); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if exists, err := l.mergeExists(); err != nil {
+		return err
+	} else if exists {
+		return ErrMergeInProgress
+	}
+	return l.refuseCheckpointFiles()
+}
+
 // Logout retires this device from the account (§11.1), or resumes a logout
 // in progress: RETIRING resumes its resolution, RETIRED its cleanup (opts
 // are then ignored, except LocalOnly, which turns a pending RETIRING into

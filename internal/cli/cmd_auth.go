@@ -1349,6 +1349,12 @@ func runAuthLogout(ctx context.Context, e *Env, args []string) error {
 			}
 		}
 	}
+	// The same refusals from the vault's files, where no daemon has the
+	// vault open (it is locked, or none runs): they read names only and
+	// need no key, so they come before the passphrase too.
+	if err := store.LogoutPreflight(e.storeConfig().DataDir); errors.Is(err, store.ErrMergeInProgress) || errors.Is(err, store.ErrCheckpointPending) {
+		return authFailure(err)
+	}
 	// A sealed device key opens with its passphrase, which a logout that
 	// tells the server needs to sign the retirement.
 	defer e.clearDevicePass()
