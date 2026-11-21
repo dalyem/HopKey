@@ -252,7 +252,7 @@ func (p *proxy) closeFds() {
 		p.w.stop()
 	}
 	if p.o != nil {
-		p.o.wake.close()
+		p.o.close()
 	}
 	if p.ptm >= 0 {
 		unix.Close(p.ptm)

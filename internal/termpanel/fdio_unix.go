@@ -272,10 +272,12 @@ func (w *writer) stop() {
 // descriptor is the shell's too, so it is non-blocking only during a
 // write.
 type termOut struct {
-	fd    int
-	fl    int // the descriptor's file status flags, as found
-	wake  wakePipe
-	state atomic.Int32
+	fd     int
+	fl     int // the descriptor's file status flags, as found
+	wake   wakePipe
+	state  atomic.Int32
+	mu     sync.Mutex // set's and close's
+	closed bool
 }
 
 // A termOut's state: the session runs, or it is ending (a write waits at
@@ -313,16 +315,22 @@ func (o *termOut) end()   { o.set(outEnding) }
 func (o *termOut) abort() { o.set(outAborted) }
 
 func (o *termOut) set(st int32) {
-	for {
-		old := o.state.Load()
-		if old >= st {
-			return
-		}
-		if o.state.CompareAndSwap(old, st) {
-			o.wake.signal()
-			return
-		}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.state.Load() >= st || o.closed {
+		return
 	}
+	o.state.Store(st)
+	o.wake.signal()
+}
+
+// close closes the wake pipe, after which end and abort do nothing: Run
+// may still say the session ends after a panic in the loop restored.
+func (o *termOut) close() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.closed = true
+	o.wake.close()
 }
 
 // write writes b, waiting for the terminal when it is full: at most limit
