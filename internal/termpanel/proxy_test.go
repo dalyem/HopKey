@@ -823,3 +823,41 @@ func TestSessionEndResetsTerminal(t *testing.T) {
 		waitReset(t, v)
 	})
 }
+
+// A child that never reads its input fills the queue of input hop holds
+// for it, while it floods its output. When the read that fills the queue
+// ends with the hotkey, the panel opens over a session that takes no
+// input and whose output waits for the panel: the panel's keys must still
+// be read, or Esc could never close it.
+func TestPanelUnderInputBackpressure(t *testing.T) {
+	v := newVTerm(t, 80, 24)
+	run(t, v, Options{Shortcuts: testShortcuts}, `stty raw -echo; exec yes`, "")
+	v.waitText("y")
+	opened := func(d time.Duration) bool {
+		for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+			v.mu.Lock()
+			up := v.scr.altActive && strings.Contains(v.scr.text(0), "Shortcuts")
+			v.mu.Unlock()
+			if up {
+				return true
+			}
+		}
+		return false
+	}
+	// One write, which the terminal passes on in one read: the queue
+	// fills during a read that ends with the hotkey.
+	chunk := strings.Repeat("a", 1000) + "\x1d"
+	for sent := len(chunk); ; sent += len(chunk) {
+		v.key(chunk)
+		if !opened(2 * time.Second) {
+			if sent <= writeLimit {
+				t.Fatalf("the panel did not open after %d bytes of input", sent)
+			}
+			// The queue is full and the panel closed: hop reads no
+			// more of the terminal until the child takes some input.
+			return
+		}
+		v.key("\x1b")
+		v.waitFor(fmt.Sprintf("Esc to close the panel after %d bytes of input", sent), func(s *screen) bool { return !s.altActive })
+	}
+}

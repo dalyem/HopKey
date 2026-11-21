@@ -15,17 +15,21 @@ type entry struct {
 	host    bool
 }
 
+// maxCommand is the longest command a shortcut may type, in bytes, as in
+// the shortcut schema.
+const maxCommand = 4096
+
 // entries checks and orders the shortcuts: host ones first, then global
 // ones, each in the order given. One whose keys are not one or two
-// printable ASCII characters is left out, and so is one whose keys an
-// entry before it has: a host shortcut hides a global one with the same
-// keys.
+// printable ASCII characters is left out, and so is one whose command is
+// longer than maxCommand, or whose keys an entry before it has: a host
+// shortcut hides a global one with the same keys.
 func entries(scs []Shortcut) []entry {
 	var host, global []entry
 	seen := map[string]bool{}
 	for _, pass := range []bool{true, false} {
 		for _, sc := range scs {
-			if sc.Host != pass || !validKeys(sc.Keys) || seen[sc.Keys] {
+			if sc.Host != pass || !validKeys(sc.Keys) || len(sc.Command) > maxCommand || seen[sc.Keys] {
 				continue
 			}
 			seen[sc.Keys] = true

@@ -118,6 +118,7 @@ func TestEntriesNeutralizeAndOrder(t *testing.T) {
 		{Keys: "abc", Name: "too long"},
 		{Keys: "\x01", Name: "control"},
 		{Keys: "y", Name: "\x9bC1", Command: "ok"},
+		{Keys: "z", Name: "too long a command", Command: strings.Repeat("a", maxCommand+1)},
 	})
 	if len(es) != 2 || es[0].name != "host x" || es[1].keys != "y" {
 		t.Fatalf("entries: %+v", es)

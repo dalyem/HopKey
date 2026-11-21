@@ -281,8 +281,14 @@ func (p *proxy) loop(ctx context.Context, childDone, abort <-chan struct{}) {
 	esc.Stop()
 	escArmed := false
 	for {
+		// A full queue of input for the child stops the reading of the
+		// terminal, but not while the panel is open: its keys are the
+		// panel's, and the child's output waits for the panel, so a child
+		// held up writing it would never take the input that frees the
+		// queue, and Esc would never be read. The panel adds at most one
+		// command (maxCommand) or the hotkey to the queue, as it closes.
 		inC, spaceC := p.inR.out, (<-chan struct{})(nil)
-		if p.gone || p.w.full() {
+		if p.gone || (p.w.full() && !p.panel.open) {
 			inC = nil
 			spaceC = p.w.space
 		}
