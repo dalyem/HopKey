@@ -195,9 +195,11 @@ type PutSnippetParams struct {
 	Snippet model.Snippet `json:"snippet"`
 }
 
-// DeleteParams is the request for OpDelete.
+// DeleteParams is the request for OpDelete. A host with shortcuts is
+// refused unless WithShortcuts, which deletes them first.
 type DeleteParams struct {
-	ID string `json:"id"`
+	ID            string `json:"id"`
+	WithShortcuts bool   `json:"with_shortcuts,omitempty"`
 }
 
 // KeyInfo describes a key without its private half.
@@ -231,6 +233,7 @@ type ListResult struct {
 	Keys        []KeyInfo          `json:"keys"`
 	Credentials []CredentialInfo   `json:"credentials"`
 	Snippets    []model.Snippet    `json:"snippets"`
+	Shortcuts   []model.Shortcut   `json:"shortcuts"`
 	SSH         map[string]HostSSH `json:"ssh"` // by host ID
 	Tailscale   *tailscale.Status  `json:"tailscale"`
 	// Marks names the items, of any type, with a queued change that has

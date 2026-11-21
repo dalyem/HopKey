@@ -271,6 +271,9 @@ func (d *Daemon) dispatch(ctx context.Context, req Request) (any, error) {
 	if result, ok, err := d.dispatchAccess(ctx, req, decode); ok {
 		return result, err
 	}
+	if result, ok, err := d.dispatchShortcut(ctx, req, decode); ok {
+		return result, err
+	}
 	return nil, invalidf("unknown op %q", req.Op)
 }
 
@@ -324,8 +327,11 @@ func (d *Daemon) opList(ctx context.Context) (*ListResult, error) {
 		return nil, err
 	}
 	out := &ListResult{
-		Hosts: snap.Hosts, Snippets: snap.Snippets, SSH: st.ssh, Tailscale: d.tsStatus(ctx),
+		Hosts: snap.Hosts, Snippets: snap.Snippets, Shortcuts: snap.Shortcuts, SSH: st.ssh, Tailscale: d.tsStatus(ctx),
 		Keys: []KeyInfo{}, Credentials: []CredentialInfo{},
+	}
+	if out.Shortcuts == nil {
+		out.Shortcuts = []model.Shortcut{}
 	}
 	if out.Hosts == nil {
 		out.Hosts = []model.Host{}
@@ -789,6 +795,9 @@ func (d *Daemon) opDelete(ctx context.Context, p DeleteParams) error {
 					a.Label, t.State, a.Label, a.Label)
 			}
 		}
+	}
+	if err := d.deleteHostShortcuts(ctx, snap, id, p.WithShortcuts); err != nil {
+		return err
 	}
 	if err := d.store.Delete(ctx, id); err != nil {
 		return storeError(err)
