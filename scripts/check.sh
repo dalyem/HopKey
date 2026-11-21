@@ -34,9 +34,11 @@ race)
 	# (the daemon package alone is the largest), so they run one at a time,
 	# each in a go test of its own: one go test keeps every package's binary
 	# in its work directory, in /tmp, until it exits, and by the store
-	# package they fill most of the 512 MiB tmpfs.
+	# package they fill most of the 512 MiB tmpfs. cmd/hop is in it for its
+	# subprocess tests of the signal handling: the hop and hop-server they
+	# run are built without the race detector, so it covers the test side.
 	HOPKEY_REQUIRE_SSH=1 exec sh "$(dirname "$0")/with-passwd.sh" sh -c '
-		packages=$(go list ./internal/...) || exit $?
+		packages=$(go list ./internal/... ./cmd/hop) || exit $?
 		[ -n "$packages" ] || { echo "go list found no packages" >&2; exit 1; }
 		status=0
 		for p in $packages; do
