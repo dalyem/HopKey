@@ -153,13 +153,14 @@ func runConnect(ctx context.Context, e *Env, args []string) error {
 	argv := append([]string{e.sshBinary()}, e.sshArgs(t, addr)...)
 	// ssh runs as a child on this process's terminal. Its session is the
 	// user's own and is not sanitized, on purpose.
-	return e.connectSSH(ctx, argv, t.alias)
+	return e.connectSSH(ctx, argv, t.alias, rr)
 }
 
 // connectSSH runs hop <target>'s ssh as a child, so that this process can
 // end it when the daemon says this device was revoked (runTerminalSSH),
-// and exits with its status.
-func (e *Env) connectSSH(ctx context.Context, argv []string, alias string) error {
+// with the shortcuts panel of the session rr resolved, and exits with its
+// status.
+func (e *Env) connectSSH(ctx context.Context, argv []string, alias string, rr *daemon.ResolveResult) error {
 	path, err := exec.LookPath(argv[0])
 	if err != nil {
 		return failf("cannot find %s: %v", argv[0], err)
@@ -170,7 +171,7 @@ func (e *Env) connectSSH(ctx context.Context, argv []string, alias string) error
 		}
 		return nil
 	}
-	code, endedWhy, err := e.runTerminalSSH(ctx, path, argv, e.sshEnviron(), alias)
+	code, endedWhy, err := e.runTerminalSSH(ctx, path, argv, e.sshEnviron(), alias, rr)
 	if err != nil {
 		return failf("cannot run %s: %v", path, err)
 	}

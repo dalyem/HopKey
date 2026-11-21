@@ -81,7 +81,7 @@ func runChild(ctx context.Context, sc *sshCmd, ended <-chan string) (endedWhy st
 		s.closeAll()
 		return "", err
 	}
-	c, err := startChild(path, sc.args, sc.env, sc.dir, files)
+	c, err := startChild(path, sc.args, sc.env, sc.dir, files, nil)
 	for _, f := range s.childEnds {
 		f.Close()
 	}

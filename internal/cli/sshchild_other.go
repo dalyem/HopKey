@@ -5,12 +5,15 @@ package cli
 import (
 	"context"
 	"os"
+	"syscall"
+
+	"github.com/dalyem/hopkey/internal/daemon"
 )
 
 // runTerminalSSH runs hop <target>'s ssh as a child on this process's
 // streams, watched by the daemon (watchSession), and returns its exit
-// status.
-func (e *Env) runTerminalSSH(_ context.Context, path string, argv, environ []string, alias string) (code int, endedWhy string, err error) {
+// status. There is no shortcuts panel here (termpanel.ErrUnsupported).
+func (e *Env) runTerminalSSH(_ context.Context, path string, argv, environ []string, alias string, _ *daemon.ResolveResult) (code int, endedWhy string, err error) {
 	return e.runPipedSSH(path, argv, environ, alias)
 }
 
@@ -25,9 +28,10 @@ type child struct {
 }
 
 // startChild starts path with argv, env (nil: this process's), dir ("":
-// this process's) and files as its stdin, stdout and stderr.
-func startChild(path string, argv, env []string, dir string, files []*os.File) (*child, error) {
-	p, err := os.StartProcess(path, argv, &os.ProcAttr{Dir: dir, Env: env, Files: files})
+// this process's), files as its stdin, stdout and stderr, and sys as its
+// os.ProcAttr.Sys.
+func startChild(path string, argv, env []string, dir string, files []*os.File, sys *syscall.SysProcAttr) (*child, error) {
+	p, err := os.StartProcess(path, argv, &os.ProcAttr{Dir: dir, Env: env, Files: files, Sys: sys})
 	if err != nil {
 		return nil, err
 	}

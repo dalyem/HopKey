@@ -171,6 +171,7 @@ func (p *plainSSH) wait(t *testing.T, within time.Duration) error {
 // job-control shell (cli.JobShellVar): this test binary twice.
 type termHop struct {
 	master *os.File
+	tty    string // the terminal's slave, as a path
 	shell  *exec.Cmd
 	log    string
 	mu     sync.Mutex
@@ -202,21 +203,27 @@ func startTerminalHop(t *testing.T, m *machine, args ...string) *termHop {
 // shell's environment.
 func startTerminalHopEnv(t *testing.T, m *machine, env []string, args ...string) *termHop {
 	t.Helper()
+	return startTerminalHopAt(t, cli.HopMainPaths{Home: m.home, Data: m.data, Run: m.paths.RunDir, Config: m.paths.ConfigDir, State: m.paths.StateDir}, env, args...)
+}
+
+// startTerminalHopAt is startTerminalHopEnv for a machine at paths.
+func startTerminalHopAt(t *testing.T, at cli.HopMainPaths, env []string, args ...string) *termHop {
+	t.Helper()
 	master, slave := openPTY(t)
 	setSize(t, master, 80, 24)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths, _ := json.Marshal(cli.HopMainPaths{Home: m.home, Data: m.data, Run: m.paths.RunDir, Config: m.paths.ConfigDir, State: m.paths.StateDir})
-	h := &termHop{master: master, log: filepath.Join(shortTemp(t), "job.log"), done: make(chan struct{})}
+	paths, _ := json.Marshal(at)
+	h := &termHop{master: master, tty: slave.Name(), log: filepath.Join(shortTemp(t), "job.log"), done: make(chan struct{})}
 	h.shell = exec.Command(exe, args...)
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(kv, "SSH_AUTH_SOCK=") && !strings.HasPrefix(kv, "HOME=") && !strings.HasPrefix(kv, "TERM=") {
 			h.shell.Env = append(h.shell.Env, kv)
 		}
 	}
-	h.shell.Env = append(h.shell.Env, "HOME="+m.home, "TERM=xterm", cli.HopMainVar+"="+string(paths), cli.JobShellVar+"="+h.log)
+	h.shell.Env = append(h.shell.Env, "HOME="+at.Home, "TERM=xterm", cli.HopMainVar+"="+string(paths), cli.JobShellVar+"="+h.log)
 	h.shell.Env = append(h.shell.Env, env...)
 	h.shell.Stdin, h.shell.Stdout, h.shell.Stderr = slave, slave, slave
 	h.shell.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}

@@ -94,7 +94,7 @@ func TestChildProcessesGetNoAuthSecrets(t *testing.T) {
 
 	var got []string
 	e.ExecSSH = func(_ string, _, environ []string) error { got = environ; return nil }
-	if err := e.connectSSH(context.Background(), []string{"sh"}, "web"); err != nil {
+	if err := e.connectSSH(context.Background(), []string{"sh"}, "web", nil); err != nil {
 		t.Fatal(err)
 	}
 	noSecrets(t, "hop <target>'s ssh", got)
