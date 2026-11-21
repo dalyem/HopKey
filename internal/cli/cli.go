@@ -187,6 +187,14 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 		<-done
 		return
 	}
+	if e.restorePending() {
+		// What is left to do takes a moment, and a second Ctrl-C skips it.
+		if asJSON || e.currentHoldJSON() {
+			printWarning(e, true, restoringText)
+		} else {
+			fmt.Fprintln(e.Stderr, "hop: "+restoringText)
+		}
+	}
 	grace := e.InterruptGrace
 	if grace <= 0 {
 		grace = 3 * time.Second
@@ -231,6 +239,42 @@ func (e *Env) watchInterrupt(ctx context.Context, done <-chan struct{}, ctxAware
 	// it returns (interruptedText), in JSON for a --json command.
 	printError(e, asJSON, &exitError{code: ExitInterrupted, msg: interruptedText})
 	e.Exit(ExitInterrupted)
+}
+
+// restoringText is said at the first signal while the vault is still to be
+// put back as the command found it (restorePending).
+const restoringText = "restoring the vault's lock state; press Ctrl-C again to quit now (the vault may be left open: run hop lock)"
+
+// quitText is said when a second signal ends hop before that is done.
+const quitText = "hop: quit before the vault's lock state was restored: the vault may be open, so run hop lock if it was locked; hop status shows its state"
+
+// restorePending reports whether the command has the vault's lock state
+// to put back: it holds the vault (a hop auth command, whose release or
+// abandon does it), or it registered what to undo (atInterrupt).
+func (e *Env) restorePending() bool {
+	e.interruptMu.Lock()
+	undo := e.onInterrupt != nil
+	e.interruptMu.Unlock()
+	return undo || e.currentHold() != nil
+}
+
+// currentHoldJSON reports whether the command holding the vault prints
+// JSON.
+func (e *Env) currentHoldJSON() bool {
+	h := e.currentHold()
+	return h != nil && h.asJSON
+}
+
+// ForceQuit is for a second SIGINT or SIGTERM, which ends hop at once,
+// however far it got after the first. Where the vault's lock state was
+// still to be put back, it says what to run; then it exits.
+func (e *Env) ForceQuit() {
+	if e.restorePending() {
+		fmt.Fprintln(e.Stderr, quitText)
+	}
+	if e.Exit != nil {
+		e.Exit(ExitInterrupted)
+	}
 }
 
 // errHalted is what a prompt returns once a signal ended the command

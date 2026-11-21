@@ -33,17 +33,6 @@ func main() {
 	}
 	exe, _ := os.Executable()
 
-	// SIGINT, SIGTERM and SIGHUP (the terminal went away) cancel the context; cli.Run decides what else
-	// happens (a hop auth flow hands the vault back to the daemon). A
-	// second signal is not caught: it ends the process at once.
-	ctx, cancel := context.WithCancelCause(context.Background())
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, stopSignals(signal.Ignored(syscall.SIGHUP))...)
-	go func() {
-		<-sigs
-		signal.Stop(sigs)
-		cancel(cli.ErrInterrupted)
-	}()
 	// A prompt may have turned echo off; exiting on a signal turns it on.
 	stdinFd := int(os.Stdin.Fd())
 	var termState *term.State
@@ -80,5 +69,18 @@ func main() {
 			return b, err
 		}
 	}
+	// SIGINT, SIGTERM and SIGHUP (the terminal went away) cancel the context; cli.Run decides what else
+	// happens (a hop auth flow hands the vault back to the daemon). A
+	// second signal ends the process at once (ForceQuit), saying what to
+	// run if the vault's lock state was still to be put back.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, stopSignals(signal.Ignored(syscall.SIGHUP))...)
+	go func() {
+		<-sigs
+		cancel(cli.ErrInterrupted)
+		<-sigs
+		env.ForceQuit()
+	}()
 	os.Exit(cli.Run(ctx, os.Args[1:], env))
 }

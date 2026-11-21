@@ -510,20 +510,24 @@ func TestAbandonWarnsInJSON(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no exit after the interrupt")
 	}
-	// The warning, then the interruption, each a line of JSON.
+	// That the vault is being put back, the warning, then the interruption,
+	// each a line of JSON.
 	out := x.e.Stderr.(*strings.Builder).String()
 	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
 	var w struct {
 		Warning string `json:"warning"`
 		Error   string `json:"error"`
 	}
-	if len(lines) != 2 {
-		t.Fatalf("stderr %q is not two lines", out)
+	if len(lines) != 3 {
+		t.Fatalf("stderr %q is not three lines", out)
 	}
-	if err := json.Unmarshal([]byte(lines[0]), &w); err != nil || !strings.Contains(w.Warning, "no daemon here") {
-		t.Errorf("stderr %q does not start with a JSON warning: %v", out, err)
+	if err := json.Unmarshal([]byte(lines[0]), &w); err != nil || w.Warning != restoringText {
+		t.Errorf("stderr %q does not start with the JSON notice of the restoring: %v", out, err)
 	}
-	if err := json.Unmarshal([]byte(lines[1]), &w); err != nil || w.Error != interruptedText {
+	if err := json.Unmarshal([]byte(lines[1]), &w); err != nil || !strings.Contains(w.Warning, "no daemon here") {
+		t.Errorf("stderr %q does not go on with a JSON warning: %v", out, err)
+	}
+	if err := json.Unmarshal([]byte(lines[2]), &w); err != nil || w.Error != interruptedText {
 		t.Errorf("stderr %q does not end with a JSON error: %v", out, err)
 	}
 }
