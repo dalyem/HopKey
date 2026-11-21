@@ -411,7 +411,7 @@ func (s *Store) beginPublication(opts PublishOptions, accepted []model.Type) (*p
 		return nil, nil, fmt.Errorf("%w: this vault has access records; the server at %s doesn't accept them", ErrAccessUnsupported, opts.Server)
 	}
 	if !slices.Contains(accepted, model.TypeShortcut) && uploadHas(wires, model.TypeShortcut) {
-		return nil, nil, fmt.Errorf("%w: this vault has shortcuts; the server at %s doesn't accept them; upgrade hop-server, or remove them with hop shortcut rm", ErrShortcutsUnsupported, opts.Server)
+		return nil, nil, fmt.Errorf("%w: this vault's history has shortcuts, and the server at %s doesn't accept them; upgrade hop-server to one that does", ErrShortcutsUnsupported, opts.Server)
 	}
 	b, err := sealPublication(s.rec, j)
 	if err != nil {

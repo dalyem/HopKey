@@ -235,8 +235,16 @@ func TestPublishWithShortcuts(t *testing.T) {
 	}
 	calls := 0
 	for _, p := range []Publisher{publisher{srv}, capsPublisher{publisher{srv}, []model.Type{model.TypeAccess, model.TypeHost}, &calls}} {
-		if _, err := f.s.Publish(ctx, p, pubOpts); !errors.Is(err, ErrShortcutsUnsupported) {
+		_, err := f.s.Publish(ctx, p, pubOpts)
+		if !errors.Is(err, ErrShortcutsUnsupported) {
 			t.Fatalf("publish: %v", err)
+		}
+		// The history holds the shortcut, so removing it would not help:
+		// only a server that takes shortcuts will do.
+		if msg := err.Error(); strings.Contains(msg, "remove") || strings.Contains(msg, "shortcut rm") {
+			t.Errorf("publish: %q advises removing shortcuts", msg)
+		} else if _, caps := p.(capsPublisher); caps && !strings.Contains(msg, "upgrade hop-server") {
+			t.Errorf("publish: %q, want the advice to upgrade hop-server", msg)
 		}
 		if pending, err := f.s.l.publicationPending(); err != nil || pending {
 			t.Fatalf("publication journaled: %v %v", pending, err)
