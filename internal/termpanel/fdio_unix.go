@@ -13,8 +13,13 @@ import (
 // errStopped is what waiting on a descriptor returns once woken to stop.
 var errStopped = errors.New("termpanel: stopped")
 
-// maxFd is the first descriptor select cannot wait on.
+// maxFd is the first descriptor select cannot wait on. newProxy checks
+// every descriptor waitFd will wait on before a goroutine starts waiting.
+// (poll has no such limit, but macOS's does not support terminals.)
 const maxFd = 1024
+
+// errFdRange is waitFd's error for a descriptor select cannot wait on.
+var errFdRange = errors.New("termpanel: descriptor out of select's range")
 
 // wakePipe wakes a goroutine waiting in select (waitFd).
 type wakePipe struct{ r, w int }
@@ -31,6 +36,9 @@ func (p wakePipe) close() {
 // lets a goroutine that does them be stopped at any time, without a
 // read taking input that is not its to take any more.
 func waitFd(fd int, write bool, wake int) error {
+	if fd >= maxFd || wake >= maxFd {
+		return errFdRange
+	}
 	for {
 		var rs, ws unix.FdSet
 		rs.Set(wake)
@@ -52,19 +60,21 @@ func waitFd(fd int, write bool, wake int) error {
 	}
 }
 
-// reader reads a descriptor in a goroutine, sending what it reads on out
-// until it is stopped or the descriptor fails; then it closes out. Each
-// buffer it sends is the receiver's until given back with release.
+// reader reads a descriptor in a goroutine, once started, sending what it
+// reads on out until it is stopped or the descriptor fails; then it closes
+// out. Each buffer it sends is the receiver's until given back with
+// release.
 type reader struct {
-	fd   int
-	wake wakePipe
-	out  chan []byte
-	free chan []byte
-	quit chan struct{}
-	done chan struct{}
-	once sync.Once
-	size int
-	err  error // once out is closed
+	fd      int
+	wake    wakePipe
+	out     chan []byte
+	free    chan []byte
+	quit    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	size    int
+	started bool
+	err     error // once out is closed
 }
 
 func newReader(fd, size int) (*reader, error) {
@@ -72,10 +82,13 @@ func newReader(fd, size int) (*reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &reader{fd: fd, wake: w, out: make(chan []byte), free: make(chan []byte, 2),
-		quit: make(chan struct{}), done: make(chan struct{}), size: size}
+	return &reader{fd: fd, wake: w, out: make(chan []byte), free: make(chan []byte, 2),
+		quit: make(chan struct{}), done: make(chan struct{}), size: size}, nil
+}
+
+func (r *reader) start() {
+	r.started = true
 	go r.run()
-	return r, nil
 }
 
 func (r *reader) run() {
@@ -124,7 +137,9 @@ func (r *reader) stop() {
 	r.once.Do(func() {
 		close(r.quit)
 		r.wake.signal()
-		<-r.done
+		if r.started {
+			<-r.done
+		}
 		r.wake.close()
 	})
 }
@@ -134,19 +149,20 @@ func (r *reader) stop() {
 // slows the user down rather than hop's memory growing.
 const writeLimit = 64 << 10
 
-// writer writes to a non-blocking descriptor in a goroutine, from a queue
-// that send never blocks on.
+// writer writes to a non-blocking descriptor in a goroutine, once
+// started, from a queue that send never blocks on.
 type writer struct {
-	fd    int
-	wake  wakePipe
-	mu    sync.Mutex
-	q     [][]byte
-	n     int
-	kick  chan struct{}
-	space chan struct{} // the queue fell below writeLimit
-	quit  chan struct{}
-	done  chan struct{}
-	once  sync.Once
+	fd      int
+	wake    wakePipe
+	mu      sync.Mutex
+	q       [][]byte
+	n       int
+	kick    chan struct{}
+	space   chan struct{} // the queue fell below writeLimit
+	quit    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	started bool
 }
 
 func newWriter(fd int) (*writer, error) {
@@ -154,10 +170,13 @@ func newWriter(fd int) (*writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	w := &writer{fd: fd, wake: wp, kick: make(chan struct{}, 1), space: make(chan struct{}, 1),
-		quit: make(chan struct{}), done: make(chan struct{})}
+	return &writer{fd: fd, wake: wp, kick: make(chan struct{}, 1), space: make(chan struct{}, 1),
+		quit: make(chan struct{}), done: make(chan struct{})}, nil
+}
+
+func (w *writer) start() {
+	w.started = true
 	go w.run()
-	return w, nil
 }
 
 func (w *writer) send(b []byte) {
@@ -230,7 +249,9 @@ func (w *writer) stop() {
 	w.once.Do(func() {
 		close(w.quit)
 		w.wake.signal()
-		<-w.done
+		if w.started {
+			<-w.done
+		}
 		w.wake.close()
 	})
 }

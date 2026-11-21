@@ -142,9 +142,6 @@ func newProxy(opts Options) (_ *proxy, err error) {
 	if p.ptm, p.pts, err = openPTY(); err != nil {
 		return nil, err
 	}
-	if p.ptm >= maxFd || p.inFd >= maxFd {
-		return nil, ErrUnsupported
-	}
 	// The child's terminal starts as the user's was, so ssh passes the
 	// same modes (the erase character, say) to the remote side's pty.
 	if err := unix.IoctlSetTermios(int(p.pts.Fd()), ioctlSetTermios, tio); err != nil {
@@ -162,6 +159,16 @@ func newProxy(opts Options) (_ *proxy, err error) {
 	if p.w, err = newWriter(p.ptm); err != nil {
 		return nil, err
 	}
+	// Every descriptor select is to wait on, before any goroutine waits:
+	// the caller then runs the child directly.
+	for _, fd := range []int{p.inFd, p.ptm, p.inR.wake.r, p.outR.wake.r, p.w.wake.r} {
+		if fd >= maxFd {
+			return nil, ErrUnsupported
+		}
+	}
+	p.inR.start()
+	p.outR.start()
+	p.w.start()
 	if p.orig, err = term.MakeRaw(p.inFd); err != nil {
 		return nil, err
 	}

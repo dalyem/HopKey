@@ -50,8 +50,10 @@ type Options struct {
 // caller runs the child on its streams directly instead.
 var ErrNotTerminal = errors.New("termpanel: not a terminal")
 
-// ErrUnsupported is Run's error on a system it does not support: it
-// supports Linux and macOS.
+// ErrUnsupported is Run's error on a system it does not support (it
+// supports Linux and macOS), or when a descriptor it would wait on is
+// 1024 or more, which select can't wait on. Run returns it before calling
+// start, and the caller runs the child on its streams directly instead.
 var ErrUnsupported = errors.New("termpanel: not supported on this system")
 
 func (o Options) hotkey() (byte, error) {

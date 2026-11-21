@@ -5,6 +5,7 @@ package termpanel
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -645,5 +646,67 @@ func TestNotATerminal(t *testing.T) {
 	})
 	if err != ErrNotTerminal || called {
 		t.Fatalf("Run on pipes: %v, started %v", err, called)
+	}
+}
+
+// select can't wait on a descriptor from 1024 up. When one of the
+// descriptors the proxy would wait on is, Run says so before it starts
+// anything, and the caller runs the child directly.
+func TestRunRefusesHighDescriptors(t *testing.T) {
+	var rl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err != nil {
+		t.Fatal(err)
+	}
+	if rl.Cur < 2*maxFd {
+		if rl.Max < 2*maxFd {
+			t.Skipf("the descriptor limit is %d", rl.Max)
+		}
+		old := rl
+		rl.Cur = 2 * maxFd
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &rl); err != nil {
+			t.Skip(err)
+		}
+		t.Cleanup(func() { unix.Setrlimit(unix.RLIMIT_NOFILE, &old) })
+	}
+	v := newVTerm(t, 80, 24)
+	orig, err := unix.IoctlGetTermios(v.fd, ioctlGetTermios)
+	if err != nil {
+		t.Fatal(err)
+	}
+	null, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := []int{null}
+	t.Cleanup(func() {
+		for _, fd := range held {
+			unix.Close(fd)
+		}
+	})
+	// Every descriptor below 1023 in use: the pty's master gets 1023,
+	// which select can wait on, and the descriptors after it can't.
+	for {
+		fd, err := unix.Dup(null)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, fd)
+		if fd >= maxFd-2 {
+			break
+		}
+	}
+	err = Run(context.Background(), Options{In: v.tty, Out: v.tty, Shortcuts: testShortcuts}, func(*os.File, *syscall.SysProcAttr) (func() error, error) {
+		t.Error("Run started the child")
+		return func() error { return nil }, nil
+	})
+	if !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Run: %v, want ErrUnsupported", err)
+	}
+	now, err := unix.IoctlGetTermios(v.fd, ioctlGetTermios)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *now != *orig {
+		t.Errorf("terminal mode %+v, want %+v", *now, *orig)
 	}
 }
