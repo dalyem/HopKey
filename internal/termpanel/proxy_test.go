@@ -142,6 +142,9 @@ func (s *screen) clone() *screen {
 	}
 	c.main.cells, c.alt.cells = cp(s.main.cells), cp(s.alt.cells)
 	c.tabs = append([]bool(nil), s.tabs...)
+	for i := range c.kitty {
+		c.kitty[i].pushed = slices.Clone(s.kitty[i].pushed)
+	}
 	c.modes = map[int]bool{}
 	for k, m := range s.modes {
 		c.modes[k] = m
@@ -1164,4 +1167,53 @@ func TestStalledTerminal(t *testing.T) {
 			t.Fatal("Run did not return with the terminal taking no output")
 		}
 	})
+}
+
+// With the kitty keyboard protocol on, the panel reads its keys in flags
+// of its own, which say what a key typed with Shift: a shortcut on ! is
+// had with Shift-1. modifyOtherKeys is off while it is open. When it
+// closes, the remote side's flags and level are as they were, on the
+// stack or not, however deep.
+func TestPanelSetsItsKeyboardModes(t *testing.T) {
+	deep := strings.Repeat(`\033[>1u`, 7) + `\033[>8u`
+	for _, c := range []struct {
+		name, setup, hotkey, bang string
+		open                      func(s *screen) bool
+	}{
+		{"pushed, normal screen", `\033[>8u`, "\x1b[93;5u", "\x1b[49:33;2;33u", func(s *screen) bool {
+			return s.altActive && slices.Equal(s.kitty[1].pushed, []int{29}) && slices.Equal(s.kitty[0].pushed, []int{8})
+		}},
+		{"pushed, alternate screen", `\033[?1049h\033[>8u`, "\x1b[93;5u", "\x1b[49:33;2;33u", func(s *screen) bool {
+			return slices.Equal(s.kitty[1].pushed, []int{8, 29})
+		}},
+		{"set, alternate screen", `\033[?1049h\033[=8;1u`, "\x1b[93;5u", "\x1b[49:33;2;33u", func(s *screen) bool {
+			return len(s.kitty[1].pushed) == 0 && s.kitty[1].base == 29
+		}},
+		{"deep stack", `\033[?1049h` + deep, "\x1b[93;5u", "\x1b[49:33;2;33u", func(s *screen) bool {
+			return len(s.kitty[1].pushed) == 8 && s.kitty[1].pushed[7] == 29
+		}},
+		{"modifyOtherKeys", `\033[>4;2m`, "\x1b[27;5;93~", "!", func(s *screen) bool { return s.otherKeys == 0 }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			v := newVTerm(t, 80, 24)
+			typed := filepath.Join(t.TempDir(), "typed")
+			sc := []Shortcut{{Keys: "!", Name: "Bang", Command: "bang"}}
+			run(t, v, Options{Shortcuts: sc}, `stty raw -echo; printf '`+c.setup+`READY'; exec cat >"$0"`, typed)
+			v.waitText("READY")
+			before := v.snapshot()
+			v.key(c.hotkey)
+			v.panelAt(40)
+			v.waitFor("the panel's keyboard modes", c.open)
+			v.key(c.bang)
+			waitFile(t, typed, "bang")
+			v.waitFor("the remote side's keyboard modes", func(s *screen) bool {
+				for i := range s.kitty {
+					if !slices.Equal(s.kitty[i].pushed, before.kitty[i].pushed) || s.kitty[i].base != before.kitty[i].base {
+						return false
+					}
+				}
+				return s.altActive == before.altActive && s.otherKeys == before.otherKeys
+			})
+		})
+	}
 }

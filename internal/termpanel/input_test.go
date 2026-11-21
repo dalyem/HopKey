@@ -140,7 +140,8 @@ func TestDecodeKey(t *testing.T) {
 		"\x1b[117;1:2u":    `text:"u"`, // a repeat
 		"\x1b[117;1:3u":    `release`,
 		"\x1b[117;2u":      `text:"U"`,
-		"\x1b[49;2u":       `none`, // Shift-1: which character is not said
+		"\x1b[49;2u":       `none`, // Shift-1 on any layout: the panel's flags ask for the character
+		"\x1b[49:33;2;33u": `text:"!"`,
 		"\x1b[49:33;2u":    `text:"!"`,
 		"\x1b[49;2;33u":    `text:"!"`,
 		"\x1b[117;;117u":   `text:"u"`,

@@ -144,8 +144,9 @@ type panelState struct {
 	pending   bool
 	pendingAt time.Time
 	queued    []token
-	altBuf    bool // drawn on the alternate screen, over a copy of the normal one
-	slot      bool // the terminal's saved cursor (DECSC) holds the cursor to put back
+	altBuf    bool   // drawn on the alternate screen, over a copy of the normal one
+	slot      bool   // the terminal's saved cursor (DECSC) holds the cursor to put back
+	keysOff   []byte // puts back the keyboard modes the panel changed (panelKeys)
 	view      view
 	prefix    string
 	note      string // why the last key did nothing
@@ -296,13 +297,14 @@ func (p *proxy) onPanic() {
 // emergencyClose is what takes the panel off the screen when it cannot
 // be closed properly.
 func (p *proxy) emergencyClose() []byte {
+	b := append([]byte(nil), p.panel.keysOff...)
 	if p.panel.altBuf {
-		return []byte("\x1b[?1049l\x1b[?25h")
+		return append(b, "\x1b[?1049l\x1b[?25h"...)
 	}
 	if p.panel.slot {
-		return []byte("\x1b8\x1b[?25h")
+		return append(b, "\x1b8\x1b[?25h"...)
 	}
-	return []byte("\x1b[?25h")
+	return append(b, "\x1b[?25h"...)
 }
 
 // loop copies between the terminal and the child until childDone, then
@@ -684,10 +686,12 @@ func (p *proxy) layout() view {
 func (p *proxy) openPanel() {
 	q := p.panel.queued
 	s := p.scr
+	altBuf := !s.altActive && !s.main.live
+	keysOn, keysOff := p.panelKeys(altBuf || s.altActive)
 	p.emergency.Lock()
-	p.panel = panelState{open: true, openedAt: time.Now()}
-	p.panel.altBuf = !s.altActive && !s.main.live
-	p.panel.slot = p.panel.altBuf || (s.altActive && !s.alt.live)
+	p.panel = panelState{open: true, openedAt: time.Now(), keysOff: keysOff}
+	p.panel.altBuf = altBuf
+	p.panel.slot = altBuf || (s.altActive && !s.alt.live)
 	p.emergency.Unlock()
 	w := &painter{}
 	w.b = append(w.b, "\x1b[?2026h"...)
@@ -697,6 +701,8 @@ func (p *proxy) openPanel() {
 	case p.panel.slot:
 		w.b = append(w.b, "\x1b7"...)
 	}
+	// On the screen the panel is drawn on: each has its own flags.
+	w.b = append(w.b, keysOn...)
 	w.b = append(w.b, drawModes...)
 	if p.panel.altBuf {
 		w.screen(s.main.cells)
@@ -706,6 +712,53 @@ func (p *proxy) openPanel() {
 	w.b = append(w.b, "\x1b[?2026l"...)
 	p.write(w.b)
 	p.handle(q)
+}
+
+// kittyPanelFlags are the kitty keyboard protocol's flags the panel reads
+// its keys in: disambiguate (1), report alternate keys (4), report all
+// keys as escape codes (8) and report the text (16). A key Shift changes
+// then says what it types, Shift-1 as CSI 49:33;2;33u, which the remote
+// side's flags may not ask for: CSI 49;2u is any layout's Shift-1.
+const kittyPanelFlags = 1 | 4 | 8 | 16
+
+// kittyPushDepth is how deep a stack the panel pushes its flags on. A
+// terminal's stack may be smaller than the model's, and a push onto a
+// full one drops its oldest entry, which the pop would not bring back.
+const kittyPushDepth = 8
+
+// panelKeys returns what sets the keyboard modes the panel reads its keys
+// in, on the alternate screen when alt, and what puts back the remote
+// side's: the kitty keyboard protocol's flags, when the remote side
+// turned them on (on either screen: the terminal has them), and
+// modifyOtherKeys off. The flags go on the stack and come off it, which
+// leaves the terminal's flags as they were, whatever the model makes of
+// them; but popping the last entry resets the flags set with nothing on
+// the stack, so then, and on a deep stack, the panel's flags replace the
+// top ones and the model's go back.
+func (p *proxy) panelKeys(alt bool) (on, off []byte) {
+	s := p.scr
+	if s.kitty[0].active() || s.kitty[1].active() {
+		k := s.kitty[0]
+		if alt {
+			k = s.kitty[1]
+		}
+		if n := len(k.pushed); (n == 0 && k.base != 0) || n >= kittyPushDepth {
+			top := k.base
+			if n > 0 {
+				top = k.pushed[n-1]
+			}
+			on = append(on, "\x1b[="+strconv.Itoa(kittyPanelFlags)+";1u"...)
+			off = append(off, "\x1b[="+strconv.Itoa(top)+";1u"...)
+		} else {
+			on = append(on, "\x1b[>"+strconv.Itoa(kittyPanelFlags)+"u"...)
+			off = append(off, "\x1b[<u"...)
+		}
+	}
+	if s.otherKeys != 0 {
+		on = append(on, "\x1b[>4;0m"...)
+		off = append(off, "\x1b[>4;"+strconv.Itoa(s.otherKeys)+"m"...)
+	}
+	return on, off
 }
 
 // drawModes are the modes the panel is drawn in: cursor hidden, absolute
@@ -750,6 +803,7 @@ func (p *proxy) closingPanel() []byte {
 	p.emergency.Unlock()
 	w := &painter{}
 	w.b = append(w.b, "\x1b[?2026h"...)
+	w.b = append(w.b, pn.keysOff...) // on the panel's screen
 	switch {
 	case pn.altBuf:
 		// The terminal puts back the normal screen and, as DECRC does,
