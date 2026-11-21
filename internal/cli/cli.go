@@ -121,6 +121,9 @@ type Env struct {
 	prompts  int
 	halted   chan struct{}
 	resumed  bool
+	// promptDecided, for tests, runs once prompt has decided whether an
+	// answer goes back to the command.
+	promptDecided func()
 
 	// onInterrupt is what a command that holds no vault has to undo if a
 	// signal ends it where it can't return (atInterrupt).
@@ -244,17 +247,26 @@ func (e *Env) prompt(read func() error) error {
 	e.prompts++
 	e.promptMu.Unlock()
 	err := read()
+	// One step decides where the answer goes: a prompt that is to return
+	// to the command stops counting as under way in the same step, so the
+	// watcher never finds it waiting (haltPrompts) once it has returned.
 	e.promptMu.Lock()
 	halted := e.halted
-	e.promptMu.Unlock()
-	if halted != nil {
-		<-halted
-		err = errHalted
+	if halted == nil {
+		e.prompts--
 	}
+	e.promptMu.Unlock()
+	if e.promptDecided != nil {
+		e.promptDecided()
+	}
+	if halted == nil {
+		return err
+	}
+	<-halted
 	e.promptMu.Lock()
 	e.prompts--
 	e.promptMu.Unlock()
-	return err
+	return errHalted
 }
 
 // readPassword is ReadPassword, through prompt.
