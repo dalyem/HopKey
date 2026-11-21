@@ -326,12 +326,14 @@ func holdVault(ctx context.Context, e *Env, asJSON bool) (*vaultHold, error) {
 // noted before it is stopped, keep or not: a vault that was locked is
 // locked again unless the command succeeded.
 func holdVaultKeeping(ctx context.Context, e *Env, asJSON, keep bool) (*vaultHold, error) {
-	h := &vaultHold{e: e, cfg: e.storeConfig(), asJSON: asJSON}
+	// The policy is settled before the hold is published: Run's signal
+	// watcher may read it from then on.
+	h := &vaultHold{e: e, cfg: e.storeConfig(), asJSON: asJSON, keepOpen: keep}
 	if err := h.mark(); err != nil {
 		return nil, err
 	}
+	h.wasLocked = daemonVaultLocked(ctx, e)
 	e.setHold(h)
-	h.keepOpen, h.wasLocked = keep, daemonVaultLocked(ctx, e)
 	if _, err := shutdownDaemon(ctx, e); err != nil {
 		if e.daemonGone() {
 			// The daemon stopped although the request failed (a signal

@@ -22,7 +22,9 @@ func TestAbandonAwayFromAPromptHandsALockedVaultBackLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	h.mu.Lock()
 	h.keepOpen, h.wasLocked = true, true // what holdVaultKeeping finds
+	h.mu.Unlock()
 	go x.e.watchInterrupt(ctx, make(chan struct{}), false, false)
 	cancel(ErrInterrupted)
 	select {
