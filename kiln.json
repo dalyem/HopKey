@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "projectId": "prj_xgx365evixpd",
+  "name": "hopkey",
+  "runtime": {
+    "image": "golang:1.27-bookworm"
+  },
+  "dev": "sh scripts/preview-server.sh",
+  "port": 8080,
+  "checks": {
+    "vet": "sh scripts/check.sh vet",
+    "test": "sh scripts/check.sh test",
+    "race": "sh scripts/check.sh race",
+    "gofmt": "sh scripts/check.sh gofmt"
+  },
+  "health": {
+    "path": "/v1/healthz",
+    "timeoutSeconds": 300
+  }
+}

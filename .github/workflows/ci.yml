@@ -1,0 +1,52 @@
+# The release's checks on a pull request and on main, so that a change can be
+# proven before a tag is spent on it. They are the checks of the verify job in
+# release.yml, without the race check (three known tests are flaky under load,
+# and it takes long). Nothing here publishes, and no secret is used.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer run of the same ref makes an older one pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # check.sh test needs the runner's ssh client (HOPKEY_REQUIRE_SSH=1), and
+      # the passwd shim even though the runner's uid has an entry.
+      - run: sh scripts/check.sh gofmt
+      - run: sh scripts/check.sh vet
+      - run: sh scripts/check.sh test
+        env:
+          HOPKEY_PASSWD_SHIM: always
+      # The CLI is MIT and the server AGPL; the CLI must not take in server code.
+      - name: Check that hop does not import the server
+        run: |
+          set -eu
+          deps=$(go list -deps ./cmd/hop)
+          if printf '%s\n' "$deps" | grep -q '/internal/server$'; then
+            echo "::error::cmd/hop imports internal/server, which is under the AGPL"
+            exit 1
+          fi
+      - name: npm package tests
+        run: node --test npm/test/*.test.js

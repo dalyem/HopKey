@@ -1,0 +1,48 @@
+{
+  "name": "@dalyem/hopkey",
+  "version": "0.0.0-template",
+  "private": true,
+  "description": "HopKey: an end-to-end encrypted vault for SSH hosts and keys (the hop CLI)",
+  "keywords": [
+    "ssh",
+    "vault",
+    "ssh-agent",
+    "hop"
+  ],
+  "homepage": "https://github.com/dalyem/HopKey#readme",
+  "bugs": {
+    "url": "https://github.com/dalyem/HopKey/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dalyem/HopKey.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "hop": "bin/hop"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/hop",
+    "install.js",
+    "lib/",
+    "vendor/",
+    "README.md"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
